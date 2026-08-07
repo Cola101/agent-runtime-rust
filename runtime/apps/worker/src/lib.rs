@@ -7,14 +7,14 @@ use agent_model_gateway_protocol::v1::{
 };
 use agent_nats_security::NatsClientConfig;
 use agent_protocol::{
-    ActiveRunAssignment, ApprovalMode, BudgetDimension, EventEnvelope, ModelFinishReason,
-    ModelStreamEvent, Placement, PreparedRunCheckpoint, RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION,
-    RunCancellationCommand, RunCheckpointPublished, RunExecutionAccepted, RunExecutionCommand,
-    RunRecoveryCommand, RunSteeringCommand, RunSteeringOutcome, SandboxClass,
-    SubagentResultDelivery, SubagentRole, SubagentSpawnRequest, ToolApprovalDecision,
-    ToolApprovalDecisionCommand, ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
-    WORKER_HEARTBEAT_SCHEMA_VERSION, WorkerHeartbeat, WorkloadIdentityRenewalCommand,
-    WorkloadToken,
+    ActiveRunAssignment, ApprovalMode, AutoApproval, BudgetDimension, EventEnvelope,
+    ModelFinishReason, ModelStreamEvent, Placement, PreparedRunCheckpoint,
+    RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION, RunCancellationCommand, RunCheckpointPublished,
+    RunExecutionAccepted, RunExecutionCommand, RunRecoveryCommand, RunSteeringCommand,
+    RunSteeringOutcome, SandboxClass, SubagentResultDelivery, SubagentRole, SubagentSpawnRequest,
+    ToolApprovalDecision, ToolApprovalDecisionCommand, ToolCall, ToolDescriptor, ToolEffect,
+    ToolExecutionRequest, WORKER_HEARTBEAT_SCHEMA_VERSION, WorkerHeartbeat,
+    WorkloadIdentityRenewalCommand, WorkloadToken,
 };
 use agent_tool_runtime::{
     ToolExecutionContext, ToolExecutionError, ToolExecutor, TrustedNativeExecutor,
@@ -500,12 +500,13 @@ pub fn prepare_trusted_workspace_tool(
         .to_path_buf();
 
     let mut tools = Vec::new();
-    for (name, access, effect, scope, description, schema) in [
+    for (name, access, effect, scope, auto_approval, description, schema) in [
         (
             "workspace.read_text",
             WorkspaceAccess::ReadOnly,
             ToolEffect::Pure,
             "tool:workspace.read",
+            AutoApproval::Never,
             "Read one bounded UTF-8 text file from the current workspace",
             serde_json::json!({
                 "type": "object",
@@ -521,6 +522,7 @@ pub fn prepare_trusted_workspace_tool(
             // never be replayed automatically.
             ToolEffect::NonIdempotent,
             "tool:workspace.write",
+            AutoApproval::Never,
             "Write one bounded UTF-8 text file into the current workspace",
             serde_json::json!({
                 "type": "object",
@@ -539,6 +541,13 @@ pub fn prepare_trusted_workspace_tool(
             // Its own scope. Granting shell is a different decision from
             // granting file writes, and must not ride along with one.
             "tool:shell.exec",
+            // Provably read-only commands skip the approval. Everything the
+            // approval still guarded -- writes outside the Workspace, network,
+            // credential directories -- is already blocked by the container, so
+            // what is left to approve is a write to the user's own files. A
+            // command that cannot write has nothing left to review, and asking
+            // for every `ls` is what makes the Tool unusable in practice.
+            AutoApproval::ProvablyReadOnlyShellCommand,
             "Run one bounded shell command inside the current workspace",
             serde_json::json!({
                 "type": "object",
@@ -567,6 +576,7 @@ pub fn prepare_trusted_workspace_tool(
                     sandbox: SandboxClass::TrustedNative,
                     implementation_digest,
                     required_scopes: BTreeSet::from([scope.to_string()]),
+                    auto_approval,
                 },
                 description: description.into(),
                 input_schema: schema,

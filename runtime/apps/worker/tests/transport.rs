@@ -7,7 +7,7 @@ use agent_model_gateway_protocol::v1::{
     Usage,
 };
 use agent_protocol::{
-    ApprovalMode, EventEnvelope, ModelFinishReason, ModelStreamEvent, Placement,
+    ApprovalMode, AutoApproval, EventEnvelope, ModelFinishReason, ModelStreamEvent, Placement,
     RUN_CANCELLATION_SCHEMA_VERSION, RunCancellationCommand, RunCheckpointPublished,
     RunExecutionAccepted, RunExecutionCommand, RunRecoveryCommand, RunSteeringCommand,
     RunSteeringOutcome, RunSteeringRequest, RunSteeringTarget, SandboxClass,
@@ -827,6 +827,7 @@ async fn recovered_waiting_approval_is_rebound_before_the_recovery_command_is_ac
             sandbox: SandboxClass::RestrictedContainer,
             implementation_digest: "a".repeat(64),
             required_scopes: BTreeSet::from(["workspace:read".into()]),
+            auto_approval: AutoApproval::Never,
         },
         description: "Read a file from the workspace".into(),
         input_schema: serde_json::json!({"type":"object"}),
@@ -1534,6 +1535,7 @@ async fn worker_consumes_bound_approval_decision_and_publishes_resume_before_ack
                 sandbox: SandboxClass::RestrictedContainer,
                 implementation_digest: "a".repeat(64),
                 required_scopes: BTreeSet::from(["workspace:write".into()]),
+                auto_approval: AutoApproval::Never,
             },
             description: "Read a file from the workspace".into(),
             input_schema: serde_json::json!({"type":"object"}),
@@ -1960,6 +1962,7 @@ async fn worker_automatically_closes_a_model_tool_model_loop() {
                 sandbox: SandboxClass::RestrictedContainer,
                 implementation_digest: "a".repeat(64),
                 required_scopes: BTreeSet::from(["workspace:read".into()]),
+                auto_approval: AutoApproval::Never,
             },
             description: "Read a workspace file".into(),
             input_schema: serde_json::json!({"type":"object"}),

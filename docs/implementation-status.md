@@ -120,7 +120,9 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 - 受控出网 HTTP 与 MCP 的 Tool 制品；Kubernetes Job/Kata 沙箱生命周期及 OCI 签名验证。
   **写文件与 Shell 已实现**（ADR-0036、0038），但都只在 macOS 上受容器约束，
   Linux 上没有 `landlock` 等价物，因此 Worker 的 Linux 路径不得注册它们。
-- **Shell 没有命令白名单**，每次调用都要人工审批；连续工作不可行，只能算实验能力。
+- Shell 的**只读命令白名单已实现**（ADR-0039）：可证明只读的命令免审批，其余仍逐次审批。
+  名单写死在代码里、无租户配置；`find`/`sed`/`awk`/`sort`/双引号/通配符仍需审批。
+  **被豁免的命令读什么无人审查**——这是豁免的真实代价。
   容器只对 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.config/gh` 拒读，其余用户可读文件仍可读，
   所以「Shell 已容器化」不得表述为「Shell 已隔离」。
 - Shell 没有交互式或长驻会话（Codex 的 `unified_exec` 对应物）。

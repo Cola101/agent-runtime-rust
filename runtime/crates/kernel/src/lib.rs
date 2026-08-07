@@ -1,5 +1,9 @@
+mod read_only_shell;
+
+pub use read_only_shell::{ShellCommandClass, classify_shell_command};
+
 use agent_protocol::{
-    ApprovalMode, BudgetDimension, CheckpointSnapshot, EventEnvelope, ModelErrorKind,
+    ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope, ModelErrorKind,
     ModelFinishReason, ModelStreamEvent, RunStatus, SubagentResultDelivery, SubagentSpawnRequest,
     ToolApprovalPolicySnapshot, ToolApprovalRequest, ToolCall, ToolDescriptor, ToolEffect,
     ToolExecutionRequest,
@@ -109,6 +113,7 @@ impl ToolRegistry {
             sandbox: descriptor.sandbox,
             implementation_digest: descriptor.implementation_digest.clone(),
             required_scopes: descriptor.required_scopes.clone(),
+            auto_approval: descriptor.auto_approval,
         };
         let policy_digest = digest(&policy_snapshot);
         let session_scope_digest = digest(&json!({
@@ -132,6 +137,22 @@ impl ToolRegistry {
             sandbox: descriptor.sandbox,
             binding_digest,
         };
+        // An `Ask` Tool may exempt a particular call, but only through a policy
+        // its descriptor declares. The Worker never decides this on its own:
+        // the exemption travels with the Tool definition and is recorded in the
+        // policy snapshot below, so it stays auditable.
+        let exempt = descriptor.approval == ApprovalMode::Ask
+            && descriptor.auto_approval == AutoApproval::ProvablyReadOnlyShellCommand
+            && execution
+                .call
+                .arguments
+                .get("command")
+                .and_then(|command| command.as_str())
+                .map(classify_shell_command)
+                == Some(ShellCommandClass::ProvablyReadOnly);
+        if exempt {
+            return Ok(ToolPlan::Execute(execution));
+        }
         Ok(match descriptor.approval {
             ApprovalMode::Allow => ToolPlan::Execute(execution),
             ApprovalMode::Ask => ToolPlan::ApprovalRequired(ToolApprovalRequest {

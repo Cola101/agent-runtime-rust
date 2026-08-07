@@ -1,5 +1,7 @@
 use agent_kernel::{RegistryError, ToolPlan, ToolRegistry};
-use agent_protocol::{ApprovalMode, SandboxClass, ToolDescriptor, ToolEffect};
+use agent_protocol::{
+    ApprovalMode, AutoApproval, SandboxClass, ToolCall, ToolDescriptor, ToolEffect,
+};
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -11,6 +13,7 @@ fn shell_tool() -> ToolDescriptor {
         sandbox: SandboxClass::Kata,
         implementation_digest: "a".repeat(64),
         required_scopes: BTreeSet::from(["workspace:write".into()]),
+        auto_approval: AutoApproval::Never,
     }
 }
 
@@ -25,6 +28,7 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
             sandbox: SandboxClass::RestrictedContainer,
             implementation_digest: "b".repeat(64),
             required_scopes: BTreeSet::from(["workspace:read".into()]),
+            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     registry
@@ -35,6 +39,7 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
             sandbox: SandboxClass::Kata,
             implementation_digest: "a".repeat(64),
             required_scopes: BTreeSet::from(["workspace:write".into()]),
+            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     let scopes = BTreeSet::from(["workspace:read".into(), "workspace:write".into()]);
@@ -116,6 +121,7 @@ fn approval_binding_changes_with_the_immutable_tool_implementation() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "1".repeat(64),
             required_scopes: BTreeSet::new(),
+            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     let mut second = ToolRegistry::default();
@@ -127,6 +133,7 @@ fn approval_binding_changes_with_the_immutable_tool_implementation() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "2".repeat(64),
             required_scopes: BTreeSet::new(),
+            auto_approval: AutoApproval::Never,
         })
         .unwrap();
 
@@ -212,5 +219,94 @@ fn registry_rejects_a_tool_without_an_immutable_implementation_digest() {
     assert_eq!(
         ToolRegistry::default().register(descriptor).unwrap_err(),
         RegistryError::InvalidImplementationDigest
+    );
+}
+
+/// The exemption must come from the Tool's declared policy, never from the
+/// command text alone. A Worker that decided this on its own would be bypassing
+/// the control plane's approval ledger, which is the thing the gate exists to
+/// keep honest.
+#[test]
+fn a_read_only_command_is_exempt_only_when_the_tool_declares_the_policy() {
+    fn plan_for(auto_approval: AutoApproval, command: &str) -> ToolPlan {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(ToolDescriptor {
+                name: "shell.exec".into(),
+                effect: ToolEffect::NonIdempotent,
+                approval: ApprovalMode::Ask,
+                sandbox: SandboxClass::TrustedNative,
+                implementation_digest: "c".repeat(64),
+                required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
+                auto_approval,
+            })
+            .unwrap();
+        registry
+            .plan(
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "shell.exec".into(),
+                    arguments: serde_json::json!({ "command": command }),
+                },
+                &BTreeSet::from(["tool:shell.exec".to_string()]),
+            )
+            .unwrap()
+    }
+
+    // Same command, two policies: only the declaring Tool skips the gate.
+    assert!(matches!(
+        plan_for(AutoApproval::ProvablyReadOnlyShellCommand, "ls -la"),
+        ToolPlan::Execute(_)
+    ));
+    assert!(matches!(
+        plan_for(AutoApproval::Never, "ls -la"),
+        ToolPlan::ApprovalRequired(_)
+    ));
+
+    // Declaring the policy exempts nothing that is not provably read-only.
+    assert!(matches!(
+        plan_for(AutoApproval::ProvablyReadOnlyShellCommand, "rm -rf /"),
+        ToolPlan::ApprovalRequired(_)
+    ));
+    assert!(matches!(
+        plan_for(AutoApproval::ProvablyReadOnlyShellCommand, "ls; rm -rf /"),
+        ToolPlan::ApprovalRequired(_)
+    ));
+}
+
+/// The ledger has to be able to show that an exemption was in force. A snapshot
+/// that omitted it would make an auto-approved call indistinguishable from a
+/// Tool that was never approval gated at all.
+#[test]
+fn the_policy_snapshot_records_the_exemption() {
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ToolDescriptor {
+            name: "shell.exec".into(),
+            effect: ToolEffect::NonIdempotent,
+            approval: ApprovalMode::Ask,
+            sandbox: SandboxClass::TrustedNative,
+            implementation_digest: "c".repeat(64),
+            required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
+            auto_approval: AutoApproval::ProvablyReadOnlyShellCommand,
+        })
+        .unwrap();
+
+    let ToolPlan::ApprovalRequired(request) = registry
+        .plan(
+            ToolCall {
+                id: "call_1".into(),
+                name: "shell.exec".into(),
+                arguments: serde_json::json!({ "command": "rm -rf /" }),
+            },
+            &BTreeSet::from(["tool:shell.exec".to_string()]),
+        )
+        .unwrap()
+    else {
+        panic!("a command that is not read-only must still be approval gated");
+    };
+    assert_eq!(
+        request.policy_snapshot.expect("snapshot").auto_approval,
+        AutoApproval::ProvablyReadOnlyShellCommand
     );
 }

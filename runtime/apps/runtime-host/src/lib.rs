@@ -13,8 +13,8 @@ use agent_model_gateway::{
     ProviderPricing, decode_model_invocation,
 };
 use agent_protocol::{
-    ApprovalMode, EventEnvelope, ModelStreamEvent, RunBudget, RunExecutionCommand, RunStatus,
-    SandboxClass, TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision,
+    ApprovalMode, AutoApproval, EventEnvelope, ModelStreamEvent, RunBudget, RunExecutionCommand,
+    RunStatus, SandboxClass, TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision,
     ToolApprovalDecisionCommand, ToolDescriptor, ToolEffect,
 };
 use agent_runtime_worker::{WorkerProcessor, WorkerToolDefinition};
@@ -38,6 +38,12 @@ pub const WORKSPACE_READ_SCOPE: &str = "tool:workspace.read";
 /// and approval gated, because it changes the user's files.
 pub const WORKSPACE_WRITE_TOOL: &str = "workspace.write_text";
 pub const WORKSPACE_WRITE_SCOPE: &str = "tool:workspace.write";
+/// Shell, same Tool and same containment as the cloud Worker installs. A local
+/// host that offered fewer Tools than the cloud one would make the desktop
+/// client a weaker product for no security reason -- the boundary is the
+/// container, and it is the same container.
+pub const SHELL_TOOL: &str = "shell.exec";
+pub const SHELL_SCOPE: &str = "tool:shell.exec";
 
 pub(crate) const LOCAL_STORE_VERSION: u32 = 1;
 
@@ -247,12 +253,13 @@ impl LocalRuntimeHost {
             // One executor per Tool rather than one shared read-write executor:
             // the read Tool then runs under a profile that grants no writes at
             // all, so a defect in it cannot change anything.
-            for (name, access, effect, scope, description) in [
+            for (name, access, effect, scope, auto_approval, description) in [
                 (
                     WORKSPACE_READ_TOOL,
                     WorkspaceAccess::ReadOnly,
                     ToolEffect::Pure,
                     WORKSPACE_READ_SCOPE,
+                    AutoApproval::Never,
                     "Read one bounded UTF-8 text file from the local workspace",
                 ),
                 (
@@ -260,7 +267,16 @@ impl LocalRuntimeHost {
                     WorkspaceAccess::ReadWrite,
                     ToolEffect::NonIdempotent,
                     WORKSPACE_WRITE_SCOPE,
+                    AutoApproval::Never,
                     "Write one bounded UTF-8 text file into the local workspace",
+                ),
+                (
+                    SHELL_TOOL,
+                    WorkspaceAccess::ReadWrite,
+                    ToolEffect::NonIdempotent,
+                    SHELL_SCOPE,
+                    AutoApproval::ProvablyReadOnlyShellCommand,
+                    "Run one bounded shell command inside the local workspace",
                 ),
             ] {
                 let native = TrustedNativeExecutor::new(TrustedNativeToolDefinition {
@@ -281,16 +297,26 @@ impl LocalRuntimeHost {
                             sandbox: SandboxClass::TrustedNative,
                             implementation_digest: native.implementation_digest().to_owned(),
                             required_scopes: BTreeSet::from([scope.to_owned()]),
+                            auto_approval,
                         },
                         description: description.into(),
-                        input_schema: match access {
-                            WorkspaceAccess::ReadOnly => serde_json::json!({
+                        // Keyed on the Tool, not on its Workspace access: shell
+                        // is also ReadWrite but takes a command, and matching on
+                        // access would have handed it the file schema.
+                        input_schema: match name {
+                            WORKSPACE_READ_TOOL => serde_json::json!({
                                 "type": "object",
                                 "properties": {"path": {"type": "string"}},
                                 "required": ["path"],
                                 "additionalProperties": false
                             }),
-                            WorkspaceAccess::ReadWrite => serde_json::json!({
+                            SHELL_TOOL => serde_json::json!({
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                                "required": ["command"],
+                                "additionalProperties": false
+                            }),
+                            _ => serde_json::json!({
                                 "type": "object",
                                 "properties": {
                                     "path": {"type": "string"},

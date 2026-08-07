@@ -1196,6 +1196,30 @@ pub struct ToolDescriptor {
     pub sandbox: SandboxClass,
     pub implementation_digest: String,
     pub required_scopes: std::collections::BTreeSet<String>,
+    /// When an `Ask` Tool may skip the approval for a particular call.
+    /// Defaults to `Never`, so a Tool that says nothing keeps asking every time.
+    #[serde(default)]
+    pub auto_approval: AutoApproval,
+}
+
+/// Narrow, per-Tool exemptions from the approval gate.
+///
+/// Kept as an explicit enum rather than a boolean so that adding a second
+/// exemption forces a decision about which Tool it applies to. The variant is
+/// part of the policy snapshot the approval ledger records, so an exemption is
+/// auditable rather than invisible.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoApproval {
+    /// Every call asks. The default, and what every Tool had before this
+    /// existed.
+    #[default]
+    Never,
+    /// A shell command that is provably read-only may run without asking. The
+    /// container already prevents writes outside the Workspace, all network and
+    /// the credential directories, so a command that cannot write has nothing
+    /// left for a person to approve.
+    ProvablyReadOnlyShellCommand,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1233,6 +1257,10 @@ pub struct ToolApprovalPolicySnapshot {
     pub sandbox: SandboxClass,
     pub implementation_digest: String,
     pub required_scopes: std::collections::BTreeSet<String>,
+    /// Recorded so the ledger shows what exemption was in force, not just that
+    /// an approval was or was not asked for.
+    #[serde(default)]
+    pub auto_approval: AutoApproval,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

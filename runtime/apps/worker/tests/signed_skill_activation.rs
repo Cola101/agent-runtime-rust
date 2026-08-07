@@ -6,8 +6,8 @@
 //! errors it fails closed with. No test asserts on call counts or internals.
 
 use agent_protocol::{
-    ApprovalMode, ModelFinishReason, ModelStreamEvent, RunExecutionCommand, SandboxClass,
-    ToolDescriptor, ToolEffect,
+    ApprovalMode, AutoApproval, ModelFinishReason, ModelStreamEvent, RunExecutionCommand,
+    SandboxClass, ToolDescriptor, ToolEffect,
 };
 use agent_runtime_worker::{
     SkillArtifactVerifier, WorkerAssignmentError, WorkerProcessor, WorkerToolDefinition,
@@ -172,6 +172,7 @@ fn install_tool(worker: &mut WorkerProcessor, name: &str, required_scope: &str) 
                 sandbox: SandboxClass::TrustedNative,
                 implementation_digest: "a".repeat(64),
                 required_scopes: BTreeSet::from([required_scope.to_owned()]),
+                auto_approval: AutoApproval::Never,
             },
             description: format!("Trusted {name}"),
             input_schema: json!({"type": "object"}),
