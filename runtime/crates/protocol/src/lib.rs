@@ -318,9 +318,18 @@ impl SkillSnapshot {
     }
 
     #[must_use]
+    /// The digest this snapshot's contents imply.
+    ///
+    /// Exposed so a caller that changes a snapshot can recompute it from the one
+    /// implementation rather than mirroring the canonical field list, which is
+    /// how the two would drift.
+    pub fn expected_artifact_digest(&self, tenant_id: Uuid) -> String {
+        hex::encode(Sha256::digest(self.canonical_bytes(tenant_id)))
+    }
+
     pub fn artifact_digest_matches(&self, tenant_id: Uuid) -> bool {
         is_sha256(&self.artifact_digest)
-            && hex::encode(Sha256::digest(self.canonical_bytes(tenant_id))) == self.artifact_digest
+            && self.expected_artifact_digest(tenant_id) == self.artifact_digest
     }
 
     fn validate(&self, tenant_id: Uuid) -> bool {
@@ -334,10 +343,7 @@ impl SkillSnapshot {
             && !self.instructions.trim().is_empty()
             && self.instructions.len() <= 32_000
             && sorted_unique(&self.tool_names, 32)
-            && self
-                .tool_names
-                .iter()
-                .all(|name| portable_identifier(name, 120))
+            && self.tool_names.iter().all(|name| skill_tool_name(name, 120))
             && sorted_unique(&self.supported_platforms, 8)
             && !self.supported_platforms.is_empty()
             && self.supported_platforms.iter().all(|platform| {
@@ -640,6 +646,30 @@ fn sorted_unique(values: &[String], maximum: usize) -> bool {
         && values
             .windows(2)
             .all(|pair| pair[0].as_str() < pair[1].as_str())
+}
+
+/// A Tool name a Skill may declare.
+///
+/// Either a native Tool's portable identifier, or a federated Tool's qualified
+/// `mcp:<server>/<tool>` (ADR-0040). Federated names were impossible before
+/// this: `portable_identifier` forbids `:` and `/`, so a Skill declaring one
+/// made the whole snapshot invalid and the Run was refused for asking for
+/// something the platform is meant to support.
+///
+/// Both halves must themselves be portable identifiers, so exactly one `:` and
+/// one `/` can appear and neither half can be empty. That is what keeps a name
+/// from parsing as a different server than it names.
+fn skill_tool_name(value: &str, maximum: usize) -> bool {
+    if value.len() > maximum {
+        return false;
+    }
+    let Some(qualified) = value.strip_prefix("mcp:") else {
+        return portable_identifier(value, maximum);
+    };
+    let Some((server, tool)) = qualified.split_once('/') else {
+        return false;
+    };
+    portable_identifier(server, 64) && portable_identifier(tool, 128)
 }
 
 fn portable_identifier(value: &str, maximum: usize) -> bool {

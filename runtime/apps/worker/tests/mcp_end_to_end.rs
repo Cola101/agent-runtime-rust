@@ -402,3 +402,120 @@ fn signed_identity(signing_key: &SigningKey, identity: &FederationIdentity) -> S
         .encode(signing_key.sign(signing_input.as_bytes()).to_bytes());
     format!("{signing_input}.{signature}")
 }
+
+/// The main chain: a federated tool goes through the same executor path a native
+/// Tool does.
+///
+/// Everything before this drove the pieces by hand. This drives
+/// `prepare_tool_launch` -> `ToolExecutor::execute`, which is what the Worker's
+/// own loop calls, so approval, the started and result events and the checkpoint
+/// all run unchanged rather than being reimplemented for federation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_executor_path_runs_a_federated_tool() {
+    use agent_protocol::{SandboxClass as Sandbox, ToolExecutionRequest};
+    use agent_runtime_worker::FederatedToolExecutor;
+    use agent_tool_runtime::{ToolExecutionContext, ToolExecutor};
+
+    let private_key_pem = RsaPrivateKey::new(&mut OsRng, 3072)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let signing_key = SigningKey::from_bytes(&[74; 32]);
+    let tools = Arc::new(Mutex::new(vec!["web_search".to_owned()]));
+    let endpoint = spawn_mcp_server(Arc::clone(&tools)).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem, &signing_key).await;
+    let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
+        .await
+        .unwrap();
+
+    let command = v9_command_with(
+        serde_json::json!([{
+            "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+            "name": "search",
+            "endpoint": endpoint,
+            "credential_envelope_base64": ""
+        }]),
+        serde_json::json!(["tool:mcp:search"]),
+    );
+    let identity = FederationIdentity::from_command(&command);
+    let token = signed_identity(&signing_key, &identity);
+    let worker = WorkerProcessor::new(
+        Uuid::now_v7(),
+        vec![agent_protocol::Placement::Cloud],
+        4,
+        "0.1.0".to_string(),
+    )
+    .unwrap();
+    let federated =
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, &token).await;
+    let digest = federated.frozen_digests["search"].clone();
+
+    let executor = FederatedToolExecutor::new(
+        client,
+        command.mcp_servers[0].clone(),
+        identity,
+        digest.clone(),
+        token,
+    );
+    // The digest the descriptor carries and the digest the executor presents
+    // have to be the same value, or registration would reject the pair.
+    assert_eq!(executor.implementation_digest(), digest);
+
+    let request = ToolExecutionRequest {
+        call: ToolCall {
+            id: "call-1".into(),
+            name: "mcp:search/web_search".into(),
+            arguments: serde_json::json!({ "query": "agent runtime" }),
+        },
+        effect: agent_protocol::ToolEffect::Unknown,
+        sandbox: Sandbox::Federated,
+        binding_digest: "b".repeat(64),
+    };
+    let context = ToolExecutionContext {
+        tenant_id: identity.tenant_id,
+        run_id: identity.run_id,
+        attempt_id: identity.attempt_id,
+        workspace_root: std::path::PathBuf::from("/tmp"),
+        timeout: Duration::from_secs(10),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        requested_at: chrono::Utc::now(),
+    };
+
+    let result = executor
+        .execute(request.clone(), context.clone())
+        .await
+        .expect("a federated tool should execute through the normal path");
+    assert!(!result.is_error);
+    assert_eq!(result.exit_code, 0);
+    assert!(result.content.to_string().contains("three results"));
+
+    // A request routed to the wrong executor must be refused rather than
+    // silently called anyway.
+    let mut wrong = request.clone();
+    wrong.sandbox = Sandbox::TrustedNative;
+    assert!(matches!(
+        executor.execute(wrong, context.clone()).await,
+        Err(agent_tool_runtime::ToolExecutionError::WrongSandbox)
+    ));
+
+    // And an executor built for one Run must refuse another Run's context.
+    let mut foreign = context.clone();
+    foreign.run_id = Uuid::now_v7();
+    assert!(matches!(
+        executor.execute(request.clone(), foreign).await,
+        Err(agent_tool_runtime::ToolExecutionError::InvalidContext(_))
+    ));
+
+    // The freeze still holds through the executor, and the failure is an
+    // execution failure rather than something the Worker would retry.
+    tools.lock().unwrap().push("delete_everything".to_owned());
+    let refused = executor
+        .execute(request, context)
+        .await
+        .expect_err("a moved catalog must refuse through the executor too");
+    assert!(
+        refused.to_string().contains("catalog changed"),
+        "expected the catalog refusal, got {refused}"
+    );
+}

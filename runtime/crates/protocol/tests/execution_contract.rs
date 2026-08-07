@@ -505,3 +505,40 @@ fn an_mcp_server_name_that_could_forge_a_qualified_tool_name_is_refused() {
         );
     }
 }
+
+/// A Skill has to be able to declare a federated tool by its qualified name.
+///
+/// Before this the name rules forbade `:` and `/`, so declaring
+/// `mcp:search/web_search` made the Skill snapshot invalid and the Run was
+/// refused -- for asking for exactly what ADR-0040 exists to provide.
+#[test]
+fn a_skill_may_declare_a_qualified_federated_tool_name() {
+    for (name, expected_valid) in [
+        ("mcp:search/web_search", true),
+        ("workspace.read_text", true),
+        // Two separators would let one server's tool name a different one.
+        ("mcp:search/a/b", false),
+        ("mcp:se:arch/tool", false),
+        ("mcp:/tool", false),
+        ("mcp:search/", false),
+        ("mcp:search", false),
+        ("mcp:UPPER/tool", false),
+        ("mcp:search/UPPER", false),
+        ("mcp:-lead/tool", false),
+    ] {
+        let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+        value["skill_snapshots"][0]["tool_names"] = serde_json::json!([name]);
+        let mut command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+        // tool_names is inside the artifact digest, so it has to be recomputed
+        // or every case fails on the digest and the name rule is never reached.
+        let digest = command.skill_snapshots[0].expected_artifact_digest(command.tenant_id);
+        command.skill_snapshots[0].artifact_digest = digest;
+
+        assert_eq!(
+            command.validate().is_ok(),
+            expected_valid,
+            "tool name {name:?} should be valid: {expected_valid}, got {:?}",
+            command.validate()
+        );
+    }
+}

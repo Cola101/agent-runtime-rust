@@ -327,3 +327,105 @@ pub async fn discover_federated_tools(
         unavailable,
     }
 }
+
+/// Executes one federated tool by asking the gateway to call it.
+///
+/// A `ToolExecutor` like any other, which is the point: approval, the started
+/// and result events, the checkpoint and the transcript all work unchanged. A
+/// special case in the dispatch path would have to reimplement each of those and
+/// would drift from the native path the first time one of them changed.
+pub struct FederatedToolExecutor {
+    client: tokio::sync::Mutex<GrpcMcpFederationClient>,
+    server: McpServerSnapshot,
+    identity: FederationIdentity,
+    /// Doubles as the implementation digest, so a Checkpoint restore that
+    /// recomputes the catalog digest refuses a Run whose server moved.
+    frozen_catalog_digest: String,
+    workload_token: String,
+}
+
+impl FederatedToolExecutor {
+    pub fn new(
+        client: GrpcMcpFederationClient,
+        server: McpServerSnapshot,
+        identity: FederationIdentity,
+        frozen_catalog_digest: String,
+        workload_token: String,
+    ) -> Self {
+        Self {
+            client: tokio::sync::Mutex::new(client),
+            server,
+            identity,
+            frozen_catalog_digest,
+            workload_token,
+        }
+    }
+}
+
+impl agent_tool_runtime::ToolExecutor for FederatedToolExecutor {
+    fn implementation_digest(&self) -> &str {
+        &self.frozen_catalog_digest
+    }
+
+    fn execute(
+        &self,
+        request: agent_protocol::ToolExecutionRequest,
+        context: agent_tool_runtime::ToolExecutionContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        agent_tool_runtime::ToolExecutionResult,
+                        agent_tool_runtime::ToolExecutionError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            use agent_tool_runtime::{ToolExecutionError, ToolExecutionResult};
+            if request.sandbox != agent_protocol::SandboxClass::Federated {
+                return Err(ToolExecutionError::WrongSandbox);
+            }
+            // The Run this executor was built for, not the one the request
+            // claims. They are the same today; asserting it means they cannot
+            // quietly stop being.
+            if context.tenant_id != self.identity.tenant_id
+                || context.run_id != self.identity.run_id
+            {
+                return Err(ToolExecutionError::InvalidContext(
+                    "federated executor belongs to another run".into(),
+                ));
+            }
+            let mut client = self.client.lock().await;
+            let outcome = tokio::select! {
+                biased;
+                () = context.cancellation.cancelled() => return Err(ToolExecutionError::Cancelled),
+                outcome = client.call_tool(
+                    &self.identity,
+                    &self.server,
+                    &request.call.name,
+                    &request.call.arguments,
+                    &self.frozen_catalog_digest,
+                    &self.workload_token,
+                ) => outcome,
+            };
+            match outcome {
+                Ok((content, is_error)) => Ok(ToolExecutionResult {
+                    content,
+                    is_error,
+                    // A federated tool has no process and so no exit code. Zero
+                    // for a completed call and one for a call the server itself
+                    // reported as failed, so the two stay distinguishable
+                    // downstream without inventing a status nobody set.
+                    exit_code: i32::from(is_error),
+                }),
+                // Everything else becomes a failed execution rather than a
+                // retry. These are non-idempotent by construction (ADR-0040),
+                // and a refusal -- a moved catalog, an unknown tool -- is a
+                // decision, not a blip to try again.
+                Err(error) => Err(ToolExecutionError::Engine(error.to_string())),
+            }
+        })
+    }
+}

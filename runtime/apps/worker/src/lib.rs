@@ -48,7 +48,7 @@ pub use checkpoint_gateway::GrpcCheckpointPayloadStore;
 pub use execution_supervisor::{ModelExecutionSupervisor, ModelExecutionUpdate};
 pub use mcp_gateway::{
     discover_federated_tools, DiscoveredCatalog, DiscoveredTool, FederatedRunTools,
-    FederationIdentity,
+    FederatedToolExecutor, FederationIdentity,
     GrpcMcpFederationClient, McpGatewayClientError,
 };
 pub use model_gateway::{GrpcModelGatewayClient, ModelGatewayClientError};
@@ -264,6 +264,18 @@ struct EffectiveSkillState {
 /// this on their own: two distinct `SkillVersion`s may render byte-identical
 /// instructions and declare the same Tools, so recovery would otherwise accept
 /// a substituted Skill artifact as unchanged.
+/// The server namespace of a qualified federated tool name, if it is one.
+///
+/// One place, so the parse used to admit a name and the parse used to route it
+/// cannot drift apart.
+fn federated_server_of(tool_name: &str) -> Option<&str> {
+    tool_name
+        .strip_prefix("mcp:")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(server, _)| server)
+        .filter(|server| !server.is_empty())
+}
+
 fn skill_binding_digest(snapshots: &[agent_protocol::SkillSnapshot]) -> String {
     let bindings = snapshots
         .iter()
@@ -348,6 +360,19 @@ struct ActiveExecution {
     subagent_result_receipt: Option<(String, EventEnvelope)>,
     steering_receipts: HashMap<Uuid, SteeringReceipt>,
     budget_usage: BudgetUsage,
+    /// Federated Tools discovered for this Run, and the executors that call
+    /// them (ADR-0040).
+    ///
+    /// Per attempt rather than per Worker because a frozen catalog belongs to a
+    /// Run: two Runs against one server can hold different digests, and a
+    /// Worker-wide map could only hold one of them.
+    federated_registry: Option<ToolRegistry>,
+    /// Not part of `Debug`: a trait object has none, and a Run's diagnostics
+    /// should not start depending on what an executor prints anyway.
+    federated_executors: FederatedExecutors,
+    /// Their definitions, so the model can be offered them. Without this the
+    /// Run holds tools it can execute and the model never learns they exist.
+    federated_definitions: Vec<WorkerToolDefinition>,
     pending_budget_exhaustion: Option<PendingBudgetExhaustion>,
     approval_decisions: HashMap<Uuid, ApprovalDecisionReceipt>,
     restored_from_checkpoint: Option<String>,
@@ -1036,6 +1061,59 @@ impl WorkerProcessor {
     /// Shared so a test can ask what the kernel would decide, rather than
     /// asserting on the descriptor and calling that the same thing. It is the
     /// planning decision that matters, and only the registry makes it.
+    /// Attaches the federated Tools discovered for one attempt.
+    ///
+    /// Separate from `accept` because discovery needs the network and `accept`
+    /// is synchronous. Until this runs the Run has no federated Tools at all,
+    /// which is the safe reading -- a model cannot call what was never offered.
+    pub fn attach_federated_tools(
+        &mut self,
+        attempt_id: Uuid,
+        registry: ToolRegistry,
+        definitions: Vec<WorkerToolDefinition>,
+        executors: Vec<(String, Arc<dyn ToolExecutor>)>,
+    ) -> Result<(), WorkerAssignmentError> {
+        let execution = self
+            .accepted
+            .get_mut(&attempt_id)
+            .ok_or(WorkerAssignmentError::UnknownAttempt)?;
+        // Only tools that ended up with an executor. A definition without one
+        // would be offered to the model and then fail to launch, which is worse
+        // than never offering it.
+        let runnable = executors
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        execution.federated_definitions = definitions
+            .into_iter()
+            .filter(|definition| runnable.contains(&definition.descriptor.name))
+            .collect();
+        execution.federated_registry = Some(registry);
+        execution.federated_executors = FederatedExecutors(executors.into_iter().collect());
+        Ok(())
+    }
+
+    pub fn federated_executor(
+        &self,
+        attempt_id: Uuid,
+        tool_name: &str,
+    ) -> Option<Arc<dyn ToolExecutor>> {
+        self.accepted
+            .get(&attempt_id)?
+            .federated_executors
+            .0
+            .get(tool_name)
+            .cloned()
+    }
+
+    /// Federated Tool definitions to offer the model for one attempt.
+    pub fn federated_tool_definitions_for(&self, attempt_id: Uuid) -> Vec<String> {
+        self.accepted
+            .get(&attempt_id)
+            .map(|execution| execution.federated_executors.0.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn tool_registry(&self) -> &ToolRegistry {
         &self.tool_registry
     }
@@ -1250,6 +1328,13 @@ impl WorkerProcessor {
                 subagent_result_receipt: None,
                 steering_receipts: HashMap::new(),
                 budget_usage: BudgetUsage::default(),
+                // Discovery needs the network, and accept() is synchronous.
+                // Attached by the transport once the Run is admitted; until then
+                // the Run simply has no federated Tools, which is the safe
+                // reading rather than a half-configured one.
+                federated_registry: None,
+                federated_executors: FederatedExecutors::default(),
+                federated_definitions: Vec::new(),
                 pending_budget_exhaustion: None,
                 approval_decisions: HashMap::new(),
                 restored_from_checkpoint: None,
@@ -1531,6 +1616,13 @@ impl WorkerProcessor {
                 budget_usage: state.budget_usage,
                 pending_budget_exhaustion: state.pending_budget_exhaustion,
                 approval_decisions: HashMap::new(),
+                // A restored Run rediscovers rather than inheriting: the
+                // digest it froze is recomputed against the catalog digest in
+                // the checkpoint, so a server that moved while the Run was
+                // suspended is caught rather than assumed unchanged.
+                federated_registry: None,
+                federated_executors: FederatedExecutors::default(),
+                federated_definitions: Vec::new(),
                 restored_from_checkpoint: Some(checkpoint.digest),
             },
         );
@@ -1697,6 +1789,35 @@ impl WorkerProcessor {
             agent_instructions.push_str("]\n");
             agent_instructions.push_str(&skill.instructions);
             for tool_name in &skill.tool_names {
+                // A federated tool is not installed on this Worker and never
+                // will be -- it is discovered per Run (ADR-0040). Judging it by
+                // `tool_definitions` rejects the whole Run for declaring
+                // something perfectly legitimate.
+                //
+                // It is effective when the command carries its server and the
+                // AgentVersion delegated that server's scope. Both are checked
+                // here rather than assumed, so a Skill still cannot widen
+                // anything: declaring `mcp:other/x` with no such server, or
+                // without `tool:mcp:other`, is refused exactly as an unavailable
+                // native tool is.
+                if let Some(server_name) = federated_server_of(tool_name) {
+                    let scope = format!("tool:mcp:{server_name}");
+                    if !command.delegated_scopes.contains(&scope)
+                        || !command
+                            .mcp_servers
+                            .iter()
+                            .any(|server| server.name == server_name)
+                    {
+                        return Err(WorkerAssignmentError::ToolConfiguration(format!(
+                            "Skill {} requires federated tool {tool_name} whose server is not \
+                             registered for this run or whose scope is not delegated",
+                            skill.name
+                        )));
+                    }
+                    declared_tool_names.insert(tool_name.clone());
+                    tool_names.insert(tool_name.clone());
+                    continue;
+                }
                 if !self.tool_definitions.contains_key(tool_name) {
                     return Err(WorkerAssignmentError::ToolConfiguration(format!(
                         "Skill {} requires unavailable trusted tool {tool_name}",
@@ -2026,15 +2147,23 @@ impl WorkerProcessor {
                     )
                 })?
         };
+        // Federated definitions sit alongside native ones and go through the
+        // same filter. The intersection is unchanged (ADR-0040 decision 5): a
+        // federated tool is offered only if the Skill declared it by qualified
+        // name and the AgentVersion delegated its server's scope.
+        let registry = execution
+            .federated_registry
+            .as_ref()
+            .unwrap_or(&self.tool_registry);
         let mut tools = self
             .tool_definitions
             .values()
+            .chain(execution.federated_definitions.iter())
             .filter(|definition| {
                 execution
                     .effective_tool_names
                     .contains(&definition.descriptor.name)
-                    && self
-                        .tool_registry
+                    && registry
                         .authorize(&definition.descriptor.name, &command.delegated_scopes)
                         .is_ok()
             })
@@ -2159,8 +2288,14 @@ impl WorkerProcessor {
                 call.name
             )));
         }
-        let plan = self
-            .tool_registry
+        // The Run's own registry when it has one -- the Worker's native Tools
+        // plus this Run's federated ones. Planning against the Worker's would
+        // leave every federated call an unknown tool.
+        let registry = execution
+            .federated_registry
+            .as_ref()
+            .unwrap_or(&self.tool_registry);
+        let plan = registry
             .plan(
                 call,
                 &execution.command.delegated_scopes,
@@ -2828,6 +2963,23 @@ pub struct NatsWorker {
     pending_tool_plan: Option<PendingToolPlan>,
     pending_tool_start: Option<PendingToolStart>,
     pending_tool_event: Option<EventEnvelope>,
+    /// Present only when the deployment configured a gateway for federation. A
+    /// Run carrying MCP servers on a Worker without one is logged, not failed:
+    /// the Run runs without those Tools rather than not at all.
+    mcp_federation: Option<GrpcMcpFederationClient>,
+}
+
+/// Newtype so `ActiveExecution` keeps its derived `Debug`.
+#[derive(Default)]
+struct FederatedExecutors(HashMap<String, Arc<dyn ToolExecutor>>);
+
+impl std::fmt::Debug for FederatedExecutors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_set()
+            .entries(self.0.keys())
+            .finish()
+    }
 }
 
 struct RegisteredToolExecutor {
@@ -3075,6 +3227,7 @@ impl NatsWorker {
             pending_tool_plan: None,
             pending_tool_start: None,
             pending_tool_event: None,
+            mcp_federation: None,
         })
     }
 
@@ -3200,9 +3353,14 @@ impl NatsWorker {
             }
         };
 
+        // Kept for discovery, which needs the servers and the workload token
+        // the command carries and which cannot happen inside accept().
+        let federation_source = command.clone();
         match self.processor.accept(command, Utc::now()) {
             Ok(accepted) => {
                 self.publish_event(EXECUTION_ACCEPTED_SUBJECT, accepted.message_id, &accepted)
+                    .await?;
+                self.attach_federated_tools(&federation_source, accepted.attempt_id)
                     .await?;
                 let started = self
                     .processor
@@ -4025,6 +4183,93 @@ impl NatsWorker {
         }
     }
 
+    /// Discovers this Run's MCP servers and attaches their Tools.
+    ///
+    /// Once, at the start, before the model is asked anything -- so the catalog
+    /// the model is offered is the catalog the Run froze, and a server that
+    /// changes later cannot change what this Run may do.
+    ///
+    /// A server that cannot be reached is logged and skipped rather than failing
+    /// the Run. One unreachable third-party server should not stop work that may
+    /// never touch it; the Run simply is not offered its Tools, and a Skill
+    /// naming one gets an unknown tool rather than a surprise.
+    /// Configures federation for this Worker.
+    ///
+    /// Optional: a deployment without a gateway configured for MCP never offers
+    /// federated Tools, and a Run carrying servers says so in the log rather
+    /// than failing.
+    pub fn set_mcp_federation(&mut self, client: GrpcMcpFederationClient) {
+        self.mcp_federation = Some(client);
+    }
+
+    async fn attach_federated_tools(
+        &mut self,
+        command: &RunExecutionCommand,
+        attempt_id: Uuid,
+    ) -> Result<(), WorkerTransportError> {
+        if command.mcp_servers.is_empty() {
+            return Ok(());
+        }
+        let Some(client) = self.mcp_federation.as_ref() else {
+            tracing::warn!(
+                run_id = %command.run_id,
+                servers = command.mcp_servers.len(),
+                "run carries mcp servers but this worker has no federation client configured"
+            );
+            return Ok(());
+        };
+        let mut client = client.clone();
+        let discovered = mcp_gateway::discover_federated_tools(
+            self.processor.tool_registry(),
+            &mut client,
+            command,
+            command.workload_token.as_str(),
+        )
+        .await;
+        for (server, reason) in &discovered.unavailable {
+            tracing::warn!(
+                run_id = %command.run_id, %server, %reason,
+                "mcp server was not discoverable; its tools are not offered to this run"
+            );
+        }
+        let identity = mcp_gateway::FederationIdentity::from_command(command);
+        let mut executors: Vec<(String, Arc<dyn ToolExecutor>)> = Vec::new();
+        for definition in &discovered.definitions {
+            let Some(server_name) = federated_server_of(&definition.descriptor.name) else {
+                continue;
+            };
+            let Some(server) = command
+                .mcp_servers
+                .iter()
+                .find(|candidate| candidate.name == server_name)
+            else {
+                continue;
+            };
+            let Some(digest) = discovered.frozen_digests.get(server_name) else {
+                continue;
+            };
+            executors.push((
+                definition.descriptor.name.clone(),
+                Arc::new(mcp_gateway::FederatedToolExecutor::new(
+                    client.clone(),
+                    server.clone(),
+                    identity,
+                    digest.clone(),
+                    command.workload_token.as_str().to_owned(),
+                )) as Arc<dyn ToolExecutor>,
+            ));
+        }
+        self.processor
+            .attach_federated_tools(
+                attempt_id,
+                discovered.registry,
+                discovered.definitions.clone(),
+                executors,
+            )
+            .map_err(transport_error)?;
+        Ok(())
+    }
+
     fn prepare_next_tool_plan(&mut self, attempt_id: Uuid) -> Result<(), WorkerTransportError> {
         let planned = self
             .processor
@@ -4131,6 +4376,29 @@ impl NatsWorker {
         ),
         WorkerAssignmentError,
     > {
+        // A federated Tool's executor is per attempt, because the frozen
+        // catalog digest it carries is. Checked first so a Worker-wide name
+        // could never shadow this Run's own.
+        if let Some(executor) = self
+            .processor
+            .federated_executor(attempt_id, &request.call.name)
+        {
+            if request.sandbox != SandboxClass::Federated {
+                return Err(WorkerAssignmentError::ToolExecutorConfiguration(format!(
+                    "tool {} executor sandbox does not match its request",
+                    request.call.name
+                )));
+            }
+            let workspace_root = self.workspace_root.as_deref().ok_or_else(|| {
+                WorkerAssignmentError::ToolExecutorConfiguration(
+                    "workspace root is not configured".into(),
+                )
+            })?;
+            let context =
+                self.processor
+                    .tool_execution_context(attempt_id, workspace_root, Utc::now())?;
+            return Ok((executor, request, context));
+        }
         let registered = self.tool_executors.get(&request.call.name).ok_or_else(|| {
             WorkerAssignmentError::ToolExecutorConfiguration(format!(
                 "tool {} has no executor",

@@ -3,7 +3,8 @@ use agent_nats_security::NatsClientConfig;
 use agent_protocol::Placement;
 use agent_runtime_health::{HealthState, serve as serve_health};
 use agent_runtime_worker::{
-    GrpcCheckpointPayloadStore, NatsWorker, SkillArtifactVerifier, WorkerAdmissionFence,
+    GrpcCheckpointPayloadStore, GrpcMcpFederationClient, NatsWorker, SkillArtifactVerifier,
+    WorkerAdmissionFence,
     WorkerPollResult, WorkerProcessor, load_or_create_worker_id, prepare_trusted_workspace_tool,
 };
 use agent_workload_identity::WorkloadTokenVerifier;
@@ -54,6 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &server_ca_path,
         std::env::var("AGENT_RUNTIME_MODEL_GATEWAY_TLS_DOMAIN")?,
     )?;
+    // Its own materials rather than a clone: ClientMtlsMaterials is consumed by
+    // the connect it is passed to, and the model gateway's are already spoken
+    // for by the model client.
+    let mcp_federation_tls = ClientMtlsMaterials::from_files(
+        &client_cert_path,
+        &client_key_path,
+        &server_ca_path,
+        std::env::var("AGENT_RUNTIME_MODEL_GATEWAY_TLS_DOMAIN")?,
+    )?;
     let checkpoint_gateway_tls = ClientMtlsMaterials::from_files(
         &client_cert_path,
         &client_key_path,
@@ -98,6 +108,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     worker.set_workload_token_verifier(workload_token_verifier);
+    // Federation shares the model gateway's endpoint and mTLS material: it is
+    // the same process, and giving it a second address to configure would be a
+    // second thing that can be configured wrong.
+    match GrpcMcpFederationClient::connect_with_mtls(
+        model_gateway_endpoint.clone(),
+        mcp_federation_tls,
+    )
+    .await
+    {
+        Ok(client) => worker.set_mcp_federation(client),
+        // Not fatal. A deployment whose gateway does not serve federation should
+        // still run Runs that do not use it, and a Run that does will say so in
+        // the log rather than failing at a point nobody can read.
+        Err(error) => tracing::warn!(
+            %error,
+            "mcp federation is unavailable; runs carrying mcp servers will run without them"
+        ),
+    }
     if let Some(configured) = trusted_workspace_tool {
         worker.set_workspace_root(configured.workspace_root);
         for tool in configured.tools {
