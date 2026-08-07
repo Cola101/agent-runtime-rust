@@ -19,7 +19,8 @@ public interface RuntimeResourceRepository {
       String instructions,
       List<String> delegatedScopes,
       List<UUID> skillVersionIds,
-      List<SubagentRoleDefinition> subagentRoles);
+      List<SubagentRoleDefinition> subagentRoles,
+      java.util.Map<String, String> toolApprovalPolicies);
 
   SkillVersionResource publishSkillVersion(
       SkillArtifact artifact, SignedSkillArtifact signedArtifact);

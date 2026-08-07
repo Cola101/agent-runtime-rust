@@ -670,6 +670,18 @@ components:
           default: []
           items:
             $ref: '#/components/schemas/SubagentRole'
+        tool_approval_policies:
+          type: object
+          description: >-
+            Per-Tool approval policy. A Tool absent from this map is approval
+            gated on every call, so omitting the field asks for everything.
+            A policy naming a Tool this AgentVersion does not delegate is
+            rejected, as is an unrecognised policy value.
+          maxProperties: 16
+          default: {}
+          additionalProperties:
+            type: string
+            enum: [never, provably_read_only_shell_command]
     SubagentRole:
       type: object
       additionalProperties: false

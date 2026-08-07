@@ -107,7 +107,8 @@ class RuntimeResourceControllerTest {
         List.of("tool:workspace.read"), List.of(skillVersionId),
         List.of(new SubagentRoleDefinition(
             "reviewer", "Review evidence and report findings.",
-            List.of("tool:workspace.read")))))
+            List.of("tool:workspace.read"))),
+        java.util.Map.of()))
         .thenReturn(new AgentVersionResource(
             versionId, agentId, 1, "Review release changes.",
             List.of("tool:workspace.read"), List.of(skillVersionId),

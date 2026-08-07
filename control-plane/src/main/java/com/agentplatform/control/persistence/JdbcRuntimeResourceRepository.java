@@ -91,7 +91,8 @@ public class JdbcRuntimeResourceRepository implements RuntimeResourceRepository 
       String instructions,
       List<String> delegatedScopes,
       List<UUID> skillVersionIds,
-      List<SubagentRoleDefinition> subagentRoles) {
+      List<SubagentRoleDefinition> subagentRoles,
+      java.util.Map<String, String> toolApprovalPolicies) {
     return inTransaction(tenantId, () -> {
       var authorized = jdbc.query("""
           select a.id
@@ -111,11 +112,13 @@ public class JdbcRuntimeResourceRepository implements RuntimeResourceRepository 
           insert into agent_versions (tenant_id,id,agent_id,application_id,version,spec)
           values (?,?,?,?,?,jsonb_build_object(
             'instructions',?,'delegated_scopes',to_jsonb(?::text[]),
-            'subagent_roles',?::jsonb))
+            'subagent_roles',?::jsonb,
+            'tool_approval_policies',?::jsonb))
           returning created_at
           """, (row, rowNumber) -> row.getTimestamp("created_at").toInstant(),
           tenantId, id, agentId, applicationId, version, instructions,
-          delegatedScopes.toArray(String[]::new), subagentRolesJson(subagentRoles));
+          delegatedScopes.toArray(String[]::new), subagentRolesJson(subagentRoles),
+          approvalPoliciesJson(toolApprovalPolicies));
       for (var ordinal = 0; ordinal < skillVersionIds.size(); ordinal++) {
         var inserted = jdbc.update("""
             insert into agent_version_skills (
@@ -130,6 +133,16 @@ public class JdbcRuntimeResourceRepository implements RuntimeResourceRepository 
           id, agentId, version, instructions, delegatedScopes, skillVersionIds, subagentRoles,
           createdAt);
     });
+  }
+
+  /** Sorted, so the same policy is the same stored bytes. */
+  private String approvalPoliciesJson(java.util.Map<String, String> policies) {
+    try {
+      return new com.fasterxml.jackson.databind.ObjectMapper()
+          .writeValueAsString(new java.util.TreeMap<>(policies));
+    } catch (Exception unwritable) {
+      throw new IllegalStateException("tool approval policies must be serialisable", unwritable);
+    }
   }
 
   private String subagentRolesJson(List<SubagentRoleDefinition> roles) {

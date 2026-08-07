@@ -182,7 +182,8 @@ public final class RuntimeResourceService {
     }
     return repository.createAgentVersion(
         required(tenantId), required(applicationId), required(agentId),
-        instructionText(instructions), normalizedScopes, normalizedSkills, normalizedRoles);
+        instructionText(instructions), normalizedScopes, normalizedSkills, normalizedRoles,
+        new java.util.TreeMap<>(toolApprovalPolicies));
   }
 
   public SkillVersionResource publishSkillVersion(

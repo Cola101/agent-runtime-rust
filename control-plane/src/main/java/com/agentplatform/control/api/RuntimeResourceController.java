@@ -73,7 +73,8 @@ public class RuntimeResourceController {
     var created = resources.createAgentVersion(
         context.tenantId(), context.applicationId(), agentId,
         request.instructions(), request.delegatedScopes(), request.skillVersionIds(),
-        request.subagentRoles().stream().map(SubagentRoleRequest::toDefinition).toList());
+        request.subagentRoles().stream().map(SubagentRoleRequest::toDefinition).toList(),
+        request.toolApprovalPolicies());
     return created(
         "/v1/agents/" + agentId + "/versions/" + created.id(),
         AgentVersionResponse.from(created));
@@ -140,10 +141,21 @@ public class RuntimeResourceController {
       List<@NotBlank @Size(max = 200) String> delegatedScopes,
       @Size(max = 16) @JsonProperty("skill_version_ids") List<@NotNull UUID> skillVersionIds,
       @Valid @Size(max = 16) @JsonProperty("subagent_roles")
-      List<@NotNull SubagentRoleRequest> subagentRoles) {
+      List<@NotNull SubagentRoleRequest> subagentRoles,
+      /**
+       * Per-Tool approval policy. Absent means every Tool asks, which is what a
+       * client that says nothing should get.
+       */
+      @Size(max = 16) @JsonProperty("tool_approval_policies")
+      java.util.Map<@NotBlank String, @NotBlank String> toolApprovalPolicies) {
     CreateAgentVersionRequest {
       skillVersionIds = skillVersionIds == null ? List.of() : List.copyOf(skillVersionIds);
       subagentRoles = subagentRoles == null ? List.of() : List.copyOf(subagentRoles);
+      // Absent means every Tool asks. A client that says nothing about policy
+      // must not be read as having asked for one.
+      toolApprovalPolicies = toolApprovalPolicies == null
+          ? java.util.Map.of()
+          : java.util.Map.copyOf(toolApprovalPolicies);
     }
   }
 
