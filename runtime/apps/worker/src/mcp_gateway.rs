@@ -206,3 +206,92 @@ fn rpc_error(status: tonic::Status) -> McpGatewayClientError {
         message: status.message().to_owned(),
     }
 }
+
+/// The federated Tools one Run may reach, plus what it froze them at.
+///
+/// A per-Run registry rather than additions to the Worker's own. A frozen
+/// catalog is a property of a Run, not of the Worker: two Runs against the same
+/// server can legitimately hold different digests, one having frozen before a
+/// change and one after, and a name-keyed registry shared between them could
+/// only hold one. Registering into the shared one would also make the second Run
+/// on a Worker fail with a duplicate-tool error for no reason it could act on.
+pub struct FederatedRunTools {
+    /// The Worker's native Tools plus this Run's federated ones.
+    pub registry: agent_kernel::ToolRegistry,
+    /// Definitions for the federated Tools, for offering them to the model.
+    pub definitions: Vec<crate::WorkerToolDefinition>,
+    /// Server name -> the catalog digest this Run froze, presented on each call.
+    pub frozen_digests: std::collections::BTreeMap<String, String>,
+    /// Servers that could not be discovered, with why.
+    ///
+    /// Reported rather than fatal, and rather than dropped. One unreachable
+    /// third-party server should not fail a Run that may not even use it; but a
+    /// Run silently missing tools it was configured with is the kind of thing
+    /// that produces an unexplainable transcript, so the caller is told.
+    pub unavailable: Vec<(String, String)>,
+}
+
+/// Discovers every MCP server the command carries and builds this Run's Tools.
+///
+/// Discovery happens once, here, at the start of the Run. Nothing re-discovers
+/// later: the digest frozen now is what every call presents, so a server that
+/// changes its catalog mid-Run does not change what the Run may do.
+pub async fn discover_federated_tools(
+    base_registry: &agent_kernel::ToolRegistry,
+    client: &mut GrpcMcpFederationClient,
+    command: &agent_protocol::RunExecutionCommand,
+    workload_token: &str,
+) -> FederatedRunTools {
+    let mut registry = base_registry.clone();
+    let mut definitions = Vec::new();
+    let mut frozen_digests = std::collections::BTreeMap::new();
+    let mut unavailable = Vec::new();
+
+    for server in &command.mcp_servers {
+        let catalog = match client
+            .list_tools(command.tenant_id, command.run_id, server, workload_token)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                unavailable.push((server.name.clone(), error.to_string()));
+                continue;
+            }
+        };
+        let discovered = catalog
+            .tools
+            .iter()
+            .cloned()
+            .map(|tool| (tool.qualified_name, tool.description, tool.input_schema));
+        match crate::federated_tool_definitions(&server.name, &catalog.digest, discovered) {
+            Ok(built) => {
+                let mut registered = Vec::with_capacity(built.len());
+                let mut rejected = None;
+                for definition in built {
+                    if let Err(error) = registry.register(definition.descriptor.clone()) {
+                        rejected = Some(error.to_string());
+                        break;
+                    }
+                    registered.push(definition);
+                }
+                match rejected {
+                    // All or nothing per server. A half-registered catalog would
+                    // freeze a digest that describes tools the Run cannot see.
+                    Some(error) => unavailable.push((server.name.clone(), error)),
+                    None => {
+                        definitions.extend(registered);
+                        frozen_digests.insert(server.name.clone(), catalog.digest);
+                    }
+                }
+            }
+            Err(error) => unavailable.push((server.name.clone(), error.to_string())),
+        }
+    }
+
+    FederatedRunTools {
+        registry,
+        definitions,
+        frozen_digests,
+        unavailable,
+    }
+}

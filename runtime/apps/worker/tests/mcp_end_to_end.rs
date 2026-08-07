@@ -12,7 +12,11 @@ use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
 use agent_protocol::{AutoApproval, McpServerSnapshot, SandboxClass, ToolCall};
-use agent_runtime_worker::{federated_tool_definitions, GrpcMcpFederationClient, WorkerProcessor};
+use agent_protocol::RunExecutionCommand;
+use agent_runtime_worker::{
+    discover_federated_tools, federated_tool_definitions, GrpcMcpFederationClient,
+    WorkerProcessor,
+};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
 use rsa::RsaPrivateKey;
@@ -214,5 +218,150 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
     assert!(
         refused.to_string().contains("catalog changed"),
         "expected the catalog refusal, got {refused}"
+    );
+}
+
+const EXECUTION_V6_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v6.example.json");
+
+fn v9_command_with(servers: serde_json::Value, scopes: serde_json::Value) -> RunExecutionCommand {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(9);
+    value["delegated_scopes"] = scopes;
+    value["mcp_servers"] = servers;
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    command.validate().expect("the command must be valid");
+    command
+}
+
+/// The automatic path: everything a Run needs comes from the command, and
+/// discovery happens once at the start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_discovers_and_freezes_its_servers_from_the_command() {
+    let private_key_pem = RsaPrivateKey::new(&mut OsRng, 3072)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let reachable = spawn_mcp_server(Arc::new(Mutex::new(vec!["web_search".to_owned()]))).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem).await;
+    let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
+        .await
+        .unwrap();
+
+    let command = v9_command_with(
+        serde_json::json!([
+            {
+                "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+                "name": "search",
+                "endpoint": reachable,
+                "credential_envelope_base64": ""
+            },
+            {
+                // Nothing listening. One unreachable third-party server must not
+                // fail a Run that may never use it, and must not vanish either.
+                "server_id": "6f1a9a1a-0000-4000-8000-000000000002",
+                "name": "down",
+                "endpoint": "http://127.0.0.1:1/rpc",
+                "credential_envelope_base64": ""
+            }
+        ]),
+        serde_json::json!(["tool:mcp:search", "tool:mcp:down"]),
+    );
+
+    let worker = WorkerProcessor::new(
+        Uuid::now_v7(),
+        vec![agent_protocol::Placement::Cloud],
+        4,
+        "0.1.0".to_string(),
+    )
+    .unwrap();
+
+    let federated = discover_federated_tools(
+        worker.tool_registry(),
+        &mut client,
+        &command,
+        "test-workload-token",
+    )
+    .await;
+
+    assert_eq!(federated.definitions.len(), 1);
+    assert_eq!(
+        federated.frozen_digests.keys().collect::<Vec<_>>(),
+        vec!["search"],
+        "only the server that answered gets a frozen digest"
+    );
+    assert_eq!(
+        federated.unavailable.len(),
+        1,
+        "the unreachable server must be reported, not dropped: {:?}",
+        federated.unavailable
+    );
+    assert_eq!(federated.unavailable[0].0, "down");
+
+    // The Run's registry can plan the discovered tool; the Worker's own cannot,
+    // which is what per-Run scoping means.
+    assert!(federated
+        .registry
+        .authorize(
+            "mcp:search/web_search",
+            &BTreeSet::from(["tool:mcp:search".to_owned()])
+        )
+        .is_ok());
+    assert!(worker
+        .tool_registry()
+        .authorize(
+            "mcp:search/web_search",
+            &BTreeSet::from(["tool:mcp:search".to_owned()])
+        )
+        .is_err());
+}
+
+/// Two Runs against the same server, frozen at different catalogs.
+///
+/// This is why the registry is per-Run. A shared, name-keyed registry could hold
+/// only one of these digests, and the second Run would either fail to register or
+/// silently inherit the first Run's freeze.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_runs_hold_different_freezes_of_the_same_server() {
+    let private_key_pem = RsaPrivateKey::new(&mut OsRng, 3072)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let tools = Arc::new(Mutex::new(vec!["web_search".to_owned()]));
+    let endpoint = spawn_mcp_server(Arc::clone(&tools)).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem).await;
+    let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
+        .await
+        .unwrap();
+    let worker = WorkerProcessor::new(
+        Uuid::now_v7(),
+        vec![agent_protocol::Placement::Cloud],
+        4,
+        "0.1.0".to_string(),
+    )
+    .unwrap();
+    let command = v9_command_with(
+        serde_json::json!([{
+            "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+            "name": "search",
+            "endpoint": endpoint,
+            "credential_envelope_base64": ""
+        }]),
+        serde_json::json!(["tool:mcp:search"]),
+    );
+
+    let first =
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, "token").await;
+    tools.lock().unwrap().push("summarise".to_owned());
+    let second =
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, "token").await;
+
+    assert_eq!(first.definitions.len(), 1);
+    assert_eq!(second.definitions.len(), 2);
+    assert_ne!(
+        first.frozen_digests["search"], second.frozen_digests["search"],
+        "each Run freezes what it discovered, not what the other did"
     );
 }
