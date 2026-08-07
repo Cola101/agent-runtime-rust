@@ -32,7 +32,37 @@ import org.springframework.transaction.support.TransactionTemplate;
 @ConditionalOnProperty(prefix = "agent.runtime.scheduler", name = "enabled", havingValue = "true")
 public class JdbcSchedulerRepository implements RecoveryMetricsSource {
   private static final ObjectMapper JSON = new ObjectMapper();
-  private static final int EXECUTION_SCHEMA_VERSION = 7;
+
+  /**
+   * Reads the per-Tool approval policy column.
+   *
+   * <p>Anything unreadable becomes an empty map rather than an exception,
+   * because the safe reading of a policy column we cannot parse is "no
+   * exemptions", and failing the dispatch outright would take down Runs over a
+   * field that only ever removes an approval.
+   */
+  /** Serialised for the Outbox payload; sorted so the same policy is the same bytes. */
+  private static String approvalPoliciesJson(java.util.Map<String, String> policies) {
+    try {
+      return JSON.writeValueAsString(new java.util.TreeMap<>(policies));
+    } catch (Exception unwritable) {
+      throw new IllegalStateException("tool approval policies must be serialisable", unwritable);
+    }
+  }
+
+  private static java.util.Map<String, String> approvalPolicies(String json) {
+    if (json == null || json.isBlank()) {
+      return java.util.Map.of();
+    }
+    try {
+      return JSON.readValue(
+          json, new com.fasterxml.jackson.core.type.TypeReference<
+              java.util.TreeMap<String, String>>() {});
+    } catch (Exception unreadable) {
+      return java.util.Map.of();
+    }
+  }
+  private static final int EXECUTION_SCHEMA_VERSION = 8;
   /** Redispatch bound for an assignment no Worker has ever accepted. */
   private static final int MAX_UNACCEPTED_DISPATCH_ATTEMPTS = 5;
   private static final int SUBAGENT_RESULT_TEXT_MAX_BYTES = 240 * 1024;
@@ -320,7 +350,11 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                  case when r.subagent_depth = 0
                    then coalesce(av.spec->'delegated_scopes','[]'::jsonb)
                    else coalesce(sr.role->'delegated_scopes','[]'::jsonb)
-                 end) order by 1) delegated_scopes
+                 end) order by 1) delegated_scopes,
+               case when r.subagent_depth = 0
+                 then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
+                 else '{}'::jsonb
+               end as tool_approval_policies
           from run_dispatches d
           join runs r on r.tenant_id = d.tenant_id and r.id = d.run_id
           join agent_versions av on av.tenant_id = r.tenant_id and av.id = r.agent_version_id
@@ -358,6 +392,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getObject("delegation_id", UUID.class),
             row.getInt("subagent_depth"),
             row.getString("agent_role"),
+            approvalPolicies(row.getString("tool_approval_policies")),
             row.getLong("max_tokens"),
             row.getLong("max_cost_cents"),
             row.getLong("max_duration_seconds")),
@@ -474,6 +509,10 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                    then coalesce(av.spec->'delegated_scopes','[]'::jsonb)
                    else coalesce(sr.role->'delegated_scopes','[]'::jsonb)
                  end) order by 1) delegated_scopes,
+               case when r.subagent_depth = 0
+                 then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
+                 else '{}'::jsonb
+               end as tool_approval_policies,
                c.checkpoint_id,c.kernel_digest,c.tool_catalog_digest,c.payload,c.payload_ref,
                c.payload_encoding,c.payload_digest,c.stored_payload_digest,
                c.uncompressed_size,c.stored_size,c.created_at
@@ -511,7 +550,9 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
               row.getObject("root_run_id", UUID.class),
               row.getObject("parent_run_id", UUID.class),
               row.getObject("parent_delegation_id", UUID.class), row.getInt("subagent_depth"),
-              row.getString("agent_role"), row.getLong("max_tokens"),
+              row.getString("agent_role"),
+              approvalPolicies(row.getString("tool_approval_policies")),
+              row.getLong("max_tokens"),
               row.getLong("max_cost_cents"), row.getLong("max_duration_seconds"));
           var checkpoint = new StoredCheckpoint(
               row.getObject("checkpoint_id", UUID.class), row.getLong("owner_epoch"),
@@ -726,6 +767,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
         subagentRoles(
             key.tenantId(), previous.agentVersionId(), previous.delegatedScopes(),
             previous.subagentDepth()),
+        previous.toolApprovalPolicies(),
         previous.input(), previous.maxTokens(),
         previous.maxCostCents(), previous.maxDurationSeconds());
     jdbc.update("""
@@ -897,6 +939,9 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
     execution.set("skill_snapshots", skillSnapshotsNode(command.skillSnapshots()));
     writeLineage(execution, command.lineage());
     execution.set("subagent_roles", subagentRolesNode(command.subagentRoles()));
+    execution.set(
+        "tool_approval_policies",
+        JSON.valueToTree(new java.util.TreeMap<>(command.toolApprovalPolicies())));
     execution.put("input", command.input());
     var budget = execution.putObject("budget");
     budget.put("max_tokens", command.maxTokens());
@@ -2086,7 +2131,11 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                  case when r.subagent_depth = 0
                    then coalesce(av.spec->'delegated_scopes','[]'::jsonb)
                    else coalesce(sr.role->'delegated_scopes','[]'::jsonb)
-                 end) order by 1) as delegated_scopes
+                 end) order by 1) as delegated_scopes,
+               case when r.subagent_depth = 0
+                 then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
+                 else '{}'::jsonb
+               end as tool_approval_policies
           from runs r
           join agent_versions av on av.tenant_id = r.tenant_id and av.id = r.agent_version_id
           left join lateral (
@@ -2114,6 +2163,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getObject("delegation_id", UUID.class),
             row.getInt("subagent_depth"),
             row.getString("agent_role"),
+            approvalPolicies(row.getString("tool_approval_policies")),
             row.getLong("max_tokens"),
             row.getLong("max_cost_cents"),
             row.getLong("max_duration_seconds")), tenantId, runId);
@@ -2187,6 +2237,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
         skillSnapshots,
         run.lineage(),
         subagentRoles(tenantId, run.agentVersionId(), run.delegatedScopes(), run.subagentDepth()),
+        run.toolApprovalPolicies(),
         run.input(), run.maxTokens(), run.maxCostCents(),
         run.maxDurationSeconds());
 
@@ -2235,6 +2286,8 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                coalesce((o.payload->>'schema_version')::int,2) as execution_schema_version,
                coalesce(o.payload->'skill_snapshots','[]'::jsonb)::text as skill_snapshots,
                coalesce(o.payload->'subagent_roles','[]'::jsonb)::text as subagent_roles,
+               coalesce(o.payload->'tool_approval_policies','{}'::jsonb)::text
+                 as tool_approval_policies,
                o.id as message_id,o.payload->>'workload_token' as workload_token,
                array(select jsonb_array_elements_text(o.payload->'delegated_scopes') order by 1)
                  as delegated_scopes
@@ -2278,6 +2331,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getInt("subagent_depth"),
             row.getString("agent_role")),
         parseSubagentRoles(row.getString("subagent_roles")),
+        approvalPolicies(row.getString("tool_approval_policies")),
         row.getString("input"),
         row.getLong("max_tokens"),
         row.getLong("max_cost_cents"),
@@ -2311,6 +2365,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
           'model_policy_digest',?,
           'skill_snapshots',?::jsonb,
           'subagent_roles',?::jsonb,
+          'tool_approval_policies',?::jsonb,
           'lineage',jsonb_build_object(
             'root_run_id',?::text,
             'parent_run_id',?::text,
@@ -2336,6 +2391,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
         command.agentInstructions(), command.modelPolicySnapshotBase64(),
         command.modelPolicyDigest(), skillSnapshotsNode(command.skillSnapshots()).toString(),
         subagentRolesNode(command.subagentRoles()).toString(),
+        approvalPoliciesJson(command.toolApprovalPolicies()),
         command.lineage().rootRunId().toString(), nullableUuid(command.lineage().parentRunId()),
         nullableUuid(command.lineage().delegationId()), command.lineage().depth(),
         command.lineage().role(),
@@ -2585,6 +2641,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
       UUID delegationId,
       int subagentDepth,
       String agentRole,
+      java.util.Map<String, String> toolApprovalPolicies,
       long maxTokens,
       long maxCostCents,
       long maxDurationSeconds) {
@@ -2729,6 +2786,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
       UUID delegationId,
       int subagentDepth,
       String agentRole,
+      java.util.Map<String, String> toolApprovalPolicies,
       long maxTokens,
       long maxCostCents,
       long maxDurationSeconds) {

@@ -29,6 +29,14 @@ public record RunExecutionCommand(
     List<SkillSnapshot> skillSnapshots,
     AgentLineageSnapshot lineage,
     List<SubagentRoleSnapshot> subagentRoles,
+    /**
+     * Per-Tool approval policy the tenant configured on the AgentVersion.
+     *
+     * <p>Empty means every Tool asks, which is what a subagent always gets: a
+     * role-scoped exemption is a second decision nobody has made, so a child
+     * never inherits one.
+     */
+    java.util.Map<String, String> toolApprovalPolicies,
     String input,
     long maxTokens,
     long maxCostCents,
@@ -60,7 +68,8 @@ public record RunExecutionCommand(
     this(schemaVersion, messageId, tenantId, runId, sessionId, workspaceId, agentVersionId,
         modelPolicyId, attemptId, workerId, workerIncarnationId, ownerEpoch, fencingToken, issuedAt,
         leaseExpiresAt, workloadToken, delegatedScopes, agentInstructions, "", "", List.of(),
-        AgentLineageSnapshot.primary(runId), List.of(), input, maxTokens, maxCostCents,
+        AgentLineageSnapshot.primary(runId), List.of(),
+        java.util.Map.of(), input, maxTokens, maxCostCents,
         maxDurationSeconds);
   }
 
@@ -89,7 +98,8 @@ public record RunExecutionCommand(
     this(schemaVersion, messageId, tenantId, runId, sessionId, workspaceId, agentVersionId,
         modelPolicyId, attemptId, workerId, workerId, ownerEpoch, fencingToken, issuedAt,
         leaseExpiresAt, workloadToken, delegatedScopes, agentInstructions, "", "", List.of(),
-        AgentLineageSnapshot.primary(runId), List.of(), input, maxTokens, maxCostCents,
+        AgentLineageSnapshot.primary(runId), List.of(),
+        java.util.Map.of(), input, maxTokens, maxCostCents,
         maxDurationSeconds);
   }
 

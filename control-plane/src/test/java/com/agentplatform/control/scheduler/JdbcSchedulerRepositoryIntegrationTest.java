@@ -69,7 +69,13 @@ class JdbcSchedulerRepositoryIntegrationTest {
         .command().orElseThrow();
 
     assertThat(command.delegatedScopes()).containsExactly("tool:http", "workspace:read");
-    assertThat(command.schemaVersion()).isEqualTo(7);
+    assertThat(command.schemaVersion()).isEqualTo(8);
+    // A root dispatch carries whatever the AgentVersion configured; a subagent
+    // dispatch carries nothing, because a role-scoped exemption is a second
+    // decision nobody has made.
+    if (command.lineage().depth() > 0) {
+      assertThat(command.toolApprovalPolicies()).isEmpty();
+    }
     assertThat(command.agentInstructions()).isEqualTo("Inspect evidence before conclusions.");
     var payload = new ObjectMapper().readTree(fixture.jdbc().queryForObject("""
         select payload::text from outbox_events
@@ -257,7 +263,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(7);
+    assertThat(command.schemaVersion()).isEqualTo(8);
     assertThat(command.subagentRoles()).containsExactly(new SubagentRoleSnapshot(
         "reviewer", "Review evidence only.", List.of("tool:workspace.read")));
     var payload = new ObjectMapper().readTree(fixture.jdbc().queryForObject("""
@@ -313,7 +319,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(7);
+    assertThat(command.schemaVersion()).isEqualTo(8);
     assertThat(command.skillSnapshots()).hasSize(1);
     assertThat(command.skillSnapshots().getFirst().skillVersionId()).isEqualTo(skillVersionId);
     assertThat(command.skillSnapshots().getFirst().toolNames())
@@ -339,7 +345,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(7);
+    assertThat(command.schemaVersion()).isEqualTo(8);
     assertThat(command.lineage().rootRunId()).isEqualTo(fixture.runId());
     assertThat(command.lineage().parentRunId()).isNull();
     assertThat(command.lineage().delegationId()).isNull();
@@ -496,7 +502,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
     var tokenParts = command.workloadToken().value().split("\\.");
     var claims = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(tokenParts[1]));
 
-    assertThat(command.schemaVersion()).isEqualTo(7);
+    assertThat(command.schemaVersion()).isEqualTo(8);
     assertThat(snapshot.path("routing").asText()).isEqualTo("ordered_failover");
     assertThat(snapshot.path("candidates").findValuesAsText("provider_id"))
         .containsExactly(primary.toString(), fallback.toString());
