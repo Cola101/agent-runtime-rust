@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.agentplatform.control.run.Run;
 import com.agentplatform.control.run.RunTargetNotFound;
+import com.agentplatform.control.run.TenantQuotaExceeded;
 import com.agentplatform.control.run.RunStatus;
 import com.agentplatform.control.run.RunSteeringConflict;
 import com.agentplatform.control.run.RunSteeringNotAllowed;
@@ -19,6 +20,9 @@ import java.sql.DriverManager;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -568,6 +572,64 @@ class JdbcRunRepositoryIntegrationTest {
       UUID agentVersionId,
       UUID sessionId,
       UUID modelPolicyId) {}
+
+  // The whole value of the quota is that it holds under concurrency. Counting
+  // active Runs and then inserting -- without taking the tenant's quota row for
+  // update first -- lets every concurrent request see room and every one insert,
+  // and the limit becomes decoration. Four requests, a limit of two.
+  @Test
+  void concurrentRunCreationCannotExceedTheTenantConcurrencyQuota() throws Exception {
+    var ids = seedResourceChain();
+    var dataSource = new DriverManagerDataSource(
+        DATABASE.jdbcUrl(), DATABASE.username(), DATABASE.password());
+    var jdbc = new JdbcTemplate(dataSource);
+    jdbc.update(
+        "insert into tenant_run_quotas (tenant_id, max_active_runs) values (?, 2)"
+            + " on conflict (tenant_id) do update set max_active_runs = 2",
+        ids.tenantId());
+
+    var start = new CountDownLatch(1);
+    var admitted = new java.util.concurrent.atomic.AtomicInteger();
+    var refused = new java.util.concurrent.atomic.AtomicInteger();
+    try (var executor = Executors.newFixedThreadPool(4)) {
+      var futures = new ArrayList<java.util.concurrent.Future<?>>();
+      for (var index = 0; index < 4; index++) {
+        var key = "concurrent-" + index;
+        futures.add(executor.submit(() -> {
+          // Each thread needs its own repository: they must contend in the
+          // database rather than share one transaction template.
+          var repository = new JdbcRunRepository(
+              new JdbcTemplate(dataSource),
+              new TransactionTemplate(new DataSourceTransactionManager(dataSource)));
+          try {
+            start.await();
+            repository.save(ids.applicationId(), new Run(
+                UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+                ids.workspaceId(), ids.modelPolicyId(), key, "hello", RunStatus.QUEUED,
+                1000, 100, 60, Instant.now()));
+            admitted.incrementAndGet();
+          } catch (TenantQuotaExceeded expected) {
+            refused.incrementAndGet();
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+          }
+          return null;
+        }));
+      }
+      start.countDown();
+      for (var future : futures) {
+        future.get();
+      }
+    }
+
+    assertThat(admitted.get()).isEqualTo(2);
+    assertThat(refused.get()).isEqualTo(2);
+    // The durable count is what matters; the in-process counters could both be
+    // right while the database held three rows.
+    assertThat(jdbc.queryForObject(
+        "select count(*) from runs where tenant_id = ?", Integer.class, ids.tenantId()))
+        .isEqualTo(2);
+  }
 
   private record WorkerTarget(UUID attemptId, UUID workerId, UUID workerIncarnationId) {}
 }
