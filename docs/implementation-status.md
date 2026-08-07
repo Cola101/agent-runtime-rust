@@ -126,8 +126,11 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 - Shell 没有交互式或长驻会话（Codex 的 `unified_exec` 对应物）。
 - **MCP 客户端完全未实现。** 这是与 Codex 差距最大的单项：工具数量目前由手写决定，
   接上 MCP 后才由生态供给。
-- **未做真实模型厂商端到端验收。** 迄今全部主链证据都用回环假 Provider，
-  协议转换的正确性只由契约测试保证，未经真实厂商响应验证。
+- 真实模型厂商端到端：**`openai_compatible` 已验证一次**（2026-08-07，DeepSeek 经网关，
+  `runtime-host` 路径，与云端共用协议转换代码）。**仍未验证**：Java 控制面 + PostgreSQL +
+  NATS 的完整云端链路对真实厂商（被 nats-server 构建的网络问题阻塞）、
+  `openai_responses` 与 `anthropic_messages` 两条协议、多 Provider 故障转移、
+  限流退避、真实错误响应分类。
 - 调用方认证与配额（谁能调用这个 Runtime、能用多少）尚未实现。
 - Checkpoint 对象缺失、内容损坏及一次短暂 `Unavailable` 后 JetStream 重投递已做故障分流；尚缺对象保留/垃圾回收、真实 Gateway 进程或存储实例丢失和跨可用区故障注入。
 - Skill 的生产 OCI 制品上传、SBOM、恶意扫描、平台审核、租户签名链与公共/私有 ACL；当前已完成控制面签名的结构化 SkillVersion 和可信 Tool 激活，不接受上传脚本。
