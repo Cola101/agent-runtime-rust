@@ -3,7 +3,7 @@ use agent_protocol::{
     ApprovalMode, AutoApproval, SandboxClass, ToolCall, ToolDescriptor, ToolEffect,
 };
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn shell_tool() -> ToolDescriptor {
     ToolDescriptor {
@@ -13,7 +13,6 @@ fn shell_tool() -> ToolDescriptor {
         sandbox: SandboxClass::Kata,
         implementation_digest: "a".repeat(64),
         required_scopes: BTreeSet::from(["workspace:write".into()]),
-        auto_approval: AutoApproval::Never,
     }
 }
 
@@ -28,7 +27,6 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
             sandbox: SandboxClass::RestrictedContainer,
             implementation_digest: "b".repeat(64),
             required_scopes: BTreeSet::from(["workspace:read".into()]),
-            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     registry
@@ -39,7 +37,6 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
             sandbox: SandboxClass::Kata,
             implementation_digest: "a".repeat(64),
             required_scopes: BTreeSet::from(["workspace:write".into()]),
-            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     let scopes = BTreeSet::from(["workspace:read".into(), "workspace:write".into()]);
@@ -52,6 +49,7 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
                 arguments: json!({"path":"README.md"}),
             },
             &scopes,
+            &BTreeMap::new(),
         )
         .unwrap();
     let asked = registry
@@ -62,6 +60,7 @@ fn tool_policy_binds_allow_and_ask_decisions_to_the_exact_call() {
                 arguments: json!({"command":"cargo test"}),
             },
             &scopes,
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -121,7 +120,6 @@ fn approval_binding_changes_with_the_immutable_tool_implementation() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "1".repeat(64),
             required_scopes: BTreeSet::new(),
-            auto_approval: AutoApproval::Never,
         })
         .unwrap();
     let mut second = ToolRegistry::default();
@@ -133,17 +131,18 @@ fn approval_binding_changes_with_the_immutable_tool_implementation() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "2".repeat(64),
             required_scopes: BTreeSet::new(),
-            auto_approval: AutoApproval::Never,
         })
         .unwrap();
 
-    let agent_kernel::ToolPlan::ApprovalRequired(first) =
-        first.plan(call.clone(), &BTreeSet::new()).unwrap()
+    let agent_kernel::ToolPlan::ApprovalRequired(first) = first
+        .plan(call.clone(), &BTreeSet::new(), &BTreeMap::new())
+        .unwrap()
     else {
         panic!("ask policy must produce an approval");
     };
-    let agent_kernel::ToolPlan::ApprovalRequired(second) =
-        second.plan(call, &BTreeSet::new()).unwrap()
+    let agent_kernel::ToolPlan::ApprovalRequired(second) = second
+        .plan(call, &BTreeSet::new(), &BTreeMap::new())
+        .unwrap()
     else {
         panic!("ask policy must produce an approval");
     };
@@ -168,6 +167,7 @@ fn session_approval_scope_ignores_call_id_but_binds_arguments_and_policy_snapsho
                     arguments: json!({"command":command}),
                 },
                 &scopes,
+                &BTreeMap::new(),
             )
             .unwrap()
         else {
@@ -229,6 +229,7 @@ fn registry_rejects_a_tool_without_an_immutable_implementation_digest() {
 #[test]
 fn a_read_only_command_is_exempt_only_when_the_tool_declares_the_policy() {
     fn plan_for(auto_approval: AutoApproval, command: &str) -> ToolPlan {
+        let policies = BTreeMap::from([("shell.exec".to_string(), auto_approval)]);
         let mut registry = ToolRegistry::default();
         registry
             .register(ToolDescriptor {
@@ -238,7 +239,6 @@ fn a_read_only_command_is_exempt_only_when_the_tool_declares_the_policy() {
                 sandbox: SandboxClass::TrustedNative,
                 implementation_digest: "c".repeat(64),
                 required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
-                auto_approval,
             })
             .unwrap();
         registry
@@ -249,6 +249,7 @@ fn a_read_only_command_is_exempt_only_when_the_tool_declares_the_policy() {
                     arguments: serde_json::json!({ "command": command }),
                 },
                 &BTreeSet::from(["tool:shell.exec".to_string()]),
+                &policies,
             )
             .unwrap()
     }
@@ -290,7 +291,6 @@ fn the_policy_snapshot_records_the_exemption() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "c".repeat(64),
             required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
-            auto_approval: AutoApproval::ProvablyReadOnlyShellCommand,
         })
         .unwrap();
 
@@ -302,6 +302,10 @@ fn the_policy_snapshot_records_the_exemption() {
                 arguments: serde_json::json!({ "command": "rm -rf /" }),
             },
             &BTreeSet::from(["tool:shell.exec".to_string()]),
+            &BTreeMap::from([(
+                "shell.exec".to_string(),
+                AutoApproval::ProvablyReadOnlyShellCommand,
+            )]),
         )
         .unwrap()
     else {
@@ -322,6 +326,7 @@ fn the_policy_snapshot_records_the_exemption() {
 #[test]
 fn the_binding_digest_covers_the_approval_policy_not_only_the_call() {
     fn digest_for(approval: ApprovalMode, auto_approval: AutoApproval) -> String {
+        let policies = BTreeMap::from([("shell.exec".to_string(), auto_approval)]);
         let mut registry = ToolRegistry::default();
         registry
             .register(ToolDescriptor {
@@ -331,7 +336,6 @@ fn the_binding_digest_covers_the_approval_policy_not_only_the_call() {
                 sandbox: SandboxClass::TrustedNative,
                 implementation_digest: "c".repeat(64),
                 required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
-                auto_approval,
             })
             .unwrap();
         let plan = registry
@@ -342,6 +346,7 @@ fn the_binding_digest_covers_the_approval_policy_not_only_the_call() {
                     arguments: json!({ "command": "ls" }),
                 },
                 &BTreeSet::from(["tool:shell.exec".to_string()]),
+                &policies,
             )
             .unwrap();
         match plan {
@@ -381,7 +386,6 @@ fn an_auto_approved_plan_carries_the_policy_that_exempted_it() {
             sandbox: SandboxClass::TrustedNative,
             implementation_digest: "c".repeat(64),
             required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
-            auto_approval: AutoApproval::ProvablyReadOnlyShellCommand,
         })
         .unwrap();
 
@@ -393,6 +397,10 @@ fn an_auto_approved_plan_carries_the_policy_that_exempted_it() {
                 arguments: json!({ "command": "ls" }),
             },
             &BTreeSet::from(["tool:shell.exec".to_string()]),
+            &BTreeMap::from([(
+                "shell.exec".to_string(),
+                AutoApproval::ProvablyReadOnlyShellCommand,
+            )]),
         )
         .unwrap();
 
@@ -411,4 +419,63 @@ fn an_auto_approved_plan_carries_the_policy_that_exempted_it() {
     );
     assert_eq!(policy_digest.len(), 64);
     assert!(!reason.is_empty(), "the ledger needs a stated reason");
+}
+
+/// The policy comes from the Run, not from the Tool.
+///
+/// It used to be a field on the descriptor, set once when the Worker started.
+/// That made it a Worker constant wearing a per-Tool name: every tenant granted
+/// the Tool got the same exemption and no tenant could turn it off. Passing it
+/// per plan makes the command the single source, so "the Worker applies what it
+/// was told" is literally true rather than a claim.
+#[test]
+fn the_approval_policy_comes_from_the_run_not_from_the_registered_tool() {
+    fn plan_with(policies: &BTreeMap<String, AutoApproval>) -> ToolPlan {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(ToolDescriptor {
+                name: "shell.exec".into(),
+                effect: ToolEffect::NonIdempotent,
+                approval: ApprovalMode::Ask,
+                sandbox: SandboxClass::TrustedNative,
+                implementation_digest: "c".repeat(64),
+                required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
+            })
+            .unwrap();
+        registry
+            .plan(
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "shell.exec".into(),
+                    arguments: json!({ "command": "ls" }),
+                },
+                &BTreeSet::from(["tool:shell.exec".to_string()]),
+                policies,
+            )
+            .unwrap()
+    }
+
+    // No policy for this Tool: it asks, whatever the Tool itself was registered
+    // with, because there is no longer anything for it to have been registered
+    // with.
+    assert!(matches!(
+        plan_with(&BTreeMap::new()),
+        ToolPlan::ApprovalRequired(_)
+    ));
+
+    let granted = BTreeMap::from([(
+        "shell.exec".to_string(),
+        AutoApproval::ProvablyReadOnlyShellCommand,
+    )]);
+    assert!(matches!(plan_with(&granted), ToolPlan::AutoApproved { .. }));
+
+    // A policy naming a different Tool grants this one nothing.
+    let elsewhere = BTreeMap::from([(
+        "workspace.write_text".to_string(),
+        AutoApproval::ProvablyReadOnlyShellCommand,
+    )]);
+    assert!(matches!(
+        plan_with(&elsewhere),
+        ToolPlan::ApprovalRequired(_)
+    ));
 }

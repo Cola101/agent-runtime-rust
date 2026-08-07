@@ -13,8 +13,8 @@ use agent_model_gateway::{
     ProviderPricing, decode_model_invocation,
 };
 use agent_protocol::{
-    ApprovalMode, AutoApproval, EventEnvelope, ModelStreamEvent, RunBudget, RunExecutionCommand,
-    RunStatus, SandboxClass, TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision,
+    ApprovalMode, EventEnvelope, ModelStreamEvent, RunBudget, RunExecutionCommand, RunStatus,
+    SandboxClass, TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision,
     ToolApprovalDecisionCommand, ToolDescriptor, ToolEffect,
 };
 use agent_runtime_worker::{WorkerProcessor, WorkerToolDefinition};
@@ -253,13 +253,12 @@ impl LocalRuntimeHost {
             // One executor per Tool rather than one shared read-write executor:
             // the read Tool then runs under a profile that grants no writes at
             // all, so a defect in it cannot change anything.
-            for (name, access, effect, scope, auto_approval, description) in [
+            for (name, access, effect, scope, description) in [
                 (
                     WORKSPACE_READ_TOOL,
                     WorkspaceAccess::ReadOnly,
                     ToolEffect::Pure,
                     WORKSPACE_READ_SCOPE,
-                    AutoApproval::Never,
                     "Read one bounded UTF-8 text file from the local workspace",
                 ),
                 (
@@ -267,7 +266,6 @@ impl LocalRuntimeHost {
                     WorkspaceAccess::ReadWrite,
                     ToolEffect::NonIdempotent,
                     WORKSPACE_WRITE_SCOPE,
-                    AutoApproval::Never,
                     "Write one bounded UTF-8 text file into the local workspace",
                 ),
                 (
@@ -275,8 +273,6 @@ impl LocalRuntimeHost {
                     WorkspaceAccess::ReadWrite,
                     ToolEffect::NonIdempotent,
                     SHELL_SCOPE,
-                    // Withdrawn 2026-08-07; see the Worker registration.
-                    AutoApproval::Never,
                     "Run one bounded shell command inside the local workspace",
                 ),
             ] {
@@ -298,7 +294,6 @@ impl LocalRuntimeHost {
                             sandbox: SandboxClass::TrustedNative,
                             implementation_digest: native.implementation_digest().to_owned(),
                             required_scopes: BTreeSet::from([scope.to_owned()]),
-                            auto_approval,
                         },
                         description: description.into(),
                         // Keyed on the Tool, not on its Workspace access: shell
@@ -377,6 +372,11 @@ impl LocalRuntimeHost {
             skill_snapshots: Vec::new(),
             lineage: agent_protocol::AgentLineage::default(),
             subagent_roles: Vec::new(),
+            // Empty: the local operator has no way to configure this yet, and an
+            // empty map means every Tool asks. When the local host grows a
+            // policy setting it belongs in LocalRuntimeConfig, so the source is
+            // still configuration rather than a constant in the code path.
+            tool_approval_policies: Default::default(),
             input: input.to_owned(),
             budget: self.config.budget.clone(),
         }

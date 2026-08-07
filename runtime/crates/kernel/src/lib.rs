@@ -117,8 +117,16 @@ impl ToolRegistry {
         &self,
         call: ToolCall,
         delegated_scopes: &BTreeSet<String>,
+        // The Run's policy, from the execution command. Absent means ask, so a
+        // command that says nothing about a Tool cannot be read as granting it
+        // anything.
+        tool_approval_policies: &BTreeMap<String, AutoApproval>,
     ) -> Result<ToolPlan, RegistryError> {
         let descriptor = self.authorize(&call.name, delegated_scopes)?;
+        let auto_approval = tool_approval_policies
+            .get(&descriptor.name)
+            .copied()
+            .unwrap_or_default();
         let policy_snapshot = ToolApprovalPolicySnapshot {
             tool_name: descriptor.name.clone(),
             effect: descriptor.effect,
@@ -126,7 +134,7 @@ impl ToolRegistry {
             sandbox: descriptor.sandbox,
             implementation_digest: descriptor.implementation_digest.clone(),
             required_scopes: descriptor.required_scopes.clone(),
-            auto_approval: descriptor.auto_approval,
+            auto_approval,
         };
         let policy_digest = digest(&policy_snapshot);
         let session_scope_digest = digest(&json!({
@@ -146,7 +154,7 @@ impl ToolRegistry {
                 &descriptor.implementation_digest,
                 &descriptor.required_scopes,
                 descriptor.approval,
-                descriptor.auto_approval,
+                auto_approval,
             ))
             .expect("tool authorization binding must be serializable"),
         ));
@@ -161,7 +169,7 @@ impl ToolRegistry {
         // the exemption travels with the Tool definition and is recorded in the
         // policy snapshot below, so it stays auditable.
         let exempt = descriptor.approval == ApprovalMode::Ask
-            && descriptor.auto_approval == AutoApproval::ProvablyReadOnlyShellCommand
+            && auto_approval == AutoApproval::ProvablyReadOnlyShellCommand
             && execution
                 .call
                 .arguments

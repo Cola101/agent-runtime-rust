@@ -7,7 +7,7 @@ use std::fmt;
 use uuid::Uuid;
 
 pub const RUN_QUEUED_SCHEMA_VERSION: u32 = 1;
-pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 7;
+pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 8;
 pub const RUN_CANCELLATION_SCHEMA_VERSION: u32 = 2;
 pub const RUN_STEERING_SCHEMA_VERSION: u32 = 1;
 pub const RUN_STEERING_OUTCOME_SCHEMA_VERSION: u32 = 1;
@@ -145,6 +145,17 @@ pub struct RunExecutionCommand {
     pub lineage: AgentLineage,
     #[serde(default)]
     pub subagent_roles: Vec<SubagentRole>,
+    /// Per-Tool approval policy, decided by the tenant and carried here.
+    ///
+    /// Added in v8. It was a constant in the Worker before that, which meant
+    /// every tenant granted a Tool got the same exemption and no tenant
+    /// administrator could turn it off -- a decision that is theirs being made
+    /// somewhere they cannot see or reach.
+    ///
+    /// A Tool absent from this map asks, so an older command and a command that
+    /// simply does not mention a Tool both mean the safe thing.
+    #[serde(default)]
+    pub tool_approval_policies: std::collections::BTreeMap<String, AutoApproval>,
     pub input: String,
     pub budget: RunBudget,
 }
@@ -405,6 +416,8 @@ pub enum RunExecutionValidationError {
     InvalidSubagentRoles,
     #[error("v2 execution must target one worker incarnation")]
     MissingWorkerIncarnation,
+    #[error("tool approval policies are only carried from v8 onward")]
+    InvalidToolApprovalPolicies,
 }
 
 impl RunExecutionCommand {
@@ -461,6 +474,12 @@ impl RunExecutionCommand {
             || (self.schema_version >= 7 && !self.valid_subagent_roles())
         {
             return Err(RunExecutionValidationError::InvalidSubagentRoles);
+        }
+        // A command claiming an older schema must not carry a v8 field: that is
+        // how a downgraded command would smuggle an exemption past a Worker
+        // that believes it is speaking the policy-free contract.
+        if self.schema_version < 8 && !self.tool_approval_policies.is_empty() {
+            return Err(RunExecutionValidationError::InvalidToolApprovalPolicies);
         }
         if !self.budget.is_positive_and_finite() {
             return Err(RunExecutionValidationError::InvalidBudget);
@@ -1196,10 +1215,6 @@ pub struct ToolDescriptor {
     pub sandbox: SandboxClass,
     pub implementation_digest: String,
     pub required_scopes: std::collections::BTreeSet<String>,
-    /// When an `Ask` Tool may skip the approval for a particular call.
-    /// Defaults to `Never`, so a Tool that says nothing keeps asking every time.
-    #[serde(default)]
-    pub auto_approval: AutoApproval,
 }
 
 /// Narrow, per-Tool exemptions from the approval gate.

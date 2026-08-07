@@ -343,3 +343,72 @@ fn execution_acceptance_must_match_a_real_attempt() {
         "execution attempt id must not be nil"
     );
 }
+
+/// The approval policy is a tenant decision, so it has to arrive in the command
+/// rather than live as a constant in the Worker.
+///
+/// ADR-0039 shipped it as a constant. That meant every tenant granted shell got
+/// the same exemption, no tenant administrator could turn it off, and the
+/// control plane had no say in a decision that is theirs. v8 carries the policy
+/// per Tool so the Worker applies what it was told rather than what it believes.
+#[test]
+fn v8_execution_carries_the_tool_approval_policy_the_tenant_configured() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(8);
+    value["tool_approval_policies"] = serde_json::json!({
+        "shell.exec": "provably_read_only_shell_command"
+    });
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(command.validate().is_ok());
+    assert_eq!(
+        command.tool_approval_policies.get("shell.exec"),
+        Some(&agent_protocol::AutoApproval::ProvablyReadOnlyShellCommand)
+    );
+}
+
+/// A command that says nothing about a Tool must mean "ask", not "whatever the
+/// Worker prefers". Older commands say nothing about any Tool, so the absent
+/// case has to be the safe one.
+#[test]
+fn an_execution_without_policies_means_every_tool_asks() {
+    let value: serde_json::Value = serde_json::from_str(EXECUTION_V4_EXAMPLE).unwrap();
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+
+    assert!(command.validate().is_ok());
+    assert!(
+        command.tool_approval_policies.is_empty(),
+        "an older command must not be read as granting an exemption"
+    );
+}
+
+/// An unknown policy name must not silently degrade to a permissive default.
+#[test]
+fn an_unrecognised_policy_name_is_refused_rather_than_defaulted() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(8);
+    value["tool_approval_policies"] = serde_json::json!({ "shell.exec": "trust_me" });
+
+    assert!(
+        serde_json::from_value::<RunExecutionCommand>(value).is_err(),
+        "an unknown policy must fail to decode rather than become a default"
+    );
+}
+
+/// A command that claims an older schema must not carry a v8 field. Accepting
+/// one would let a downgraded command smuggle an exemption past a Worker that
+/// believes it is speaking the older, policy-free contract.
+#[test]
+fn a_pre_v8_execution_carrying_policies_is_refused() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(7);
+    value["tool_approval_policies"] = serde_json::json!({
+        "shell.exec": "provably_read_only_shell_command"
+    });
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        command.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidToolApprovalPolicies)
+    );
+}
