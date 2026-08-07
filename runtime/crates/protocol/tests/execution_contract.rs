@@ -412,3 +412,96 @@ fn a_pre_v8_execution_carrying_policies_is_refused() {
         Err(agent_protocol::RunExecutionValidationError::InvalidToolApprovalPolicies)
     );
 }
+
+/// A federated MCP server arrives sealed, exactly as a model Provider does.
+///
+/// The Worker gets the endpoint and the namespace so it can name the tools; it
+/// does not get the credential, because the credential is unsealed at the egress
+/// hop and never on the machine running the model's suggestions (ADR-0040).
+#[test]
+fn v9_execution_carries_sealed_mcp_servers() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(9);
+    value["delegated_scopes"] = serde_json::json!(["tool:mcp:search"]);
+    value["mcp_servers"] = serde_json::json!([{
+        "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+        "name": "search",
+        "endpoint": "https://mcp.example.com/rpc",
+        "credential_envelope_base64": "eyJzZWFsZWQiOnRydWV9"
+    }]);
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(command.validate().is_ok());
+    assert_eq!(command.mcp_servers.len(), 1);
+    assert_eq!(command.mcp_servers[0].name, "search");
+}
+
+/// The same downgrade guard v8 has. A command claiming an older schema while
+/// carrying v9 servers would federate tools past a Worker that believes it is
+/// speaking a contract with no federation in it.
+#[test]
+fn a_pre_v9_execution_carrying_mcp_servers_is_refused() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(8);
+    value["mcp_servers"] = serde_json::json!([{
+        "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+        "name": "search",
+        "endpoint": "https://mcp.example.com/rpc",
+        "credential_envelope_base64": ""
+    }]);
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(
+        command.validate().is_err(),
+        "a downgraded command must not smuggle federated servers"
+    );
+}
+
+/// A server the AgentVersion does not delegate is not reachable, and shipping it
+/// anyway is a pre-authorisation waiting for a scope change to activate.
+#[test]
+fn an_mcp_server_without_its_delegated_scope_is_refused() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(9);
+    value["delegated_scopes"] = serde_json::json!(["tool:workspace.read"]);
+    value["mcp_servers"] = serde_json::json!([{
+        "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+        "name": "search",
+        "endpoint": "https://mcp.example.com/rpc",
+        "credential_envelope_base64": ""
+    }]);
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(
+        command.validate().is_err(),
+        "a server nobody delegated must not be carried"
+    );
+}
+
+/// The name is the namespace in `mcp:<server>/<tool>`. A name carrying a
+/// separator could make one server's tool resolve as another's, and the Worker
+/// has to refuse that on its own rather than trusting the control plane to have
+/// checked -- the whole point of validating a contract on receipt.
+#[test]
+fn an_mcp_server_name_that_could_forge_a_qualified_tool_name_is_refused() {
+    // "1/b" and "9:x" are here because a first pass at this check let any
+    // name starting with a digit through regardless of what followed it, and a
+    // hostile list without one would have shipped that.
+    for hostile in ["a/b", "a:b", "", "UPPER", "1/b", "9:x", "-lead", "a b"] {
+        let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+        value["schema_version"] = serde_json::json!(9);
+        value["delegated_scopes"] = serde_json::json!([format!("tool:mcp:{hostile}")]);
+        value["mcp_servers"] = serde_json::json!([{
+            "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+            "name": hostile,
+            "endpoint": "https://mcp.example.com/rpc",
+            "credential_envelope_base64": ""
+        }]);
+
+        let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+        assert!(
+            command.validate().is_err(),
+            "server name {hostile:?} must be refused"
+        );
+    }
+}

@@ -37,6 +37,15 @@ public record RunExecutionCommand(
      * never inherits one.
      */
     java.util.Map<String, String> toolApprovalPolicies,
+    /**
+     * Federated MCP servers this Run may reach.
+     *
+     * <p>Only servers whose {@code tool:mcp:<name>} scope is in
+     * {@code delegatedScopes} are ever put here, and for a subagent that is the
+     * role's scopes rather than the AgentVersion's -- a child does not reach a
+     * server its role never delegated.
+     */
+    List<McpServerSnapshot> mcpServers,
     String input,
     long maxTokens,
     long maxCostCents,
@@ -69,7 +78,7 @@ public record RunExecutionCommand(
         modelPolicyId, attemptId, workerId, workerIncarnationId, ownerEpoch, fencingToken, issuedAt,
         leaseExpiresAt, workloadToken, delegatedScopes, agentInstructions, "", "", List.of(),
         AgentLineageSnapshot.primary(runId), List.of(),
-        java.util.Map.of(), input, maxTokens, maxCostCents,
+        java.util.Map.of(), List.of(), input, maxTokens, maxCostCents,
         maxDurationSeconds);
   }
 
@@ -99,7 +108,7 @@ public record RunExecutionCommand(
         modelPolicyId, attemptId, workerId, workerId, ownerEpoch, fencingToken, issuedAt,
         leaseExpiresAt, workloadToken, delegatedScopes, agentInstructions, "", "", List.of(),
         AgentLineageSnapshot.primary(runId), List.of(),
-        java.util.Map.of(), input, maxTokens, maxCostCents,
+        java.util.Map.of(), List.of(), input, maxTokens, maxCostCents,
         maxDurationSeconds);
   }
 
@@ -107,6 +116,7 @@ public record RunExecutionCommand(
     delegatedScopes = List.copyOf(delegatedScopes);
     skillSnapshots = List.copyOf(skillSnapshots);
     subagentRoles = List.copyOf(subagentRoles);
+    mcpServers = mcpServers == null ? List.of() : List.copyOf(mcpServers);
     if (lineage == null) {
       throw new IllegalArgumentException("agent lineage is required");
     }

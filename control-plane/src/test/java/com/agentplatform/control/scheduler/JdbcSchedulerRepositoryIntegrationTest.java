@@ -69,7 +69,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         .command().orElseThrow();
 
     assertThat(command.delegatedScopes()).containsExactly("tool:http", "workspace:read");
-    assertThat(command.schemaVersion()).isEqualTo(8);
+    assertThat(command.schemaVersion()).isEqualTo(9);
     // A root dispatch carries whatever the AgentVersion configured; a subagent
     // dispatch carries nothing, because a role-scoped exemption is a second
     // decision nobody has made.
@@ -263,7 +263,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(8);
+    assertThat(command.schemaVersion()).isEqualTo(9);
     assertThat(command.subagentRoles()).containsExactly(new SubagentRoleSnapshot(
         "reviewer", "Review evidence only.", List.of("tool:workspace.read")));
     var payload = new ObjectMapper().readTree(fixture.jdbc().queryForObject("""
@@ -319,7 +319,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(8);
+    assertThat(command.schemaVersion()).isEqualTo(9);
     assertThat(command.skillSnapshots()).hasSize(1);
     assertThat(command.skillSnapshots().getFirst().skillVersionId()).isEqualTo(skillVersionId);
     assertThat(command.skillSnapshots().getFirst().toolNames())
@@ -345,7 +345,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
         fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
         .command().orElseThrow();
 
-    assertThat(command.schemaVersion()).isEqualTo(8);
+    assertThat(command.schemaVersion()).isEqualTo(9);
     assertThat(command.lineage().rootRunId()).isEqualTo(fixture.runId());
     assertThat(command.lineage().parentRunId()).isNull();
     assertThat(command.lineage().delegationId()).isNull();
@@ -502,7 +502,7 @@ class JdbcSchedulerRepositoryIntegrationTest {
     var tokenParts = command.workloadToken().value().split("\\.");
     var claims = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(tokenParts[1]));
 
-    assertThat(command.schemaVersion()).isEqualTo(8);
+    assertThat(command.schemaVersion()).isEqualTo(9);
     assertThat(snapshot.path("routing").asText()).isEqualTo("ordered_failover");
     assertThat(snapshot.path("candidates").findValuesAsText("provider_id"))
         .containsExactly(primary.toString(), fallback.toString());
@@ -2458,6 +2458,67 @@ class JdbcSchedulerRepositoryIntegrationTest {
            select d.worker_id,d.worker_incarnation_id from run_dispatches d
             where d.tenant_id = ? and d.run_id = ? and d.worker_id = ?)
         """, fixture.tenantId(), fixture.runId(), workerId);
+  }
+
+  /**
+   * A registered MCP server has to actually arrive in the command and in the
+   * outbox payload.
+   *
+   * <p>The suite passing after the projection was added only proves the columns
+   * line up; it does not prove anything reached the Worker. This is the
+   * assertion that would fail if the projection returned an empty array
+   * everywhere, which is exactly what a missing join would produce.
+   */
+  @Test
+  void dispatchCarriesDelegatedMcpServersSealedIntoTheCommandAndOutbox() throws Exception {
+    var fixture = fixture("scheduler-mcp-servers");
+    fixture.jdbc().update("""
+        insert into mcp_servers (
+          tenant_id,id,application_id,name,endpoint,credential_envelope)
+        values (?,?,?,'search','https://mcp.example.com/rpc',
+                '{"schema_version":1,"key_id":"k","algorithm":"a",
+                  "encrypted_key":"e","nonce":"n","ciphertext":"c"}'::jsonb)
+        """, fixture.tenantId(), UUID.randomUUID(), fixture.applicationId());
+    // A second server nobody delegates, so "carried" is distinguishable from
+    // "everything registered was carried".
+    fixture.jdbc().update("""
+        insert into mcp_servers (tenant_id,id,application_id,name,endpoint)
+        values (?,?,?,'undelegated','https://other.example.com/rpc')
+        """, fixture.tenantId(), UUID.randomUUID(), fixture.applicationId());
+    fixture.jdbc().update("""
+        update agent_versions
+           set spec = '{"instructions":"Search before answering.",
+                        "delegated_scopes":["tool:mcp:search"]}'::jsonb
+         where tenant_id = ? and id = ?
+        """, fixture.tenantId(), fixture.agentVersionId());
+    var workerId = UUID.randomUUID();
+    fixture.scheduler().recordHeartbeat(new WorkerHeartbeatMessage(
+        1, UUID.randomUUID(), workerId, Instant.now(), List.of("cloud"), 4, 0, "0.1.0"));
+
+    var command = fixture.scheduler().schedule(
+        fixture.tenantId(), fixture.runId(), Duration.ofSeconds(30), Duration.ofSeconds(15))
+        .command().orElseThrow();
+
+    assertThat(command.mcpServers()).hasSize(1);
+    var server = command.mcpServers().getFirst();
+    assertThat(server.name()).isEqualTo("search");
+    assertThat(server.endpoint()).isEqualTo("https://mcp.example.com/rpc");
+    // Sealed and base64: the Worker gets something opaque, and it must not be
+    // wrapped at 76 characters the way PostgreSQL's own encode() would leave it.
+    assertThat(server.credentialEnvelopeBase64()).isNotBlank().doesNotContain("\n");
+    assertThat(new String(java.util.Base64.getDecoder().decode(
+        server.credentialEnvelopeBase64()), java.nio.charset.StandardCharsets.UTF_8))
+        .contains("ciphertext");
+
+    var payload = new ObjectMapper().readTree(fixture.jdbc().queryForObject("""
+        select payload::text from outbox_events
+         where tenant_id = ? and event_type = 'run.execution.requested'
+         order by created_at desc limit 1
+        """, String.class, fixture.tenantId()));
+    var carried = payload.path("mcp_servers");
+    assertThat(carried.size()).isEqualTo(1);
+    assertThat(carried.get(0).path("name").asText()).isEqualTo("search");
+    assertThat(carried.get(0).path("credential_envelope_base64").asText()).isNotBlank();
   }
 
   private Fixture fixture(String idempotencyKey) throws Exception {

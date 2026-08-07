@@ -377,6 +377,10 @@ impl LocalRuntimeHost {
             // policy setting it belongs in LocalRuntimeConfig, so the source is
             // still configuration rather than a constant in the code path.
             tool_approval_policies: Default::default(),
+            // The offline host federates nothing. There is no egress hop here
+            // to unseal a credential at, so an MCP server carried into this
+            // path would have nowhere safe to be opened.
+            mcp_servers: Vec::new(),
             input: input.to_owned(),
             budget: self.config.budget.clone(),
         }

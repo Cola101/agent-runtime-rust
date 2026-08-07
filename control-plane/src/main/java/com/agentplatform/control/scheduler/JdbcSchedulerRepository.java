@@ -50,6 +50,52 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
     }
   }
 
+  /**
+   * Reads the projected MCP server array.
+   *
+   * <p>The envelope is base64-encoded here rather than in SQL because
+   * PostgreSQL's {@code encode(...,'base64')} wraps at 76 characters, and a
+   * base64 string with newlines in it fails strict decoding at the other end --
+   * a difference that would only show up on a server whose envelope happened to
+   * be long enough.
+   */
+  private static java.util.List<McpServerSnapshot> mcpServers(String json) {
+    if (json == null || json.isBlank()) {
+      return java.util.List.of();
+    }
+    try {
+      var node = JSON.readTree(json);
+      var servers = new java.util.ArrayList<McpServerSnapshot>();
+      for (var entry : node) {
+        var envelope = entry.path("credential_envelope");
+        servers.add(new McpServerSnapshot(
+            UUID.fromString(entry.path("server_id").asText()),
+            entry.path("name").asText(),
+            entry.path("endpoint").asText(),
+            envelope.isMissingNode() || envelope.isNull()
+                ? ""
+                : java.util.Base64.getEncoder().encodeToString(
+                    envelope.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+      }
+      return java.util.List.copyOf(servers);
+    } catch (com.fasterxml.jackson.core.JsonProcessingException malformed) {
+      throw new IllegalStateException("mcp server projection is malformed", malformed);
+    }
+  }
+
+  private static com.fasterxml.jackson.databind.node.ArrayNode mcpServersNode(
+      java.util.List<McpServerSnapshot> servers) {
+    var array = JSON.createArrayNode();
+    for (var server : servers) {
+      var node = array.addObject();
+      node.put("server_id", server.serverId().toString());
+      node.put("name", server.name());
+      node.put("endpoint", server.endpoint());
+      node.put("credential_envelope_base64", server.credentialEnvelopeBase64());
+    }
+    return array;
+  }
+
   private static java.util.Map<String, String> approvalPolicies(String json) {
     if (json == null || json.isBlank()) {
       return java.util.Map.of();
@@ -62,7 +108,41 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
       return java.util.Map.of();
     }
   }
-  private static final int EXECUTION_SCHEMA_VERSION = 8;
+  private static final int EXECUTION_SCHEMA_VERSION = 9;
+
+  /**
+   * Federated MCP servers this Run may reach, as a JSON array (ADR-0040).
+   *
+   * <p>One string used by every projection rather than three copies. Four
+   * projections against four readers is how the approval-policy column arrived
+   * with two sites missing, and that was caught only because the SQL failed
+   * loudly; a shared fragment removes the chance rather than relying on care.
+   *
+   * <p>The delegated-scope test uses the Run's <em>effective</em> scopes, which
+   * for a subagent are the role's rather than the AgentVersion's. A child does
+   * not reach a server its role never delegated.
+   *
+   * <p>{@code jsonb_exists} rather than the {@code ?} operator: {@code ?} is
+   * also the JDBC placeholder, so the operator form would be read as a bind
+   * parameter and the statement would not match its arguments.
+   */
+  private static final String MCP_SERVERS_PROJECTION = """
+                 (select coalesce(jsonb_agg(jsonb_build_object(
+                           'server_id', m.id,
+                           'name', m.name,
+                           'endpoint', m.endpoint,
+                           'credential_envelope', m.credential_envelope)
+                         order by m.name), '[]'::jsonb)::text
+                    from mcp_servers m
+                   where m.tenant_id = r.tenant_id
+                     and m.application_id = av.application_id
+                     and m.state = 'active'
+                     and jsonb_exists(
+                           case when r.subagent_depth = 0
+                             then coalesce(av.spec->'delegated_scopes','[]'::jsonb)
+                             else coalesce(sr.role->'delegated_scopes','[]'::jsonb)
+                           end,
+                           'tool:mcp:' || m.name)) as mcp_servers""";
   /** Redispatch bound for an assignment no Worker has ever accepted. */
   private static final int MAX_UNACCEPTED_DISPATCH_ATTEMPTS = 5;
   private static final int SUBAGENT_RESULT_TEXT_MAX_BYTES = 240 * 1024;
@@ -354,7 +434,8 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                case when r.subagent_depth = 0
                  then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
                  else '{}'::jsonb
-               end as tool_approval_policies
+               end as tool_approval_policies,
+        """ + MCP_SERVERS_PROJECTION + """
           from run_dispatches d
           join runs r on r.tenant_id = d.tenant_id and r.id = d.run_id
           join agent_versions av on av.tenant_id = r.tenant_id and av.id = r.agent_version_id
@@ -393,6 +474,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getInt("subagent_depth"),
             row.getString("agent_role"),
             approvalPolicies(row.getString("tool_approval_policies")),
+            mcpServers(row.getString("mcp_servers")),
             row.getLong("max_tokens"),
             row.getLong("max_cost_cents"),
             row.getLong("max_duration_seconds")),
@@ -513,7 +595,8 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                  then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
                  else '{}'::jsonb
                end as tool_approval_policies,
-               c.checkpoint_id,c.kernel_digest,c.tool_catalog_digest,c.payload,c.payload_ref,
+        """ + MCP_SERVERS_PROJECTION + """
+               ,c.checkpoint_id,c.kernel_digest,c.tool_catalog_digest,c.payload,c.payload_ref,
                c.payload_encoding,c.payload_digest,c.stored_payload_digest,
                c.uncompressed_size,c.stored_size,c.created_at
           from subagent_calls s
@@ -552,6 +635,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
               row.getObject("parent_delegation_id", UUID.class), row.getInt("subagent_depth"),
               row.getString("agent_role"),
               approvalPolicies(row.getString("tool_approval_policies")),
+              mcpServers(row.getString("mcp_servers")),
               row.getLong("max_tokens"),
               row.getLong("max_cost_cents"), row.getLong("max_duration_seconds"));
           var checkpoint = new StoredCheckpoint(
@@ -768,6 +852,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             key.tenantId(), previous.agentVersionId(), previous.delegatedScopes(),
             previous.subagentDepth()),
         previous.toolApprovalPolicies(),
+        previous.mcpServers(),
         previous.input(), previous.maxTokens(),
         previous.maxCostCents(), previous.maxDurationSeconds());
     jdbc.update("""
@@ -942,6 +1027,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
     execution.set(
         "tool_approval_policies",
         JSON.valueToTree(new java.util.TreeMap<>(command.toolApprovalPolicies())));
+    execution.set("mcp_servers", mcpServersNode(command.mcpServers()));
     execution.put("input", command.input());
     var budget = execution.putObject("budget");
     budget.put("max_tokens", command.maxTokens());
@@ -2135,7 +2221,8 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                case when r.subagent_depth = 0
                  then coalesce(av.spec->'tool_approval_policies','{}'::jsonb)
                  else '{}'::jsonb
-               end as tool_approval_policies
+               end as tool_approval_policies,
+        """ + MCP_SERVERS_PROJECTION + """
           from runs r
           join agent_versions av on av.tenant_id = r.tenant_id and av.id = r.agent_version_id
           left join lateral (
@@ -2164,6 +2251,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getInt("subagent_depth"),
             row.getString("agent_role"),
             approvalPolicies(row.getString("tool_approval_policies")),
+            mcpServers(row.getString("mcp_servers")),
             row.getLong("max_tokens"),
             row.getLong("max_cost_cents"),
             row.getLong("max_duration_seconds")), tenantId, runId);
@@ -2238,6 +2326,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
         run.lineage(),
         subagentRoles(tenantId, run.agentVersionId(), run.delegatedScopes(), run.subagentDepth()),
         run.toolApprovalPolicies(),
+        run.mcpServers(),
         run.input(), run.maxTokens(), run.maxCostCents(),
         run.maxDurationSeconds());
 
@@ -2288,6 +2377,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
                coalesce(o.payload->'subagent_roles','[]'::jsonb)::text as subagent_roles,
                coalesce(o.payload->'tool_approval_policies','{}'::jsonb)::text
                  as tool_approval_policies,
+               coalesce(o.payload->'mcp_servers','[]'::jsonb)::text as mcp_servers,
                o.id as message_id,o.payload->>'workload_token' as workload_token,
                array(select jsonb_array_elements_text(o.payload->'delegated_scopes') order by 1)
                  as delegated_scopes
@@ -2332,6 +2422,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
             row.getString("agent_role")),
         parseSubagentRoles(row.getString("subagent_roles")),
         approvalPolicies(row.getString("tool_approval_policies")),
+        mcpServers(row.getString("mcp_servers")),
         row.getString("input"),
         row.getLong("max_tokens"),
         row.getLong("max_cost_cents"),
@@ -2366,6 +2457,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
           'skill_snapshots',?::jsonb,
           'subagent_roles',?::jsonb,
           'tool_approval_policies',?::jsonb,
+          'mcp_servers',?::jsonb,
           'lineage',jsonb_build_object(
             'root_run_id',?::text,
             'parent_run_id',?::text,
@@ -2392,6 +2484,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
         command.modelPolicyDigest(), skillSnapshotsNode(command.skillSnapshots()).toString(),
         subagentRolesNode(command.subagentRoles()).toString(),
         approvalPoliciesJson(command.toolApprovalPolicies()),
+        mcpServersNode(command.mcpServers()).toString(),
         command.lineage().rootRunId().toString(), nullableUuid(command.lineage().parentRunId()),
         nullableUuid(command.lineage().delegationId()), command.lineage().depth(),
         command.lineage().role(),
@@ -2642,6 +2735,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
       int subagentDepth,
       String agentRole,
       java.util.Map<String, String> toolApprovalPolicies,
+      java.util.List<McpServerSnapshot> mcpServers,
       long maxTokens,
       long maxCostCents,
       long maxDurationSeconds) {
@@ -2787,6 +2881,7 @@ public class JdbcSchedulerRepository implements RecoveryMetricsSource {
       int subagentDepth,
       String agentRole,
       java.util.Map<String, String> toolApprovalPolicies,
+      java.util.List<McpServerSnapshot> mcpServers,
       long maxTokens,
       long maxCostCents,
       long maxDurationSeconds) {

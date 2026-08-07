@@ -7,7 +7,7 @@ use std::fmt;
 use uuid::Uuid;
 
 pub const RUN_QUEUED_SCHEMA_VERSION: u32 = 1;
-pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 8;
+pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 9;
 pub const RUN_CANCELLATION_SCHEMA_VERSION: u32 = 2;
 pub const RUN_STEERING_SCHEMA_VERSION: u32 = 1;
 pub const RUN_STEERING_OUTCOME_SCHEMA_VERSION: u32 = 1;
@@ -156,8 +156,60 @@ pub struct RunExecutionCommand {
     /// simply does not mention a Tool both mean the safe thing.
     #[serde(default)]
     pub tool_approval_policies: std::collections::BTreeMap<String, AutoApproval>,
+    /// Federated MCP servers this Run may reach (ADR-0040).
+    ///
+    /// Added in v9, and sealed exactly as a model Provider is: the Worker gets
+    /// the endpoint and the namespace so it can name and route the tools, and
+    /// never the credential. Unsealing happens at the egress hop, not on the
+    /// machine that is executing a model's suggestions.
+    ///
+    /// Empty is the normal case and means no federation, so an older command and
+    /// a tenant with no servers registered both mean the same safe thing.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSnapshot>,
     pub input: String,
     pub budget: RunBudget,
+}
+
+/// One federated MCP server as the Worker sees it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpServerSnapshot {
+    pub server_id: Uuid,
+    /// Namespace in qualified tool names: `mcp:<name>/<tool>`.
+    pub name: String,
+    /// The only host the federation client may reach for this server.
+    pub endpoint: String,
+    /// Sealed. Base64 of the envelope, opaque here and opened at the egress hop.
+    #[serde(default)]
+    pub credential_envelope_base64: String,
+}
+
+impl McpServerSnapshot {
+    /// The name shape, re-checked here rather than trusted from the control
+    /// plane. Validating a contract on receipt is the point of having one; a
+    /// name carrying `/` or `:` could make one server's tool resolve as
+    /// another's, and the Worker is the party that would act on it.
+    fn has_usable_namespace(&self) -> bool {
+        let bytes = self.name.as_bytes();
+        // Written as one expression with no `||` at the top level. The first
+        // version mixed && and || and, because && binds tighter, read as
+        // "(everything) or (starts with a digit)" -- so `1/b` was accepted and
+        // could have forged a qualified name. The hostile list in the test now
+        // carries a digit-leading case for that reason.
+        matches!(bytes.first(), Some(first)
+            if first.is_ascii_lowercase() || first.is_ascii_digit())
+            && bytes.len() <= 64
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || *byte == b'-'
+                    || *byte == b'_'
+            })
+    }
+
+    fn scope(&self) -> String {
+        format!("tool:mcp:{}", self.name)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -418,6 +470,8 @@ pub enum RunExecutionValidationError {
     MissingWorkerIncarnation,
     #[error("tool approval policies are only carried from v8 onward")]
     InvalidToolApprovalPolicies,
+    #[error("v9 federated MCP servers are malformed, undelegated, or carried by an older schema")]
+    InvalidMcpServers,
 }
 
 impl RunExecutionCommand {
@@ -481,10 +535,36 @@ impl RunExecutionCommand {
         if self.schema_version < 8 && !self.tool_approval_policies.is_empty() {
             return Err(RunExecutionValidationError::InvalidToolApprovalPolicies);
         }
+        // The same downgrade guard v8 has: a command claiming an older schema
+        // must not carry v9 servers, or federation reaches a Worker that
+        // believes it is speaking a contract without any in it.
+        if (self.schema_version < 9 && !self.mcp_servers.is_empty())
+            || (self.schema_version >= 9 && !self.valid_mcp_servers())
+        {
+            return Err(RunExecutionValidationError::InvalidMcpServers);
+        }
         if !self.budget.is_positive_and_finite() {
             return Err(RunExecutionValidationError::InvalidBudget);
         }
         Ok(())
+    }
+
+    fn valid_mcp_servers(&self) -> bool {
+        if self.mcp_servers.len() > 16 {
+            return false;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        self.mcp_servers.iter().all(|server| {
+            !server.server_id.is_nil()
+                && server.has_usable_namespace()
+                && server.endpoint.len() <= 2_048
+                && !server.endpoint.trim().is_empty()
+                && server.credential_envelope_base64.len() <= 16 * 1024
+                // A server nobody delegated is either a mistake or a
+                // pre-authorisation waiting for a scope change to activate it.
+                && self.delegated_scopes.contains(&server.scope())
+                && seen.insert(server.name.clone())
+        })
     }
 
     fn valid_subagent_roles(&self) -> bool {
