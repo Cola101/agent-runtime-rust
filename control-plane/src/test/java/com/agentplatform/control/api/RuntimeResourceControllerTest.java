@@ -1,5 +1,6 @@
 package com.agentplatform.control.api;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -221,5 +222,31 @@ class RuntimeResourceControllerTest {
         .andExpect(status().isCreated())
         .andExpect(header().string("Location", "/v1/sessions/" + sessionId))
         .andExpect(jsonPath("$.title").value("Release review"));
+  }
+
+  // Input the service refuses is the caller's mistake, not the server's. It
+  // surfaced as 500, which tells a client to retry something that will never
+  // succeed and hides a validation failure inside an incident.
+  @Test
+  void invalidResourceInputIsRejectedAsAClientErrorRatherThanAServerFault() throws Exception {
+    var tenantId = UUID.randomUUID();
+    var applicationId = UUID.randomUUID();
+    var agentId = UUID.randomUUID();
+    when(resources.createAgentVersion(
+        any(), any(), any(), any(), any(), any(), any(), any()))
+        .thenThrow(new IllegalArgumentException(
+            "tool approval policy names a tool this AgentVersion does not delegate: shell.exec"));
+
+    mvc.perform(post("/v1/agents/{agentId}/versions", agentId)
+            .with(jwt().jwt(jwt -> jwt.claim("tenant_id", tenantId.toString())
+                .claim("application_id", applicationId.toString())
+                .claim("scope", "resources:write")))
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("""
+                {"instructions":"x","delegated_scopes":["tool:workspace.read"],
+                 "tool_approval_policies":{"shell.exec":"provably_read_only_shell_command"}}
+                """))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.type").value("urn:agent-runtime:problem:resource-input"));
   }
 }

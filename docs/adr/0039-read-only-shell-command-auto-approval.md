@@ -56,6 +56,28 @@ a list is the wrong place for a security decision that a tenant should be making
 Re-enabling this requires the policy to be a tenant decision carried in the
 execution snapshot, not a constant in the Worker.
 
+## The precondition is now met (2026-08-07, later the same day)
+
+The policy is no longer a Worker constant. A tenant sets
+`tool_approval_policies` on an AgentVersion; it is stored in the version's spec,
+projected by the Scheduler into RunExecution v8, and applied by the kernel from
+the command. `auto_approval` was removed from `ToolDescriptor` entirely so there
+is one source rather than two.
+
+Absent means ask, enforced independently at each layer -- the API record
+defaults a missing map, the command contract treats an absent Tool as gated, and
+the kernel's lookup falls back to `Never` -- so the safe reading survives any one
+layer being bypassed. Two contract rules guard the edges: an unrecognised policy
+value fails to decode rather than defaulting, and a command claiming a pre-v8
+schema while carrying the v8 field is refused as a downgrade. Subagents receive
+an empty map unconditionally, because a role-scoped exemption is a second
+decision nobody has made.
+
+**This does not re-enable anything.** No Tool declares a policy anywhere, so
+every `shell.exec` call is still approval gated. What changed is who is able to
+decide. Turning it on additionally requires a list that survives the review this
+one did not, and that list does not exist yet.
+
 ## Superseded content
 
 Everything below is the original ADR as accepted, kept because the mechanism

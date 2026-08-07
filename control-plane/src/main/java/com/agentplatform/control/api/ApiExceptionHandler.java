@@ -54,6 +54,25 @@ public class ApiExceptionHandler {
             "detail", error.getMessage()));
   }
 
+  /**
+   * Input the service refused.
+   *
+   * <p>Left unmapped it surfaced as 500, which tells a client to retry something
+   * that will never succeed and files a validation failure as a server incident.
+   * The message is the service's own, and those are written for the caller --
+   * "this AgentVersion does not delegate that tool" is exactly what they need.
+   */
+  @ExceptionHandler(IllegalArgumentException.class)
+  ResponseEntity<Map<String, Object>> invalidResourceInput(IllegalArgumentException error) {
+    return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+        .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+        .body(Map.of(
+            "type", URI.create("urn:agent-runtime:problem:resource-input").toString(),
+            "title", "Request was refused",
+            "status", HttpStatus.BAD_REQUEST.value(),
+            "detail", error.getMessage() == null ? "invalid request" : error.getMessage()));
+  }
+
   @ExceptionHandler(RunAlreadyTerminal.class)
   ResponseEntity<Map<String, Object>> runAlreadyTerminal(RunAlreadyTerminal error) {
     return problem(HttpStatus.CONFLICT, "Run is already terminal", error.getMessage());
