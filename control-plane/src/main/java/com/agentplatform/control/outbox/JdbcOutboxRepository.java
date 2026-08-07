@@ -20,6 +20,29 @@ public class JdbcOutboxRepository implements OutboxStore {
     this.transactions = Objects.requireNonNull(transactions);
   }
 
+  /**
+   * Takes the next batch, shared fairly across tenants rather than first-come.
+   *
+   * <p>Strict {@code order by created_at} let one tenant's burst hold every
+   * other tenant behind it for as long as the burst took to enqueue. Quotas do
+   * not help: a quota refuses admission and says nothing about the order of what
+   * was already admitted.
+   *
+   * <p>Each message is ranked within its own tenant and then ordered by
+   * {@code position / weight}. A tenant at weight 4 reaches virtual position 1
+   * on its fourth message, at the same point a tenant at weight 1 reaches it on
+   * its first, so the batch divides four to one. Equal weights make it plain
+   * round-robin. The ordering is across tenants only -- within a tenant the rank
+   * is still oldest-first, so an ordered stream is never shuffled.
+   *
+   * <p>The final select is ordered explicitly. {@code UPDATE ... RETURNING} has
+   * no defined row order, and the publisher sends the batch in list order, so
+   * without this the order messages reach the broker in was left to the plan --
+   * it happened to come out oldest-first, and nothing said it had to.
+   *
+   * <p>The rank is computed over every claimable row each poll. That is bounded
+   * by the backlog, not by the batch size, and is the known cost of this shape.
+   */
   @Override
   public List<OutboxMessage> claimNext(int limit, UUID claimToken, Duration leaseDuration) {
     if (limit < 1 || limit > 1000) {
@@ -32,25 +55,43 @@ public class JdbcOutboxRepository implements OutboxStore {
     }
 
     return transactions.execute(status -> jdbc.query("""
-        with candidates as (
+        with claimable as (
+          select o.tenant_id, o.id, o.created_at,
+                 row_number() over (
+                   partition by o.tenant_id order by o.created_at, o.id) as position,
+                 coalesce(q.dispatch_weight, 1) as weight
+            from outbox_events o
+            left join tenant_run_quotas q on q.tenant_id = o.tenant_id
+           where o.published_at is null
+             and (o.claim_until is null or o.claim_until <= clock_timestamp())
+        ),
+        fair as (
           select tenant_id, id
-            from outbox_events
-           where published_at is null
-             and (claim_until is null or claim_until <= clock_timestamp())
-           order by created_at, id
-           for update skip locked
+            from claimable
+           order by position::numeric / weight, created_at, id
            limit ?
+        ),
+        candidates as (
+          select o.tenant_id, o.id
+            from outbox_events o
+           where o.published_at is null
+             and (o.claim_until is null or o.claim_until <= clock_timestamp())
+             and (o.tenant_id, o.id) in (select tenant_id, id from fair)
+           for update skip locked
+        ),
+        claimed as (
+          update outbox_events message
+             set claim_token = ?,
+                 claim_until = clock_timestamp() + (? * interval '1 millisecond'),
+                 publish_attempts = publish_attempts + 1
+            from candidates
+           where message.tenant_id = candidates.tenant_id
+             and message.id = candidates.id
+          returning message.tenant_id, message.id, message.aggregate_type,
+                    message.aggregate_id, message.event_type, message.payload::text as payload,
+                    message.created_at, message.publish_attempts, message.claim_token
         )
-        update outbox_events message
-           set claim_token = ?,
-               claim_until = clock_timestamp() + (? * interval '1 millisecond'),
-               publish_attempts = publish_attempts + 1
-          from candidates
-         where message.tenant_id = candidates.tenant_id
-           and message.id = candidates.id
-        returning message.tenant_id, message.id, message.aggregate_type,
-                  message.aggregate_id, message.event_type, message.payload::text,
-                  message.created_at, message.publish_attempts, message.claim_token
+        select * from claimed order by created_at, id
         """, this::mapMessage, limit, claimToken, leaseDuration.toMillis()));
   }
 
