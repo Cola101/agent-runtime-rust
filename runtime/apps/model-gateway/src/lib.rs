@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use agent_protocol::{ModelRequest, ModelStreamEvent};
 
+pub mod mcp;
 mod anthropic_messages;
 mod failover;
 mod grpc;
