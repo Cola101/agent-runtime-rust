@@ -15,7 +15,7 @@ use agent_runtime_host::{
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
 use uuid::Uuid;
@@ -111,8 +111,19 @@ async fn request(socket: &Path, request: &LocalRequest) -> LocalResponse {
     serde_json::from_str(&lines.next_line().await.expect("read").expect("line")).expect("decode")
 }
 
+/// Waits for an eventual condition.
+///
+/// The budget is sized for "how long before this counts as a hang", not for how
+/// long the work is expected to take. It used to be 5s, which is the latter, and
+/// under a full `cargo test --workspace` -- forty-odd test binaries competing for
+/// cores -- a Run that spawns a tool binary and makes a provider round trip does
+/// not reliably finish inside it. That produced a red suite three times with
+/// nothing wrong, which is worse than a slow one: it makes "the suite is green"
+/// useless as a signal. A longer budget costs nothing on the happy path, because
+/// this returns as soon as the predicate holds.
 async fn wait_for<F: Fn() -> bool>(label: &str, predicate: F) {
-    for _ in 0..200 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
         if predicate() {
             return;
         }

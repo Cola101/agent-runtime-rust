@@ -15,7 +15,9 @@ use agent_runtime_host::{
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
 use uuid::Uuid;
@@ -30,9 +32,18 @@ fn text_turn(text: &str) -> String {
 
 /// Provider that strands its first caller and answers every later one. The
 /// stranded connection stands in for a daemon that died mid-turn.
-async fn spawn_stranding_provider() -> String {
+/// Returns the endpoint and a counter of requests it has accepted.
+///
+/// The counter matters: this provider strands only its *first* caller, and the
+/// test's premise is that the caller stranded is the daemon that later crashes.
+/// Without a way to observe that, the test can crash the first daemon before it
+/// ever reached the provider, and then the *recovered* daemon becomes the one
+/// that gets stranded -- which looks exactly like recovery being broken.
+async fn spawn_stranding_provider() -> (String, Arc<AtomicU32>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    let accepted = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         let mut served = 0u32;
         loop {
@@ -42,6 +53,7 @@ async fn spawn_stranding_provider() -> String {
             let mut buffer = vec![0u8; 64 * 1024];
             let _ = socket.read(&mut buffer).await;
             served += 1;
+            counter.store(served, Ordering::SeqCst);
             if served == 1 {
                 // Hold the connection open forever without answering.
                 tokio::spawn(async move {
@@ -60,7 +72,10 @@ async fn spawn_stranding_provider() -> String {
             let _ = socket.flush().await;
         }
     });
-    format!("http://127.0.0.1:{port}/v1/chat/completions")
+    (
+        format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        accepted,
+    )
 }
 
 fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> LocalRuntimeConfig {
@@ -104,8 +119,19 @@ async fn submit(socket: &Path, input: &str) -> Uuid {
     }
 }
 
+/// Waits for an eventual condition.
+///
+/// The budget is sized for "how long before this counts as a hang", not for how
+/// long the work is expected to take. It used to be 5s, which is the latter, and
+/// under a full `cargo test --workspace` -- forty-odd test binaries competing for
+/// cores -- a Run that spawns a tool binary and makes a provider round trip does
+/// not reliably finish inside it. That produced a red suite three times with
+/// nothing wrong, which is worse than a slow one: it makes "the suite is green"
+/// useless as a signal. A longer budget costs nothing on the happy path, because
+/// this returns as soon as the predicate holds.
 async fn wait_for<F: Fn() -> bool>(label: &str, predicate: F) {
-    for _ in 0..200 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
         if predicate() {
             return;
         }
@@ -117,7 +143,7 @@ async fn wait_for<F: Fn() -> bool>(label: &str, predicate: F) {
 /// Runs a daemon on its own runtime, submits one Run, waits for it to become
 /// durable, then drops the runtime. Dropping aborts every task the daemon
 /// spawned, which is as close to a crash as a test can get in-process.
-fn crash_after_first_checkpoint(config: LocalRuntimeConfig) -> Uuid {
+fn crash_after_first_checkpoint(config: LocalRuntimeConfig, accepted: Arc<AtomicU32>) -> Uuid {
     let state_root = config.state_root.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -127,8 +153,11 @@ fn crash_after_first_checkpoint(config: LocalRuntimeConfig) -> Uuid {
             let daemon = LocalRuntimeDaemon::new(config);
             tokio::spawn(daemon.serve(listener));
             let run_id = submit(&socket, "Summarize the workspace.").await;
-            wait_for("the run to become durable", || {
+            // Both conditions: a Checkpoint on disk, and this daemon having
+            // been the one the provider stranded.
+            wait_for("the run to become durable and reach the provider", || {
                 LocalRuntimeHost::checkpoint_path(&state_root, run_id).is_file()
+                    && accepted.load(Ordering::SeqCst) >= 1
             })
             .await;
             run_id
@@ -139,19 +168,26 @@ fn crash_after_first_checkpoint(config: LocalRuntimeConfig) -> Uuid {
     .expect("daemon thread")
 }
 
-#[tokio::test]
+// Multi-threaded on purpose. `crash_after_first_checkpoint` blocks on `join`,
+// and on the default current-thread runtime that also blocks the provider's
+// accept loop, so the crashing daemon can never be the caller the provider
+// strands. The test used to pass anyway, by an ordering accident: the daemon's
+// connection sat in the kernel backlog until `join` returned, and was then
+// accepted as a dead socket. Under load that accident does not hold and the
+// *recovered* daemon became the stranded one, which looks exactly like recovery
+// being broken.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_daemon_resumes_a_run_its_predecessor_left_unfinished() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
     let state_root = state.path().to_path_buf();
     let workspace_root = workspace.path().canonicalize().expect("canonical");
-    let endpoint = spawn_stranding_provider().await;
+    let (endpoint, accepted) = spawn_stranding_provider().await;
 
-    let run_id = crash_after_first_checkpoint(config(
-        state_root.clone(),
-        workspace_root.clone(),
-        endpoint.clone(),
-    ));
+    let run_id = crash_after_first_checkpoint(
+        config(state_root.clone(), workspace_root.clone(), endpoint.clone()),
+        Arc::clone(&accepted),
+    );
 
     // The predecessor left the Run marked running with a Checkpoint on disk.
     let stranded = LocalRuntimeHost::read_run_record(&state_root, run_id)
@@ -193,14 +229,14 @@ async fn a_restarted_daemon_resumes_a_run_its_predecessor_left_unfinished() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_daemon_never_re_executes_a_run_that_already_finished() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
     let state_root = state.path().to_path_buf();
     let workspace_root = workspace.path().canonicalize().expect("canonical");
     // Exactly one turn is available: a second execution would strand forever.
-    let endpoint = spawn_stranding_provider().await;
+    let (endpoint, accepted) = spawn_stranding_provider().await;
 
     // Burn the stranding first connection so the next call succeeds.
     let _ = tokio::net::TcpStream::connect(
@@ -208,6 +244,13 @@ async fn a_restarted_daemon_never_re_executes_a_run_that_already_finished() {
             .trim_start_matches("http://")
             .trim_end_matches("/v1/chat/completions"),
     )
+    .await;
+    // Wait until the provider has actually counted it. Connecting is not the
+    // same as being accepted, and if the daemon's own call is accepted first it
+    // is the one that gets stranded.
+    wait_for("the stranding connection to be consumed", || {
+        accepted.load(Ordering::SeqCst) >= 1
+    })
     .await;
 
     let socket = default_socket_path(&state_root);
