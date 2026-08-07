@@ -103,37 +103,6 @@ fn backgrounding_and_subshells_always_ask() {
     }
 }
 
-/// `git` is worth allowing -- status and log are most of what an Agent reads --
-/// but only for subcommands that cannot write, and only when nothing precedes
-/// the subcommand. `git -c` can define an alias that runs an arbitrary shell
-/// command, which is a write capability wearing a read's name.
-#[test]
-fn git_is_allowed_only_for_read_only_subcommands_with_no_preceding_options() {
-    for command in [
-        "git status",
-        "git log --oneline -5",
-        "git diff",
-        "git show HEAD",
-        "git rev-parse HEAD",
-        "git ls-files",
-    ] {
-        assert!(read_only(command), "should not need approval: {command}");
-    }
-    for command in [
-        "git push",
-        "git commit -m x",
-        "git checkout main",
-        "git clean -fd",
-        "git reset --hard",
-        "git -c alias.st=!rm status",
-        "git -C /other status",
-        "git --exec-path=/tmp status",
-        "git",
-    ] {
-        assert!(!read_only(command), "must ask: {command}");
-    }
-}
-
 /// Single quotes suppress every expansion in sh, so a quoted argument is inert.
 /// Double quotes do not, and getting their rules exactly right is where this
 /// kind of code grows bugs, so they ask.
@@ -191,5 +160,61 @@ fn home_and_glob_expansion_outside_the_workspace_asks() {
 fn leading_environment_assignment_asks() {
     for command in ["PATH=/tmp ls", "LD_PRELOAD=/tmp/x cat f"] {
         assert!(!read_only(command), "must ask: {command}");
+    }
+}
+
+/// Counter-examples from the 2026-08-07 review, which found the list called
+/// five writable commands read-only. Each one was on the list, and each one
+/// writes.
+///
+/// The mistake behind all five is visible in the comment the list used to
+/// carry: "no write capability reachable through **any flag**". I checked that
+/// claim for `sort`, `sed`, `tee` and `awk` and then wrote it as though it held
+/// for every entry. It did not, and the wording is what hid two of them --
+/// `uniq`'s output is a positional argument, not a flag, and git's write modes
+/// live in subcommands whose names read as queries.
+#[test]
+fn commands_that_write_are_not_read_only_however_they_are_spelled() {
+    for command in [
+        // Deletes a branch. `branch` reads as a query and is not one.
+        "git branch -D feature",
+        "git branch -d feature",
+        // Deletes a tag.
+        "git tag -d v1",
+        // git's diff family accepts an output file, so the whole family can
+        // write regardless of which subcommand invokes it.
+        "git diff --output=leak.txt",
+        "git log --output=leak.txt",
+        "git show --output=leak.txt",
+        // uniq's second positional argument is an output file.
+        "uniq input.txt output.txt",
+        // `file -C` compiles and writes a magic database.
+        "file -C -m custom.magic",
+        // date sets the system clock when given an operand.
+        "date 0101000026",
+        // tree writes its output to a file.
+        "tree -o listing.txt",
+    ] {
+        assert!(
+            !read_only(command),
+            "writes but was classified read-only: {command}"
+        );
+    }
+}
+
+/// The general lesson, pinned so it cannot regress quietly: a name is not
+/// evidence of an effect. Anything whose write modes cannot be ruled out by
+/// inspecting the executable alone stays off the list, and `git` is off it
+/// entirely -- its subcommands share an option surface that includes writing.
+#[test]
+fn git_is_no_longer_exempt_at_all() {
+    for command in [
+        "git status",
+        "git log",
+        "git diff",
+        "git rev-parse HEAD",
+        "git ls-files",
+    ] {
+        assert!(!read_only(command), "git must ask: {command}");
     }
 }

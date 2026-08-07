@@ -57,6 +57,19 @@ pub struct ToolRegistry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToolPlan {
     Execute(ToolExecutionRequest),
+    /// An approval-gated Tool whose policy exempted this particular call.
+    ///
+    /// Deliberately not `Execute`. An exempted call and a Tool that was never
+    /// gated look the same to anything downstream if they share a variant, and
+    /// then the ledger cannot say why no approval was asked for. Carrying the
+    /// snapshot, its digest and a stated reason is what makes the exemption
+    /// auditable rather than merely claimed.
+    AutoApproved {
+        execution: ToolExecutionRequest,
+        policy_snapshot: ToolApprovalPolicySnapshot,
+        policy_digest: String,
+        reason: String,
+    },
     ApprovalRequired(ToolApprovalRequest),
     Denied(ToolExecutionRequest),
     SubagentSpawn(agent_protocol::SubagentSpawnRequest),
@@ -121,6 +134,10 @@ impl ToolRegistry {
             "policy_snapshot": &policy_snapshot,
             "tool_name": &call.name,
         }));
+        // The approval policy is part of the binding. Without it a call that was
+        // gated and the same call that was exempted produced identical digests,
+        // so a decision taken under one policy bound just as well to an
+        // execution under another.
         let binding_digest = hex::encode(Sha256::digest(
             serde_json::to_vec(&(
                 &call,
@@ -128,6 +145,8 @@ impl ToolRegistry {
                 descriptor.sandbox,
                 &descriptor.implementation_digest,
                 &descriptor.required_scopes,
+                descriptor.approval,
+                descriptor.auto_approval,
             ))
             .expect("tool authorization binding must be serializable"),
         ));
@@ -151,7 +170,12 @@ impl ToolRegistry {
                 .map(classify_shell_command)
                 == Some(ShellCommandClass::ProvablyReadOnly);
         if exempt {
-            return Ok(ToolPlan::Execute(execution));
+            return Ok(ToolPlan::AutoApproved {
+                execution,
+                policy_snapshot,
+                policy_digest,
+                reason: "shell command classified provably read-only".to_owned(),
+            });
         }
         Ok(match descriptor.approval {
             ApprovalMode::Allow => ToolPlan::Execute(execution),
@@ -536,6 +560,26 @@ impl RunMachine {
                 RunStatus::Running,
                 "tool.execution.requested",
                 json!({"execution": execution}),
+            ),
+            // Its own event type, not `tool.execution.requested`. An exempted
+            // call that emitted the ordinary event would be indistinguishable in
+            // the durable log from a Tool that was never approval gated, and
+            // "no approval was asked for" would have no recorded reason. The
+            // snapshot, its digest and the reason are all persisted here.
+            ToolPlan::AutoApproved {
+                execution,
+                policy_snapshot,
+                policy_digest,
+                reason,
+            } => (
+                RunStatus::Running,
+                "tool.execution.auto_approved",
+                json!({
+                    "execution": execution,
+                    "policy_snapshot": policy_snapshot,
+                    "policy_digest": policy_digest,
+                    "reason": reason,
+                }),
             ),
             ToolPlan::ApprovalRequired(approval) => (
                 RunStatus::WaitingApproval,

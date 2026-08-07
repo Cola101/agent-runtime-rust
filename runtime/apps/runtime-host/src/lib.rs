@@ -275,7 +275,8 @@ impl LocalRuntimeHost {
                     WorkspaceAccess::ReadWrite,
                     ToolEffect::NonIdempotent,
                     SHELL_SCOPE,
-                    AutoApproval::ProvablyReadOnlyShellCommand,
+                    // Withdrawn 2026-08-07; see the Worker registration.
+                    AutoApproval::Never,
                     "Run one bounded shell command inside the local workspace",
                 ),
             ] {
@@ -831,6 +832,9 @@ impl LocalRuntimeHost {
             }
             let execution = match planned.plan {
                 ToolPlan::Execute(request) => Some(request),
+                // Runs, like Execute, but arrived here through an exemption the
+                // kernel already recorded as its own durable event.
+                ToolPlan::AutoApproved { execution, .. } => Some(execution),
                 ToolPlan::ApprovalRequired(approval) => {
                     if self.config.consent == LocalToolConsent::Ask {
                         return Ok(Some(LocalPendingApproval {

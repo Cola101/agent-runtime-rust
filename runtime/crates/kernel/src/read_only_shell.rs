@@ -44,32 +44,37 @@ pub enum ShellCommandClass {
     RequiresApproval,
 }
 
-/// Executables with no write capability reachable through any flag. Anything
-/// that can be pointed at an output file (`sort -o`, `sed -i`, `tee`, `awk`)
-/// is absent by design: including it would require per-flag rules, and a
-/// per-flag rule that misses one flag is a silent write.
+/// Executables with no way to write, by flag **or by positional argument**.
+///
+/// The earlier version of this list said "no write capability reachable through
+/// any flag", and that wording is what broke it. A 2026-08-07 review found five
+/// writable commands on it: `uniq in out` writes through a positional argument
+/// rather than a flag, `file -C` compiles a magic database, `tree -o` writes its
+/// output, `date` with an operand sets the system clock, and git's write modes
+/// live in subcommands whose names read as queries.
+///
+/// Each entry below has been checked for both shapes. Anything that could not be
+/// ruled out by inspecting the executable alone is absent, which is why `sort`,
+/// `sed`, `tee`, `awk`, `find` and now `date`, `file`, `tree` and `uniq` are not
+/// here.
 const READ_ONLY_COMMANDS: &[&str] = &[
-    "basename", "cat", "cksum", "date", "dirname", "du", "echo", "file", "grep", "head",
-    "hostname", "ls", "nl", "pwd", "rg", "stat", "tail", "tree", "uniq", "wc", "whoami", "which",
+    "basename", "cat", "cksum", "dirname", "du", "echo", "grep", "head", "hostname", "ls", "nl",
+    "pwd", "rg", "stat", "tail", "wc", "whoami", "which",
 ];
 
-/// `git` earns an exception because status and log are most of what an Agent
-/// reads, and its read-only subcommands are well defined.
-const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
-    "blame",
-    "branch",
-    "cat-file",
-    "describe",
-    "diff",
-    "log",
-    "ls-files",
-    "ls-tree",
-    "rev-parse",
-    "shortlog",
-    "show",
-    "status",
-    "tag",
-];
+/// `git` used to have an exception here for "read-only subcommands". It was
+/// wrong and has been withdrawn entirely.
+///
+/// The exception assumed a subcommand name determines its effects. It does not:
+/// `branch -D` and `tag -d` delete, and the whole diff family -- `diff`, `log`,
+/// `show` -- accepts `--output=<file>`, so the write capability is in the shared
+/// option surface rather than in any one subcommand. Enumerating safe
+/// subcommands cannot be right while that is true, and being wrong here is an
+/// approval bypass rather than an inconvenience.
+///
+/// Left as an empty constant rather than deleted so the reason stays attached to
+/// the decision.
+const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[];
 
 /// Characters that introduce an effect this classifier does not model.
 const REJECTED_CHARACTERS: &[char] = &[
@@ -163,6 +168,15 @@ fn is_read_only_segment(segment: &str) -> bool {
             .first()
             .is_some_and(|subcommand| READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand.as_str()));
     }
+    // An operand-count rule was tried here and removed the same day: it read
+    // `head -n 20 file` as two operands, because `20` is an option's value and
+    // telling those apart needs the per-command knowledge this was meant to
+    // avoid. It was the original mistake in a new shape -- a general rule that
+    // is only correct if you already know each command.
+    //
+    // What is left is a curated list, and a curated list is only as good as the
+    // review behind it. That is a real weakness, not a solved problem, and it is
+    // why this classifier is currently unused: see ADR-0039 Status.
     READ_ONLY_COMMANDS.contains(&executable.as_str())
 }
 

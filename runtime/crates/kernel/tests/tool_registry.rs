@@ -253,10 +253,12 @@ fn a_read_only_command_is_exempt_only_when_the_tool_declares_the_policy() {
             .unwrap()
     }
 
-    // Same command, two policies: only the declaring Tool skips the gate.
+    // Same command, two policies: only the declaring Tool skips the gate, and
+    // it lands in AutoApproved rather than Execute so the exemption stays
+    // distinguishable in the durable log.
     assert!(matches!(
         plan_for(AutoApproval::ProvablyReadOnlyShellCommand, "ls -la"),
-        ToolPlan::Execute(_)
+        ToolPlan::AutoApproved { .. }
     ));
     assert!(matches!(
         plan_for(AutoApproval::Never, "ls -la"),
@@ -309,4 +311,104 @@ fn the_policy_snapshot_records_the_exemption() {
         request.policy_snapshot.expect("snapshot").auto_approval,
         AutoApproval::ProvablyReadOnlyShellCommand
     );
+}
+
+/// The binding digest must cover the policy that produced the decision.
+///
+/// It did not. A call that was approval gated and the same call that was
+/// exempted produced identical digests, so a decision taken under one policy
+/// bound just as well to an execution under another, and the ledger could not
+/// tell them apart by digest at all.
+#[test]
+fn the_binding_digest_covers_the_approval_policy_not_only_the_call() {
+    fn digest_for(approval: ApprovalMode, auto_approval: AutoApproval) -> String {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(ToolDescriptor {
+                name: "shell.exec".into(),
+                effect: ToolEffect::NonIdempotent,
+                approval,
+                sandbox: SandboxClass::TrustedNative,
+                implementation_digest: "c".repeat(64),
+                required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
+                auto_approval,
+            })
+            .unwrap();
+        let plan = registry
+            .plan(
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "shell.exec".into(),
+                    arguments: json!({ "command": "ls" }),
+                },
+                &BTreeSet::from(["tool:shell.exec".to_string()]),
+            )
+            .unwrap();
+        match plan {
+            ToolPlan::Execute(execution) | ToolPlan::Denied(execution) => execution.binding_digest,
+            ToolPlan::AutoApproved { execution, .. } => execution.binding_digest,
+            ToolPlan::ApprovalRequired(request) => request.execution.binding_digest,
+            ToolPlan::SubagentSpawn(_) => panic!("shell.exec does not spawn a subagent"),
+        }
+    }
+
+    let gated = digest_for(ApprovalMode::Ask, AutoApproval::Never);
+    let allowed = digest_for(ApprovalMode::Allow, AutoApproval::Never);
+    let exempted = digest_for(
+        ApprovalMode::Ask,
+        AutoApproval::ProvablyReadOnlyShellCommand,
+    );
+
+    assert_ne!(gated, allowed, "approval mode must change the binding");
+    assert_ne!(
+        gated, exempted,
+        "an exempted call must not share a binding digest with a gated one"
+    );
+}
+
+/// An auto-approved execution has to carry why it was auto-approved. Returning a
+/// bare execution meant the policy snapshot and digest were computed and then
+/// dropped, so nothing downstream could persist the reason -- which made
+/// ADR-0039's claim that the exemption stays auditable untrue in the code.
+#[test]
+fn an_auto_approved_plan_carries_the_policy_that_exempted_it() {
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ToolDescriptor {
+            name: "shell.exec".into(),
+            effect: ToolEffect::NonIdempotent,
+            approval: ApprovalMode::Ask,
+            sandbox: SandboxClass::TrustedNative,
+            implementation_digest: "c".repeat(64),
+            required_scopes: BTreeSet::from(["tool:shell.exec".into()]),
+            auto_approval: AutoApproval::ProvablyReadOnlyShellCommand,
+        })
+        .unwrap();
+
+    let plan = registry
+        .plan(
+            ToolCall {
+                id: "call_1".into(),
+                name: "shell.exec".into(),
+                arguments: json!({ "command": "ls" }),
+            },
+            &BTreeSet::from(["tool:shell.exec".to_string()]),
+        )
+        .unwrap();
+
+    let ToolPlan::AutoApproved {
+        policy_snapshot,
+        policy_digest,
+        reason,
+        ..
+    } = plan
+    else {
+        panic!("an exempted call must be distinguishable from an ungated Allow: {plan:?}");
+    };
+    assert_eq!(
+        policy_snapshot.auto_approval,
+        AutoApproval::ProvablyReadOnlyShellCommand
+    );
+    assert_eq!(policy_digest.len(), 64);
+    assert!(!reason.is_empty(), "the ledger needs a stated reason");
 }

@@ -541,13 +541,14 @@ pub fn prepare_trusted_workspace_tool(
             // Its own scope. Granting shell is a different decision from
             // granting file writes, and must not ride along with one.
             "tool:shell.exec",
-            // Provably read-only commands skip the approval. Everything the
-            // approval still guarded -- writes outside the Workspace, network,
-            // credential directories -- is already blocked by the container, so
-            // what is left to approve is a write to the user's own files. A
-            // command that cannot write has nothing left to review, and asking
-            // for every `ls` is what makes the Tool unusable in practice.
-            AutoApproval::ProvablyReadOnlyShellCommand,
+            // Withdrawn 2026-08-07. The classifier behind this exemption called
+            // `git branch -D`, `git tag -d`, `git diff --output=f`,
+            // `uniq in out` and `file -C` read-only, so an approval bypass
+            // shipped. The mechanism is sound; the list was not, and a list is
+            // the wrong place for this decision to live anyway -- see ADR-0039
+            // Status. Shell asks for everything until the policy is a tenant
+            // decision carried in the execution snapshot.
+            AutoApproval::Never,
             "Run one bounded shell command inside the current workspace",
             serde_json::json!({
                 "type": "object",
@@ -2098,6 +2099,17 @@ impl WorkerProcessor {
             .map_err(|error| WorkerAssignmentError::KernelTransition(error.to_string()))?;
         let followup_event = match &plan {
             ToolPlan::Execute(request) => {
+                execution
+                    .outstanding_tool_calls
+                    .insert(request.call.id.clone(), request.clone());
+                None
+            }
+            // Same bookkeeping as Execute -- it is going to run -- but a
+            // separate arm so the exemption cannot be folded back into the
+            // ordinary path by accident.
+            ToolPlan::AutoApproved {
+                execution: request, ..
+            } => {
                 execution
                     .outstanding_tool_calls
                     .insert(request.call.id.clone(), request.clone());
@@ -3943,6 +3955,7 @@ impl NatsWorker {
             .map_err(transport_error)?;
         let execution = match planned.plan {
             ToolPlan::Execute(request) => Some(request),
+            ToolPlan::AutoApproved { execution, .. } => Some(execution),
             ToolPlan::ApprovalRequired(_) | ToolPlan::Denied(_) | ToolPlan::SubagentSpawn(_) => {
                 None
             }

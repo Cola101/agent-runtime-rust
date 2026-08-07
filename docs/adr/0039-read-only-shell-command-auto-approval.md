@@ -2,7 +2,64 @@
 
 ## Status
 
-Accepted. Narrows ADR-0038 decision 8.
+**Withdrawn 2026-08-07, the day it was accepted.** The exemption is off:
+`shell.exec` declares `AutoApproval::Never` in both the Worker and the local
+host, so every call asks again.
+
+A review found the allow-list called five writable commands read-only, which
+made this an approval bypass rather than a convenience:
+
+| Command | What it does |
+| --- | --- |
+| `git branch -D` | deletes a branch |
+| `git tag -d` | deletes a tag |
+| `git diff --output=f` | writes a file; `log` and `show` take it too |
+| `uniq in out` | second positional is an output file |
+| `file -C` | compiles and writes a magic database |
+
+Two further defects the same review found, both now fixed:
+
+- The binding digest did not cover `approval` or `auto_approval`, so a gated
+  call and an exempted one produced identical digests.
+- The exempt path returned a bare `ToolPlan::Execute` and dropped the policy
+  snapshot and digest, which made decision 3 below — that the exemption stays
+  auditable — **untrue in the code**. There is now a distinct
+  `ToolPlan::AutoApproved` and a `tool.execution.auto_approved` event carrying
+  the snapshot, its digest and a stated reason.
+
+The mechanism was salvageable and is kept. The judgement that produced the list
+was not: see "What went wrong" below. Read the decisions that follow as the
+design of a mechanism that is currently disabled, not as current behaviour.
+
+## What went wrong
+
+The list carried this comment: *executables with no write capability reachable
+through any flag*. I verified that claim for `sort`, `sed`, `tee` and `awk`, and
+then wrote it as though it held for every entry without checking the rest.
+
+The wording is what hid two of the five. `uniq`'s output is a **positional
+argument**, not a flag, so a rule phrased around flags could not see it. And
+git's write modes live in **subcommands whose names read as queries**, plus a
+shared diff-option surface that includes `--output=`, so enumerating "read-only
+subcommands" cannot be correct while that surface exists. `git` is now off the
+list entirely for that reason.
+
+A replacement heuristic — refuse any command with more than one positional
+operand — was tried and removed within the hour: it read `head -n 20 file` as two
+operands, because telling an option's value from an operand needs the
+per-command knowledge the heuristic existed to avoid. That was the original
+mistake in a new shape.
+
+The durable lesson is the one ADR-0038 already implied and this ADR failed to
+apply to itself: **a curated list is only as good as the review behind it**, and
+a list is the wrong place for a security decision that a tenant should be making.
+Re-enabling this requires the policy to be a tenant decision carried in the
+execution snapshot, not a constant in the Worker.
+
+## Superseded content
+
+Everything below is the original ADR as accepted, kept because the mechanism
+survives and its reasoning is still the reasoning.
 
 ## Context
 
