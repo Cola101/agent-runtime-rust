@@ -1,0 +1,31 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: model-gateway, namespace: agent-runtime}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: model-gateway}
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: checkpoint-gateway, namespace: agent-runtime}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: checkpoint-gateway}
+  minReplicas: 2
+  maxReplicas: 12
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}

@@ -1,0 +1,1340 @@
+openapi: 3.1.0
+info:
+  title: Agent Runtime Platform API
+  version: 0.1.0
+  description: Multi-tenant resource API. Every operation is authorized against the tenant and application claims in the OIDC access token.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: /
+security:
+  - oidc: []
+tags:
+  - name: Workspaces
+    description: Persistent tenant project assets and their lifecycle.
+  - name: Agents
+    description: Versioned Agent identities and immutable execution configuration.
+  - name: ModelProviders
+    description: Application-scoped model endpoints with Gateway-sealed tenant credentials.
+  - name: ModelPolicies
+    description: Workspace-scoped model routing and budget policy.
+  - name: Sessions
+    description: Durable conversation and execution context.
+  - name: Runs
+    description: Agent execution, state and ordered event streams.
+  - name: Approvals
+    description: Versioned human decisions for guarded operations.
+  - name: Console
+    description: Tenant- and application-scoped projections composed for the management console.
+paths:
+  /v1/console/resource-context:
+    get:
+      summary: Read the authorized Application and Projects used to configure Runtime resources
+      tags: [Console]
+      operationId: getConsoleResourceContext
+      responses:
+        '200':
+          description: Application-scoped resource creation context
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsoleResourceContext'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/console/run-targets:
+    get:
+      summary: List authorized combinations that can create a Run
+      tags: [Console]
+      operationId: listConsoleRunTargets
+      responses:
+        '200':
+          description: Run targets visible to the authorized tenant and application
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunTargetList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/workspaces:
+    post:
+      summary: Create a workspace
+      tags: [Workspaces]
+      operationId: createWorkspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkspaceRequest'
+      responses:
+        '201':
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/agents:
+    post:
+      summary: Create an Agent in a Workspace
+      tags: [Agents]
+      operationId: createAgent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+      responses:
+        '201':
+          description: Agent created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/agents/{agentId}/versions:
+    post:
+      summary: Publish an immutable Agent version
+      tags: [Agents]
+      operationId: createAgentVersion
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentVersionRequest'
+      responses:
+        '201':
+          description: Agent version published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/skills:publish:
+    post:
+      summary: Publish an immutable signed Skill version
+      tags: [Skills]
+      operationId: publishSkillVersion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishSkillVersionRequest'
+      responses:
+        '201':
+          description: Signed Skill version published
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/model-policies:
+    post:
+      summary: Create a Workspace model policy
+      tags: [ModelPolicies]
+      operationId: createModelPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelPolicyRequest'
+      responses:
+        '201':
+          description: Model policy created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/model-providers:
+    post:
+      summary: Register an immutable model Provider with a write-only BYOK credential
+      tags: [ModelProviders]
+      operationId: createModelProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateModelProviderRequest'
+      responses:
+        '201':
+          description: Model Provider registered; credential material is never returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelProvider'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /v1/sessions:
+    post:
+      summary: Create a session
+      tags: [Sessions]
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/sessions/{sessionId}/runs:
+    post:
+      summary: Create an idempotent run
+      tags: [Runs]
+      operationId: createRun
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRunRequest'
+      responses:
+        '202':
+          description: Run durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The idempotency key was already used with a different request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/runs:
+    get:
+      summary: List recent runs
+      tags: [Runs]
+      operationId: listRuns
+      responses:
+        '200':
+          description: Recent runs visible to the authorized tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/runs/{runId}:
+    get:
+      summary: Get a run
+      tags: [Runs]
+      operationId: getRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: Run status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/runs/{runId}/events:
+    get:
+      summary: Stream ordered run events
+      tags: [Runs]
+      operationId: streamRunEvents
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Ordered run event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/runs/{runId}:cancel:
+    post:
+      summary: Cancel a run
+      tags: [Runs]
+      operationId: cancelRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '202':
+          description: Cancellation accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunCancellationAccepted'
+        '409':
+          description: Run is already terminal
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/runs/{runId}:steer:
+    post:
+      summary: Add durable user input to a running Run and restart its model turn
+      tags: [Runs]
+      operationId: steerRun
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SteerRunRequest'
+      responses:
+        '202':
+          description: Steering command durably recorded for the current fenced execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunSteeringAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Run is not at a safe running boundary or the idempotency key conflicts
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: A new steering command was submitted inside the per-Run rate window
+          headers:
+            Retry-After:
+              description: Whole seconds until another steering command may be accepted.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /v1/approvals:
+    get:
+      summary: List pending approvals visible to the current application
+      tags: [Approvals]
+      operationId: listPendingApprovals
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending]
+            default: pending
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Pending approvals ordered from oldest to newest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/approvals/{approvalId}:decide:
+    post:
+      summary: Decide a pending approval
+      tags: [Approvals]
+      operationId: decideApproval
+      parameters:
+        - name: approvalId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalDecisionRequest'
+      responses:
+        '200':
+          description: Approval decision recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Approval'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Version is stale or approval is no longer pending
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://iam.example.com/.well-known/openid-configuration
+  parameters:
+    AgentId:
+      name: agentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing or invalid access token
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The caller lacks permission for this tenant resource
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Resource is absent or not visible to the current tenant
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: A resource with the same parent-scoped name already exists
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    ConsoleResourceContext:
+      type: object
+      additionalProperties: false
+      required: [application_id, application_name, projects]
+      properties:
+        application_id:
+          type: string
+          format: uuid
+        application_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        projects:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ProjectSummary'
+    ProjectSummary:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    CreateWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      required: [project_id, name]
+      properties:
+        project_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Workspace:
+      type: object
+      additionalProperties: false
+      required: [id, project_id, name, state, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        project_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        state:
+          type: string
+          enum: [ready, leased, conflicted, deleted]
+        created_at:
+          type: string
+          format: date-time
+    CreateAgentRequest:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, name]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Agent:
+      type: object
+      additionalProperties: false
+      required: [id, workspace_id, name, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        created_at:
+          type: string
+          format: date-time
+    CreateAgentVersionRequest:
+      type: object
+      additionalProperties: false
+      required: [instructions, delegated_scopes]
+      properties:
+        instructions:
+          type: string
+          minLength: 1
+          maxLength: 32000
+        delegated_scopes:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 200
+        skill_version_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          default: []
+          items:
+            type: string
+            format: uuid
+        subagent_roles:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          default: []
+          items:
+            $ref: '#/components/schemas/SubagentRole'
+    SubagentRole:
+      type: object
+      additionalProperties: false
+      required: [name, instructions, delegated_scopes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+          pattern: '^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$'
+        instructions:
+          type: string
+          minLength: 1
+          maxLength: 32000
+        delegated_scopes:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 200
+    AgentVersion:
+      type: object
+      additionalProperties: false
+      required:
+        [id, agent_id, version, instructions, delegated_scopes, skill_version_ids,
+         subagent_roles, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        agent_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
+        instructions:
+          type: string
+          minLength: 1
+          maxLength: 32000
+        delegated_scopes:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+        skill_version_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        subagent_roles:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/SubagentRole'
+        created_at:
+          type: string
+          format: date-time
+    PublishSkillVersionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        [name, semantic_version, description, instructions, tool_names,
+         supported_platforms, min_runtime_version]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          pattern: '^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$'
+        semantic_version:
+          type: string
+          minLength: 5
+          maxLength: 64
+        description:
+          type: string
+          minLength: 1
+          maxLength: 500
+        instructions:
+          type: string
+          minLength: 1
+          maxLength: 32000
+        tool_names:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 120
+            pattern: '^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$'
+        supported_platforms:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          items:
+            type: string
+            enum: [darwin-arm64, linux-arm64, linux-x86_64]
+        min_runtime_version:
+          type: string
+          minLength: 5
+          maxLength: 64
+    SkillVersion:
+      type: object
+      additionalProperties: false
+      required:
+        [id, skill_id, name, semantic_version, description, instructions, tool_names,
+         supported_platforms, min_runtime_version, artifact_digest, signing_key_id, signature,
+         created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        skill_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        semantic_version:
+          type: string
+        description:
+          type: string
+        instructions:
+          type: string
+        tool_names:
+          type: array
+          items:
+            type: string
+        supported_platforms:
+          type: array
+          items:
+            type: string
+        min_runtime_version:
+          type: string
+        artifact_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        signing_key_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        signature:
+          type: string
+          minLength: 80
+          maxLength: 128
+        created_at:
+          type: string
+          format: date-time
+    CreateModelPolicyRequest:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, name, routing]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        routing:
+          type: string
+          enum: [single_provider, ordered_failover]
+        provider_ids:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+    ModelPolicy:
+      type: object
+      additionalProperties: false
+      required: [id, workspace_id, name, routing, provider_ids, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        routing:
+          type: string
+          enum: [single_provider, ordered_failover]
+        provider_ids:
+          type: array
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        created_at:
+          type: string
+          format: date-time
+    CreateModelProviderRequest:
+      type: object
+      additionalProperties: false
+      required: [name, protocol, endpoint, model, api_key]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        protocol:
+          type: string
+          enum: [openai_compatible, openai_responses, anthropic_messages]
+        endpoint:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+        model:
+          type: string
+          minLength: 1
+          maxLength: 200
+        api_key:
+          type: string
+          minLength: 1
+          maxLength: 8192
+          writeOnly: true
+    ModelProvider:
+      type: object
+      additionalProperties: false
+      required: [id, name, protocol, endpoint, model, state, credential_status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        protocol:
+          type: string
+          enum: [openai_compatible, openai_responses, anthropic_messages]
+        endpoint:
+          type: string
+          format: uri
+        model:
+          type: string
+        state:
+          type: string
+          enum: [active, disabled]
+        credential_status:
+          type: string
+          enum: [configured]
+        created_at:
+          type: string
+          format: date-time
+    CreateSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [workspace_id]
+      properties:
+        workspace_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Session:
+      type: object
+      additionalProperties: false
+      required: [id, workspace_id, title, state, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        title:
+          type: [string, 'null']
+          maxLength: 200
+        state:
+          type: string
+          enum: [active, suspended, closed]
+        created_at:
+          type: string
+          format: date-time
+    CreateRunRequest:
+      type: object
+      additionalProperties: false
+      required: [agent_version_id, workspace_id, model_policy_id, input, budget]
+      properties:
+        agent_version_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        model_policy_id:
+          type: string
+          format: uuid
+        input:
+          type: string
+          minLength: 1
+          maxLength: 200000
+        priority:
+          type: string
+          enum: [interactive, batch, system]
+          default: interactive
+        placement:
+          type: string
+          enum: [auto, cloud, edge]
+          default: auto
+        budget:
+          $ref: '#/components/schemas/RunBudget'
+    RunTargetList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/RunTarget'
+    RunTarget:
+      type: object
+      additionalProperties: false
+      required:
+        - session_id
+        - workspace_id
+        - workspace_name
+        - agent_version_id
+        - agent_name
+        - agent_version
+        - model_policy_id
+        - model_policy_name
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        workspace_id:
+          type: string
+          format: uuid
+        workspace_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        agent_version_id:
+          type: string
+          format: uuid
+        agent_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        agent_version:
+          type: integer
+          minimum: 1
+        model_policy_id:
+          type: string
+          format: uuid
+        model_policy_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    RunBudget:
+      type: object
+      additionalProperties: false
+      required: [max_tokens, max_cost_cents, max_duration_seconds]
+      properties:
+        max_tokens:
+          type: integer
+          minimum: 1
+        max_cost_cents:
+          type: integer
+          format: int64
+          minimum: 1
+        max_duration_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+    RunAccepted:
+      type: object
+      additionalProperties: false
+      required: [run_id, events_url]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        events_url:
+          type: string
+          format: uri-reference
+    Run:
+      type: object
+      additionalProperties: false
+      required: [id, tenantId, sessionId, workspaceId, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        sessionId:
+          type: string
+          format: uuid
+        workspaceId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    RunStatus:
+      type: string
+      enum: [queued, running, waiting_approval, suspended, succeeded, failed, cancelled, timed_out, indeterminate]
+    RunCancellationAccepted:
+      type: object
+      additionalProperties: false
+      required: [run_id, status]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RunStatus'
+    SteerRunRequest:
+      type: object
+      additionalProperties: false
+      required: [input]
+      properties:
+        input:
+          type: string
+          minLength: 1
+          maxLength: 32768
+          description: User input bounded to 32768 UTF-8 bytes by the API.
+    RunSteeringAccepted:
+      type: object
+      additionalProperties: false
+      required: [run_id, steering_id, state]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        steering_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [pending, applied, rejected, cancelled]
+    RunList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunSummary'
+    RunSummary:
+      type: object
+      additionalProperties: false
+      required: [id, workspace_name, agent_name, status, budget, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        workspace_name:
+          type: string
+        agent_name:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        budget:
+          type: object
+          additionalProperties: false
+          required: [max_tokens, max_cost_cents, max_duration_seconds]
+          properties:
+            max_tokens:
+              type: integer
+              format: int64
+            max_cost_cents:
+              type: integer
+              format: int64
+            max_duration_seconds:
+              type: integer
+              format: int64
+        created_at:
+          type: string
+          format: date-time
+    ApprovalDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [version, decision]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        decision:
+          type: string
+          enum: [allow_once, allow_session, deny]
+        reason:
+          type: string
+          maxLength: 1000
+    ApprovalListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalSummary'
+    ApprovalSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - run_id
+        - version
+        - status
+        - workspace_name
+        - agent_name
+        - tool_name
+        - tool_call_id
+        - effect
+        - sandbox
+        - binding_digest
+        - arguments
+        - policy_digest
+        - session_scope_digest
+        - policy_snapshot
+        - available_decisions
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        run_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [pending]
+        workspace_name:
+          type: string
+        agent_name:
+          type: string
+        tool_name:
+          type: string
+        tool_call_id:
+          type: string
+        effect:
+          type: string
+          enum: [pure, idempotent, non_idempotent, unknown]
+        sandbox:
+          type: string
+          enum: [restricted_container, kata, trusted_native]
+        binding_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        arguments:
+          type: object
+          additionalProperties: true
+        policy_digest:
+          anyOf:
+            - type: string
+              pattern: '^[0-9a-f]{64}$'
+            - type: 'null'
+        session_scope_digest:
+          anyOf:
+            - type: string
+              pattern: '^[0-9a-f]{64}$'
+            - type: 'null'
+        policy_snapshot:
+          anyOf:
+            - $ref: '#/components/schemas/ApprovalPolicySnapshot'
+            - type: 'null'
+        available_decisions:
+          type: array
+          minItems: 2
+          uniqueItems: true
+          items:
+            type: string
+            enum: [allow_once, allow_session, deny]
+        created_at:
+          type: string
+          format: date-time
+    ApprovalPolicySnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - approval
+        - effect
+        - implementation_digest
+        - required_scopes
+        - sandbox
+        - tool_name
+      properties:
+        approval:
+          type: string
+          const: ask
+        effect:
+          type: string
+          enum: [pure, idempotent, non_idempotent, unknown]
+        implementation_digest:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        required_scopes:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+        sandbox:
+          type: string
+          enum: [restricted_container, kata, trusted_native]
+        tool_name:
+          type: string
+    Approval:
+      type: object
+      additionalProperties: false
+      required: [id, tenantId, runId, version, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        runId:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        status:
+          type: string
+          enum: [pending, approved, denied, expired]
+        createdAt:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      additionalProperties: true
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        traceId:
+          type: string

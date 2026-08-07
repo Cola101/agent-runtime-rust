@@ -1,0 +1,21 @@
+Agent Runtime Platform
+Copyright 2026 Agent Runtime Platform contributors
+
+This repository does not currently contain copied Codex source code. Any future
+selective port must preserve the original Apache-2.0 header, be recorded in
+docs/third-party-sources.md, and update this NOTICE file before merge.
+
+Adapted designs (no source copied)
+----------------------------------
+
+runtime/crates/tool-runtime/src/seatbelt.rs adapts the macOS Seatbelt containment
+approach from OpenAI Codex (Apache-2.0), codex-rs/sandboxing: invoking
+/usr/bin/sandbox-exec by absolute path, passing filesystem paths as profile
+parameters rather than interpolating them, restricting reads by allowing
+everything and then appending targeted deny rules (SBPL resolves by last match),
+pairing subpath with literal so the directory node itself is covered, and
+normalizing paths before they enter the profile because macOS symlinks /var and
+/tmp into /private. The profile text and the executor integration are original to
+this project. See docs/third-party-sources.md,
+docs/adr/0036-seatbelt-contained-trusted-tools-and-workspace-writes.md and
+docs/adr/0037-sensitive-path-read-containment.md.

@@ -1,0 +1,54 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+def fail!(message)
+  warn "error: #{message}"
+  exit 1
+end
+
+def write_private(path, value)
+  temporary = "#{path}.tmp.#{$$}"
+  begin
+    File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.puts(value)
+      file.flush
+      file.fsync
+    end
+    File.rename(temporary, path)
+    File.chmod(0o600, path)
+  ensure
+    File.unlink(temporary) if File.exist?(temporary)
+  end
+end
+
+service, local_root, executable, *arguments = ARGV
+fail!("usage: daemonize-service SERVICE LOCAL_ROOT EXECUTABLE [ARGUMENT ...]") unless executable
+fail!("invalid service name") unless service.match?(/\A[a-z0-9][a-z0-9-]*\z/)
+local_root = File.expand_path(local_root)
+fail!("unsafe local state root") if ["/", File.expand_path("~")].include?(local_root)
+fail!("native local root is not initialized") unless File.file?(File.join(local_root, ".agent-runtime-local-root"))
+fail!("native run directory is missing") unless Dir.exist?(File.join(local_root, "run"))
+fail!("native log directory is missing") unless Dir.exist?(File.join(local_root, "logs"))
+executable = File.expand_path(executable)
+fail!("service executable is unavailable: #{executable}") unless File.executable?(executable)
+
+Process.daemon(true, true)
+File.umask(0o077)
+$stdin.reopen("/dev/null", "r")
+stdout_file = File.open(
+  File.join(local_root, "logs", "#{service}.stdout.log"),
+  File::WRONLY | File::CREAT | File::TRUNC,
+  0o600
+)
+stderr_file = File.open(
+  File.join(local_root, "logs", "#{service}.stderr.log"),
+  File::WRONLY | File::CREAT | File::TRUNC,
+  0o600
+)
+$stdout.reopen(stdout_file)
+$stderr.reopen(stderr_file)
+$stdout.sync = true
+$stderr.sync = true
+write_private(File.join(local_root, "run", "#{service}.pid"), Process.pid)
+write_private(File.join(local_root, "run", "#{service}.pgid"), Process.getpgrp)
+exec(executable, *arguments)

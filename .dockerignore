@@ -1,0 +1,13 @@
+**
+!runtime/
+!runtime/**
+!contracts/
+!contracts/**
+!control-plane/
+!control-plane/pom.xml
+!control-plane/src/
+!control-plane/src/**
+!control-plane/Dockerfile
+runtime/target
+control-plane/target
+**/*.log

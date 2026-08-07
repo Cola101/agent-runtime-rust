@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "message_id": "0197f173-1c57-7bd1-92f1-bb32ca7ed901",
+  "tenant_id": "0f67d250-13d6-4f0c-94d0-4ace0260e7a1",
+  "run_id": "5274f656-28f7-4bb0-8204-7b00fd1da851",
+  "attempt_id": "5f9ee40a-cf76-4b23-96ba-079443d10b72",
+  "worker_id": "bc259f63-e65f-4c73-ab70-3836b2143913",
+  "approval_id": "78c280e5-3bd1-4a64-a41a-d67730fa7149",
+  "approval_version": 2,
+  "binding_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "decision": "allow_once",
+  "issued_at": "2026-08-01T04:00:00Z",
+  "expires_at": "2026-08-01T04:05:00Z"
+}

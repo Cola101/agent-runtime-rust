@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package agent.checkpoint.v1;
+
+service CheckpointStorage {
+  rpc PutCheckpoint(PutCheckpointRequest) returns (PutCheckpointResponse);
+  rpc GetCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+}
+
+message WorkloadBinding {
+  string tenant_id = 1;
+  string run_id = 2;
+  string attempt_id = 3;
+  string worker_id = 4;
+  string worker_incarnation_id = 5;
+}
+
+message PutCheckpointRequest {
+  uint32 schema_version = 1;
+  WorkloadBinding binding = 2;
+  string payload_ref = 3;
+  bytes payload = 4;
+}
+
+message PutCheckpointResponse {
+  uint32 schema_version = 1;
+  string payload_ref = 2;
+  string stored_payload_digest = 3;
+  uint64 stored_size = 4;
+}
+
+message GetCheckpointRequest {
+  uint32 schema_version = 1;
+  WorkloadBinding binding = 2;
+  string payload_ref = 3;
+}
+
+message GetCheckpointResponse {
+  uint32 schema_version = 1;
+  string payload_ref = 2;
+  bytes payload = 3;
+}

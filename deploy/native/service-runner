@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DOWNLOAD_WRAPPER=${AGENT_RUNTIME_DOWNLOAD_WRAPPER:-"$SCRIPT_DIR/with-download-proxy"}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+[ "$#" -ge 3 ] || fail "usage: service-runner SERVICE LOCAL_ROOT EXECUTABLE [ARGUMENT ...]"
+
+SERVICE=$1
+LOCAL_ROOT=$2
+EXECUTABLE=$3
+shift 3
+
+[ -f "$LOCAL_ROOT/.agent-runtime-local-root" ] || fail "native local root is not initialized"
+[ -r "$LOCAL_ROOT/env/native.env" ] || fail "native environment is missing"
+[ -x "$EXECUTABLE" ] || fail "service executable is unavailable: $EXECUTABLE"
+
+set -a
+. "$LOCAL_ROOT/env/native.env"
+set +a
+
+PID_FILE="$LOCAL_ROOT/run/$SERVICE.pid"
+umask 077
+printf '%s\n' "$$" > "$PID_FILE"
+
+provider_value() {
+  value_path="$LOCAL_ROOT/secrets/$1"
+  [ -s "$value_path" ] || fail "provider configuration is missing: $1"
+  cat "$value_path"
+}
+
+provider_value_or_default() {
+  value_path="$LOCAL_ROOT/secrets/$1"
+  if [ -s "$value_path" ]; then
+    cat "$value_path"
+  else
+    printf '%s' "$2"
+  fi
+}
+
+case "$SERVICE" in
+  control-plane)
+    [ "$#" -eq 1 ] || fail "control-plane requires its executable jar"
+    export SERVER_ADDRESS=127.0.0.1
+    export SERVER_PORT=${AGENT_RUNTIME_LOCAL_API_PORT:-18080}
+    export MANAGEMENT_SERVER_ADDRESS=127.0.0.1
+    export MANAGEMENT_SERVER_PORT=${AGENT_RUNTIME_LOCAL_MANAGEMENT_PORT:-9090}
+    export AGENT_RUNTIME_OUTBOX_ENABLED=true
+    export AGENT_RUNTIME_SCHEDULER_ENABLED=true
+    exec "$EXECUTABLE" \
+      -Djava.net.useSystemProxies=false \
+      -Dhttp.proxyHost= \
+      -Dhttps.proxyHost= \
+      -DsocksProxyHost= \
+      -jar "$1"
+    ;;
+  model-gateway)
+    export AGENT_RUNTIME_HEALTH_BIND="127.0.0.1:${AGENT_RUNTIME_LOCAL_MODEL_HEALTH_PORT:-18081}"
+    export AGENT_RUNTIME_MODEL_GATEWAY_BIND="127.0.0.1:${AGENT_RUNTIME_LOCAL_MODEL_GRPC_PORT:-50051}"
+    export AGENT_RUNTIME_PROVIDER_ENDPOINT="$(provider_value provider-endpoint)"
+    export AGENT_RUNTIME_PROVIDER_MODEL="$(provider_value provider-model)"
+    export AGENT_RUNTIME_PROVIDER_API_KEY="$(provider_value provider-api-key)"
+    export AGENT_RUNTIME_PROVIDER_PROTOCOL="$(provider_value_or_default provider-protocol openai_compatible)"
+    export AGENT_RUNTIME_PROVIDER_ANTHROPIC_VERSION="$(provider_value_or_default provider-anthropic-version 2023-06-01)"
+    export AGENT_RUNTIME_GRPC_SERVER_CERT="$AGENT_RUNTIME_LOCAL_MODEL_GATEWAY_CERT"
+    export AGENT_RUNTIME_GRPC_SERVER_KEY="$AGENT_RUNTIME_LOCAL_MODEL_GATEWAY_KEY"
+    export AGENT_RUNTIME_GRPC_CLIENT_CA_CERT="$AGENT_RUNTIME_LOCAL_GRPC_CA_CERT"
+    exec "$DOWNLOAD_WRAPPER" "$EXECUTABLE"
+    ;;
+  checkpoint-gateway)
+    export AGENT_RUNTIME_HEALTH_BIND="127.0.0.1:${AGENT_RUNTIME_LOCAL_CHECKPOINT_HEALTH_PORT:-18082}"
+    export AGENT_RUNTIME_CHECKPOINT_GATEWAY_BIND="127.0.0.1:${AGENT_RUNTIME_LOCAL_CHECKPOINT_GRPC_PORT:-50052}"
+    export AGENT_RUNTIME_GRPC_SERVER_CERT="$AGENT_RUNTIME_LOCAL_CHECKPOINT_GATEWAY_CERT"
+    export AGENT_RUNTIME_GRPC_SERVER_KEY="$AGENT_RUNTIME_LOCAL_CHECKPOINT_GATEWAY_KEY"
+    export AGENT_RUNTIME_GRPC_CLIENT_CA_CERT="$AGENT_RUNTIME_LOCAL_GRPC_CA_CERT"
+    mkdir -p "$AGENT_RUNTIME_CHECKPOINT_LOCAL_DIR"
+    exec "$EXECUTABLE"
+    ;;
+  runtime-worker)
+    export AGENT_RUNTIME_HEALTH_BIND="127.0.0.1:${AGENT_RUNTIME_LOCAL_WORKER_HEALTH_PORT:-18083}"
+    export AGENT_RUNTIME_WORKER_CAPACITY=${AGENT_RUNTIME_LOCAL_WORKER_CAPACITY:-2}
+    export AGENT_RUNTIME_DRAIN_GRACE_SECONDS=${AGENT_RUNTIME_LOCAL_DRAIN_GRACE_SECONDS:-15}
+    exec "$EXECUTABLE"
+    ;;
+  console)
+    [ "$#" -eq 1 ] || fail "console requires the project root"
+    export AGENT_RUNTIME_CONTROL_API="http://127.0.0.1:${AGENT_RUNTIME_LOCAL_API_PORT:-18080}"
+    export AGENT_RUNTIME_LOCAL_ACCESS_TOKEN_FILE="$LOCAL_ROOT/secrets/local-access-token"
+    cd "$1"
+    exec "$EXECUTABLE" --filter @agent-runtime/console dev --host 127.0.0.1 \
+      --port "${AGENT_RUNTIME_LOCAL_CONSOLE_PORT:-5173}"
+    ;;
+  *) fail "unsupported native service: $SERVICE" ;;
+esac

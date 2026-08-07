@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package agent.runtime.v1;
+
+option java_multiple_files = true;
+option java_package = "com.agentplatform.contract.runtime.v1";
+
+service RuntimeControl {
+  rpc Connect(stream NodeMessage) returns (stream ControlMessage);
+}
+
+message NodeMessage {
+  oneof body {
+    NodeHello hello = 1;
+    Heartbeat heartbeat = 2;
+    EventBatch event_batch = 3;
+    Checkpoint checkpoint = 4;
+  }
+}
+
+message ControlMessage {
+  oneof body {
+    RunLease run_lease = 1;
+    LeaseRevoked lease_revoked = 2;
+    EventAck event_ack = 3;
+    RunCancellation run_cancellation = 4;
+  }
+}
+
+message RunCancellation {
+  string message_id = 1;
+  string tenant_id = 2;
+  string run_id = 3;
+  string attempt_id = 4;
+  string worker_id = 5;
+  int64 issued_at_unix_ms = 6;
+  int64 expires_at_unix_ms = 7;
+  string reason = 8;
+  string worker_incarnation_id = 9;
+}
+
+message NodeHello {
+  string node_id = 1;
+  string runtime_version = 2;
+  repeated string capabilities = 3;
+  string node_incarnation_id = 4;
+}
+
+message Heartbeat {
+  string node_id = 1;
+  int64 observed_at_unix_ms = 2;
+  repeated ActiveRunAssignment active_assignments = 3;
+  string node_incarnation_id = 4;
+}
+
+message ActiveRunAssignment {
+  string tenant_id = 1;
+  string run_id = 2;
+  string attempt_id = 3;
+  string workspace_id = 4;
+  int64 owner_epoch = 5;
+  string fencing_token = 6;
+}
+
+message RunLease {
+  string tenant_id = 1;
+  string run_id = 2;
+  string workspace_id = 3;
+  int64 owner_epoch = 4;
+  string fencing_token = 5;
+  int64 expires_at_unix_ms = 6;
+  string policy_digest = 7;
+  string worker_id = 8;
+  string worker_incarnation_id = 9;
+}
+
+message LeaseRevoked {
+  string run_id = 1;
+  int64 owner_epoch = 2;
+  string reason = 3;
+}
+
+message RuntimeEvent {
+  string event_id = 1;
+  string tenant_id = 2;
+  string session_id = 3;
+  string run_id = 4;
+  uint64 sequence = 5;
+  string attempt_id = 6;
+  int64 occurred_at_unix_ms = 7;
+  string trace_id = 8;
+  string type = 9;
+  bytes payload_json = 10;
+  string digest = 11;
+}
+
+message EventBatch {
+  string run_id = 1;
+  int64 owner_epoch = 2;
+  string fencing_token = 3;
+  repeated RuntimeEvent events = 4;
+}
+
+message EventAck {
+  string run_id = 1;
+  uint64 through_sequence = 2;
+}
+
+message Checkpoint {
+  string run_id = 1;
+  int64 owner_epoch = 2;
+  string object_ref = 3;
+  string digest = 4;
+}

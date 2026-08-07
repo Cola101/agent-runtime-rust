@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "message_id": "0198a5a6-a7a8-7def-8abc-0123456789d1",
+  "tenant_id": "0198a5a6-a7a8-7def-8abc-0123456789ac",
+  "run_id": "0198a5a6-a7a8-7def-8abc-0123456789ad",
+  "attempt_id": "0198a5a6-a7a8-7def-8abc-0123456789b1",
+  "worker_id": "0198a5a6-a7a8-7def-8abc-0123456789b2",
+  "worker_incarnation_id": "0198a5a6-a7a8-7def-8abc-0123456789c1",
+  "owner_epoch": 7,
+  "fencing_token": "0198a5a6-a7a8-7def-8abc-0123456789b3",
+  "generation": 2,
+  "issued_at": "2026-07-31T14:00:25Z",
+  "lease_expires_at": "2026-07-31T14:00:55Z",
+  "workload_token": "v2.eyJleGFtcGxlIjoidGVzdC1vbmx5In0.c2lnbmF0dXJl"
+}

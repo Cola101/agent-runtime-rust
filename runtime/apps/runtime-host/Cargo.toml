@@ -1,0 +1,29 @@
+[package]
+name = "agent-runtime-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-kernel.workspace = true
+agent-model-gateway = { path = "../model-gateway" }
+agent-model-gateway-protocol.workspace = true
+agent-protocol.workspace = true
+agent-runtime-worker = { path = "../worker" }
+agent-tool-runtime.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

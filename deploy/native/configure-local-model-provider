@@ -1,0 +1,133 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "open3"
+require "securerandom"
+require "uri"
+
+PROJECT_ROOT = File.expand_path("../..", __dir__)
+LOCAL_ROOT = File.expand_path(
+  ENV.fetch("AGENT_RUNTIME_LOCAL_ROOT", File.join(PROJECT_ROOT, ".local"))
+)
+BINDING_SQL = File.join(__dir__, "local-model-provider-binding.sql")
+UUID_PATTERN = /\A[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i.freeze
+
+def abort_configuration(message)
+  warn "error: #{message}"
+  exit 1
+end
+
+def positive_port(name, default)
+  value = Integer(ENV.fetch(name, default.to_s), 10)
+  raise ArgumentError unless (1..65_535).cover?(value)
+
+  value
+rescue ArgumentError
+  abort_configuration("#{name} must be a port between 1 and 65535")
+end
+
+def control_uri
+  port = positive_port("AGENT_RUNTIME_LOCAL_API_PORT", 18_080)
+  uri = URI.parse(ENV.fetch("AGENT_RUNTIME_CONTROL_API", "http://127.0.0.1:#{port}"))
+  local_host = %w[127.0.0.1 localhost].include?(uri.host)
+  local_path = uri.path.nil? || uri.path.empty? || uri.path == "/"
+  unless uri.is_a?(URI::HTTP) && !uri.is_a?(URI::HTTPS) && local_host && local_path &&
+         uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
+    abort_configuration("native Provider configuration only accepts a loopback control API")
+  end
+
+  uri
+rescue URI::InvalidURIError
+  abort_configuration("native Provider configuration only accepts a loopback control API")
+end
+
+def secure_value(name)
+  path = File.join(LOCAL_ROOT, "secrets", name)
+  abort_configuration("native secret is missing: #{name}") unless File.file?(path)
+  abort_configuration("native secret must not be a symbolic link: #{name}") if File.lstat(path).symlink?
+  abort_configuration("native secret permissions must be 600: #{name}") unless (File.stat(path).mode & 0o077).zero?
+
+  value = File.read(path).strip
+  abort_configuration("native secret is empty: #{name}") if value.empty?
+  value
+end
+
+def database_connection
+  jdbc = ENV.fetch("SPRING_DATASOURCE_URL", "")
+  prefix = "jdbc:postgresql://"
+  abort_configuration("unsupported PostgreSQL JDBC URL") unless jdbc.start_with?(prefix)
+
+  uri = URI.parse("postgresql://#{jdbc.delete_prefix(prefix)}")
+  unless %w[127.0.0.1 localhost].include?(uri.host) && uri.port &&
+         uri.path && uri.path.length > 1 && uri.query.nil? && uri.fragment.nil?
+    abort_configuration("native Provider binding only accepts loopback PostgreSQL")
+  end
+  [uri.host, uri.port, uri.path.delete_prefix("/")]
+rescue URI::InvalidURIError
+  abort_configuration("unsupported PostgreSQL JDBC URL")
+end
+
+def create_provider(uri, token, provider)
+  request = Net::HTTP::Post.new("/v1/model-providers")
+  request["Authorization"] = "Bearer #{token}"
+  request["Accept"] = "application/json"
+  request["Content-Type"] = "application/json"
+  request.body = JSON.generate(provider)
+  http = Net::HTTP.new(uri.host, uri.port, nil)
+  http.open_timeout = 10
+  http.read_timeout = 30
+  http.write_timeout = 10 if http.respond_to?(:write_timeout=)
+  response = http.request(request)
+  abort_configuration("control API rejected native Provider with HTTP #{response.code}") \
+    unless response.code == "201"
+  payload = JSON.parse(response.body)
+  provider_id = payload.fetch("id")
+  abort_configuration("control API returned an invalid Provider id") \
+    unless provider_id.is_a?(String) && provider_id.match?(UUID_PATTERN)
+
+  provider_id
+rescue JSON::ParserError, KeyError, TypeError
+  abort_configuration("control API returned malformed Provider JSON")
+rescue Errno::ECONNREFUSED
+  abort_configuration("local control API is not running")
+rescue Net::OpenTimeout, Net::ReadTimeout
+  abort_configuration("local control API timed out while configuring the Provider")
+end
+
+def bind_provider(provider_id)
+  psql = ENV.fetch("AGENT_RUNTIME_PSQL_BIN", "psql")
+  host, port, database = database_connection
+  username = ENV.fetch("SPRING_DATASOURCE_USERNAME", "")
+  password = ENV.fetch("SPRING_DATASOURCE_PASSWORD", "")
+  abort_configuration("PostgreSQL credentials are missing") if username.empty? || password.empty?
+  abort_configuration("native model Provider binding SQL is missing") unless File.file?(BINDING_SQL)
+
+  _output, error, status = Open3.capture3(
+    { "PGPASSWORD" => password },
+    psql, "-h", host, "-p", port.to_s, "-U", username, "-d", database,
+    "-v", "provider_id=#{provider_id}", "-v", "ON_ERROR_STOP=1", "-f", BINDING_SQL
+  )
+  abort_configuration("native model Provider could not be bound to its policy: #{error.strip}") \
+    unless status.success?
+rescue Errno::ENOENT
+  abort_configuration("native psql was not found")
+end
+
+marker = File.join(LOCAL_ROOT, ".agent-runtime-local-root")
+abort_configuration("native local root is not initialized") unless File.file?(marker)
+
+provider_id = create_provider(
+  control_uri,
+  secure_value("local-access-token"),
+  {
+    "name" => "Native Local Provider #{SecureRandom.hex(8)}",
+    "protocol" => secure_value("provider-protocol"),
+    "endpoint" => secure_value("provider-endpoint"),
+    "model" => secure_value("provider-model"),
+    "api_key" => secure_value("provider-api-key")
+  }
+)
+bind_provider(provider_id)
+puts "native model Provider sealed and bound to the development policy"

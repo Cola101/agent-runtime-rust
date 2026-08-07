@@ -1,0 +1,26 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: control-plane
+  namespace: agent-runtime
+  labels:
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  selector:
+    matchLabels:
+      agent-runtime.io/metrics: "true"
+  namespaceSelector:
+    matchNames: [agent-runtime]
+  endpoints:
+    - port: management
+      scheme: https
+      path: /actuator/prometheus
+      interval: 15s
+      scrapeTimeout: 10s
+      basicAuth:
+        username: {name: control-plane-credentials, key: management-scrape-username}
+        password: {name: control-plane-credentials, key: management-scrape-password}
+      tlsConfig:
+        serverName: control-plane-management.agent-runtime.svc.cluster.local
+        ca:
+          secret: {name: control-plane-credentials, key: management-ca.pem}

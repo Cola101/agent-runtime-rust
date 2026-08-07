@@ -1,0 +1,22 @@
+.idea/
+.vscode/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Java
+control-plane/target/
+
+# Rust
+runtime/target/
+
+# Node
+node_modules/
+console/dist/
+console/coverage/
+console/test-results/
+console/playwright-report/
+
+# Native local development state, toolchain, logs and ephemeral secrets
+.local/

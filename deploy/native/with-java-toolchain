@@ -1,0 +1,95 @@
+#!/bin/sh
+set -eu
+
+# Runs a command against the JDK the control plane declares.
+#
+# Homebrew's Maven ships and prefers its own JVM, so `mvn` can silently run on a
+# different major version than the JDK on PATH that the native services use.
+# Byte Buddy (under Mockito) refuses to instrument class files from a JDK newer
+# than it knows, so that split turns into unrelated-looking test failures.
+# Pinning one JDK keeps the build, the tests, and the running services together.
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+POM="$PROJECT_ROOT/control-plane/pom.xml"
+
+required_major() {
+  [ -f "$POM" ] || fail "control-plane pom.xml is missing"
+  major=$(sed -n 's|.*<java\.version>[[:space:]]*\([0-9][0-9]*\)[[:space:]]*</java\.version>.*|\1|p' \
+    "$POM" | head -1)
+  [ -n "$major" ] || fail "control-plane pom.xml does not declare <java.version>"
+  printf '%s' "$major"
+}
+
+# Major version of the JDK rooted at $1, or empty when it is not usable.
+home_major() {
+  candidate=$1
+  [ -n "$candidate" ] && [ -x "$candidate/bin/java" ] || return 0
+  "$candidate/bin/java" -version 2>&1 \
+    | sed -n 's|^[a-zA-Z ]*version "\([0-9][0-9]*\).*|\1|p' | head -1
+}
+
+# Resolves the JDK home that owns the given java executable, following symlinks
+# so a Homebrew shim still lands on the real JDK.
+home_of_java() {
+  java_bin=$1
+  [ -n "$java_bin" ] || return 0
+  while [ -L "$java_bin" ]; do
+    link=$(readlink "$java_bin")
+    case "$link" in
+      /*) java_bin=$link ;;
+      *) java_bin=$(dirname "$java_bin")/$link ;;
+    esac
+  done
+  (CDPATH= cd -- "$(dirname -- "$java_bin")/.." && pwd)
+}
+
+REQUIRED=$(required_major)
+
+# An explicit override wins, but it must still satisfy the declared version so a
+# stale export cannot silently reintroduce the split this wrapper exists to stop.
+for candidate in "${AGENT_RUNTIME_JAVA_HOME:-}" "${JAVA_HOME:-}"; do
+  [ -n "$candidate" ] || continue
+  if [ "$(home_major "$candidate")" = "$REQUIRED" ]; then
+    RESOLVED=$candidate
+    break
+  fi
+done
+
+if [ -z "${RESOLVED:-}" ]; then
+  path_java=$(command -v java 2>/dev/null || true)
+  if [ -n "$path_java" ]; then
+    path_home=$(home_of_java "$path_java")
+    [ "$(home_major "$path_home")" = "$REQUIRED" ] && RESOLVED=$path_home
+  fi
+fi
+
+if [ -z "${RESOLVED:-}" ] && [ -x /usr/libexec/java_home ]; then
+  discovered=$(/usr/libexec/java_home -v "$REQUIRED" 2>/dev/null || true)
+  [ -n "$discovered" ] && [ "$(home_major "$discovered")" = "$REQUIRED" ] && RESOLVED=$discovered
+fi
+
+if [ -z "${RESOLVED:-}" ]; then
+  for candidate in \
+    "/opt/homebrew/opt/openjdk@$REQUIRED/libexec/openjdk.jdk/Contents/Home" \
+    "/usr/local/opt/openjdk@$REQUIRED/libexec/openjdk.jdk/Contents/Home"; do
+    if [ "$(home_major "$candidate")" = "$REQUIRED" ]; then
+      RESOLVED=$candidate
+      break
+    fi
+  done
+fi
+
+[ -n "${RESOLVED:-}" ] || fail "no Java $REQUIRED toolchain found; install it or set AGENT_RUNTIME_JAVA_HOME"
+
+JAVA_HOME=$RESOLVED
+export JAVA_HOME
+PATH="$JAVA_HOME/bin:$PATH"
+export PATH
+
+exec "$@"

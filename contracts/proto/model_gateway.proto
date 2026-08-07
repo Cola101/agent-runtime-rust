@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package agent.model.v1;
+
+service ModelExecution {
+  rpc Execute(ModelInvocation) returns (stream ModelEvent);
+}
+
+message ModelInvocation {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string run_id = 3;
+  string session_id = 4;
+  string attempt_id = 5;
+  string worker_id = 6;
+  string model_policy_id = 7;
+  int64 expires_at_unix_ms = 8;
+  repeated ModelMessage messages = 9;
+  repeated ModelTool tools = 10;
+  bytes output_schema_json = 11;
+  ReasoningPolicy reasoning = 12;
+  uint64 max_output_tokens = 13;
+  string worker_incarnation_id = 14;
+  bytes model_policy_snapshot_json = 15;
+  string model_policy_digest = 16;
+}
+
+message ModelMessage {
+  ModelRole role = 1;
+  repeated ContentPart content = 2;
+}
+
+message ContentPart {
+  oneof body {
+    TextPart text = 1;
+    MediaPart image = 2;
+    MediaPart audio = 3;
+    ToolResultPart tool_result = 4;
+    ToolCallPart tool_call = 5;
+  }
+}
+
+message TextPart {
+  string text = 1;
+}
+
+message MediaPart {
+  string media_type = 1;
+  string source = 2;
+}
+
+message ToolResultPart {
+  string tool_call_id = 1;
+  bytes content_json = 2;
+}
+
+message ToolCallPart {
+  string tool_call_id = 1;
+  string name = 2;
+  bytes arguments_json = 3;
+}
+
+message ModelTool {
+  string name = 1;
+  string description = 2;
+  bytes input_schema_json = 3;
+}
+
+enum ModelRole {
+  MODEL_ROLE_UNSPECIFIED = 0;
+  MODEL_ROLE_SYSTEM = 1;
+  MODEL_ROLE_USER = 2;
+  MODEL_ROLE_ASSISTANT = 3;
+  MODEL_ROLE_TOOL = 4;
+}
+
+enum ReasoningPolicy {
+  REASONING_POLICY_UNSPECIFIED = 0;
+  REASONING_POLICY_MINIMAL = 1;
+  REASONING_POLICY_BALANCED = 2;
+  REASONING_POLICY_THOROUGH = 3;
+}
+
+message ModelEvent {
+  uint32 schema_version = 1;
+  uint64 sequence = 2;
+  oneof body {
+    TextDelta text_delta = 3;
+    ToolCall tool_call = 4;
+    Usage usage = 5;
+    Completed completed = 6;
+    Failed failed = 7;
+  }
+}
+
+message TextDelta {
+  string text = 1;
+}
+
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  bytes arguments_json = 3;
+}
+
+message Usage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cost_micros = 3;
+}
+
+message Completed {
+  FinishReason reason = 1;
+}
+
+message Failed {
+  ModelErrorKind kind = 1;
+  bool retryable = 2;
+  string message = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_TOOL_CALLS = 2;
+  FINISH_REASON_LENGTH = 3;
+  FINISH_REASON_CONTENT_FILTER = 4;
+}
+
+enum ModelErrorKind {
+  MODEL_ERROR_KIND_UNSPECIFIED = 0;
+  MODEL_ERROR_KIND_AUTHENTICATION = 1;
+  MODEL_ERROR_KIND_BILLING = 2;
+  MODEL_ERROR_KIND_RATE_LIMITED = 3;
+  MODEL_ERROR_KIND_TIMEOUT = 4;
+  MODEL_ERROR_KIND_PROTOCOL = 5;
+  MODEL_ERROR_KIND_CONTEXT_OVERFLOW = 6;
+  MODEL_ERROR_KIND_CAPABILITY_MISMATCH = 7;
+  MODEL_ERROR_KIND_UNAVAILABLE = 8;
+}

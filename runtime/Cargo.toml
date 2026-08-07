@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/runtime-health",
+  "crates/nats-security",
+  "crates/protocol",
+  "crates/kernel",
+  "crates/model-gateway-protocol",
+  "crates/workload-identity",
+  "crates/grpc-security",
+  "crates/checkpoint-gateway-protocol",
+  "crates/tool-runtime",
+  "apps/worker",
+  "apps/model-gateway",
+  "apps/checkpoint-gateway",
+  "apps/trusted-workspace-tool",
+  "apps/edge-node",
+  "apps/runtime-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Proprietary"
+rust-version = "1.88"
+
+[workspace.dependencies]
+agent-protocol = { path = "crates/protocol" }
+agent-kernel = { path = "crates/kernel" }
+agent-model-gateway-protocol = { path = "crates/model-gateway-protocol" }
+agent-workload-identity = { path = "crates/workload-identity" }
+agent-grpc-security = { path = "crates/grpc-security" }
+agent-checkpoint-gateway-protocol = { path = "crates/checkpoint-gateway-protocol" }
+agent-tool-runtime = { path = "crates/tool-runtime" }
+agent-runtime-health = { path = "crates/runtime-health" }
+agent-nats-security = { path = "crates/nats-security" }
+axum = "0.8.9"
+aes-gcm = "0.10.3"
+async-nats = "0.50.0"
+base64 = "0.22.1"
+bytes = "1.10.1"
+chrono = { version = "0.4.41", features = ["serde"] }
+futures-util = "0.3.31"
+eventsource-stream = "0.2.3"
+ed25519-dalek = "2.2.0"
+hmac = "0.12.1"
+prost = "0.14.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest-013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rsa = { version = "0.9.8", features = ["pem", "sha2"] }
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+semver = "1.0.28"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.16"
+tokio-stream = { version = "0.1.17", features = ["net"] }
+tonic = { version = "0.14.3", features = ["transport", "tls-ring"] }
+tonic-prost = "0.14.3"
+tonic-prost-build = "0.14.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+uuid = { version = "1.17.0", features = ["v7", "serde"] }
+zeroize = "1.8.1"
+hex = "0.4.3"
+zstd = "0.13.3"
+object_store = { version = "0.14.1", default-features = false, features = ["aws-base", "fs", "reqwest", "ring"] }
+rcgen = "0.14.8"

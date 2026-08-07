@@ -1,0 +1,11 @@
+[package]
+name = "agent-grpc-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tonic.workspace = true
+

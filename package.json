@@ -1,0 +1,15 @@
+{
+  "name": "agent-runtime-platform",
+  "private": true,
+  "packageManager": "pnpm@10.13.1",
+  "scripts": {
+    "test": "pnpm --filter @agent-runtime/console test",
+    "lint": "pnpm --filter @agent-runtime/console lint",
+    "typecheck": "pnpm --filter @agent-runtime/console typecheck",
+    "build": "pnpm --filter @agent-runtime/console build",
+    "lint:openapi": "redocly lint contracts/openapi/openapi.yaml"
+  },
+  "devDependencies": {
+    "@redocly/cli": "1.27.2"
+  }
+}

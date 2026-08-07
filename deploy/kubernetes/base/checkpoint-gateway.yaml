@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkpoint-gateway
+  namespace: agent-runtime
+  labels: &labels
+    app.kubernetes.io/name: checkpoint-gateway
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: checkpoint-gateway}
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: checkpoint-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: checkpoint-gateway
+          image: ghcr.io/agent-runtime-platform/checkpoint-gateway:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: grpc, containerPort: 50052}
+            - {name: health, containerPort: 8080}
+          env:
+            - {name: AGENT_RUNTIME_CHECKPOINT_GATEWAY_BIND, value: "0.0.0.0:50052"}
+            - {name: AGENT_RUNTIME_HEALTH_BIND, value: "0.0.0.0:8080"}
+            - {name: AGENT_RUNTIME_CHECKPOINT_S3_ENDPOINT, value: "https://s3.platform.example"}
+            - {name: AGENT_RUNTIME_CHECKPOINT_S3_BUCKET, value: agent-runtime-checkpoints}
+            - {name: AGENT_RUNTIME_CHECKPOINT_S3_REGION, value: us-east-1}
+            - name: AGENT_RUNTIME_CHECKPOINT_S3_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: runtime-gateway-credentials, key: checkpoint-s3-access-key-id}}
+            - name: AGENT_RUNTIME_CHECKPOINT_S3_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: runtime-gateway-credentials, key: checkpoint-s3-secret-access-key}}
+            - name: AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY
+              valueFrom: {secretKeyRef: {name: runtime-gateway-credentials, key: workload-identity-public-key}}
+            - {name: AGENT_RUNTIME_GRPC_SERVER_CERT, value: /var/run/secrets/runtime/grpc-server-cert.pem}
+            - {name: AGENT_RUNTIME_GRPC_SERVER_KEY, value: /var/run/secrets/runtime/grpc-server-key.pem}
+            - {name: AGENT_RUNTIME_GRPC_CLIENT_CA_CERT, value: /var/run/secrets/runtime/grpc-client-ca.pem}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /var/run/secrets/runtime, readOnly: true}
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: runtime-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: runtime-gateway-secrets}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkpoint-gateway
+  namespace: agent-runtime
+spec:
+  selector: {app.kubernetes.io/name: checkpoint-gateway}
+  ports:
+    - {name: grpc, port: 50052, targetPort: grpc}

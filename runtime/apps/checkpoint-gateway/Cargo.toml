@@ -1,0 +1,32 @@
+[package]
+name = "agent-checkpoint-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-runtime-health.workspace = true
+agent-grpc-security.workspace = true
+agent-checkpoint-gateway-protocol.workspace = true
+agent-workload-identity.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+object_store.workspace = true
+reqwest-013.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+serde_json.workspace = true

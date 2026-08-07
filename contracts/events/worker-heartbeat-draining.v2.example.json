@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "message_id": "0198a5a6-a7a8-7def-8abc-0123456789d0",
+  "worker_id": "0198a5a6-a7a8-7def-8abc-0123456789b2",
+  "incarnation_id": "0198a5a6-a7a8-7def-8abc-0123456789c1",
+  "occurred_at": "2026-07-31T14:00:11Z",
+  "placements": ["cloud"],
+  "capacity": 8,
+  "active_runs": 1,
+  "active_assignments": [
+    {
+      "tenant_id": "0198a5a6-a7a8-7def-8abc-0123456789ac",
+      "run_id": "0198a5a6-a7a8-7def-8abc-0123456789ad",
+      "attempt_id": "0198a5a6-a7a8-7def-8abc-0123456789b1",
+      "workspace_id": "0198a5a6-a7a8-7def-8abc-0123456789af",
+      "owner_epoch": 7,
+      "fencing_token": "0198a5a6-a7a8-7def-8abc-0123456789b3"
+    }
+  ],
+  "runtime_version": "0.1.0",
+  "accepting_work": false,
+  "draining_since": "2026-07-31T14:00:10Z",
+  "drain_deadline": "2026-07-31T14:01:40Z"
+}

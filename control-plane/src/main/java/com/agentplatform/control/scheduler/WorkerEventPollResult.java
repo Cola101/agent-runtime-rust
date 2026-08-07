@@ -1,0 +1,12 @@
+package com.agentplatform.control.scheduler;
+
+public enum WorkerEventPollResult {
+  IDLE,
+  HEARTBEAT_RECORDED,
+  ACCEPTANCE_RECORDED,
+  RUN_EVENT_RECORDED,
+  CHECKPOINT_RECORDED,
+  STEERING_OUTCOME_RECORDED,
+  RETRY_SCHEDULED,
+  TERMINATED
+}

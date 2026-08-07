@@ -1,0 +1,146 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-plane-config
+  namespace: agent-runtime
+data:
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgresql.platform.svc.cluster.local:5432/agent_runtime?sslmode=verify-full&sslrootcert=/var/run/secrets/control-plane/postgres-ca.pem
+  SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE: "2"
+  SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "10"
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: https://iam.platform.svc.cluster.local/realms/agent-runtime
+  AGENT_RUNTIME_OUTBOX_ENABLED: "true"
+  AGENT_RUNTIME_OUTBOX_NATS_URL: tls://nats.agent-runtime.svc.cluster.local:4222
+  AGENT_RUNTIME_OUTBOX_NATS_SECURITY_TLS_REQUIRED: "true"
+  AGENT_RUNTIME_OUTBOX_NATS_SECURITY_TRUSTSTORE_PATH: /var/run/secrets/control-plane/nats-truststore.p12
+  AGENT_RUNTIME_SCHEDULER_ENABLED: "true"
+  AGENT_RUNTIME_SCHEDULER_NATS_URL: tls://nats.agent-runtime.svc.cluster.local:4222
+  AGENT_RUNTIME_SCHEDULER_NATS_SECURITY_TLS_REQUIRED: "true"
+  AGENT_RUNTIME_SCHEDULER_NATS_SECURITY_TRUSTSTORE_PATH: /var/run/secrets/control-plane/nats-truststore.p12
+  SERVER_SHUTDOWN: graceful
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 30s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: agent-runtime
+  labels: &labels
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app.kubernetes.io/name: control-plane}
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: control-plane
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: control-plane}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: control-plane
+          image: ghcr.io/agent-runtime-platform/control-plane:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: api, containerPort: 8080}
+            - {name: management, containerPort: 9090}
+          envFrom:
+            - configMapRef: {name: control-plane-config}
+          env:
+            - {name: MANAGEMENT_SERVER_SSL_ENABLED, value: "true"}
+            - {name: MANAGEMENT_SERVER_SSL_CERTIFICATE, value: file:/var/run/secrets/control-plane/management-server-cert.pem}
+            - {name: MANAGEMENT_SERVER_SSL_CERTIFICATE_PRIVATE_KEY, value: file:/var/run/secrets/control-plane/management-server-key.pem}
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: database-username}}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: database-password}}
+            - name: MANAGEMENT_SCRAPE_USERNAME
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: management-scrape-username}}
+            - name: MANAGEMENT_SCRAPE_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: management-scrape-password}}
+            - name: AGENT_RUNTIME_WORKLOAD_IDENTITY_PRIVATE_KEY_PKCS8
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: workload-identity-private-key-pkcs8}}
+            - name: AGENT_RUNTIME_SKILL_SIGNING_KEY_ID
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: skill-signing-key-id}}
+            - name: AGENT_RUNTIME_SKILL_SIGNING_PRIVATE_KEY_PKCS8
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: skill-signing-private-key-pkcs8}}
+            - name: AGENT_RUNTIME_OUTBOX_NATS_SECURITY_USERNAME
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-username}}
+            - name: AGENT_RUNTIME_OUTBOX_NATS_SECURITY_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-password}}
+            - name: AGENT_RUNTIME_OUTBOX_NATS_SECURITY_TRUSTSTORE_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-truststore-password}}
+            - name: AGENT_RUNTIME_SCHEDULER_NATS_SECURITY_USERNAME
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-username}}
+            - name: AGENT_RUNTIME_SCHEDULER_NATS_SECURITY_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-password}}
+            - name: AGENT_RUNTIME_SCHEDULER_NATS_SECURITY_TRUSTSTORE_PASSWORD
+              valueFrom: {secretKeyRef: {name: control-plane-credentials, key: nats-truststore-password}}
+          volumeMounts:
+            - {name: control-plane-secrets, mountPath: /var/run/secrets/control-plane, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          startupProbe:
+            httpGet: {path: /actuator/health/liveness, port: management, scheme: HTTPS}
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: management, scheme: HTTPS}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: management, scheme: HTTPS}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 250m, memory: 384Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: control-plane-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: control-plane-secrets}
+        - name: tmp
+          emptyDir: {sizeLimit: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: agent-runtime
+spec:
+  selector: {app.kubernetes.io/name: control-plane}
+  ports:
+    - {name: http, port: 8080, targetPort: api}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane-management
+  namespace: agent-runtime
+  labels:
+    app.kubernetes.io/name: control-plane
+    app.kubernetes.io/part-of: agent-runtime
+    agent-runtime.io/metrics: "true"
+spec:
+  selector: {app.kubernetes.io/name: control-plane}
+  ports:
+    - {name: management, port: 9090, targetPort: management}

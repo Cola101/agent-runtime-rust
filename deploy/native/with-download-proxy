@@ -1,0 +1,80 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+resolve_download_proxy() {
+  DOWNLOAD_PROXY=${AGENT_RUNTIME_DOWNLOAD_PROXY:-}
+  case "$DOWNLOAD_PROXY" in
+    direct|off) DOWNLOAD_PROXY=""; return ;;
+    ?*) return ;;
+  esac
+  # Bare `return` inherits the failing guard's status, which `set -e` turns into
+  # a wrapper that exits before ever running the wrapped command.
+  command -v scutil >/dev/null 2>&1 || return 0
+  proxy_dump=$(scutil --proxy 2>/dev/null || true)
+  proxy_host=$(printf '%s\n' "$proxy_dump" | awk '/HTTPProxy :/ {print $3; exit}')
+  proxy_port=$(printf '%s\n' "$proxy_dump" | awk '/HTTPPort :/ {print $3; exit}')
+  proxy_enabled=$(printf '%s\n' "$proxy_dump" | awk '/HTTPEnable :/ {print $3; exit}')
+  if [ "$proxy_enabled" = "1" ] && [ -n "$proxy_host" ] && [ -n "$proxy_port" ]; then
+    DOWNLOAD_PROXY="http://$proxy_host:$proxy_port"
+  fi
+}
+
+configure_loopback_bypass() {
+  local_bypass='localhost,127.0.0.1,::1,.local'
+  inherited_bypass=${NO_PROXY:-${no_proxy:-}}
+  if [ -n "$inherited_bypass" ]; then
+    local_bypass="$inherited_bypass,$local_bypass"
+  fi
+  export NO_PROXY="$local_bypass"
+  export no_proxy="$local_bypass"
+}
+
+configure_download_proxy() {
+  # No proxy configured is the direct-connection case, not an error.
+  [ -n "$DOWNLOAD_PROXY" ] || return 0
+  case "$DOWNLOAD_PROXY" in
+    http://*|https://*) ;;
+    *) fail "download proxy must use http:// or https://" ;;
+  esac
+  proxy_authority=${DOWNLOAD_PROXY#*://}
+  proxy_authority=${proxy_authority%%/*}
+  case "$proxy_authority" in
+    *@*) fail "authenticated download proxies are not supported by the native wrapper" ;;
+  esac
+  proxy_host=${proxy_authority%:*}
+  proxy_port=${proxy_authority##*:}
+  [ -n "$proxy_host" ] && [ "$proxy_host" != "$proxy_port" ] || \
+    fail "download proxy must include a host and port"
+  case "$proxy_port" in
+    *[!0-9]*|'') fail "download proxy port must be numeric" ;;
+  esac
+
+  export HTTP_PROXY="$DOWNLOAD_PROXY"
+  export HTTPS_PROXY="$DOWNLOAD_PROXY"
+  export ALL_PROXY="$DOWNLOAD_PROXY"
+  export http_proxy="$DOWNLOAD_PROXY"
+  export https_proxy="$DOWNLOAD_PROXY"
+  export all_proxy="$DOWNLOAD_PROXY"
+
+  maven_proxy_options="-Djava.net.useSystemProxies=false \
+-Dhttp.proxyHost=$proxy_host -Dhttp.proxyPort=$proxy_port \
+-Dhttps.proxyHost=$proxy_host -Dhttps.proxyPort=$proxy_port \
+-Dhttp.nonProxyHosts=localhost|127.*|[::1]|*.local \
+-Dhttps.nonProxyHosts=localhost|127.*|[::1]|*.local"
+  if [ -n "${MAVEN_OPTS:-}" ]; then
+    export MAVEN_OPTS="$MAVEN_OPTS $maven_proxy_options"
+  else
+    export MAVEN_OPTS="$maven_proxy_options"
+  fi
+}
+
+[ "$#" -gt 0 ] || fail "a command is required"
+resolve_download_proxy
+configure_loopback_bypass
+configure_download_proxy
+exec "$@"

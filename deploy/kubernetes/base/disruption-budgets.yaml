@@ -1,0 +1,27 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: control-plane, namespace: agent-runtime}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: control-plane}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: model-gateway, namespace: agent-runtime}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: model-gateway}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: checkpoint-gateway, namespace: agent-runtime}
+spec:
+  minAvailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: checkpoint-gateway}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: runtime-worker, namespace: agent-runtime}
+spec:
+  maxUnavailable: 1
+  selector: {matchLabels: {app.kubernetes.io/name: runtime-worker}}

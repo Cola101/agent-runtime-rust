@@ -1,0 +1,313 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+LOCAL_ROOT=${AGENT_RUNTIME_LOCAL_ROOT:-"$PROJECT_ROOT/.local"}
+DEVCTL=${AGENT_RUNTIME_DEVCTL:-"$SCRIPT_DIR/devctl"}
+DAEMONIZER=${AGENT_RUNTIME_DAEMONIZER:-"$SCRIPT_DIR/daemonize-service"}
+SERVICE_RUNNER=${AGENT_RUNTIME_SERVICE_RUNNER:-"$SCRIPT_DIR/service-runner"}
+SEEDER=${AGENT_RUNTIME_SEEDER:-"$SCRIPT_DIR/seed-local-development"}
+DOWNLOAD_WRAPPER=${AGENT_RUNTIME_DOWNLOAD_WRAPPER:-"$SCRIPT_DIR/with-download-proxy"}
+CURL_BIN=${AGENT_RUNTIME_CURL_BIN:-curl}
+LAUNCHCTL=${AGENT_RUNTIME_LAUNCHCTL_BIN:-launchctl}
+
+SERVICES="control-plane model-gateway checkpoint-gateway runtime-worker console"
+STOP_SERVICES="console runtime-worker checkpoint-gateway model-gateway control-plane"
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_local_root() {
+  case "$LOCAL_ROOT" in
+    ""|/|"$PROJECT_ROOT") fail "unsafe local state root: $LOCAL_ROOT" ;;
+  esac
+  [ "${HOME:-}" != "$LOCAL_ROOT" ] || fail "local state root must not be the user home directory"
+}
+
+provider_file() {
+  printf '%s/secrets/%s\n' "$LOCAL_ROOT" "$1"
+}
+
+provider_configuration_available() {
+  [ -s "$(provider_file provider-endpoint)" ] && \
+    [ -s "$(provider_file provider-model)" ] && \
+    [ -s "$(provider_file provider-api-key)" ]
+}
+
+validate_provider_configuration() {
+  supplied=0
+  [ -n "${AGENT_RUNTIME_PROVIDER_ENDPOINT:-}" ] && supplied=$((supplied + 1))
+  [ -n "${AGENT_RUNTIME_PROVIDER_MODEL:-}" ] && supplied=$((supplied + 1))
+  [ -n "${AGENT_RUNTIME_PROVIDER_API_KEY:-}" ] && supplied=$((supplied + 1))
+  if [ "$supplied" -ne 0 ] && [ "$supplied" -ne 3 ]; then
+    fail "provider endpoint, model, and API key must be supplied together"
+  fi
+  if [ "$supplied" -eq 0 ]; then
+    provider_configuration_available || \
+      fail "model provider is not configured; set AGENT_RUNTIME_PROVIDER_ENDPOINT, AGENT_RUNTIME_PROVIDER_MODEL, and AGENT_RUNTIME_PROVIDER_API_KEY"
+    endpoint=$(cat "$(provider_file provider-endpoint)")
+  else
+    endpoint=$AGENT_RUNTIME_PROVIDER_ENDPOINT
+  fi
+  case "$endpoint" in
+    https://*) ;;
+    http://127.0.0.1:*|http://localhost:*) ;;
+    *) fail "provider endpoint must use HTTPS, except for an explicit loopback endpoint" ;;
+  esac
+  protocol=${AGENT_RUNTIME_PROVIDER_PROTOCOL:-openai_compatible}
+  case "$protocol" in
+    openai_compatible|openai_responses|anthropic_messages) ;;
+    *) fail "unsupported provider protocol: $protocol" ;;
+  esac
+}
+
+store_provider_configuration() {
+  if [ -z "${AGENT_RUNTIME_PROVIDER_ENDPOINT:-}" ]; then
+    return 0
+  fi
+  mkdir -p "$LOCAL_ROOT/secrets"
+  chmod 700 "$LOCAL_ROOT/secrets"
+  umask 077
+  printf '%s' "$AGENT_RUNTIME_PROVIDER_ENDPOINT" > "$(provider_file provider-endpoint)"
+  printf '%s' "$AGENT_RUNTIME_PROVIDER_MODEL" > "$(provider_file provider-model)"
+  printf '%s' "$AGENT_RUNTIME_PROVIDER_API_KEY" > "$(provider_file provider-api-key)"
+  printf '%s' "${AGENT_RUNTIME_PROVIDER_PROTOCOL:-openai_compatible}" > \
+    "$(provider_file provider-protocol)"
+  printf '%s' "${AGENT_RUNTIME_PROVIDER_ANTHROPIC_VERSION:-2023-06-01}" > \
+    "$(provider_file provider-anthropic-version)"
+  chmod 600 "$(provider_file provider-endpoint)" \
+    "$(provider_file provider-model)" "$(provider_file provider-api-key)" \
+    "$(provider_file provider-protocol)" "$(provider_file provider-anthropic-version)"
+}
+
+resolve_build_artifacts() {
+  if [ -n "${AGENT_RUNTIME_JAVA_BIN:-}" ]; then
+    JAVA_BIN=$AGENT_RUNTIME_JAVA_BIN
+  elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    JAVA_BIN=$JAVA_HOME/bin/java
+  else
+    JAVA_BIN=$(command -v java || true)
+  fi
+  CONTROL_PLANE_JAR=${AGENT_RUNTIME_CONTROL_PLANE_JAR:-"$PROJECT_ROOT/control-plane/target/control-plane-0.1.0-SNAPSHOT.jar"}
+  MODEL_GATEWAY_BIN=${AGENT_RUNTIME_MODEL_GATEWAY_BIN:-"$PROJECT_ROOT/runtime/target/debug/agent-model-gateway"}
+  CHECKPOINT_GATEWAY_BIN=${AGENT_RUNTIME_CHECKPOINT_GATEWAY_BIN:-"$PROJECT_ROOT/runtime/target/debug/agent-checkpoint-gateway"}
+  WORKER_BIN=${AGENT_RUNTIME_WORKER_BIN:-"$PROJECT_ROOT/runtime/target/debug/agent-runtime-worker"}
+  TRUSTED_WORKSPACE_TOOL_BIN=${AGENT_RUNTIME_TRUSTED_WORKSPACE_TOOL_BIN:-"$PROJECT_ROOT/runtime/target/debug/agent-trusted-workspace-tool"}
+  PNPM_BIN=${AGENT_RUNTIME_PNPM_BIN:-$(command -v pnpm || true)}
+
+  [ -x "$JAVA_BIN" ] || fail "Java 21 executable was not found"
+  java_version=$("$JAVA_BIN" -version 2>&1 | head -n 1)
+  case "$java_version" in
+    'openjdk version "21.'*|'java version "21.'*) ;;
+    *) fail "Java 21 is required; resolved $JAVA_BIN ($java_version)" ;;
+  esac
+  [ -s "$CONTROL_PLANE_JAR" ] || fail "control-plane jar was not built: $CONTROL_PLANE_JAR"
+  [ -x "$MODEL_GATEWAY_BIN" ] || fail "model-gateway binary was not built: $MODEL_GATEWAY_BIN"
+  [ -x "$CHECKPOINT_GATEWAY_BIN" ] || fail "checkpoint-gateway binary was not built: $CHECKPOINT_GATEWAY_BIN"
+  [ -x "$WORKER_BIN" ] || fail "runtime-worker binary was not built: $WORKER_BIN"
+  [ -x "$TRUSTED_WORKSPACE_TOOL_BIN" ] || \
+    fail "trusted workspace tool binary was not built: $TRUSTED_WORKSPACE_TOOL_BIN"
+  [ -x "$PNPM_BIN" ] || fail "pnpm executable was not found"
+  [ -x "$DAEMONIZER" ] || fail "native daemonizer is unavailable: $DAEMONIZER"
+  [ -x "$SERVICE_RUNNER" ] || fail "native service runner is unavailable: $SERVICE_RUNNER"
+}
+
+build_applications() {
+  if [ "${AGENT_RUNTIME_SKIP_BUILD:-false}" = "true" ]; then
+    return 0
+  fi
+  MAVEN_BIN=${AGENT_RUNTIME_MAVEN_BIN:-mvn}
+  CARGO_BIN=${AGENT_RUNTIME_CARGO_BIN:-cargo}
+  PNPM_BUILD_BIN=${AGENT_RUNTIME_PNPM_BIN:-pnpm}
+  "$DOWNLOAD_WRAPPER" "$MAVEN_BIN" -f "$PROJECT_ROOT/control-plane/pom.xml" package -DskipTests
+  "$DOWNLOAD_WRAPPER" "$CARGO_BIN" build --manifest-path "$PROJECT_ROOT/runtime/Cargo.toml" \
+    --package agent-model-gateway --package agent-checkpoint-gateway --package agent-runtime-worker \
+    --package agent-trusted-workspace-tool
+  "$DOWNLOAD_WRAPPER" "$PNPM_BUILD_BIN" --dir "$PROJECT_ROOT" install --frozen-lockfile
+}
+
+service_pid_file() {
+  printf '%s/run/%s.pid\n' "$LOCAL_ROOT" "$1"
+}
+
+service_running() {
+  pid_file=$(service_pid_file "$1")
+  [ -s "$pid_file" ] || return 1
+  pid=$(cat "$pid_file")
+  case "$pid" in *[!0-9]*|'') return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+health_url() {
+  case "$1" in
+    control-plane) printf 'http://127.0.0.1:%s/actuator/health/liveness\n' "${AGENT_RUNTIME_LOCAL_MANAGEMENT_PORT:-9090}" ;;
+    model-gateway) printf 'http://127.0.0.1:%s/ready\n' "${AGENT_RUNTIME_LOCAL_MODEL_HEALTH_PORT:-18081}" ;;
+    checkpoint-gateway) printf 'http://127.0.0.1:%s/ready\n' "${AGENT_RUNTIME_LOCAL_CHECKPOINT_HEALTH_PORT:-18082}" ;;
+    runtime-worker) printf 'http://127.0.0.1:%s/ready\n' "${AGENT_RUNTIME_LOCAL_WORKER_HEALTH_PORT:-18083}" ;;
+    console) printf 'http://127.0.0.1:%s/\n' "${AGENT_RUNTIME_LOCAL_CONSOLE_PORT:-5173}" ;;
+  esac
+}
+
+wait_for_service() {
+  service=$1
+  attempts=0
+  while [ "$attempts" -lt "${AGENT_RUNTIME_STARTUP_ATTEMPTS:-600}" ]; do
+    if service_running "$service" && \
+        "$CURL_BIN" --fail --silent --show-error --max-time 2 "$(health_url "$service")" >/dev/null 2>&1; then
+      return
+    fi
+    if [ -s "$(service_pid_file "$service")" ] && ! service_running "$service"; then
+      break
+    fi
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  fail "$service did not become healthy; inspect $LOCAL_ROOT/logs/$service.stderr.log"
+}
+
+launch_service() {
+  service=$1
+  executable=$2
+  shift 2
+  stop_service "$service"
+  "$DAEMONIZER" "$service" "$LOCAL_ROOT" "$SERVICE_RUNNER" \
+    "$service" "$LOCAL_ROOT" "$executable" "$@"
+  wait_for_service "$service"
+  printf '%s: running\n' "$service"
+}
+
+stop_service() {
+  service=$1
+  pid_file=$(service_pid_file "$service")
+  pgid_file="$LOCAL_ROOT/run/$service.pgid"
+  label_file="$LOCAL_ROOT/run/$service.launchd-label"
+  if [ -s "$label_file" ]; then
+    label=$(cat "$label_file")
+    "$LAUNCHCTL" bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || \
+      "$LAUNCHCTL" remove "$label" >/dev/null 2>&1 || true
+  fi
+  if service_running "$service"; then
+    pid=$(cat "$pid_file")
+    pgid=""
+    if [ -s "$pgid_file" ]; then
+      pgid=$(cat "$pgid_file")
+      case "$pgid" in *[!0-9]*|'') pgid="" ;; esac
+    fi
+    current_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+    if [ -n "$pgid" ] && [ "$pgid" -gt 1 ] && [ "$pgid" != "$current_pgid" ]; then
+      /bin/kill -TERM "-$pgid" 2>/dev/null || true
+    else
+      kill "$pid" 2>/dev/null || true
+    fi
+    attempts=0
+    while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt "${AGENT_RUNTIME_STOP_ATTEMPTS:-150}" ]; do
+      sleep 0.1
+      attempts=$((attempts + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      if [ -n "${pgid:-}" ] && [ "$pgid" -gt 1 ] && [ "$pgid" != "$current_pgid" ]; then
+        /bin/kill -KILL "-$pgid" 2>/dev/null || true
+      else
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  rm -f "$pid_file" "$pgid_file" "$label_file" "$LOCAL_ROOT/run/$service.plist"
+}
+
+stop_applications() {
+  if [ ! -d "$LOCAL_ROOT" ]; then
+    return 0
+  fi
+  for service in $STOP_SERVICES; do
+    stop_service "$service"
+  done
+}
+
+start_all() {
+  validate_local_root
+  validate_provider_configuration
+  "$DEVCTL" bootstrap
+  build_applications
+  resolve_build_artifacts
+  trap 'stop_applications; "$DEVCTL" stop >/dev/null 2>&1 || true' EXIT HUP INT TERM
+  "$DEVCTL" start-infra
+  store_provider_configuration
+  launch_service control-plane "$JAVA_BIN" "$CONTROL_PLANE_JAR"
+  "$SEEDER"
+  launch_service model-gateway "$MODEL_GATEWAY_BIN"
+  launch_service checkpoint-gateway "$CHECKPOINT_GATEWAY_BIN"
+  launch_service runtime-worker "$WORKER_BIN"
+  launch_service console "$PNPM_BIN" "$PROJECT_ROOT"
+  trap - EXIT HUP INT TERM
+  printf 'native Agent Runtime started at http://127.0.0.1:%s\n' "${AGENT_RUNTIME_LOCAL_CONSOLE_PORT:-5173}"
+}
+
+status_all() {
+  "$DEVCTL" status
+  for service in $SERVICES; do
+    if service_running "$service"; then
+      printf '%s: running\n' "$service"
+    else
+      printf '%s: stopped\n' "$service"
+    fi
+  done
+}
+
+stop_all() {
+  validate_local_root
+  stop_applications
+  "$DEVCTL" stop
+  printf 'native Agent Runtime stopped\n'
+}
+
+clean_all() {
+  validate_local_root
+  stop_applications
+  "$DEVCTL" clean
+}
+
+restart_one() {
+  [ "$#" -eq 1 ] || fail "restart requires exactly one service name"
+  service=$1
+  validate_local_root
+  [ -f "$LOCAL_ROOT/.agent-runtime-local-root" ] || \
+    fail "native local root is not initialized"
+  [ -r "$LOCAL_ROOT/env/native.env" ] || fail "native environment is missing"
+  resolve_build_artifacts
+  case "$service" in
+    control-plane)
+      launch_service control-plane "$JAVA_BIN" "$CONTROL_PLANE_JAR"
+      ;;
+    model-gateway)
+      validate_provider_configuration
+      store_provider_configuration
+      launch_service model-gateway "$MODEL_GATEWAY_BIN"
+      ;;
+    checkpoint-gateway)
+      launch_service checkpoint-gateway "$CHECKPOINT_GATEWAY_BIN"
+      ;;
+    runtime-worker)
+      launch_service runtime-worker "$WORKER_BIN"
+      ;;
+    console)
+      launch_service console "$PNPM_BIN" "$PROJECT_ROOT"
+      ;;
+    *) fail "unsupported native service: $service" ;;
+  esac
+}
+
+case "${1:-}" in
+  start) start_all ;;
+  status) status_all ;;
+  stop) stop_all ;;
+  clean) clean_all ;;
+  restart) shift; restart_one "$@" ;;
+  *)
+    printf 'usage: %s {start|status|stop|clean|restart SERVICE}\n' "$0" >&2
+    exit 2
+    ;;
+esac

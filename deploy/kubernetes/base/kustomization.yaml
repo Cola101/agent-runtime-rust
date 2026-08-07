@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - runtimeclass-kata.yaml
+  - default-deny.yaml
+  - serviceaccounts.yaml
+  - secret-provider.yaml
+  - control-plane.yaml
+  - model-gateway.yaml
+  - checkpoint-gateway.yaml
+  - runtime-worker.yaml
+  - autoscaling.yaml
+  - disruption-budgets.yaml
+  - runtime-network-policy.yaml

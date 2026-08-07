@@ -1,0 +1,100 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "uri"
+
+PROJECT_ROOT = File.expand_path("../..", __dir__)
+LOCAL_ROOT = File.expand_path(ENV.fetch("AGENT_RUNTIME_LOCAL_ROOT", File.join(PROJECT_ROOT, ".local")))
+UUID_PATTERN = /\A[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
+
+def abort_approval(message)
+  warn "error: #{message}"
+  exit 1
+end
+
+def positive_integer(name, value, maximum = nil)
+  parsed = Integer(value, 10)
+  raise ArgumentError if parsed <= 0 || (maximum && parsed > maximum)
+
+  parsed
+rescue ArgumentError
+  range = maximum ? "1..#{maximum}" : "a positive integer"
+  abort_approval("#{name} must be #{range}")
+end
+
+def local_control_uri
+  api_port = positive_integer("AGENT_RUNTIME_LOCAL_API_PORT", ENV.fetch("AGENT_RUNTIME_LOCAL_API_PORT", "18080"), 65_535)
+  uri = URI.parse(
+    ENV.fetch("AGENT_RUNTIME_CONTROL_API", "http://127.0.0.1:#{api_port}")
+  )
+  valid_host = %w[127.0.0.1 localhost].include?(uri.host)
+  valid_path = uri.path.nil? || uri.path.empty? || uri.path == "/"
+  unless uri.is_a?(URI::HTTP) && !uri.is_a?(URI::HTTPS) && valid_host && valid_path &&
+         uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
+    abort_approval("local approval command only accepts a loopback control API")
+  end
+
+  uri
+rescue URI::InvalidURIError
+  abort_approval("local approval command only accepts a loopback control API")
+end
+
+def read_access_token
+  marker = File.join(LOCAL_ROOT, ".agent-runtime-local-root")
+  abort_approval("native local root is not initialized; run make dev first") unless File.file?(marker)
+
+  token_path = File.join(LOCAL_ROOT, "secrets", "local-access-token")
+  abort_approval("local access token is missing; run make dev first") unless File.file?(token_path)
+  abort_approval("local access token must not be a symbolic link") if File.lstat(token_path).symlink?
+  abort_approval("local access token permissions must be 600") unless (File.stat(token_path).mode & 0o077).zero?
+
+  token = File.read(token_path).strip
+  abort_approval("local access token is empty") if token.empty? || token.match?(/\s/)
+  token
+end
+
+begin
+  approval_id = ARGV.fetch(0, "")
+  abort_approval("usage: make dev-approve APPROVAL_ID=<uuid> [VERSION=1] [DECISION=allow_once]") unless approval_id.match?(UUID_PATTERN)
+  version = positive_integer("approval version", ARGV.fetch(1, "1"), 2_147_483_647)
+  decision = ARGV.fetch(2, "allow_once")
+  abort_approval("approval decision must be allow_once or deny") unless %w[allow_once deny].include?(decision)
+
+  control_uri = local_control_uri
+  token = read_access_token
+  request = Net::HTTP::Post.new("/v1/approvals/#{approval_id}:decide")
+  request["Authorization"] = "Bearer #{token}"
+  request["Content-Type"] = "application/json"
+  request["Accept"] = "application/json"
+  request.body = JSON.generate(
+    "version" => version,
+    "decision" => decision,
+    "reason" => "native development review"
+  )
+
+  http = Net::HTTP.new(control_uri.host, control_uri.port, nil)
+  http.open_timeout = 10
+  http.read_timeout = 30
+  response = http.request(request)
+  unless response.code == "200"
+    body = response.body.to_s.strip.byteslice(0, 2_000)
+    detail = body.empty? ? "" : ": #{body}"
+    abort_approval("control API returned HTTP #{response.code}#{detail}")
+  end
+  result = JSON.parse(response.body)
+  unless result["id"] == approval_id && result["version"].is_a?(Integer) &&
+         %w[approved denied].include?(result["status"])
+    abort_approval("control API returned an invalid approval result")
+  end
+  puts "Approval #{approval_id}: #{result.fetch('status')} (version #{result.fetch('version')})"
+rescue JSON::ParserError, KeyError, TypeError
+  abort_approval("control API returned malformed JSON")
+rescue Errno::ECONNREFUSED
+  abort_approval("native Agent Runtime is not running; run make dev first")
+rescue Net::OpenTimeout, Net::ReadTimeout
+  abort_approval("approval request timed out")
+rescue SocketError, SystemCallError => error
+  abort_approval("local control API request failed: #{error.message}")
+end

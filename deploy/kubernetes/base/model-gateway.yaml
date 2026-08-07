@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-gateway
+  namespace: agent-runtime
+  labels: &labels
+    app.kubernetes.io/name: model-gateway
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-gateway
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: model-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: model-gateway
+          image: ghcr.io/agent-runtime-platform/model-gateway:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: grpc, containerPort: 50051}
+            - {name: health, containerPort: 8080}
+          env:
+            - {name: AGENT_RUNTIME_MODEL_GATEWAY_BIND, value: "0.0.0.0:50051"}
+            - {name: AGENT_RUNTIME_HEALTH_BIND, value: "0.0.0.0:8080"}
+            - {name: AGENT_RUNTIME_PROVIDER_PROTOCOL, value: "openai_responses"}
+            - {name: AGENT_RUNTIME_PROVIDER_ENDPOINT, value: "https://api.openai.com/v1/responses"}
+            - {name: AGENT_RUNTIME_PROVIDER_MODEL, value: "gpt-5"}
+            - name: AGENT_RUNTIME_PROVIDER_API_KEY
+              valueFrom: {secretKeyRef: {name: runtime-gateway-credentials, key: provider-api-key}}
+            - name: AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY
+              valueFrom: {secretKeyRef: {name: runtime-gateway-credentials, key: workload-identity-public-key}}
+            - {name: AGENT_RUNTIME_GRPC_SERVER_CERT, value: /var/run/secrets/runtime/grpc-server-cert.pem}
+            - {name: AGENT_RUNTIME_GRPC_SERVER_KEY, value: /var/run/secrets/runtime/grpc-server-key.pem}
+            - {name: AGENT_RUNTIME_GRPC_CLIENT_CA_CERT, value: /var/run/secrets/runtime/grpc-client-ca.pem}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /var/run/secrets/runtime, readOnly: true}
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext: &containerSecurity
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: runtime-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: runtime-gateway-secrets}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-gateway
+  namespace: agent-runtime
+spec:
+  selector: {app.kubernetes.io/name: model-gateway}
+  ports:
+    - {name: grpc, port: 50051, targetPort: grpc}

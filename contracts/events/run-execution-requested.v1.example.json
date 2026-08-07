@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "message_id": "0198a5a6-a7a8-7def-8abc-0123456789ab",
+  "tenant_id": "0198a5a6-a7a8-7def-8abc-0123456789ac",
+  "run_id": "0198a5a6-a7a8-7def-8abc-0123456789ad",
+  "session_id": "0198a5a6-a7a8-7def-8abc-0123456789ae",
+  "workspace_id": "0198a5a6-a7a8-7def-8abc-0123456789af",
+  "agent_version_id": "0198a5a6-a7a8-7def-8abc-0123456789b0",
+  "model_policy_id": "0198a5a6-a7a8-7def-8abc-0123456789b4",
+  "attempt_id": "0198a5a6-a7a8-7def-8abc-0123456789b1",
+  "worker_id": "0198a5a6-a7a8-7def-8abc-0123456789b2",
+  "owner_epoch": 7,
+  "fencing_token": "0198a5a6-a7a8-7def-8abc-0123456789b3",
+  "issued_at": "2026-07-31T14:00:00Z",
+  "lease_expires_at": "2026-07-31T14:00:30Z",
+  "workload_token": "v1.eyJleGFtcGxlIjoidGVzdC1vbmx5In0.c2lnbmF0dXJl",
+  "delegated_scopes": [],
+  "input": "inspect the workspace",
+  "budget": {
+    "max_tokens": 12000,
+    "max_cost_cents": 500,
+    "max_duration_seconds": 3600
+  }
+}

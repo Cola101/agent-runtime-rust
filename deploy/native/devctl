@@ -1,0 +1,706 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+LOCAL_ROOT=${AGENT_RUNTIME_LOCAL_ROOT:-"$PROJECT_ROOT/.local"}
+POSTGRES_PORT=${AGENT_RUNTIME_LOCAL_POSTGRES_PORT:-54329}
+NATS_PORT=${AGENT_RUNTIME_LOCAL_NATS_PORT:-4222}
+NATS_MONITOR_PORT=${AGENT_RUNTIME_LOCAL_NATS_MONITOR_PORT:-8222}
+DAEMONIZER=${AGENT_RUNTIME_DAEMONIZER:-"$SCRIPT_DIR/daemonize-service"}
+NATS_VERSION=2.10.20
+NATS_DARWIN_ARM64_ASSET_ID=189197479
+NATS_DARWIN_ARM64_SHA256=eec96584d95e16590c846e1e224bbedfcc3916ef6ebad234e9ecfefaaa7e503b
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+resolve_download_proxy() {
+  DOWNLOAD_PROXY=${AGENT_RUNTIME_DOWNLOAD_PROXY:-}
+  if [ -n "$DOWNLOAD_PROXY" ]; then
+    return
+  fi
+  if command -v scutil >/dev/null 2>&1; then
+    proxy_dump=$(scutil --proxy 2>/dev/null || true)
+    proxy_host=$(printf '%s\n' "$proxy_dump" | awk '/HTTPProxy :/ {print $3; exit}')
+    proxy_port=$(printf '%s\n' "$proxy_dump" | awk '/HTTPPort :/ {print $3; exit}')
+    proxy_enabled=$(printf '%s\n' "$proxy_dump" | awk '/HTTPEnable :/ {print $3; exit}')
+    if [ "$proxy_enabled" = "1" ] && [ -n "$proxy_host" ] && [ -n "$proxy_port" ]; then
+      DOWNLOAD_PROXY="http://$proxy_host:$proxy_port"
+    fi
+  fi
+}
+
+validate_local_root() {
+  case "$LOCAL_ROOT" in
+    ""|/|"$PROJECT_ROOT") fail "unsafe local state root: $LOCAL_ROOT" ;;
+  esac
+  if [ "${HOME:-}" = "$LOCAL_ROOT" ]; then
+    fail "local state root must not be the user home directory"
+  fi
+}
+
+resolve_postgres_bin() {
+  if [ -n "${AGENT_RUNTIME_POSTGRES_BIN_DIR:-}" ]; then
+    POSTGRES_BIN_DIR=$AGENT_RUNTIME_POSTGRES_BIN_DIR
+  elif command -v pg_ctl >/dev/null 2>&1; then
+    POSTGRES_BIN_DIR=$(dirname -- "$(command -v pg_ctl)")
+  else
+    fail "native PostgreSQL tools are missing; pg_ctl was not found"
+  fi
+  for binary in initdb pg_ctl psql createdb; do
+    [ -x "$POSTGRES_BIN_DIR/$binary" ] || fail "missing PostgreSQL binary: $POSTGRES_BIN_DIR/$binary"
+  done
+}
+
+resolve_nats_server() {
+  if [ -n "${AGENT_RUNTIME_NATS_SERVER_BIN:-}" ]; then
+    NATS_SERVER_BIN=$AGENT_RUNTIME_NATS_SERVER_BIN
+  elif [ -x "$LOCAL_ROOT/toolchain/nats-server" ]; then
+    NATS_SERVER_BIN="$LOCAL_ROOT/toolchain/nats-server"
+  elif command -v nats-server >/dev/null 2>&1; then
+    NATS_SERVER_BIN=$(command -v nats-server)
+  else
+    fail "native nats-server is missing; run the project bootstrap command first"
+  fi
+  [ -x "$NATS_SERVER_BIN" ] || fail "nats-server is not executable: $NATS_SERVER_BIN"
+}
+
+prepare_directories() {
+  validate_local_root
+  trusted_workspace="$LOCAL_ROOT/state/workspaces/11111111-1111-4111-8111-111111111111/44444444-4444-4444-8444-444444444444"
+  mkdir -p \
+    "$LOCAL_ROOT/config" \
+    "$LOCAL_ROOT/env" \
+    "$LOCAL_ROOT/logs" \
+    "$LOCAL_ROOT/run" \
+    "$LOCAL_ROOT/secrets" \
+    "$LOCAL_ROOT/state/postgres" \
+    "$LOCAL_ROOT/state/nats" \
+    "$LOCAL_ROOT/state/checkpoints" \
+    "$trusted_workspace" \
+    "$LOCAL_ROOT/tmp/postgres-socket"
+  : > "$LOCAL_ROOT/.agent-runtime-local-root"
+  chmod 700 "$LOCAL_ROOT/secrets"
+  if [ ! -f "$trusted_workspace/README.txt" ]; then
+    printf '%s\n' 'Agent Runtime native workspace: trusted read-only Tool fixture.' > \
+      "$trusted_workspace/README.txt"
+  fi
+}
+
+ensure_secret() {
+  secret_path=$1
+  if [ ! -s "$secret_path" ]; then
+    command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate local-only secrets"
+    umask 077
+    openssl rand -hex 24 > "$secret_path"
+  fi
+}
+
+validate_local_identity() {
+  identity_root=$1
+  for relative in \
+    identity.ready ca.crt ca.key \
+    nats-server.crt nats-server.key \
+    model-gateway.crt model-gateway.key \
+    checkpoint-gateway.crt checkpoint-gateway.key \
+    worker-client.crt worker-client.key \
+    workload-private.pem workload-private.pkcs8.b64 workload-public.raw.b64 \
+    skill-private.pem skill-private.pkcs8.b64 skill-public.raw.b64 \
+    model-credential-private.pem model-credential-public.pem \
+    local-jwt-private.pem local-jwt-public.pem \
+    control-plane-truststore.p12 control-plane-truststore-password \
+    nats-control-plane-password nats-worker-password; do
+    [ -s "$identity_root/$relative" ] || fail "local identity is incomplete: $relative"
+  done
+  for certificate in nats-server model-gateway checkpoint-gateway worker-client; do
+    openssl verify -CAfile "$identity_root/ca.crt" \
+      "$identity_root/$certificate.crt" >/dev/null 2>&1 || \
+      fail "local identity certificate verification failed: $certificate"
+  done
+  openssl pkey -in "$identity_root/workload-private.pem" -noout >/dev/null 2>&1 || \
+    fail "local workload private key is invalid"
+  openssl pkey -in "$identity_root/model-credential-private.pem" -check -noout >/dev/null 2>&1 || \
+    fail "local model credential private key is invalid"
+  openssl pkey -pubin -in "$identity_root/model-credential-public.pem" -noout >/dev/null 2>&1 || \
+    fail "local model credential public key is invalid"
+  model_credential_bits=$(openssl pkey -in "$identity_root/model-credential-private.pem" -text -noout 2>/dev/null | sed -n '1s/.*(\([0-9][0-9]*\) bit.*/\1/p')
+  [ "${model_credential_bits:-0}" -ge 3072 ] || \
+    fail "local model credential key must be RSA-3072 or stronger"
+  openssl pkey -in "$identity_root/local-jwt-private.pem" -check -noout >/dev/null 2>&1 || \
+    fail "local JWT private key is invalid"
+  public_key_length=$(openssl base64 -d -A < "$identity_root/workload-public.raw.b64" | wc -c | tr -d ' ')
+  [ "$public_key_length" = "32" ] || fail "local workload public key must contain 32 bytes"
+  skill_public_key_length=$(openssl base64 -d -A < "$identity_root/skill-public.raw.b64" | wc -c | tr -d ' ')
+  [ "$skill_public_key_length" = "32" ] || fail "local Skill public key must contain 32 bytes"
+  truststore_password=$(cat "$identity_root/control-plane-truststore-password")
+  keytool -list -storetype PKCS12 \
+    -keystore "$identity_root/control-plane-truststore.p12" \
+    -storepass "$truststore_password" >/dev/null 2>&1 || \
+    fail "local control-plane truststore is invalid"
+}
+
+cleanup_identity_build() {
+  if [ -n "${IDENTITY_BUILD_DIR:-}" ] && [ -d "$IDENTITY_BUILD_DIR" ]; then
+    rm -rf -- "$IDENTITY_BUILD_DIR"
+  fi
+}
+
+issue_local_certificate() {
+  certificate_name=$1
+  common_name=$2
+  extended_usage=$3
+  subject_alternative_names=$4
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$IDENTITY_BUILD_DIR/$certificate_name.key" \
+    -out "$IDENTITY_BUILD_DIR/$certificate_name.csr" \
+    -subj "/CN=$common_name" >/dev/null 2>&1
+  {
+    printf 'basicConstraints=critical,CA:FALSE\n'
+    printf 'keyUsage=critical,digitalSignature,keyEncipherment\n'
+    printf 'extendedKeyUsage=%s\n' "$extended_usage"
+    printf 'subjectAltName=%s\n' "$subject_alternative_names"
+  } > "$IDENTITY_BUILD_DIR/$certificate_name.ext"
+  openssl x509 -req \
+    -in "$IDENTITY_BUILD_DIR/$certificate_name.csr" \
+    -CA "$IDENTITY_BUILD_DIR/ca.crt" \
+    -CAkey "$IDENTITY_BUILD_DIR/ca.key" \
+    -CAserial "$IDENTITY_BUILD_DIR/ca.srl" \
+    -CAcreateserial \
+    -out "$IDENTITY_BUILD_DIR/$certificate_name.crt" \
+    -days 365 -sha256 \
+    -extfile "$IDENTITY_BUILD_DIR/$certificate_name.ext" >/dev/null 2>&1
+  rm -f -- \
+    "$IDENTITY_BUILD_DIR/$certificate_name.csr" \
+    "$IDENTITY_BUILD_DIR/$certificate_name.ext"
+}
+
+prepare_local_identity() {
+  command -v openssl >/dev/null 2>&1 || fail "openssl is required for local identity"
+  command -v keytool >/dev/null 2>&1 || fail "keytool is required for the Java NATS truststore"
+  prepare_directories
+  identity_root="$LOCAL_ROOT/secrets/identity"
+  if [ -f "$identity_root/identity.ready" ]; then
+    validate_local_identity "$identity_root"
+    printf 'native development identity is already valid\n'
+    return
+  fi
+  [ ! -e "$identity_root" ] || fail "refusing to replace an incomplete local identity; run clean first"
+
+  IDENTITY_BUILD_DIR="$LOCAL_ROOT/tmp/identity-build-$$"
+  cleanup_identity_build
+  mkdir -p "$IDENTITY_BUILD_DIR"
+  chmod 700 "$IDENTITY_BUILD_DIR"
+  trap cleanup_identity_build EXIT HUP INT TERM
+  umask 077
+
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$IDENTITY_BUILD_DIR/ca.key" \
+    -out "$IDENTITY_BUILD_DIR/ca.crt" \
+    -days 365 -sha256 \
+    -subj '/CN=Agent Runtime Local Development CA' \
+    -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
+  issue_local_certificate \
+    nats-server nats.local serverAuth \
+    'DNS:nats.local,DNS:localhost,IP:127.0.0.1'
+  issue_local_certificate \
+    model-gateway model-gateway.local serverAuth \
+    'DNS:model-gateway.local,DNS:localhost,IP:127.0.0.1'
+  issue_local_certificate \
+    checkpoint-gateway checkpoint-gateway.local serverAuth \
+    'DNS:checkpoint-gateway.local,DNS:localhost,IP:127.0.0.1'
+  issue_local_certificate \
+    worker-client runtime-worker.local clientAuth \
+    'DNS:runtime-worker.local'
+
+  openssl genpkey -algorithm ED25519 \
+    -out "$IDENTITY_BUILD_DIR/workload-private.pem" >/dev/null 2>&1
+  openssl pkey -in "$IDENTITY_BUILD_DIR/workload-private.pem" -outform DER | \
+    openssl base64 -A > "$IDENTITY_BUILD_DIR/workload-private.pkcs8.b64"
+  printf '\n' >> "$IDENTITY_BUILD_DIR/workload-private.pkcs8.b64"
+  openssl pkey -in "$IDENTITY_BUILD_DIR/workload-private.pem" -pubout -outform DER | \
+    tail -c 32 | openssl base64 -A > "$IDENTITY_BUILD_DIR/workload-public.raw.b64"
+  printf '\n' >> "$IDENTITY_BUILD_DIR/workload-public.raw.b64"
+
+  openssl genpkey -algorithm ED25519 \
+    -out "$IDENTITY_BUILD_DIR/skill-private.pem" >/dev/null 2>&1
+  openssl pkey -in "$IDENTITY_BUILD_DIR/skill-private.pem" -outform DER | \
+    openssl base64 -A > "$IDENTITY_BUILD_DIR/skill-private.pkcs8.b64"
+  printf '\n' >> "$IDENTITY_BUILD_DIR/skill-private.pkcs8.b64"
+  openssl pkey -in "$IDENTITY_BUILD_DIR/skill-private.pem" -pubout -outform DER | \
+    tail -c 32 | openssl base64 -A > "$IDENTITY_BUILD_DIR/skill-public.raw.b64"
+  printf '\n' >> "$IDENTITY_BUILD_DIR/skill-public.raw.b64"
+
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$IDENTITY_BUILD_DIR/local-jwt-private.pem" >/dev/null 2>&1
+  openssl pkey -in "$IDENTITY_BUILD_DIR/local-jwt-private.pem" -pubout \
+    -out "$IDENTITY_BUILD_DIR/local-jwt-public.pem" >/dev/null 2>&1
+
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+    -out "$IDENTITY_BUILD_DIR/model-credential-private.pem" >/dev/null 2>&1
+  openssl pkey -in "$IDENTITY_BUILD_DIR/model-credential-private.pem" -pubout \
+    -out "$IDENTITY_BUILD_DIR/model-credential-public.pem" >/dev/null 2>&1
+
+  openssl rand -hex 24 > "$IDENTITY_BUILD_DIR/control-plane-truststore-password"
+  openssl rand -hex 24 > "$IDENTITY_BUILD_DIR/nats-control-plane-password"
+  openssl rand -hex 24 > "$IDENTITY_BUILD_DIR/nats-worker-password"
+  truststore_password=$(cat "$IDENTITY_BUILD_DIR/control-plane-truststore-password")
+  keytool -importcert -noprompt \
+    -alias agent-runtime-local-ca \
+    -file "$IDENTITY_BUILD_DIR/ca.crt" \
+    -keystore "$IDENTITY_BUILD_DIR/control-plane-truststore.p12" \
+    -storetype PKCS12 \
+    -storepass "$truststore_password" >/dev/null 2>&1
+  rm -f -- "$IDENTITY_BUILD_DIR/ca.srl"
+  printf 'v1\n' > "$IDENTITY_BUILD_DIR/identity.ready"
+  chmod 600 "$IDENTITY_BUILD_DIR"/*
+  mv "$IDENTITY_BUILD_DIR" "$identity_root"
+  trap - EXIT HUP INT TERM
+  validate_local_identity "$identity_root"
+  printf 'native development identity generated\n'
+}
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+cleanup_access_token_build() {
+  if [ -n "${ACCESS_TOKEN_BUILD_DIR:-}" ] && [ -d "$ACCESS_TOKEN_BUILD_DIR" ]; then
+    rm -rf -- "$ACCESS_TOKEN_BUILD_DIR"
+  fi
+}
+
+refresh_local_access_token() {
+  identity_root="$LOCAL_ROOT/secrets/identity"
+  [ -s "$identity_root/local-jwt-private.pem" ] || fail "local JWT signing key is missing"
+  issued_at=$(date +%s)
+  expires_at=$((issued_at + 86400))
+  header=$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | base64url)
+  payload=$(printf '%s' "{\"iss\":\"agent-runtime-local\",\"sub\":\"local-developer\",\"aud\":\"agent-runtime-api\",\"tenant_id\":\"11111111-1111-4111-8111-111111111111\",\"application_id\":\"22222222-2222-4222-8222-222222222222\",\"scope\":\"resources:read resources:write runs:read runs:write approvals:read approvals:write\",\"iat\":$issued_at,\"exp\":$expires_at}" | base64url)
+  signing_input="$header.$payload"
+
+  ACCESS_TOKEN_BUILD_DIR="$LOCAL_ROOT/tmp/access-token-$$"
+  cleanup_access_token_build
+  mkdir -p "$ACCESS_TOKEN_BUILD_DIR"
+  chmod 700 "$ACCESS_TOKEN_BUILD_DIR"
+  trap cleanup_access_token_build EXIT HUP INT TERM
+  printf '%s' "$signing_input" > "$ACCESS_TOKEN_BUILD_DIR/signing-input"
+  openssl dgst -sha256 -sign "$identity_root/local-jwt-private.pem" \
+    -out "$ACCESS_TOKEN_BUILD_DIR/signature" "$ACCESS_TOKEN_BUILD_DIR/signing-input"
+  signature=$(base64url < "$ACCESS_TOKEN_BUILD_DIR/signature")
+  umask 077
+  printf '%s\n' "$signing_input.$signature" > "$LOCAL_ROOT/secrets/local-access-token"
+  chmod 600 "$LOCAL_ROOT/secrets/local-access-token"
+  cleanup_access_token_build
+  trap - EXIT HUP INT TERM
+}
+
+write_native_environment() {
+  postgres_password=$(cat "$LOCAL_ROOT/secrets/postgres-password")
+  scrape_password=$(cat "$LOCAL_ROOT/secrets/management-scrape-password")
+  identity_root="$LOCAL_ROOT/secrets/identity"
+  nats_control_password=$(cat "$identity_root/nats-control-plane-password")
+  nats_worker_password=$(cat "$identity_root/nats-worker-password")
+  truststore_password=$(cat "$identity_root/control-plane-truststore-password")
+  workload_private_key=$(cat "$identity_root/workload-private.pkcs8.b64")
+  workload_public_key=$(cat "$identity_root/workload-public.raw.b64")
+  skill_private_key=$(cat "$identity_root/skill-private.pkcs8.b64")
+  skill_public_key=$(cat "$identity_root/skill-public.raw.b64")
+  trusted_workspace_tool_bin=${AGENT_RUNTIME_TRUSTED_WORKSPACE_TOOL_BIN:-"$PROJECT_ROOT/runtime/target/debug/agent-trusted-workspace-tool"}
+  model_gateway_grpc_port=${AGENT_RUNTIME_LOCAL_MODEL_GRPC_PORT:-50051}
+  checkpoint_gateway_grpc_port=${AGENT_RUNTIME_LOCAL_CHECKPOINT_GRPC_PORT:-50052}
+  environment_file="$LOCAL_ROOT/env/native.env"
+  umask 077
+  {
+    printf "export SPRING_DATASOURCE_URL='%s'\n" "jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/agent_runtime"
+    printf "export SPRING_DATASOURCE_USERNAME='%s'\n" "agent_runtime_owner"
+    printf "export SPRING_DATASOURCE_PASSWORD='%s'\n" "$postgres_password"
+    printf "export MANAGEMENT_SCRAPE_PASSWORD='%s'\n" "$scrape_password"
+    printf "export AGENT_RUNTIME_LOCAL_NATS_URL='%s'\n" "tls://127.0.0.1:$NATS_PORT"
+    printf "export AGENT_RUNTIME_NATS_PID_FILE='%s'\n" "$LOCAL_ROOT/run/nats.pid"
+    printf "export AGENT_RUNTIME_NATS_URL='%s'\n" "tls://127.0.0.1:$NATS_PORT"
+    printf "export AGENT_RUNTIME_NATS_USERNAME='%s'\n" "runtime-worker"
+    printf "export AGENT_RUNTIME_NATS_PASSWORD='%s'\n" "$nats_worker_password"
+    printf "export AGENT_RUNTIME_NATS_CA_CERT='%s'\n" "$identity_root/ca.crt"
+    printf "export AGENT_RUNTIME_LOCAL_NATS_CONTROL_USERNAME='%s'\n" "control-plane"
+    printf "export AGENT_RUNTIME_LOCAL_NATS_CONTROL_PASSWORD='%s'\n" "$nats_control_password"
+    printf "export AGENT_RUNTIME_LOCAL_NATS_TRUSTSTORE='%s'\n" "$identity_root/control-plane-truststore.p12"
+    printf "export AGENT_RUNTIME_LOCAL_NATS_TRUSTSTORE_PASSWORD='%s'\n" "$truststore_password"
+    for component in OUTBOX SCHEDULER; do
+      printf "export AGENT_RUNTIME_%s_NATS_URL='%s'\n" "$component" "tls://127.0.0.1:$NATS_PORT"
+      printf "export AGENT_RUNTIME_%s_NATS_SECURITY_TLS_REQUIRED='%s'\n" "$component" "true"
+      printf "export AGENT_RUNTIME_%s_NATS_SECURITY_USERNAME='%s'\n" "$component" "control-plane"
+      printf "export AGENT_RUNTIME_%s_NATS_SECURITY_PASSWORD='%s'\n" "$component" "$nats_control_password"
+      printf "export AGENT_RUNTIME_%s_NATS_SECURITY_TRUSTSTORE_PATH='%s'\n" "$component" "$identity_root/control-plane-truststore.p12"
+      printf "export AGENT_RUNTIME_%s_NATS_SECURITY_TRUSTSTORE_PASSWORD='%s'\n" "$component" "$truststore_password"
+    done
+    printf "export AGENT_RUNTIME_WORKLOAD_IDENTITY_PRIVATE_KEY_PKCS8='%s'\n" "$workload_private_key"
+    printf "export AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY='%s'\n" "$workload_public_key"
+    printf "export AGENT_RUNTIME_SKILL_SIGNING_KEY_ID='%s'\n" "local-skill-key-v1"
+    printf "export AGENT_RUNTIME_SKILL_SIGNING_PRIVATE_KEY_PKCS8='%s'\n" "$skill_private_key"
+    printf "export AGENT_RUNTIME_SKILL_SIGNING_PUBLIC_KEY='%s'\n" "$skill_public_key"
+    printf "export AGENT_RUNTIME_MODEL_GATEWAY_CREDENTIAL_PUBLIC_KEY_PATH='%s'\n" \
+      "$identity_root/model-credential-public.pem"
+    printf "export AGENT_RUNTIME_MODEL_GATEWAY_CREDENTIAL_PRIVATE_KEY_PATH='%s'\n" \
+      "$identity_root/model-credential-private.pem"
+    printf "export SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_PUBLIC_KEY_LOCATION='%s'\n" \
+      "file:$identity_root/local-jwt-public.pem"
+    printf "export AGENT_RUNTIME_LOCAL_GRPC_CA_CERT='%s'\n" "$identity_root/ca.crt"
+    printf "export AGENT_RUNTIME_LOCAL_MODEL_GATEWAY_CERT='%s'\n" "$identity_root/model-gateway.crt"
+    printf "export AGENT_RUNTIME_LOCAL_MODEL_GATEWAY_KEY='%s'\n" "$identity_root/model-gateway.key"
+    printf "export AGENT_RUNTIME_LOCAL_CHECKPOINT_GATEWAY_CERT='%s'\n" "$identity_root/checkpoint-gateway.crt"
+    printf "export AGENT_RUNTIME_LOCAL_CHECKPOINT_GATEWAY_KEY='%s'\n" "$identity_root/checkpoint-gateway.key"
+    printf "export AGENT_RUNTIME_GRPC_CLIENT_CERT='%s'\n" "$identity_root/worker-client.crt"
+    printf "export AGENT_RUNTIME_GRPC_CLIENT_KEY='%s'\n" "$identity_root/worker-client.key"
+    printf "export AGENT_RUNTIME_GRPC_SERVER_CA_CERT='%s'\n" "$identity_root/ca.crt"
+    printf "export AGENT_RUNTIME_MODEL_GATEWAY_ENDPOINT='%s'\n" "https://127.0.0.1:$model_gateway_grpc_port"
+    printf "export AGENT_RUNTIME_MODEL_GATEWAY_TLS_DOMAIN='%s'\n" "model-gateway.local"
+    printf "export AGENT_RUNTIME_CHECKPOINT_GATEWAY_ENDPOINT='%s'\n" "https://127.0.0.1:$checkpoint_gateway_grpc_port"
+    printf "export AGENT_RUNTIME_CHECKPOINT_GATEWAY_TLS_DOMAIN='%s'\n" "checkpoint-gateway.local"
+    printf "export AGENT_RUNTIME_WORKER_ID_FILE='%s'\n" "$LOCAL_ROOT/state/worker-id"
+    printf "export AGENT_RUNTIME_CHECKPOINT_LOCAL_DIR='%s'\n" "$LOCAL_ROOT/state/checkpoints"
+    printf "export AGENT_RUNTIME_TRUSTED_NATIVE_TOOLS='%s'\n" "true"
+    printf "export AGENT_RUNTIME_TRUSTED_WORKSPACE_TOOL_BIN='%s'\n" "$trusted_workspace_tool_bin"
+    printf "export AGENT_RUNTIME_WORKSPACE_ROOT='%s'\n" "$LOCAL_ROOT/state/workspaces"
+  } > "$environment_file"
+}
+
+postgres_running() {
+  "$POSTGRES_BIN_DIR/pg_ctl" -D "$LOCAL_ROOT/state/postgres" status >/dev/null 2>&1
+}
+
+start_postgres() {
+  postgres_data="$LOCAL_ROOT/state/postgres"
+  postgres_password_file="$LOCAL_ROOT/secrets/postgres-password"
+  if [ ! -f "$postgres_data/PG_VERSION" ]; then
+    "$POSTGRES_BIN_DIR/initdb" \
+      -D "$postgres_data" \
+      --encoding=UTF8 \
+      --username=agent_runtime_owner \
+      --pwfile="$postgres_password_file" \
+      --auth-local=trust \
+      --auth-host=scram-sha-256 >/dev/null
+  fi
+  if ! postgres_running; then
+    "$POSTGRES_BIN_DIR/pg_ctl" \
+      -D "$postgres_data" \
+      -l "$LOCAL_ROOT/logs/postgres.log" \
+      -o "-h 127.0.0.1 -p $POSTGRES_PORT -c unix_socket_directories=''" \
+      start -w >/dev/null
+  fi
+  if ! PGPASSWORD=$(cat "$postgres_password_file") "$POSTGRES_BIN_DIR/psql" \
+      -h 127.0.0.1 -p "$POSTGRES_PORT" -U agent_runtime_owner -d postgres \
+      -Atqc "select 1 from pg_database where datname='agent_runtime'" | grep -qx 1; then
+    PGPASSWORD=$(cat "$postgres_password_file") \
+      "$POSTGRES_BIN_DIR/createdb" \
+      -h 127.0.0.1 -p "$POSTGRES_PORT" -U agent_runtime_owner agent_runtime
+  fi
+}
+
+nats_running() {
+  [ -s "$LOCAL_ROOT/run/nats.pid" ] || return 1
+  nats_pid=$(cat "$LOCAL_ROOT/run/nats.pid")
+  kill -0 "$nats_pid" 2>/dev/null
+}
+
+write_nats_config() {
+  identity_root="$LOCAL_ROOT/secrets/identity"
+  nats_control_password=$(cat "$identity_root/nats-control-plane-password")
+  nats_worker_password=$(cat "$identity_root/nats-worker-password")
+  command -v htpasswd >/dev/null 2>&1 || fail "htpasswd is required to hash local NATS passwords"
+  nats_control_hash=$(htpasswd -bnBC 10 '' "$nats_control_password" | tr -d ':\n')
+  nats_worker_hash=$(htpasswd -bnBC 10 '' "$nats_worker_password" | tr -d ':\n')
+  case "$nats_control_hash:$nats_worker_hash" in
+    \$2[aby]\$*:\$2[aby]\$*) ;;
+    *) fail "failed to generate bcrypt NATS passwords" ;;
+  esac
+  {
+    printf 'listen: 127.0.0.1:%s\n' "$NATS_PORT"
+    printf 'http_port: %s\n' "$NATS_MONITOR_PORT"
+    printf 'jetstream {\n'
+    printf '  store_dir: "%s/state/nats"\n' "$LOCAL_ROOT"
+    printf '  max_memory_store: 256MB\n'
+    printf '  max_file_store: 1GB\n'
+    printf '}\n'
+    printf 'tls {\n'
+    printf '  cert_file: "%s/nats-server.crt"\n' "$identity_root"
+    printf '  key_file: "%s/nats-server.key"\n' "$identity_root"
+    printf '  ca_file: "%s/ca.crt"\n' "$identity_root"
+    printf '  timeout: 2\n'
+    printf '}\n'
+    printf 'authorization {\n'
+    printf '  users: [\n'
+    printf '    {\n'
+    printf '      user: "control-plane"\n'
+    printf '      password: "%s"\n' "$nats_control_hash"
+    printf '      permissions: {\n'
+    printf '        publish: ["runtime.control.>", "runtime.execution.>", "$JS.API.>", "$JS.ACK.>", "_INBOX.>"]\n'
+    printf '        subscribe: ["runtime.control.>", "runtime.worker.>", "_INBOX.>"]\n'
+    printf '      }\n'
+    printf '    },\n'
+    printf '    {\n'
+    printf '      user: "runtime-worker"\n'
+    printf '      password: "%s"\n' "$nats_worker_hash"
+    printf '      permissions: {\n'
+    printf '        publish: ["runtime.worker.>", "$JS.API.STREAM.INFO.RUNTIME_EXECUTION", "$JS.API.STREAM.INFO.RUNTIME_WORKER", "$JS.API.CONSUMER.INFO.RUNTIME_EXECUTION.>", "$JS.API.CONSUMER.CREATE.RUNTIME_EXECUTION.>", "$JS.API.CONSUMER.DURABLE.CREATE.RUNTIME_EXECUTION.>", "$JS.API.CONSUMER.MSG.NEXT.RUNTIME_EXECUTION.>", "$JS.ACK.RUNTIME_EXECUTION.>", "_INBOX.>"]\n'
+    printf '        subscribe: ["runtime.execution.>", "$JS.FC.>", "_INBOX.>"]\n'
+    printf '      }\n'
+    printf '    }\n'
+    printf '  ]\n'
+    printf '}\n'
+  } > "$LOCAL_ROOT/config/nats.conf"
+}
+
+cleanup_bootstrap() {
+  if [ -n "${BOOTSTRAP_DIR:-}" ] && [ -d "$BOOTSTRAP_DIR" ]; then
+    rm -rf -- "$BOOTSTRAP_DIR"
+  fi
+}
+
+bootstrap_native_tools() {
+  validate_local_root
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) ;;
+    *) fail "native bootstrap currently supports only macOS ARM64" ;;
+  esac
+  prepare_directories
+  resolve_download_proxy
+  mkdir -p "$LOCAL_ROOT/toolchain" "$LOCAL_ROOT/tmp"
+  installed="$LOCAL_ROOT/toolchain/nats-server"
+  if [ -x "$installed" ] && "$installed" --version 2>&1 | grep -q "v$NATS_VERSION"; then
+    printf 'native nats-server v%s is already installed\n' "$NATS_VERSION"
+    return
+  fi
+
+  bootstrap_method=${AGENT_RUNTIME_NATS_BOOTSTRAP_METHOD:-auto}
+  if [ "$bootstrap_method" != "archive" ] && \
+      [ -z "${AGENT_RUNTIME_NATS_ARCHIVE_PATH:-}" ] && command -v go >/dev/null 2>&1; then
+    mkdir -p "$LOCAL_ROOT/cache/go/pkg/mod" "$LOCAL_ROOT/cache/go/build"
+    GOBIN="$LOCAL_ROOT/toolchain" \
+      GOMODCACHE="$LOCAL_ROOT/cache/go/pkg/mod" \
+      GOCACHE="$LOCAL_ROOT/cache/go/build" \
+      GOPROXY="https://proxy.golang.org,direct" \
+      GOSUMDB="sum.golang.org" \
+      HTTP_PROXY="$DOWNLOAD_PROXY" \
+      HTTPS_PROXY="$DOWNLOAD_PROXY" \
+      ALL_PROXY="$DOWNLOAD_PROXY" \
+      go install "github.com/nats-io/nats-server/v2@v$NATS_VERSION"
+    version_output=$($installed --version 2>&1)
+    printf '%s\n' "$version_output" | grep -q "v$NATS_VERSION" || fail "unexpected nats-server version"
+    printf 'built native nats-server v%s with project-local Go caches\n' "$NATS_VERSION"
+    return
+  fi
+
+  BOOTSTRAP_DIR="$LOCAL_ROOT/tmp/nats-bootstrap"
+  cleanup_bootstrap
+  mkdir -p "$BOOTSTRAP_DIR"
+  trap cleanup_bootstrap EXIT HUP INT TERM
+  archive="$BOOTSTRAP_DIR/nats-server.tar.gz"
+  expected_sha=${AGENT_RUNTIME_NATS_ARCHIVE_SHA256:-$NATS_DARWIN_ARM64_SHA256}
+  if [ -n "${AGENT_RUNTIME_NATS_ARCHIVE_PATH:-}" ]; then
+    cp "$AGENT_RUNTIME_NATS_ARCHIVE_PATH" "$archive"
+  else
+    command -v curl >/dev/null 2>&1 || fail "curl is required to download the pinned native nats-server"
+    HTTP_PROXY="$DOWNLOAD_PROXY" HTTPS_PROXY="$DOWNLOAD_PROXY" ALL_PROXY="$DOWNLOAD_PROXY" \
+    curl --fail --location --silent --show-error \
+      --connect-timeout 10 \
+      --max-time 120 \
+      --retry 2 \
+      --retry-all-errors \
+      -H 'Accept: application/octet-stream' \
+      "https://api.github.com/repos/nats-io/nats-server/releases/assets/$NATS_DARWIN_ARM64_ASSET_ID" \
+      -o "$archive"
+  fi
+  actual_sha=$(openssl dgst -sha256 "$archive" | awk '{print $2}')
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    fail "nats-server archive checksum mismatch"
+  fi
+  tar -xzf "$archive" -C "$BOOTSTRAP_DIR"
+  extracted="$BOOTSTRAP_DIR/nats-server-v$NATS_VERSION-darwin-arm64/nats-server"
+  [ -x "$extracted" ] || fail "downloaded archive does not contain nats-server"
+  version_output=$($extracted --version 2>&1)
+  printf '%s\n' "$version_output" | grep -q "v$NATS_VERSION" || fail "unexpected nats-server version"
+  cp "$extracted" "$installed"
+  chmod 755 "$installed"
+  cleanup_bootstrap
+  trap - EXIT HUP INT TERM
+  printf 'installed native nats-server v%s\n' "$NATS_VERSION"
+}
+
+start_nats() {
+  if nats_running; then
+    return
+  fi
+  rm -f "$LOCAL_ROOT/run/nats.pid"
+  rm -f "$LOCAL_ROOT/run/nats.pgid"
+  write_nats_config
+  "$NATS_SERVER_BIN" -t -c "$LOCAL_ROOT/config/nats.conf" >/dev/null 2>&1 || \
+    fail "native NATS configuration is invalid"
+  launch_mode=${AGENT_RUNTIME_NATS_LAUNCH_MODE:-daemon}
+  case "$launch_mode" in
+    daemon)
+      [ -x "$DAEMONIZER" ] || fail "native daemonizer is unavailable: $DAEMONIZER"
+      "$DAEMONIZER" nats "$LOCAL_ROOT" "$NATS_SERVER_BIN" \
+        -c "$LOCAL_ROOT/config/nats.conf" \
+        -P "$LOCAL_ROOT/run/nats.pid"
+      ;;
+    launchctl)
+      command -v launchctl >/dev/null 2>&1 || fail "launchctl is required for detached native NATS"
+      root_digest=$(printf '%s' "$LOCAL_ROOT" | openssl dgst -sha256 | awk '{print substr($2,1,16)}')
+      nats_label="com.agent-runtime.local.nats.$(id -u).$root_digest"
+      printf '%s\n' "$nats_label" > "$LOCAL_ROOT/run/nats.launchd-label"
+      launchctl remove "$nats_label" >/dev/null 2>&1 || true
+      launchctl submit \
+        -l "$nats_label" \
+        -p "$NATS_SERVER_BIN" \
+        -o "$LOCAL_ROOT/logs/nats.stdout.log" \
+        -e "$LOCAL_ROOT/logs/nats.stderr.log" \
+        -- nats-server -c "$LOCAL_ROOT/config/nats.conf" \
+        -P "$LOCAL_ROOT/run/nats.pid" >/dev/null
+      ;;
+    direct)
+      nohup "$NATS_SERVER_BIN" -c "$LOCAL_ROOT/config/nats.conf" \
+        -P "$LOCAL_ROOT/run/nats.pid" \
+        </dev/null > "$LOCAL_ROOT/logs/nats.log" 2>&1 &
+      ;;
+    *) fail "unsupported NATS launch mode: $launch_mode" ;;
+  esac
+  attempts=0
+  while ! nats_running && [ "$attempts" -lt 50 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if ! nats_running; then
+    if [ -s "$LOCAL_ROOT/run/nats.launchd-label" ]; then
+      launchctl remove "$(cat "$LOCAL_ROOT/run/nats.launchd-label")" >/dev/null 2>&1 || true
+    fi
+    stop_nats
+    fail "nats-server exited during startup; inspect $LOCAL_ROOT/logs/nats.stderr.log"
+  fi
+}
+
+stop_nats() {
+  nats_pgid=""
+  if [ -s "$LOCAL_ROOT/run/nats.pgid" ]; then
+    nats_pgid=$(cat "$LOCAL_ROOT/run/nats.pgid")
+    case "$nats_pgid" in *[!0-9]*|'') nats_pgid="" ;; esac
+  fi
+  if [ -s "$LOCAL_ROOT/run/nats.pid" ]; then
+    nats_pid=$(cat "$LOCAL_ROOT/run/nats.pid")
+    if kill -0 "$nats_pid" 2>/dev/null; then
+      current_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+      if [ -n "$nats_pgid" ] && [ "$nats_pgid" -gt 1 ] && [ "$nats_pgid" != "$current_pgid" ]; then
+        /bin/kill -TERM "-$nats_pgid" 2>/dev/null || true
+      else
+        kill "$nats_pid" 2>/dev/null || true
+      fi
+      attempts=0
+      while kill -0 "$nats_pid" 2>/dev/null && [ "$attempts" -lt 50 ]; do
+        sleep 0.1
+        attempts=$((attempts + 1))
+      done
+      if kill -0 "$nats_pid" 2>/dev/null; then
+        if [ -n "$nats_pgid" ] && [ "$nats_pgid" -gt 1 ] && [ "$nats_pgid" != "$current_pgid" ]; then
+          /bin/kill -KILL "-$nats_pgid" 2>/dev/null || true
+        else
+          kill -KILL "$nats_pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
+  if [ -s "$LOCAL_ROOT/run/nats.launchd-label" ]; then
+    launchctl remove "$(cat "$LOCAL_ROOT/run/nats.launchd-label")" >/dev/null 2>&1 || true
+  fi
+  rm -f "$LOCAL_ROOT/run/nats.pid" "$LOCAL_ROOT/run/nats.pgid" \
+    "$LOCAL_ROOT/run/nats.launchd-label"
+}
+
+stop_postgres() {
+  resolve_postgres_bin
+  if [ -f "$LOCAL_ROOT/state/postgres/PG_VERSION" ] && postgres_running; then
+    "$POSTGRES_BIN_DIR/pg_ctl" -D "$LOCAL_ROOT/state/postgres" stop -m fast -w >/dev/null
+  fi
+}
+
+start_infra() {
+  resolve_postgres_bin
+  resolve_nats_server
+  prepare_directories
+  prepare_local_identity
+  refresh_local_access_token
+  ensure_secret "$LOCAL_ROOT/secrets/postgres-password"
+  ensure_secret "$LOCAL_ROOT/secrets/management-scrape-password"
+  write_native_environment
+  start_postgres
+  start_nats
+  printf 'native infrastructure started\n'
+}
+
+stop_all() {
+  validate_local_root
+  if [ ! -d "$LOCAL_ROOT" ]; then
+    printf 'native development environment is already stopped\n'
+    return
+  fi
+  [ -f "$LOCAL_ROOT/.agent-runtime-local-root" ] || fail "refusing to stop unmarked directory: $LOCAL_ROOT"
+  stop_nats
+  stop_postgres
+  printf 'native infrastructure stopped\n'
+}
+
+status_all() {
+  validate_local_root
+  resolve_postgres_bin
+  if [ -f "$LOCAL_ROOT/state/postgres/PG_VERSION" ] && postgres_running; then
+    printf 'postgresql: running\n'
+  else
+    printf 'postgresql: stopped\n'
+  fi
+  if nats_running; then
+    printf 'nats: running\n'
+  else
+    printf 'nats: stopped\n'
+  fi
+}
+
+clean_all() {
+  validate_local_root
+  if [ -d "$LOCAL_ROOT" ]; then
+    [ -f "$LOCAL_ROOT/.agent-runtime-local-root" ] || fail "refusing to clean unmarked directory: $LOCAL_ROOT"
+    stop_all
+    find "$LOCAL_ROOT" -type d -exec chmod u+rwx {} +
+    find "$LOCAL_ROOT" -mindepth 1 -maxdepth 1 \
+      ! -name '.agent-runtime-local-root' -exec rm -rf -- {} +
+    rm -f -- "$LOCAL_ROOT/.agent-runtime-local-root"
+    rmdir -- "$LOCAL_ROOT"
+  fi
+  if [ "${AGENT_RUNTIME_PRESERVE_BUILD_OUTPUTS:-false}" != "true" ]; then
+    rm -rf -- \
+      "$PROJECT_ROOT/node_modules" \
+      "$PROJECT_ROOT/control-plane/target" \
+      "$PROJECT_ROOT/runtime/target" \
+      "$PROJECT_ROOT/console/node_modules" \
+      "$PROJECT_ROOT/console/dist" \
+      "$PROJECT_ROOT/console/coverage" \
+      "$PROJECT_ROOT/console/test-results" \
+      "$PROJECT_ROOT/console/playwright-report" \
+      "$PROJECT_ROOT/graphify-out"
+  fi
+  printf 'native development state and build outputs cleaned\n'
+}
+
+case "${1:-}" in
+  bootstrap) bootstrap_native_tools ;;
+  prepare-identity) prepare_local_identity; refresh_local_access_token ;;
+  start-infra) start_infra ;;
+  stop) stop_all ;;
+  status) status_all ;;
+  clean) clean_all ;;
+  *)
+    printf 'usage: %s {bootstrap|prepare-identity|start-infra|stop|status|clean}\n' "$0" >&2
+    exit 2
+    ;;
+esac

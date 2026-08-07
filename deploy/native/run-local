@@ -1,0 +1,207 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "net/http"
+require "securerandom"
+require "uri"
+
+PROJECT_ROOT = File.expand_path("../..", __dir__)
+LOCAL_ROOT = File.expand_path(ENV.fetch("AGENT_RUNTIME_LOCAL_ROOT", File.join(PROJECT_ROOT, ".local")))
+SESSION_ID = "77777777-7777-4777-8777-777777777777"
+AGENT_VERSION_ID = "66666666-6666-4666-8666-666666666666"
+WORKSPACE_ID = "44444444-4444-4444-8444-444444444444"
+MODEL_POLICY_ID = "88888888-8888-4888-8888-888888888888"
+TERMINAL_EVENTS = %w[
+  run.succeeded
+  run.failed
+  run.cancelled
+  run.timed_out
+  run.indeterminate
+].freeze
+
+def abort_run(message)
+  warn "error: #{message}"
+  exit 1
+end
+
+def positive_integer(name, default, maximum = nil)
+  value = Integer(ENV.fetch(name, default.to_s), 10)
+  raise ArgumentError if value <= 0 || (maximum && value > maximum)
+
+  value
+rescue ArgumentError
+  range = maximum ? "1..#{maximum}" : "a positive integer"
+  abort_run("#{name} must be #{range}")
+end
+
+def local_control_uri
+  api_port = positive_integer("AGENT_RUNTIME_LOCAL_API_PORT", 18_080, 65_535)
+  uri = URI.parse(
+    ENV.fetch("AGENT_RUNTIME_CONTROL_API", "http://127.0.0.1:#{api_port}")
+  )
+  valid_host = %w[127.0.0.1 localhost].include?(uri.host)
+  valid_path = uri.path.nil? || uri.path.empty? || uri.path == "/"
+  unless uri.is_a?(URI::HTTP) && !uri.is_a?(URI::HTTPS) && valid_host && valid_path &&
+         uri.userinfo.nil? && uri.query.nil? && uri.fragment.nil?
+    abort_run("local Run command only accepts a loopback control API")
+  end
+
+  uri
+rescue URI::InvalidURIError
+  abort_run("local Run command only accepts a loopback control API")
+end
+
+def read_access_token
+  marker = File.join(LOCAL_ROOT, ".agent-runtime-local-root")
+  abort_run("native local root is not initialized; run make dev first") unless File.file?(marker)
+
+  token_path = File.join(LOCAL_ROOT, "secrets", "local-access-token")
+  abort_run("local access token is missing; run make dev first") unless File.file?(token_path)
+  abort_run("local access token must not be a symbolic link") if File.lstat(token_path).symlink?
+  abort_run("local access token permissions must be 600") unless (File.stat(token_path).mode & 0o077).zero?
+
+  token = File.read(token_path).strip
+  abort_run("local access token is empty") if token.empty? || token.match?(/\s/)
+
+  token
+end
+
+def direct_http(uri, timeout)
+  http = Net::HTTP.new(uri.host, uri.port, nil)
+  http.open_timeout = [timeout, 10].min
+  http.read_timeout = timeout
+  http.write_timeout = 10 if http.respond_to?(:write_timeout=)
+  http
+end
+
+def request_failure(response)
+  body = response.body.to_s.strip
+  body = body.byteslice(0, 2_000) if body.bytesize > 2_000
+  detail = body.empty? ? "" : ": #{body}"
+  abort_run("control API returned HTTP #{response.code}#{detail}")
+end
+
+class SseConsumer
+  attr_reader :terminal
+
+  def initialize
+    @buffer = +""
+    @event = nil
+    @data = []
+    @terminal = false
+  end
+
+  def consume(chunk)
+    @buffer << chunk
+    while (newline = @buffer.index("\n"))
+      line = @buffer.slice!(0, newline + 1).chomp
+      line = line.delete_suffix("\r")
+      consume_line(line)
+    end
+  end
+
+  def finish
+    consume_line(@buffer.delete_suffix("\r")) unless @buffer.empty?
+    dispatch unless @event.nil? && @data.empty?
+  end
+
+  private
+
+  def consume_line(line)
+    if line.empty?
+      dispatch
+      return
+    end
+    return if line.start_with?(":")
+
+    field, value = line.split(":", 2)
+    value = value.to_s.sub(/\A /, "")
+    case field
+    when "event" then @event = value
+    when "data" then @data << value
+    end
+  end
+
+  def dispatch
+    unless @event.nil? && @data.empty?
+      event_name = @event || "message"
+      payload = @data.join("\n")
+      puts payload.empty? ? event_name : "#{event_name} #{payload}"
+      @terminal ||= TERMINAL_EVENTS.include?(event_name)
+    end
+    @event = nil
+    @data.clear
+  end
+end
+
+begin
+  input = ARGV.join(" ").strip
+  input = ENV.fetch("AGENT_RUNTIME_RUN_INPUT", "").strip if input.empty?
+  abort_run("usage: AGENT_RUNTIME_RUN_INPUT='your request' make dev-run") if input.empty?
+
+  control_uri = local_control_uri
+  token = read_access_token
+  timeout = positive_integer("AGENT_RUNTIME_RUN_TIMEOUT_SECONDS", 1_800, 86_400)
+  payload = JSON.generate(
+  "agent_version_id" => AGENT_VERSION_ID,
+  "workspace_id" => WORKSPACE_ID,
+  "model_policy_id" => MODEL_POLICY_ID,
+  "input" => input,
+  "priority" => "interactive",
+  "placement" => "auto",
+  "budget" => {
+    "max_tokens" => positive_integer("AGENT_RUNTIME_RUN_MAX_TOKENS", 4_096),
+    "max_cost_cents" => positive_integer("AGENT_RUNTIME_RUN_MAX_COST_CENTS", 100),
+    "max_duration_seconds" => positive_integer(
+      "AGENT_RUNTIME_RUN_MAX_DURATION_SECONDS", 600, 86_400
+    )
+  }
+  )
+
+  create_path = "/v1/sessions/#{SESSION_ID}/runs"
+  create_request = Net::HTTP::Post.new(create_path)
+  create_request["Authorization"] = "Bearer #{token}"
+  create_request["Idempotency-Key"] = SecureRandom.uuid
+  create_request["Content-Type"] = "application/json"
+  create_request["Accept"] = "application/json"
+  create_request.body = payload
+
+  create_response = direct_http(control_uri, timeout).request(create_request)
+  request_failure(create_response) unless create_response.code == "202"
+  accepted = JSON.parse(create_response.body)
+  run_id = accepted.fetch("run_id")
+  events_path = accepted.fetch("events_url")
+  unless run_id.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i) &&
+         events_path == "/v1/runs/#{run_id}/events"
+    abort_run("control API returned an invalid Run acknowledgement")
+  end
+
+  puts "Run accepted: #{run_id}"
+  $stdout.flush
+
+  stream_request = Net::HTTP::Get.new(events_path)
+  stream_request["Authorization"] = "Bearer #{token}"
+  stream_request["Accept"] = "text/event-stream"
+  consumer = SseConsumer.new
+  direct_http(control_uri, timeout).request(stream_request) do |response|
+    request_failure(response) unless response.code == "200"
+    unless response["content-type"].to_s.downcase.start_with?("text/event-stream")
+      abort_run("control API did not return an event stream")
+    end
+    response.read_body do |chunk|
+      consumer.consume(chunk)
+      $stdout.flush
+    end
+  end
+  consumer.finish
+  abort_run("event stream ended before the Run reached a terminal state") unless consumer.terminal
+rescue JSON::ParserError, KeyError, TypeError
+  abort_run("control API returned malformed JSON")
+rescue Errno::ECONNREFUSED
+  abort_run("native Agent Runtime is not running; run make dev first")
+rescue Net::OpenTimeout, Net::ReadTimeout
+  abort_run("Run exceeded the local command timeout")
+rescue SocketError, SystemCallError => error
+  abort_run("local control API request failed: #{error.message}")
+end

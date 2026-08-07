@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "message_id": "019fb352-6ea8-7a3a-9a52-4d54f290a60d",
+  "tenant_id": "019fb352-6ea8-7a3a-9a52-4d54f290a601",
+  "run_id": "019fb352-6ea8-7a3a-9a52-4d54f290a602",
+  "session_id": "019fb352-6ea8-7a3a-9a52-4d54f290a603",
+  "workspace_id": "019fb352-6ea8-7a3a-9a52-4d54f290a604",
+  "agent_version_id": "019fb352-6ea8-7a3a-9a52-4d54f290a605",
+  "model_policy_id": "019fb352-6ea8-7a3a-9a52-4d54f290a606",
+  "occurred_at": "2026-07-31T08:30:00Z",
+  "input": "Inspect the workspace and prepare a release summary.",
+  "priority": "interactive",
+  "placement": "cloud",
+  "budget": {
+    "max_tokens": 12000,
+    "max_cost_cents": 500,
+    "max_duration_seconds": 3600
+  }
+}

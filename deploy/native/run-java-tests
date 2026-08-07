@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+DEVCTL=${AGENT_RUNTIME_DEVCTL:-"$SCRIPT_DIR/devctl"}
+DOWNLOAD_WRAPPER=${AGENT_RUNTIME_DOWNLOAD_WRAPPER:-"$SCRIPT_DIR/with-download-proxy"}
+JAVA_TOOLCHAIN_WRAPPER=${AGENT_RUNTIME_JAVA_TOOLCHAIN_WRAPPER:-"$SCRIPT_DIR/with-java-toolchain"}
+MAVEN=${AGENT_RUNTIME_MAVEN:-mvn}
+TOOLCHAIN_ROOT=${AGENT_RUNTIME_TOOLCHAIN_ROOT:-"$PROJECT_ROOT/.local"}
+TEST_ROOT=${AGENT_RUNTIME_JAVA_TEST_ROOT:-"$TOOLCHAIN_ROOT/test/java-$$"}
+
+allocate_loopback_port() {
+  /usr/bin/ruby -rsocket -e 'server = TCPServer.new("127.0.0.1", 0); puts server.addr[1]; server.close'
+}
+
+POSTGRES_PORT=${AGENT_RUNTIME_LOCAL_POSTGRES_PORT:-$(allocate_loopback_port)}
+NATS_PORT=${AGENT_RUNTIME_LOCAL_NATS_PORT:-$(allocate_loopback_port)}
+NATS_MONITOR_PORT=${AGENT_RUNTIME_LOCAL_NATS_MONITOR_PORT:-$(allocate_loopback_port)}
+
+cleanup_test_runtime() {
+  [ -d "$TEST_ROOT" ] || return 0
+  AGENT_RUNTIME_LOCAL_ROOT="$TEST_ROOT" \
+    AGENT_RUNTIME_LOCAL_POSTGRES_PORT="$POSTGRES_PORT" \
+    AGENT_RUNTIME_LOCAL_NATS_PORT="$NATS_PORT" \
+    AGENT_RUNTIME_LOCAL_NATS_MONITOR_PORT="$NATS_MONITOR_PORT" \
+    AGENT_RUNTIME_PRESERVE_BUILD_OUTPUTS=true \
+    "$DEVCTL" clean
+}
+
+print_failure_logs() {
+  [ -d "$TEST_ROOT/logs" ] || return 0
+  for log_path in "$TEST_ROOT"/logs/*.log; do
+    [ -f "$log_path" ] || continue
+    printf 'native test log: %s\n' "$(basename -- "$log_path")" >&2
+    tail -n 200 "$log_path" >&2
+  done
+}
+
+on_exit() {
+  original_status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ "$original_status" -ne 0 ]; then
+    print_failure_logs
+  fi
+  cleanup_test_runtime
+  cleanup_status=$?
+  if [ "$original_status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    original_status=$cleanup_status
+  fi
+  exit "$original_status"
+}
+
+trap on_exit EXIT
+trap 'exit 130' HUP INT TERM
+
+AGENT_RUNTIME_LOCAL_ROOT="$TOOLCHAIN_ROOT" "$DEVCTL" bootstrap
+
+AGENT_RUNTIME_LOCAL_ROOT="$TEST_ROOT" \
+  AGENT_RUNTIME_LOCAL_POSTGRES_PORT="$POSTGRES_PORT" \
+  AGENT_RUNTIME_LOCAL_NATS_PORT="$NATS_PORT" \
+  AGENT_RUNTIME_LOCAL_NATS_MONITOR_PORT="$NATS_MONITOR_PORT" \
+  AGENT_RUNTIME_NATS_SERVER_BIN="$TOOLCHAIN_ROOT/toolchain/nats-server" \
+  "$DEVCTL" start-infra
+
+set -a
+. "$TEST_ROOT/env/native.env"
+set +a
+
+cd "$PROJECT_ROOT/control-plane"
+# Pin the JDK before Maven starts: Homebrew's Maven otherwise runs on its own
+# bundled JVM instead of the JDK the control plane declares and the native
+# services run on.
+"$JAVA_TOOLCHAIN_WRAPPER" "$DOWNLOAD_WRAPPER" "$MAVEN" test
+
+cleanup_test_runtime
+trap - EXIT HUP INT TERM

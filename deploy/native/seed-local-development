@@ -1,0 +1,62 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+LOCAL_ROOT=${AGENT_RUNTIME_LOCAL_ROOT:-"$PROJECT_ROOT/.local"}
+PSQL_BIN=${AGENT_RUNTIME_PSQL_BIN:-psql}
+MODEL_PROVIDER_CONFIGURER=${AGENT_RUNTIME_MODEL_PROVIDER_CONFIGURER:-"$SCRIPT_DIR/configure-local-model-provider"}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+[ -f "$LOCAL_ROOT/.agent-runtime-local-root" ] || fail "native local root is not initialized"
+[ -r "$LOCAL_ROOT/env/native.env" ] || fail "native environment is missing"
+command -v "$PSQL_BIN" >/dev/null 2>&1 || fail "native psql was not found"
+
+set -a
+. "$LOCAL_ROOT/env/native.env"
+set +a
+
+database_address=${SPRING_DATASOURCE_URL#jdbc:postgresql://}
+[ "$database_address" != "$SPRING_DATASOURCE_URL" ] || fail "unsupported PostgreSQL JDBC URL"
+host_and_port=${database_address%%/*}
+database_name=${database_address#*/}
+database_host=${host_and_port%:*}
+database_port=${host_and_port##*:}
+case "$database_host" in 127.0.0.1|localhost) ;; *) fail "local seed may only connect to loopback PostgreSQL" ;; esac
+case "$database_port" in *[!0-9]*|'') fail "invalid local PostgreSQL port" ;; esac
+[ -n "$database_name" ] && [ "$database_name" != "$database_address" ] || fail "invalid local PostgreSQL database"
+
+skill_private_key="$LOCAL_ROOT/secrets/identity/skill-private.pem"
+[ -s "$skill_private_key" ] || fail "local Skill signing key is missing"
+skill_artifact='{"application_id":"22222222-2222-4222-8222-222222222222","description":"Review bounded workspace evidence.","instructions":"Read workspace evidence before answering.","min_runtime_version":"0.1.0","name":"workspace-review","schema_version":1,"semantic_version":"1.0.0","skill_version_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","supported_platforms":["darwin-arm64","linux-arm64","linux-x86_64"],"tenant_id":"11111111-1111-4111-8111-111111111111","tool_names":["workspace.read_text"]}'
+skill_artifact_digest=$(printf '%s' "$skill_artifact" | openssl dgst -sha256 -r | awk '{print $1}')
+mkdir -p "$LOCAL_ROOT/tmp"
+skill_signing_input="$LOCAL_ROOT/tmp/skill-signing-input-$$"
+trap 'rm -f -- "$skill_signing_input"' EXIT HUP INT TERM
+printf 'agent-runtime-skill-v1.%s' "$skill_artifact_digest" > "$skill_signing_input"
+skill_signature=$(openssl pkeyutl -sign -rawin -inkey "$skill_private_key" \
+  -in "$skill_signing_input" | \
+  openssl base64 -A | tr '+/' '-_' | tr -d '=')
+rm -f -- "$skill_signing_input"
+trap - EXIT HUP INT TERM
+[ "${#skill_artifact_digest}" -eq 64 ] || fail "local Skill digest generation failed"
+[ "${#skill_signature}" -eq 86 ] || fail "local Skill signature generation failed"
+
+PGPASSWORD=$SPRING_DATASOURCE_PASSWORD "$PSQL_BIN" \
+  -h "$database_host" \
+  -p "$database_port" \
+  -U "$SPRING_DATASOURCE_USERNAME" \
+  -d "$database_name" \
+  -v "skill_artifact_digest=$skill_artifact_digest" \
+  -v "skill_signature=$skill_signature" \
+  -v ON_ERROR_STOP=1 \
+  -f "$SCRIPT_DIR/local-development-seed.sql" >/dev/null
+
+[ -x "$MODEL_PROVIDER_CONFIGURER" ] || fail "native model Provider configurator is unavailable"
+"$MODEL_PROVIDER_CONFIGURER"
+
+printf 'native development tenant and runtime resources seeded\n'

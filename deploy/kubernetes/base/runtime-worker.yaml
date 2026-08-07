@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: runtime-worker
+  namespace: agent-runtime
+  labels: &labels
+    app.kubernetes.io/name: runtime-worker
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  serviceName: runtime-worker-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: runtime-worker}
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: runtime-worker
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: runtime-worker
+          image: ghcr.io/agent-runtime-platform/runtime-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: health, containerPort: 8080}
+          env:
+            - {name: AGENT_RUNTIME_HEALTH_BIND, value: "0.0.0.0:8080"}
+            - {name: AGENT_RUNTIME_WORKER_ID_FILE, value: /var/lib/agent-runtime/identity/worker-id}
+            - {name: AGENT_RUNTIME_WORKER_CAPACITY, value: "8"}
+            - {name: AGENT_RUNTIME_DRAIN_GRACE_SECONDS, value: "90"}
+            - {name: AGENT_RUNTIME_NATS_URL, value: "tls://nats.agent-runtime.svc.cluster.local:4222"}
+            - name: AGENT_RUNTIME_NATS_USERNAME
+              valueFrom: {secretKeyRef: {name: runtime-worker-credentials, key: nats-username}}
+            - name: AGENT_RUNTIME_NATS_PASSWORD
+              valueFrom: {secretKeyRef: {name: runtime-worker-credentials, key: nats-password}}
+            - {name: AGENT_RUNTIME_NATS_CA_CERT, value: /var/run/secrets/runtime/nats-ca.pem}
+            - {name: AGENT_RUNTIME_MODEL_GATEWAY_ENDPOINT, value: "https://model-gateway.agent-runtime.svc.cluster.local:50051"}
+            - {name: AGENT_RUNTIME_CHECKPOINT_GATEWAY_ENDPOINT, value: "https://checkpoint-gateway.agent-runtime.svc.cluster.local:50052"}
+            - {name: AGENT_RUNTIME_MODEL_GATEWAY_TLS_DOMAIN, value: model-gateway.agent-runtime.svc.cluster.local}
+            - {name: AGENT_RUNTIME_CHECKPOINT_GATEWAY_TLS_DOMAIN, value: checkpoint-gateway.agent-runtime.svc.cluster.local}
+            - {name: AGENT_RUNTIME_GRPC_CLIENT_CERT, value: /var/run/secrets/runtime/grpc-client-cert.pem}
+            - {name: AGENT_RUNTIME_GRPC_CLIENT_KEY, value: /var/run/secrets/runtime/grpc-client-key.pem}
+            - {name: AGENT_RUNTIME_GRPC_SERVER_CA_CERT, value: /var/run/secrets/runtime/grpc-server-ca.pem}
+            - name: AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY
+              valueFrom: {secretKeyRef: {name: runtime-worker-credentials, key: workload-identity-public-key}}
+            - name: AGENT_RUNTIME_SKILL_SIGNING_KEY_ID
+              valueFrom: {secretKeyRef: {name: runtime-worker-credentials, key: skill-signing-key-id}}
+            - name: AGENT_RUNTIME_SKILL_SIGNING_PUBLIC_KEY
+              valueFrom: {secretKeyRef: {name: runtime-worker-credentials, key: skill-signing-public-key}}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /var/run/secrets/runtime, readOnly: true}
+            - {name: worker-identity, mountPath: /var/lib/agent-runtime/identity}
+          livenessProbe:
+            httpGet: {path: /live, port: health}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: health}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "4", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: runtime-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: {secretProviderClass: runtime-worker-secrets}
+  volumeClaimTemplates:
+    - metadata: {name: worker-identity}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: runtime-worker-headless
+  namespace: agent-runtime
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/name: runtime-worker}
+  ports:
+    - {name: health, port: 8080, targetPort: health}

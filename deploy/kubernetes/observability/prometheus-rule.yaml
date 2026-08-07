@@ -1,0 +1,36 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: agent-runtime-recovery
+  namespace: agent-runtime
+  labels:
+    app.kubernetes.io/part-of: agent-runtime
+spec:
+  groups:
+    - name: agent-runtime.recovery
+      interval: 15s
+      rules:
+        - alert: AgentRuntimeRecoverySloBreached
+          expr: max(agent_runtime_recovery_incidents{state="overdue"}) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: Agent Runtime recovery objective breached
+            description: At least one recovery incident has exceeded the configured objective.
+        - alert: AgentRuntimeRecoveryWaitingCapacity
+          expr: max(agent_runtime_recovery_incidents{state="waiting_capacity"}) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Agent Runtime recovery is waiting for capacity
+            description: Recovery remains blocked by worker capacity for at least ten minutes.
+        - alert: AgentRuntimeRecoveryMetricsStale
+          expr: time() - max(agent_runtime_recovery_metrics_last_success_seconds) > 30
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: Agent Runtime recovery metrics are stale
+            description: The scheduler has not refreshed its recovery snapshot for over thirty seconds.

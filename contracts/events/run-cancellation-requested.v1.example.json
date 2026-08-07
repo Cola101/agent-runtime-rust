@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "message_id": "0198f43e-9f65-7ef1-a740-9e6fcf4b43df",
+  "tenant_id": "0198f43e-77df-7151-9557-f6eb7ab96de0",
+  "run_id": "0198f43e-8354-7912-a7bb-354f7d977142",
+  "attempt_id": "0198f43e-89f2-7c26-a15f-091321c48fd5",
+  "worker_id": "0198f43e-9300-76a0-98be-c78580b5b40c",
+  "issued_at": "2026-08-01T00:00:00Z",
+  "expires_at": "2026-08-01T00:00:30Z",
+  "reason": "user_requested"
+}
