@@ -22,10 +22,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-fn temporary_directory(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("agent-reap-{label}-{}", Uuid::now_v7()));
-    fs::create_dir_all(&path).unwrap();
-    path
+/// Returns a guard, not a path: dropping it removes the directory.
+fn temporary_directory(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-reap-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 /// Stands in for the trusted tool: it starts a grandchild that outlives it and
@@ -104,14 +106,14 @@ async fn marker_still_advancing(marker: &Path) -> bool {
 async fn a_timeout_reaps_the_whole_process_tree_not_just_the_direct_child() {
     let root = temporary_directory("timeout");
     let workspace = temporary_directory("timeout-ws");
-    let marker = workspace.join("grandchild-alive");
-    let executable = spawning_script(&root, &marker);
+    let marker = workspace.path().join("grandchild-alive");
+    let executable = spawning_script(root.path(), &marker);
 
-    let executor = TrustedNativeExecutor::new(definition(&root, &executable)).unwrap();
+    let executor = TrustedNativeExecutor::new(definition(root.path(), &executable)).unwrap();
     let outcome = executor
         .execute(
             request(),
-            context(workspace.clone(), Duration::from_millis(2000)),
+            context(workspace.path().to_path_buf(), Duration::from_millis(2000)),
         )
         .await;
 
@@ -134,11 +136,11 @@ async fn a_timeout_reaps_the_whole_process_tree_not_just_the_direct_child() {
 async fn a_cancellation_reaps_the_whole_process_tree() {
     let root = temporary_directory("cancel");
     let workspace = temporary_directory("cancel-ws");
-    let marker = workspace.join("grandchild-alive");
-    let executable = spawning_script(&root, &marker);
+    let marker = workspace.path().join("grandchild-alive");
+    let executable = spawning_script(root.path(), &marker);
 
-    let executor = TrustedNativeExecutor::new(definition(&root, &executable)).unwrap();
-    let mut execution_context = context(workspace.clone(), Duration::from_secs(30));
+    let executor = TrustedNativeExecutor::new(definition(root.path(), &executable)).unwrap();
+    let mut execution_context = context(workspace.path().to_path_buf(), Duration::from_secs(30));
     let cancellation = execution_context.cancellation.clone();
     execution_context.cancellation = cancellation.clone();
     // Long enough for the grandchild to have started touching. A shorter delay

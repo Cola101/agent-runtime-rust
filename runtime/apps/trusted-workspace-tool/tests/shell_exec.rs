@@ -25,12 +25,13 @@ fn tool_binary() -> PathBuf {
     panic!("agent-trusted-workspace-tool must be built");
 }
 
-fn workspace(label: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("agent-shell-tool-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("workspace");
-    path
+/// Returns a guard, not a path: dropping it removes the directory, so a run
+/// of this suite leaves nothing behind.
+fn workspace(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-shell-tool-{label}-"))
+        .tempdir()
+        .expect("workspace")
 }
 
 /// Runs the tool as the executor does, and with a secret in the parent
@@ -71,7 +72,10 @@ fn invoke(workspace: &Path, arguments: Value) -> Value {
 #[test]
 fn a_command_runs_and_reports_its_output_and_exit_status() {
     let workspace = workspace("basic");
-    let result = invoke(&workspace, json!({"command": "echo hello-from-shell"}));
+    let result = invoke(
+        workspace.path(),
+        json!({"command": "echo hello-from-shell"}),
+    );
 
     assert_eq!(result["is_error"], json!(false), "{result}");
     assert_eq!(result["content"]["exit_code"], json!(0), "{result}");
@@ -90,7 +94,10 @@ fn a_command_runs_and_reports_its_output_and_exit_status() {
 #[test]
 fn a_failing_command_reports_its_status_without_becoming_a_tool_error() {
     let workspace = workspace("exit-status");
-    let result = invoke(&workspace, json!({"command": "echo to-stderr >&2; exit 3"}));
+    let result = invoke(
+        workspace.path(),
+        json!({"command": "echo to-stderr >&2; exit 3"}),
+    );
 
     assert_eq!(result["is_error"], json!(false), "{result}");
     assert_eq!(result["content"]["exit_code"], json!(3), "{result}");
@@ -106,8 +113,8 @@ fn a_failing_command_reports_its_status_without_becoming_a_tool_error() {
 #[test]
 fn the_command_starts_in_the_workspace() {
     let workspace = workspace("cwd");
-    std::fs::write(workspace.join("marker.txt"), "found\n").unwrap();
-    let result = invoke(&workspace, json!({"command": "cat marker.txt"}));
+    std::fs::write(workspace.path().join("marker.txt"), "found\n").unwrap();
+    let result = invoke(workspace.path(), json!({"command": "cat marker.txt"}));
 
     assert!(
         result["content"]["stdout"]
@@ -124,7 +131,7 @@ fn the_command_starts_in_the_workspace() {
 fn the_parent_environment_never_reaches_the_command() {
     let workspace = workspace("env");
     let result = invoke(
-        &workspace,
+        workspace.path(),
         json!({"command": "echo \"key=[${AGENT_RUNTIME_PROVIDER_API_KEY:-unset}]\"; env | wc -l"}),
     );
 
@@ -146,7 +153,7 @@ fn the_parent_environment_never_reaches_the_command() {
 #[test]
 fn home_points_inside_the_workspace_and_not_at_the_real_home() {
     let workspace = workspace("home");
-    let result = invoke(&workspace, json!({"command": "echo \"$HOME\""}));
+    let result = invoke(workspace.path(), json!({"command": "echo \"$HOME\""}));
 
     let home = result["content"]["stdout"]
         .as_str()
@@ -168,10 +175,10 @@ fn home_points_inside_the_workspace_and_not_at_the_real_home() {
 fn an_empty_or_oversized_command_is_refused() {
     let workspace = workspace("bounds");
 
-    let empty = invoke(&workspace, json!({"command": "   "}));
+    let empty = invoke(workspace.path(), json!({"command": "   "}));
     assert_eq!(empty["is_error"], json!(true), "{empty}");
 
-    let oversized = invoke(&workspace, json!({"command": "x".repeat(64 * 1024)}));
+    let oversized = invoke(workspace.path(), json!({"command": "x".repeat(64 * 1024)}));
     assert_eq!(oversized["is_error"], json!(true), "{oversized}");
 }
 
@@ -181,7 +188,7 @@ fn an_empty_or_oversized_command_is_refused() {
 fn command_output_is_truncated_rather_than_unbounded() {
     let workspace = workspace("output-bound");
     let result = invoke(
-        &workspace,
+        workspace.path(),
         json!({"command": "yes abcdefghijklmnopqrstuvwxyz | head -c 400000"}),
     );
 
@@ -202,7 +209,7 @@ fn command_output_is_truncated_rather_than_unbounded() {
 #[test]
 fn the_result_stays_bound_to_the_tool_call_that_asked_for_it() {
     let workspace = workspace("binding");
-    let result = invoke(&workspace, json!({"command": "true"}));
+    let result = invoke(workspace.path(), json!({"command": "true"}));
 
     assert_eq!(result["tool_call_id"], json!("call_shell_1"), "{result}");
     assert_eq!(result["binding_digest"], json!("c".repeat(64)), "{result}");

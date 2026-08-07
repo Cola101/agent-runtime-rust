@@ -201,11 +201,13 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    fn temporary_directory(label: &str) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("agent-seatbelt-{label}-{}", uuid::Uuid::now_v7()));
-        fs::create_dir_all(&path).unwrap();
-        path
+    /// Returns a guard, not a path: dropping it removes the directory, so a run
+    /// of this suite does not leave one behind per test.
+    fn temporary_directory(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("agent-seatbelt-{label}-"))
+            .tempdir()
+            .unwrap()
     }
 
     fn probe_script(root: &Path, body: &str) -> std::path::PathBuf {
@@ -246,13 +248,20 @@ mod tests {
         let root = temporary_directory("deny-read");
         let workspace = temporary_directory("deny-read-ws");
         let home = temporary_directory("deny-read-home");
-        let secrets = home.join(".ssh");
+        let secrets = home.path().join(".ssh");
         fs::create_dir_all(&secrets).unwrap();
         let secret = secrets.join("id_ed25519");
         fs::write(&secret, "not-a-real-key\n").unwrap();
 
-        let probe = probe_script(&root, &format!("exec /bin/cat '{}'", secret.display()));
-        let output = run_contained(&probe, &workspace, &sensitive_read_denials(&home));
+        let probe = probe_script(
+            root.path(),
+            &format!("exec /bin/cat '{}'", secret.display()),
+        );
+        let output = run_contained(
+            &probe,
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
+        );
 
         assert!(
             !output.status.success(),
@@ -275,12 +284,19 @@ mod tests {
         let root = temporary_directory("deny-read-control");
         let workspace = temporary_directory("deny-read-control-ws");
         let home = temporary_directory("deny-read-control-home");
-        fs::create_dir_all(home.join(".ssh")).unwrap();
-        let ordinary = workspace.join("readable.txt");
+        fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        let ordinary = workspace.path().join("readable.txt");
         fs::write(&ordinary, "ordinary-content\n").unwrap();
 
-        let probe = probe_script(&root, &format!("exec /bin/cat '{}'", ordinary.display()));
-        let output = run_contained(&probe, &workspace, &sensitive_read_denials(&home));
+        let probe = probe_script(
+            root.path(),
+            &format!("exec /bin/cat '{}'", ordinary.display()),
+        );
+        let output = run_contained(
+            &probe,
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
+        );
 
         assert!(
             output.status.success(),
@@ -296,12 +312,19 @@ mod tests {
         let root = temporary_directory("deny-list");
         let workspace = temporary_directory("deny-list-ws");
         let home = temporary_directory("deny-list-home");
-        let secrets = home.join(".aws");
+        let secrets = home.path().join(".aws");
         fs::create_dir_all(&secrets).unwrap();
         fs::write(secrets.join("credentials"), "[default]\n").unwrap();
 
-        let probe = probe_script(&root, &format!("exec /bin/ls '{}'", secrets.display()));
-        let output = run_contained(&probe, &workspace, &sensitive_read_denials(&home));
+        let probe = probe_script(
+            root.path(),
+            &format!("exec /bin/ls '{}'", secrets.display()),
+        );
+        let output = run_contained(
+            &probe,
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
+        );
 
         assert!(
             !output.status.success(),
@@ -336,9 +359,9 @@ mod tests {
 
     /// Builds a home with a protected `.ssh/id_ed25519` and returns
     /// `(home, secret_path)`.
-    fn home_with_secret(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn home_with_secret(label: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let home = temporary_directory(label);
-        let secrets = home.join(".ssh");
+        let secrets = home.path().join(".ssh");
         fs::create_dir_all(&secrets).unwrap();
         let secret = secrets.join("id_ed25519");
         fs::write(&secret, "not-a-real-key\n").unwrap();
@@ -362,19 +385,19 @@ mod tests {
         let (home, secret) = home_with_secret("link-self-home");
 
         let probe = probe_script(
-            &root,
+            root.path(),
             &format!(
                 "/bin/ln -s '{secret}' '{ws}/link' && echo LINK_CREATED\n\
                  /bin/cat '{ws}/link' 2>/dev/null || echo FOLLOW_DENIED\n\
                  echo {RAN}",
                 secret = secret.display(),
-                ws = workspace.display()
+                ws = workspace.path().display()
             ),
         );
         let output = run_contained_with(
             &probe,
-            &workspace,
-            &sensitive_read_denials(&home),
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
             WorkspaceAccess::ReadWrite,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -409,13 +432,13 @@ mod tests {
         let (home, secret) = home_with_secret("hardlink-self-home");
 
         let probe = probe_script(
-            &root,
+            root.path(),
             &format!(
                 "/bin/ln '{secret}' '{ws}/hard' 2>/dev/null && echo HARD_CREATED\n\
                  /bin/cat '{ws}/hard' 2>/dev/null || echo HARD_UNREADABLE\n\
                  echo {RAN}",
                 secret = secret.display(),
-                ws = workspace.display()
+                ws = workspace.path().display()
             ),
         );
         // ReadWrite on purpose: the Workspace must genuinely be writable, so a
@@ -423,8 +446,8 @@ mod tests {
         // destination.
         let output = run_contained_with(
             &probe,
-            &workspace,
-            &sensitive_read_denials(&home),
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
             WorkspaceAccess::ReadWrite,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -449,16 +472,20 @@ mod tests {
         let root = temporary_directory("link-pre");
         let workspace = temporary_directory("link-pre-ws");
         let (home, secret) = home_with_secret("link-pre-home");
-        std::os::unix::fs::symlink(&secret, workspace.join("planted")).unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.path().join("planted")).unwrap();
 
         let probe = probe_script(
-            &root,
+            root.path(),
             &format!(
                 "/bin/cat '{ws}/planted' 2>/dev/null || echo FOLLOW_DENIED\necho {RAN}",
-                ws = workspace.display()
+                ws = workspace.path().display()
             ),
         );
-        let output = run_contained(&probe, &workspace, &sensitive_read_denials(&home));
+        let output = run_contained(
+            &probe,
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(stdout.contains(RAN), "the probe did not run: {stdout}");
@@ -477,19 +504,19 @@ mod tests {
         let root = temporary_directory("link-control");
         let workspace = temporary_directory("link-control-ws");
         let (home, _secret) = home_with_secret("link-control-home");
-        fs::write(workspace.join("plain.txt"), "ordinary-content\n").unwrap();
+        fs::write(workspace.path().join("plain.txt"), "ordinary-content\n").unwrap();
 
         let probe = probe_script(
-            &root,
+            root.path(),
             &format!(
                 "/bin/ln -s '{ws}/plain.txt' '{ws}/ok' && /bin/cat '{ws}/ok'\necho {RAN}",
-                ws = workspace.display()
+                ws = workspace.path().display()
             ),
         );
         let output = run_contained_with(
             &probe,
-            &workspace,
-            &sensitive_read_denials(&home),
+            workspace.path(),
+            &sensitive_read_denials(home.path()),
             WorkspaceAccess::ReadWrite,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);

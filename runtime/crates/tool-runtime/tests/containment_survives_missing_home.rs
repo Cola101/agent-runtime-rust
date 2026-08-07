@@ -22,10 +22,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-fn temporary_directory(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("agent-no-home-{label}-{}", Uuid::now_v7()));
-    fs::create_dir_all(&path).unwrap();
-    path
+/// Returns a guard, not a path: dropping it removes the directory.
+fn temporary_directory(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-no-home-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 fn executable_script(root: &Path) -> PathBuf {
@@ -39,7 +41,7 @@ fn executable_script(root: &Path) -> PathBuf {
 #[test]
 fn credential_denials_survive_an_unset_home_variable() {
     let trusted_root = temporary_directory("root");
-    let executable = executable_script(&trusted_root);
+    let executable = executable_script(trusted_root.path());
     let workspace = temporary_directory("workspace");
 
     // Single-test file, so nothing else in this process reads the environment
@@ -47,7 +49,7 @@ fn credential_denials_survive_an_unset_home_variable() {
     unsafe { std::env::remove_var("HOME") };
 
     let executor = TrustedNativeExecutor::new(TrustedNativeToolDefinition {
-        trusted_root: trusted_root.clone(),
+        trusted_root: trusted_root.path().to_path_buf(),
         executable: executable.clone(),
         fixed_args: Vec::new(),
         workspace_access: WorkspaceAccess::ReadOnly,
@@ -72,7 +74,7 @@ fn credential_denials_survive_an_unset_home_variable() {
                 tenant_id: Uuid::now_v7(),
                 run_id: Uuid::now_v7(),
                 attempt_id: Uuid::now_v7(),
-                workspace_root: workspace,
+                workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),
                 cancellation: CancellationToken::new(),
                 requested_at: Utc::now(),

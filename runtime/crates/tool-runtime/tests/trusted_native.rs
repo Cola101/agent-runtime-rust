@@ -11,10 +11,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-fn temporary_directory(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("agent-native-tool-{label}-{}", Uuid::now_v7()));
-    fs::create_dir_all(&path).unwrap();
-    path
+/// Returns a guard, not a path: dropping it removes the directory. Callers must
+/// bind it for as long as the directory is needed -- see the escape test below,
+/// where dropping it early would delete the very file the assertion looks for.
+fn temporary_directory(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-native-tool-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 fn executable_script(root: &Path, body: &str) -> PathBuf {
@@ -67,12 +71,13 @@ fn context(workspace_root: PathBuf) -> ToolExecutionContext {
 #[test]
 fn trusted_native_launch_is_root_bound_and_never_places_model_arguments_in_argv_or_env() {
     let trusted_root = temporary_directory("root-bound");
-    let executable = executable_script(&trusted_root, "exit 0");
+    let executable = executable_script(trusted_root.path(), "exit 0");
     let workspace = temporary_directory("workspace");
-    let executor = TrustedNativeExecutor::new(definition(&trusted_root, &executable)).unwrap();
+    let executor =
+        TrustedNativeExecutor::new(definition(trusted_root.path(), &executable)).unwrap();
 
     let launch = executor
-        .prepare(&request(), &context(workspace.clone()))
+        .prepare(&request(), &context(workspace.path().to_path_buf()))
         .unwrap();
 
     // The launch is now wrapped by Seatbelt on macOS, so the registered
@@ -126,23 +131,25 @@ fn trusted_native_launch_is_root_bound_and_never_places_model_arguments_in_argv_
 
 #[test]
 fn executable_outside_trusted_root_and_wrong_sandbox_fail_closed() {
+    let scratch_wrong_sandbox = temporary_directory("wrong-sandbox");
     let trusted_root = temporary_directory("trusted-root");
     let outside_root = temporary_directory("outside-root");
-    let outside = executable_script(&outside_root, "exit 0");
+    let outside = executable_script(outside_root.path(), "exit 0");
     assert!(matches!(
-        TrustedNativeExecutor::new(definition(&trusted_root, &outside)),
+        TrustedNativeExecutor::new(definition(trusted_root.path(), &outside)),
         Err(ToolExecutionError::InvalidDefinition(_))
     ));
 
-    let executable = executable_script(&trusted_root, "exit 0");
-    let executor = TrustedNativeExecutor::new(definition(&trusted_root, &executable)).unwrap();
+    let executable = executable_script(trusted_root.path(), "exit 0");
+    let executor =
+        TrustedNativeExecutor::new(definition(trusted_root.path(), &executable)).unwrap();
     let mut wrong_sandbox = request();
     wrong_sandbox.sandbox = SandboxClass::RestrictedContainer;
     assert_eq!(
         executor
             .prepare(
                 &wrong_sandbox,
-                &context(temporary_directory("wrong-sandbox"))
+                &context(scratch_wrong_sandbox.path().to_path_buf())
             )
             .unwrap_err(),
         ToolExecutionError::WrongSandbox
@@ -151,14 +158,19 @@ fn executable_outside_trusted_root_and_wrong_sandbox_fail_closed() {
 
 #[test]
 fn executable_replacement_after_registration_is_rejected_before_spawn() {
+    let scratch_drift_workspace = temporary_directory("drift-workspace");
     let trusted_root = temporary_directory("drift");
-    let executable = executable_script(&trusted_root, "exit 0");
-    let executor = TrustedNativeExecutor::new(definition(&trusted_root, &executable)).unwrap();
+    let executable = executable_script(trusted_root.path(), "exit 0");
+    let executor =
+        TrustedNativeExecutor::new(definition(trusted_root.path(), &executable)).unwrap();
     fs::write(&executable, "#!/bin/sh\nexit 99\n").unwrap();
 
     assert_eq!(
         executor
-            .prepare(&request(), &context(temporary_directory("drift-workspace")))
+            .prepare(
+                &request(),
+                &context(scratch_drift_workspace.path().to_path_buf())
+            )
             .unwrap_err(),
         ToolExecutionError::ExecutableChanged
     );
@@ -167,9 +179,9 @@ fn executable_replacement_after_registration_is_rejected_before_spawn() {
 #[test]
 fn implementation_digest_binds_the_executable_bytes_and_fixed_arguments() {
     let trusted_root = temporary_directory("implementation-digest");
-    let executable = executable_script(&trusted_root, "exit 0");
-    let first = TrustedNativeExecutor::new(definition(&trusted_root, &executable)).unwrap();
-    let mut changed_definition = definition(&trusted_root, &executable);
+    let executable = executable_script(trusted_root.path(), "exit 0");
+    let first = TrustedNativeExecutor::new(definition(trusted_root.path(), &executable)).unwrap();
+    let mut changed_definition = definition(trusted_root.path(), &executable);
     changed_definition.fixed_args = vec!["--different-mode".into()];
     let changed = TrustedNativeExecutor::new(changed_definition).unwrap();
 
@@ -182,15 +194,20 @@ fn implementation_digest_binds_the_executable_bytes_and_fixed_arguments() {
 
 #[tokio::test]
 async fn bound_native_result_is_returned_and_preserves_tool_error_semantics() {
+    let scratch_execute_workspace = temporary_directory("execute-workspace");
     let trusted_root = temporary_directory("execute");
     let executable = executable_script(
-        &trusted_root,
+        trusted_root.path(),
         "/bin/cat >/dev/null\nprintf '%s' '{\"tool_call_id\":\"call_workspace_read_1\",\"binding_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"content\":{\"text\":\"hello\"},\"is_error\":false}'",
     );
-    let executor = TrustedNativeExecutor::new(definition(&trusted_root, &executable)).unwrap();
+    let executor =
+        TrustedNativeExecutor::new(definition(trusted_root.path(), &executable)).unwrap();
 
     let result = executor
-        .execute(request(), context(temporary_directory("execute-workspace")))
+        .execute(
+            request(),
+            context(scratch_execute_workspace.path().to_path_buf()),
+        )
         .await
         .unwrap();
 
@@ -206,16 +223,19 @@ async fn bound_native_result_is_returned_and_preserves_tool_error_semantics() {
 async fn a_trusted_native_tool_cannot_write_outside_its_workspace() {
     let root = temporary_directory("contain-write");
     let workspace = temporary_directory("contain-write-ws");
-    let escape = temporary_directory("contain-write-escape").join("escaped.txt");
+    // Bound, not discarded: dropping the guard here would remove the directory
+    // and make `!escape.exists()` true for the wrong reason.
+    let escape_root = temporary_directory("contain-write-escape");
+    let escape = escape_root.path().join("escaped.txt");
     let executable = executable_script(
-        &root,
+        root.path(),
         &format!(
             "cat > /dev/null\n/usr/bin/touch '{}' 2>/dev/null || true\nprintf '{{\"content\":{{}},\"is_error\":false}}'",
             escape.display()
         ),
     );
 
-    let executor = TrustedNativeExecutor::new(definition(&root, &executable)).unwrap();
+    let executor = TrustedNativeExecutor::new(definition(root.path(), &executable)).unwrap();
     let _ = executor
         .execute(
             request(),
@@ -223,7 +243,7 @@ async fn a_trusted_native_tool_cannot_write_outside_its_workspace() {
                 tenant_id: Uuid::now_v7(),
                 run_id: Uuid::now_v7(),
                 attempt_id: Uuid::now_v7(),
-                workspace_root: workspace.clone(),
+                workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),
                 cancellation: CancellationToken::new(),
                 requested_at: Utc::now(),
@@ -252,16 +272,16 @@ async fn a_trusted_native_tool_cannot_reach_the_network() {
 
     let root = temporary_directory("contain-net");
     let workspace = temporary_directory("contain-net-ws");
-    let marker = workspace.join("reached-network");
+    let marker = workspace.path().join("reached-network");
     let executable = executable_script(
-        &root,
+        root.path(),
         &format!(
             "cat > /dev/null\nif /usr/bin/nc -z -G 2 127.0.0.1 {port} 2>/dev/null; then /usr/bin/touch '{}' 2>/dev/null || true; fi\nprintf '{{\"content\":{{}},\"is_error\":false}}'",
             marker.display()
         ),
     );
 
-    let executor = TrustedNativeExecutor::new(definition(&root, &executable)).unwrap();
+    let executor = TrustedNativeExecutor::new(definition(root.path(), &executable)).unwrap();
     let _ = executor
         .execute(
             request(),
@@ -269,7 +289,7 @@ async fn a_trusted_native_tool_cannot_reach_the_network() {
                 tenant_id: Uuid::now_v7(),
                 run_id: Uuid::now_v7(),
                 attempt_id: Uuid::now_v7(),
-                workspace_root: workspace.clone(),
+                workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),
                 cancellation: CancellationToken::new(),
                 requested_at: Utc::now(),

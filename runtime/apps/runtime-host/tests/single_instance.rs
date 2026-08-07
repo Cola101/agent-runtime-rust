@@ -8,19 +8,20 @@
 //! one, and the consequence is a Run executing twice.
 
 use agent_runtime_host::ipc::{LocalRuntimeDaemon, default_socket_path};
-use std::path::PathBuf;
-use uuid::Uuid;
 
-fn state_root(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("agent-single-{label}-{}", Uuid::now_v7()));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+/// Returns a guard, not a path: dropping it removes the directory, so a test
+/// run does not leave one behind per invocation.
+fn state_root(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-single-{label}-"))
+        .tempdir()
+        .unwrap()
 }
 
 #[tokio::test]
 async fn a_second_daemon_on_the_same_state_root_is_refused() {
     let root = state_root("refuse");
-    let socket = default_socket_path(&root);
+    let socket = default_socket_path(root.path());
 
     let first = LocalRuntimeDaemon::bind(&socket)
         .await
@@ -32,7 +33,9 @@ async fn a_second_daemon_on_the_same_state_root_is_refused() {
         "a second daemon took over a live state root, so one Run can execute twice"
     );
 
-    drop(first);
+    // The socket can land in $TMPDIR rather than the state root when the root is
+    // deep enough to exceed SUN_LEN, so the state root's guard does not cover it.
+    LocalRuntimeDaemon::release(&socket, first);
 }
 
 /// The other half of the same problem: refusing too eagerly would leave a host
@@ -40,7 +43,7 @@ async fn a_second_daemon_on_the_same_state_root_is_refused() {
 #[tokio::test]
 async fn a_socket_left_by_a_dead_daemon_does_not_block_startup() {
     let root = state_root("stale");
-    let socket = default_socket_path(&root);
+    let socket = default_socket_path(root.path());
 
     let listener = LocalRuntimeDaemon::bind(&socket).await.expect("first bind");
     // Dropping the listener ends the daemon exactly as a crash would: the file
@@ -51,9 +54,10 @@ async fn a_socket_left_by_a_dead_daemon_does_not_block_startup() {
         "the test needs a leftover socket to be meaningful"
     );
 
-    LocalRuntimeDaemon::bind(&socket)
+    let listener = LocalRuntimeDaemon::bind(&socket)
         .await
         .expect("a stale socket must not make the host unstartable");
+    LocalRuntimeDaemon::release(&socket, listener);
 }
 
 /// A clean exit should not leave the socket behind for the next start to
@@ -61,7 +65,7 @@ async fn a_socket_left_by_a_dead_daemon_does_not_block_startup() {
 #[tokio::test]
 async fn a_clean_shutdown_removes_its_socket() {
     let root = state_root("cleanup");
-    let socket = default_socket_path(&root);
+    let socket = default_socket_path(root.path());
 
     let listener = LocalRuntimeDaemon::bind(&socket).await.expect("bind");
     LocalRuntimeDaemon::release(&socket, listener);

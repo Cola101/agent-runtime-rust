@@ -11,10 +11,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-fn workspace() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("agent-tool-runtime-{}", Uuid::now_v7()));
-    fs::create_dir_all(&path).unwrap();
-    path
+/// Returns a guard, not a path: dropping it removes the directory. Callers must
+/// bind it for as long as the directory is needed.
+fn workspace() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("agent-tool-runtime-")
+        .tempdir()
+        .unwrap()
 }
 
 fn definition() -> ContainerToolDefinition {
@@ -55,8 +58,9 @@ fn context(workspace_root: PathBuf) -> ToolExecutionContext {
     }
 }
 
-fn executable_script(body: &str) -> PathBuf {
-    let engine = workspace().join("container-engine.sh");
+fn executable_script(body: &str) -> (tempfile::TempDir, PathBuf) {
+    let root = workspace();
+    let engine = root.path().join("container-engine.sh");
     fs::write(&engine, format!("#!/bin/sh\n{body}\n")).unwrap();
     let mut permissions = fs::metadata(&engine).unwrap().permissions();
     #[cfg(unix)]
@@ -65,17 +69,17 @@ fn executable_script(body: &str) -> PathBuf {
         permissions.set_mode(0o700);
         fs::set_permissions(&engine, permissions).unwrap();
     }
-    engine
+    (root, engine)
 }
 
 #[test]
 fn restricted_container_is_digest_pinned_non_networked_and_argument_safe() {
     let workspace_root = workspace();
-    let canonical_workspace = fs::canonicalize(&workspace_root).unwrap();
+    let canonical_workspace = fs::canonicalize(workspace_root.path()).unwrap();
     let executor = RestrictedContainerExecutor::new("/usr/local/bin/docker", definition()).unwrap();
 
     let launch = executor
-        .prepare(&request(), &context(workspace_root.clone()))
+        .prepare(&request(), &context(workspace_root.path().to_path_buf()))
         .unwrap();
 
     assert_eq!(launch.program, "/usr/local/bin/docker");
@@ -131,20 +135,24 @@ fn floating_image_and_non_restricted_request_are_rejected_before_spawn() {
     ));
 
     let executor = RestrictedContainerExecutor::new("/usr/local/bin/docker", definition()).unwrap();
+    let scratch = workspace();
     let mut kata = request();
     kata.sandbox = SandboxClass::Kata;
     assert_eq!(
-        executor.prepare(&kata, &context(workspace())).unwrap_err(),
+        executor
+            .prepare(&kata, &context(scratch.path().to_path_buf()))
+            .unwrap_err(),
         ToolExecutionError::WrongSandbox
     );
 }
 
 #[tokio::test]
 async fn process_timeout_is_an_error_not_a_successful_empty_tool_result() {
-    let engine = executable_script("sleep 5");
+    let (_engine_root, engine) = executable_script("sleep 5");
     let executor =
         RestrictedContainerExecutor::new(engine.to_string_lossy(), definition()).unwrap();
-    let mut execution_context = context(workspace());
+    let scratch = workspace();
+    let mut execution_context = context(scratch.path().to_path_buf());
     execution_context.timeout = Duration::from_millis(50);
 
     assert_eq!(
@@ -158,15 +166,16 @@ async fn process_timeout_is_an_error_not_a_successful_empty_tool_result() {
 
 #[tokio::test]
 async fn container_result_for_another_tool_call_is_rejected() {
-    let engine = executable_script(
+    let (_engine_root, engine) = executable_script(
         "cat >/dev/null\nprintf '%s' '{\"tool_call_id\":\"call_http_7\",\"binding_digest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"content\":{\"ok\":true},\"is_error\":false}'",
     );
     let executor =
         RestrictedContainerExecutor::new(engine.to_string_lossy(), definition()).unwrap();
+    let scratch = workspace();
 
     assert_eq!(
         executor
-            .execute(request(), context(workspace()))
+            .execute(request(), context(scratch.path().to_path_buf()))
             .await
             .unwrap_err(),
         ToolExecutionError::OutputBindingMismatch
@@ -175,14 +184,15 @@ async fn container_result_for_another_tool_call_is_rejected() {
 
 #[tokio::test]
 async fn bound_container_result_is_returned_without_losing_tool_error_semantics() {
-    let engine = executable_script(
+    let (_engine_root, engine) = executable_script(
         "cat >/dev/null\nprintf '%s' '{\"tool_call_id\":\"call_http_7\",\"binding_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"content\":{\"status\":403},\"is_error\":true}'",
     );
     let executor =
         RestrictedContainerExecutor::new(engine.to_string_lossy(), definition()).unwrap();
+    let scratch = workspace();
 
     let result = executor
-        .execute(request(), context(workspace()))
+        .execute(request(), context(scratch.path().to_path_buf()))
         .await
         .unwrap();
 

@@ -18,12 +18,13 @@ fn tool_binary() -> PathBuf {
     panic!("agent-trusted-workspace-tool must be built");
 }
 
-fn workspace(label: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("agent-write-tool-{label}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("workspace");
-    path
+/// Returns a guard, not a path: dropping it removes the directory, so a run
+/// of this suite leaves nothing behind.
+fn workspace(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("agent-write-tool-{label}-"))
+        .tempdir()
+        .expect("workspace")
 }
 
 /// Runs the tool exactly as the executor does: fixed argv, JSON on stdin, cwd
@@ -63,7 +64,7 @@ fn writing_a_relative_path_creates_the_file_inside_the_workspace() {
     // The tool must not create missing parents implicitly; silently making
     // directories would let one write reshape the Workspace layout.
     let result = invoke(
-        &workspace,
+        workspace.path(),
         "workspace.write_text",
         json!({"path": "notes/summary.md", "text": "evidence first"}),
     );
@@ -72,15 +73,15 @@ fn writing_a_relative_path_creates_the_file_inside_the_workspace() {
         "a missing parent must be refused, not created: {result}"
     );
 
-    std::fs::create_dir_all(workspace.join("notes")).expect("parent");
+    std::fs::create_dir_all(workspace.path().join("notes")).expect("parent");
     let result = invoke(
-        &workspace,
+        workspace.path(),
         "workspace.write_text",
         json!({"path": "notes/summary.md", "text": "evidence first"}),
     );
     assert_eq!(result["content"]["bytes"], 14, "unexpected: {result}");
     assert_eq!(
-        std::fs::read_to_string(workspace.join("notes/summary.md")).unwrap(),
+        std::fs::read_to_string(workspace.path().join("notes/summary.md")).unwrap(),
         "evidence first"
     );
 }
@@ -94,7 +95,7 @@ fn absolute_and_parent_relative_paths_are_refused() {
         "notes/../../escaped.txt",
     ] {
         let result = invoke(
-            &workspace,
+            workspace.path(),
             "workspace.write_text",
             json!({"path": path, "text": "x"}),
         );
@@ -108,13 +109,17 @@ fn absolute_and_parent_relative_paths_are_refused() {
 #[test]
 fn a_symlinked_path_component_is_refused_so_a_write_cannot_be_redirected() {
     let workspace = workspace("symlink");
-    let outside = workspace.parent().unwrap().join("agent-write-tool-outside");
-    std::fs::create_dir_all(&outside).expect("outside dir");
+    // Its own guard: the escape target must outlive the assertion below.
+    let outside_guard = tempfile::Builder::new()
+        .prefix("agent-write-tool-outside-")
+        .tempdir()
+        .expect("outside dir");
+    let outside = outside_guard.path().to_path_buf();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+    std::os::unix::fs::symlink(&outside, workspace.path().join("link")).expect("symlink");
 
     let result = invoke(
-        &workspace,
+        workspace.path(),
         "workspace.write_text",
         json!({"path": "link/escaped.txt", "text": "x"}),
     );
@@ -150,5 +155,5 @@ fn a_write_request_without_text_is_refused_before_touching_the_filesystem() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success(), "a malformed request must fail");
-    assert!(!workspace.join("notes.md").exists());
+    assert!(!workspace.path().join("notes.md").exists());
 }
