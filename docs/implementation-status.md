@@ -1,11 +1,41 @@
 # 实施状态
 
-更新时间：2026-08-02
+更新时间：2026-08-07
 
 本文件区分“已实现并有证据”“仅有契约或骨架”“尚未实现”，避免把六个月目标误报为当前能力。
 
-当前按私有 Beta 全部验收项估算约 **96%**；“Mac 原生开发闭环”里程碑为 **100%**。这些数字表示
-可验证能力覆盖率，不按代码量计算。
+## 进度（2026-08-07 重算）
+
+此前这里写着「私有 Beta 约 **96%**」，更新时间停在 08-02。那个数字**不可信**，已作废：
+它是按「已列出的验收项覆盖率」算的，而那份验收项清单本身没有覆盖工具面、MCP、桌面客户端和
+规模验证。分母定小了，分子自然好看。
+
+重算，三个不同坐标系，**不要混用**：
+
+| 坐标系 | 估计 | 依据 |
+| --- | --- | --- |
+| 十一项路线（`docs/project-goal.md` 后续顺序） | **约 40%** | runtime-host 与本地 IPC/恢复完成（1、2）；第 9 项落了「写文件 + 容器边界 + Shell」 |
+| Codex 已发布能力面 | **约 25–30%** | 工具面 3 : 约 18；MCP 0；并行调度 0；会话历史重建、Compaction/Fork/Rollback 均无 |
+| 私有 Beta 可交付 | **约 70%** | 缺桌面客户端、命令白名单、Linux 容器化、真实厂商验收、调用方认证与配额 |
+
+三个数字差距大是正常的，因为分母不同。**引用时必须带上坐标系**，单说一个百分比没有意义。
+
+拉低最多的两项是**工具面**和 **MCP**——它们决定「Agent 能干多少事」，而此前的投入几乎都在
+「Agent 跑得稳不稳」上。稳定性与安全性上本项目局部已超过 Codex（多租户、fencing、签名 Skill、
+更严的命令环境隔离），能力广度上差一个数量级。
+
+### 实测计数（本次重算时执行，非引用历史）
+
+```
+cargo test --workspace              274 通过 / 0 失败
+deploy/native/run-java-tests        143 通过 / 0 失败 / 1 跳过
+ADR                                 38 份
+证据文件                            16 份
+常驻 live 门禁                      5 条
+模型可见工具                        3 个（workspace.read_text / workspace.write_text / shell.exec）
+```
+
+Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中，也不得据此声称其状态。
 
 ## 已实现并验证
 
@@ -87,7 +117,18 @@
 - Anthropic 首版尚未覆盖 OpenClaw 的模型特定 thinking/cache/refusal、OAuth/Foundry 与图片预算兼容层；结构化输出和图片输入会 fail-closed。
 - 工作负载令牌已完成 incarnation、audience、scope、ModelPolicy 摘要绑定、持久化代际续期与 401 有界恢复；gRPC mTLS、NATS TLS/角色 ACL 和租户 BYOK 密文边界已验证。尚缺主动撤销、签名密钥与证书自动轮换、逐操作最小授权、Vault/KMS 真实联调和 Provider 级精确出站策略。
 - Reconciler 已接通 SAFE Checkpoint 自动接管、持久恢复事故、按租户 SLO 快照及不含租户标签的全局 Prometheus 告警指标，Worker 也已实现计划内 draining；当前只有缩放租约、传输层故障和离线告警规则证据，真实 Prometheus/Alertmanager、Kubernetes 节点级故障注入、生产 15 分钟恢复时限证明、加权公平调度和多租户配额抢占尚未完成。
-- Shell、写文件、受控出网 HTTP、MCP 的具体 Tool 制品；Kubernetes Job/Kata 沙箱生命周期及 OCI 签名验证。当前只读文本 Tool 仅适用于可信本地开发，不能视为通用文件 Tool。
+- 受控出网 HTTP 与 MCP 的 Tool 制品；Kubernetes Job/Kata 沙箱生命周期及 OCI 签名验证。
+  **写文件与 Shell 已实现**（ADR-0036、0038），但都只在 macOS 上受容器约束，
+  Linux 上没有 `landlock` 等价物，因此 Worker 的 Linux 路径不得注册它们。
+- **Shell 没有命令白名单**，每次调用都要人工审批；连续工作不可行，只能算实验能力。
+  容器只对 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.config/gh` 拒读，其余用户可读文件仍可读，
+  所以「Shell 已容器化」不得表述为「Shell 已隔离」。
+- Shell 没有交互式或长驻会话（Codex 的 `unified_exec` 对应物）。
+- **MCP 客户端完全未实现。** 这是与 Codex 差距最大的单项：工具数量目前由手写决定，
+  接上 MCP 后才由生态供给。
+- **未做真实模型厂商端到端验收。** 迄今全部主链证据都用回环假 Provider，
+  协议转换的正确性只由契约测试保证，未经真实厂商响应验证。
+- 调用方认证与配额（谁能调用这个 Runtime、能用多少）尚未实现。
 - Checkpoint 对象缺失、内容损坏及一次短暂 `Unavailable` 后 JetStream 重投递已做故障分流；尚缺对象保留/垃圾回收、真实 Gateway 进程或存储实例丢失和跨可用区故障注入。
 - Skill 的生产 OCI 制品上传、SBOM、恶意扫描、平台审核、租户签名链与公共/私有 ACL；当前已完成控制面签名的结构化 SkillVersion 和可信 Tool 激活，不接受上传脚本。
 - 子代理的 Worker 发起、父挂起检查点、原子子 Run 入队、Workspace 正反向租约交接、子结果回送、
