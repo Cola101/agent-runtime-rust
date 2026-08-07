@@ -126,8 +126,9 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
   容器只对 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.config/gh` 拒读，其余用户可读文件仍可读，
   所以「Shell 已容器化」不得表述为「Shell 已隔离」。
 - Shell 没有交互式或长驻会话（Codex 的 `unified_exec` 对应物）。
-- **MCP 客户端完全未实现。** 这是与 Codex 差距最大的单项：工具数量目前由手写决定，
-  接上 MCP 后才由生态供给。
+- **MCP 客户端未实现**，形态已定案（ADR-0040）：v1 只联邦 HTTP 传输的 server，不派生本地进程。
+  这是与 Codex 差距最大的单项。**代价要说清**：今天多数已发布的 MCP server 是本地 npm/Python 进程，
+  v1 支持不了它们——而支持它们需要一套「允许出网」的容器化方案，与 ADR-0036 现有 profile 不同。
 - 真实模型厂商端到端：**`openai_compatible` 已验证一次**（2026-08-07，DeepSeek 经网关，
   `runtime-host` 路径，与云端共用协议转换代码）。**仍未验证**：Java 控制面 + PostgreSQL +
   NATS 的完整云端链路对真实厂商（被 nats-server 构建的网络问题阻塞）、
