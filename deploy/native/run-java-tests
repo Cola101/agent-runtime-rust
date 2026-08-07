@@ -72,7 +72,12 @@ cd "$PROJECT_ROOT/control-plane"
 # Pin the JDK before Maven starts: Homebrew's Maven otherwise runs on its own
 # bundled JVM instead of the JDK the control plane declares and the native
 # services run on.
-"$JAVA_TOOLCHAIN_WRAPPER" "$DOWNLOAD_WRAPPER" "$MAVEN" test
+# Extra arguments are forwarded to Maven so a single test can be run with the
+# database environment this script injects. Running `mvn -Dtest=...` directly
+# instead gives ExceptionInInitializerError, because the integration tests need
+# that environment and Maven on its own does not have it -- a trap easy enough to
+# fall into twice.
+"$JAVA_TOOLCHAIN_WRAPPER" "$DOWNLOAD_WRAPPER" "$MAVEN" test "$@"
 
 cleanup_test_runtime
 trap - EXIT HUP INT TERM
