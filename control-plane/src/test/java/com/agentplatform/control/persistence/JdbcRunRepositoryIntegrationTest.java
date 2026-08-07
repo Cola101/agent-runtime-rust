@@ -451,44 +451,14 @@ class JdbcRunRepositoryIntegrationTest {
         """, String.class, ids.tenantId(), steering.steeringId())).isEqualTo("cancelled");
   }
 
-  private ResourceIds seedResourceChain() throws Exception {
-    var tenantId = UUID.randomUUID();
-    var applicationId = UUID.randomUUID();
-    var projectId = UUID.randomUUID();
-    var workspaceId = UUID.randomUUID();
-    var agentId = UUID.randomUUID();
-    var agentVersionId = UUID.randomUUID();
-    var sessionId = UUID.randomUUID();
-    var modelPolicyId = UUID.randomUUID();
-    try (Connection connection = DriverManager.getConnection(
-        DATABASE.jdbcUrl(), DATABASE.username(), DATABASE.password());
-        var statement = connection.createStatement()) {
-      statement.execute("select set_config('app.tenant_id','%s',false)".formatted(tenantId));
-      statement.execute("insert into tenants (tenant_id,id,slug,display_name) values ('%s','%s','t-%s','Tenant')"
-          .formatted(tenantId, tenantId, tenantId));
-      statement.execute("insert into applications (tenant_id,id,name) values ('%s','%s','App')"
-          .formatted(tenantId, applicationId));
-      statement.execute("insert into projects (tenant_id,id,application_id,name) values ('%s','%s','%s','Project')"
-          .formatted(tenantId, projectId, applicationId));
-      statement.execute("insert into workspaces (tenant_id,id,project_id,name) values ('%s','%s','%s','Workspace')"
-          .formatted(tenantId, workspaceId, projectId));
-      statement.execute("insert into agents (tenant_id,id,workspace_id,name) values ('%s','%s','%s','Agent')"
-          .formatted(tenantId, agentId, workspaceId));
-      statement.execute("insert into agent_versions (tenant_id,id,application_id,agent_id,version,spec) values ('%s','%s','%s','%s',1,'{}')"
-          .formatted(tenantId, agentVersionId, applicationId, agentId));
-      statement.execute("insert into sessions (tenant_id,id,workspace_id) values ('%s','%s','%s')"
-          .formatted(tenantId, sessionId, workspaceId));
-      statement.execute("insert into model_policies (tenant_id,id,workspace_id,name,policy,application_id) values ('%s','%s','%s','Default','{}','%s')"
-          .formatted(tenantId, modelPolicyId, workspaceId, applicationId));
-    }
-    return new ResourceIds(
-        tenantId, applicationId, workspaceId, agentVersionId, sessionId, modelPolicyId);
+  private ResourceChainFixture.ResourceIds seedResourceChain() throws Exception {
+    return ResourceChainFixture.seed(DATABASE);
   }
 
   private WorkerTarget markRunning(
       JdbcTemplate jdbc,
       TransactionTemplate transactions,
-      ResourceIds ids,
+      ResourceChainFixture.ResourceIds ids,
       UUID runId) {
     var workerId = UUID.randomUUID();
     var incarnationId = UUID.randomUUID();
@@ -522,7 +492,7 @@ class JdbcRunRepositoryIntegrationTest {
     return new WorkerTarget(attemptId, workerId, incarnationId);
   }
 
-  private ResourceIds seedApplicationResourceChain(UUID tenantId, String suffix) throws Exception {
+  private ResourceChainFixture.ResourceIds seedApplicationResourceChain(UUID tenantId, String suffix) throws Exception {
     var applicationId = UUID.randomUUID();
     var projectId = UUID.randomUUID();
     var workspaceId = UUID.randomUUID();
@@ -549,12 +519,12 @@ class JdbcRunRepositoryIntegrationTest {
       statement.execute("insert into model_policies (tenant_id,id,workspace_id,name,policy,application_id) values ('%s','%s','%s','Default','{}','%s')"
           .formatted(tenantId, modelPolicyId, workspaceId, applicationId));
     }
-    return new ResourceIds(
+    return new ResourceChainFixture.ResourceIds(
         tenantId, applicationId, workspaceId, agentVersionId, sessionId, modelPolicyId);
   }
 
   private void insertEvent(
-      JdbcTemplate jdbc, ResourceIds ids, UUID runId, UUID eventId, long sequence, String type) {
+      JdbcTemplate jdbc, ResourceChainFixture.ResourceIds ids, UUID runId, UUID eventId, long sequence, String type) {
     jdbc.queryForObject(
         "select set_config('app.tenant_id', ?, false)", String.class, ids.tenantId().toString());
     jdbc.update("""
@@ -565,14 +535,6 @@ class JdbcRunRepositoryIntegrationTest {
         """, ids.tenantId(), eventId, runId, ids.sessionId(), sequence, UUID.randomUUID(),
         UUID.randomUUID().toString(), type, "{\"text\":\"ok\"}", "digest-" + sequence);
   }
-
-  private record ResourceIds(
-      UUID tenantId,
-      UUID applicationId,
-      UUID workspaceId,
-      UUID agentVersionId,
-      UUID sessionId,
-      UUID modelPolicyId) {}
 
   // The whole value of the quota is that it holds under concurrency. Counting
   // active Runs and then inserting -- without taking the tenant's quota row for
