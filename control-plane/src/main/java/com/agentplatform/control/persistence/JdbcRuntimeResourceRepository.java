@@ -231,6 +231,29 @@ public class JdbcRuntimeResourceRepository implements RuntimeResourceRepository 
   }
 
   @Override
+  public com.agentplatform.control.resource.McpServerResource createMcpServer(
+      UUID tenantId,
+      UUID applicationId,
+      UUID serverId,
+      String name,
+      String endpoint,
+      String credentialEnvelope) {
+    return inTransaction(tenantId, () -> oneOrNotFound(jdbc.query("""
+        insert into mcp_servers (tenant_id,id,application_id,name,endpoint,credential_envelope)
+        select a.tenant_id,?,a.id,?,?,?::jsonb
+          from applications a
+         where a.tenant_id = ? and a.id = ?
+        returning id,name,endpoint,state,credential_envelope is not null as has_credential,
+                  created_at
+        """, (row, rowNumber) -> new com.agentplatform.control.resource.McpServerResource(
+            row.getObject("id", UUID.class), row.getString("name"), row.getString("endpoint"),
+            row.getString("state"),
+            row.getBoolean("has_credential") ? "sealed" : "absent",
+            row.getTimestamp("created_at").toInstant()),
+        serverId, name, endpoint, credentialEnvelope, tenantId, applicationId)));
+  }
+
+  @Override
   public ModelPolicyResource createModelPolicy(
       UUID tenantId,
       UUID applicationId,

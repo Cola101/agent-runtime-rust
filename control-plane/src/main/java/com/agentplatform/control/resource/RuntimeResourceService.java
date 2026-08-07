@@ -223,6 +223,34 @@ public final class RuntimeResourceService {
     return repository.publishSkillVersion(artifact, skillArtifactSigner.sign(artifact));
   }
 
+  /**
+   * Registers a federated MCP server (ADR-0040).
+   *
+   * <p>Two things are checked here rather than only in SQL. The name shape,
+   * because it becomes the namespace in {@code mcp:<server>/<tool>} and a name
+   * carrying a separator could make one server's tool parse as another's. And
+   * the endpoint, because it is the only host the federation client may reach
+   * for this server, and plain HTTP to an arbitrary host would put a tenant's
+   * credential on the wire in clear.
+   *
+   * <p>A credential is optional. Open servers exist, and requiring one would
+   * only teach tenants to invent a placeholder secret.
+   */
+  public McpServerResource createMcpServer(
+      UUID tenantId, UUID applicationId, String name, String endpoint, String apiKey) {
+    var normalizedTenant = required(tenantId);
+    var normalizedApplication = required(applicationId);
+    var normalizedName = mcpServerName(name);
+    var normalizedEndpoint = providerEndpoint(endpoint);
+    var serverId = UUID.randomUUID();
+    var envelope = apiKey == null || apiKey.isBlank()
+        ? null
+        : credentialSealer.seal(normalizedTenant, serverId, text(apiKey, "api key", 8_192));
+    return repository.createMcpServer(
+        normalizedTenant, normalizedApplication, serverId, normalizedName,
+        normalizedEndpoint, envelope);
+  }
+
   public ModelPolicyResource createModelPolicy(
       UUID tenantId, UUID applicationId, UUID workspaceId, String name, String routing) {
     return createModelPolicy(
@@ -321,6 +349,21 @@ public final class RuntimeResourceService {
     if (!normalized.matches(
         "(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?")) {
       throw new IllegalArgumentException(field + " must be a semantic version");
+    }
+    return normalized;
+  }
+
+  /**
+   * The same shape the database constraint enforces, checked before the insert
+   * so a bad name is a refusal rather than a constraint violation surfacing as a
+   * server fault.
+   */
+  private String mcpServerName(String value) {
+    var normalized = text(value, "name", 64);
+    if (!normalized.matches("[a-z0-9][a-z0-9_-]{0,63}")) {
+      throw new IllegalArgumentException(
+          "mcp server name must be lowercase alphanumeric with - or _, and cannot contain"
+              + " the qualified-name separators / or :");
     }
     return normalized;
   }

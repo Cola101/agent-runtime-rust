@@ -119,6 +119,33 @@ class JdbcRuntimeResourceRepositoryIntegrationTest {
     });
   }
 
+  // The service checks the name shape before the insert, but the service is not
+  // the only way rows get written. The database constraint is the one that
+  // cannot be bypassed, so it is checked where it lives.
+  @Test
+  void theDatabaseRefusesAnMcpServerNameThatCouldForgeAQualifiedToolName() {
+    var jdbc = new JdbcTemplate(DATABASE.dataSource());
+    var transactions = new TransactionTemplate(
+        new DataSourceTransactionManager(DATABASE.dataSource()));
+    var tenantId = UUID.randomUUID();
+    var applicationId = UUID.randomUUID();
+    seedTenant(jdbc, tenantId, applicationId, UUID.randomUUID());
+    var repository = new JdbcRuntimeResourceRepository(jdbc, transactions);
+
+    var created = repository.createMcpServer(
+        tenantId, applicationId, UUID.randomUUID(), "search",
+        "https://mcp.example.com/rpc", null);
+    assertThat(created.name()).isEqualTo("search");
+    assertThat(created.credentialStatus())
+        .as("no envelope was supplied, so nothing may claim one was sealed")
+        .isEqualTo("absent");
+
+    assertThatThrownBy(() -> repository.createMcpServer(
+        tenantId, applicationId, UUID.randomUUID(), "other/tool",
+        "https://mcp.example.com/rpc", null))
+        .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+  }
+
   @Test
   void rejectsCrossApplicationParentsAndDuplicateNamesWithoutLeakingTheirExistence() {
     var jdbc = new JdbcTemplate(DATABASE.dataSource());

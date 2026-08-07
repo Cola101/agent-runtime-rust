@@ -3,6 +3,7 @@ package com.agentplatform.control.api;
 import com.agentplatform.control.resource.AgentResource;
 import com.agentplatform.control.resource.AgentVersionResource;
 import com.agentplatform.control.resource.ModelPolicyResource;
+import com.agentplatform.control.resource.McpServerResource;
 import com.agentplatform.control.resource.ModelProviderResource;
 import com.agentplatform.control.resource.ProjectSummary;
 import com.agentplatform.control.resource.ResourceContext;
@@ -114,6 +115,16 @@ public class RuntimeResourceController {
     return created("/v1/model-providers/" + created.id(), ModelProviderResponse.from(created));
   }
 
+  @PostMapping("/mcp-servers")
+  ResponseEntity<McpServerResponse> createMcpServer(
+      @AuthenticationPrincipal Jwt jwt, @Valid @RequestBody CreateMcpServerRequest request) {
+    var context = TenantContext.from(jwt);
+    var created = resources.createMcpServer(
+        context.tenantId(), context.applicationId(), request.name(),
+        request.endpoint(), request.apiKey());
+    return created("/v1/mcp-servers/" + created.id(), McpServerResponse.from(created));
+  }
+
   @PostMapping("/sessions")
   ResponseEntity<SessionResponse> createSession(
       @AuthenticationPrincipal Jwt jwt, @Valid @RequestBody CreateSessionRequest request) {
@@ -194,6 +205,13 @@ public class RuntimeResourceController {
       @NotBlank @Size(max = 2_048) String endpoint,
       @NotBlank @Size(max = 200) String model,
       @NotBlank @Size(max = 8_192) @JsonProperty("api_key") String apiKey) {}
+
+  record CreateMcpServerRequest(
+      @NotBlank @Size(max = 64) String name,
+      @NotBlank @Size(max = 2_048) String endpoint,
+      // Optional: open MCP servers exist, and demanding a key would only teach
+      // tenants to send a placeholder.
+      @Size(max = 8_192) @JsonProperty("api_key") String apiKey) {}
 
   record CreateSessionRequest(
       @NotNull @JsonProperty("workspace_id") UUID workspaceId,
@@ -302,6 +320,20 @@ public class RuntimeResourceController {
           policy.id(), policy.workspaceId(), policy.name(), policy.routing(),
           policy.providerIds(),
           policy.createdAt().toString());
+    }
+  }
+
+  record McpServerResponse(
+      UUID id,
+      String name,
+      String endpoint,
+      String state,
+      @JsonProperty("credential_status") String credentialStatus,
+      @JsonProperty("created_at") String createdAt) {
+    static McpServerResponse from(McpServerResource server) {
+      return new McpServerResponse(
+          server.id(), server.name(), server.endpoint(), server.state(),
+          server.credentialStatus(), server.createdAt().toString());
     }
   }
 

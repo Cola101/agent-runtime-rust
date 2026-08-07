@@ -35,6 +35,14 @@ public interface RuntimeResourceRepository {
       String model,
       String credentialEnvelope);
 
+  McpServerResource createMcpServer(
+      UUID tenantId,
+      UUID applicationId,
+      UUID serverId,
+      String name,
+      String endpoint,
+      String credentialEnvelope);
+
   ModelPolicyResource createModelPolicy(
       UUID tenantId,
       UUID applicationId,
