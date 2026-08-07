@@ -36,15 +36,6 @@
 **没有复制任何源代码。** profile 文本与执行器集成均为本项目原创。若将来需要复制 Codex 源码，
 必须保留其 Apache-2.0 头并在此另立条目。
 
-## OpenClaw
-
-来源仓库：`https://github.com/openclaw/openclaw`
-本地参考快照：`/Users/cola/Documents/Code/agent-source-research/openclaw`
-
-**当前仅作架构参考，未移植任何设计或代码。** 已阅读并在 ADR 与证据文档中作为对标提及的部分
-（Skill 树摘要、session snapshot、tool dispatch、静态扫描、node-host、模型 fallback、优雅排空）
-均未进入实现。**复制前必须先复核其具体许可证**，并在此登记。
-
 ### 2. 进程组回收
 
 - **本项目文件**：`runtime/crates/tool-runtime/src/lib.rs`（`reap_process_tree`）
@@ -64,3 +55,12 @@
 另外本项目用 tokio 的 `Command::process_group(0)` 而非 `pre_exec`，避免额外的 unsafe。
 
 **没有复制任何源代码。**
+
+## OpenClaw
+
+来源仓库：`https://github.com/openclaw/openclaw`
+本地参考快照：`/Users/cola/Documents/Code/agent-source-research/openclaw`
+
+**当前仅作架构参考，未移植任何设计或代码。** 已阅读并在 ADR 与证据文档中作为对标提及的部分
+（Skill 树摘要、session snapshot、tool dispatch、静态扫描、node-host、模型 fallback、优雅排空）
+均未进入实现。**复制前必须先复核其具体许可证**，并在此登记。
