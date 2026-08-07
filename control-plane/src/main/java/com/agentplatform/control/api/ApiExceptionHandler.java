@@ -73,6 +73,25 @@ public class ApiExceptionHandler {
             "detail", error.getMessage() == null ? "invalid request" : error.getMessage()));
   }
 
+  /**
+   * At a quota, not in error. Nothing about the request is wrong and the same
+   * request succeeds once capacity frees, so it carries a retry hint -- a client
+   * told 400 would change something that is not broken.
+   */
+  @ExceptionHandler(com.agentplatform.control.run.TenantQuotaExceeded.class)
+  ResponseEntity<Map<String, Object>> tenantQuotaExceeded(
+      com.agentplatform.control.run.TenantQuotaExceeded error) {
+    return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+        .header(HttpHeaders.RETRY_AFTER, Long.toString(error.retryAfterSeconds()))
+        .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+        .body(Map.of(
+            "type", URI.create("urn:agent-runtime:problem:tenant-quota").toString(),
+            "title", "Tenant is at its concurrency quota",
+            "status", HttpStatus.TOO_MANY_REQUESTS.value(),
+            "detail", error.getMessage(),
+            "retry_after_seconds", error.retryAfterSeconds()));
+  }
+
   @ExceptionHandler(RunAlreadyTerminal.class)
   ResponseEntity<Map<String, Object>> runAlreadyTerminal(RunAlreadyTerminal error) {
     return problem(HttpStatus.CONFLICT, "Run is already terminal", error.getMessage());

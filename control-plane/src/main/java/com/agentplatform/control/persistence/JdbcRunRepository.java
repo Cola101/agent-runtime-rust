@@ -1,6 +1,7 @@
 package com.agentplatform.control.persistence;
 
 import com.agentplatform.control.run.Run;
+import com.agentplatform.control.run.TenantQuotaExceeded;
 import com.agentplatform.control.run.RunRepository;
 import com.agentplatform.control.run.RunAlreadyTerminal;
 import com.agentplatform.control.run.RunNotFound;
@@ -29,6 +30,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Repository
 public class JdbcRunRepository implements RunRepository {
+  /** Applied to a tenant with no configured limit. */
+  private static final int DEFAULT_MAX_ACTIVE_RUNS = 64;
+  /** Long enough that a client retrying is not itself the load problem. */
+  private static final long TENANT_QUOTA_RETRY_AFTER_SECONDS = 30;
+
   private static final String SELECT_BY_KEY = """
       select id, tenant_id, session_id, agent_version_id, workspace_id, model_policy_id, idempotency_key,
              input, status, max_tokens, max_cost_cents, max_duration_seconds, created_at
@@ -58,6 +64,7 @@ public class JdbcRunRepository implements RunRepository {
     return transactions.execute(status -> {
       setTenant(run.tenantId());
       ensureAuthorizedTarget(applicationId, run);
+      admitWithinTenantQuota(run.tenantId(), applicationId, run.idempotencyKey());
       int inserted = jdbc.update("""
           insert into runs (
             tenant_id, application_id, id, session_id, workspace_id, agent_version_id,
@@ -496,6 +503,52 @@ public class JdbcRunRepository implements RunRepository {
               row.getLong("max_duration_seconds"),
               row.getTimestamp("created_at").toInstant()), tenantId, applicationId, limit);
     });
+  }
+
+  /**
+   * Refuses admission when the tenant is already at its concurrent Run limit.
+   *
+   * <p>Takes the tenant's quota row {@code for update} before counting.
+   * Counting and then inserting without the lock lets two concurrent requests
+   * both see room and both insert, which is the failure this exists to prevent
+   * -- the same reason subagent admission locks the parent Run row.
+   *
+   * <p>An idempotent retry is not charged: if the key already names a Run, the
+   * caller is asking about capacity it already holds, and refusing would give a
+   * quota error for the client's own Run.
+   */
+  private void admitWithinTenantQuota(UUID tenantId, UUID applicationId, String idempotencyKey) {
+    var alreadyAdmitted = jdbc.queryForObject(
+        "select count(*) from runs where tenant_id = ? and application_id = ? and idempotency_key = ?",
+        Integer.class, tenantId, applicationId, idempotencyKey);
+    if (alreadyAdmitted != null && alreadyAdmitted > 0) {
+      return;
+    }
+    var limits = jdbc.query(
+        "select max_active_runs from tenant_run_quotas where tenant_id = ? for update",
+        (row, rowNumber) -> row.getInt("max_active_runs"), tenantId);
+    if (limits.isEmpty()) {
+      // No row means no configured limit for this tenant. Inserting the default
+      // here rather than treating absence as unlimited keeps the lock target
+      // present for every subsequent admission.
+      jdbc.update(
+          "insert into tenant_run_quotas (tenant_id, max_active_runs) values (?, ?)"
+              + " on conflict (tenant_id) do nothing",
+          tenantId, DEFAULT_MAX_ACTIVE_RUNS);
+      limits = jdbc.query(
+          "select max_active_runs from tenant_run_quotas where tenant_id = ? for update",
+          (row, rowNumber) -> row.getInt("max_active_runs"), tenantId);
+    }
+    var limit = limits.isEmpty() ? DEFAULT_MAX_ACTIVE_RUNS : limits.get(0);
+    var active = jdbc.queryForObject(
+        "select count(*) from runs where tenant_id = ? and status in "
+            + "('queued','running','waiting_approval','suspended')",
+        Integer.class, tenantId);
+    if (active != null && active >= limit) {
+      throw new TenantQuotaExceeded(
+          "tenant is at its concurrent run limit of " + limit,
+          TENANT_QUOTA_RETRY_AFTER_SECONDS);
+    }
   }
 
   private void setTenant(UUID tenantId) {

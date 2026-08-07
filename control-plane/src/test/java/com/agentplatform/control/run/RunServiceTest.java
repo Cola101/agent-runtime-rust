@@ -7,6 +7,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.time.Instant;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import org.junit.jupiter.api.Test;
 
 class RunServiceTest {
@@ -104,8 +106,26 @@ class RunServiceTest {
 
     @Override
     public Run save(UUID applicationId, Run run) {
+      // Mirrors the real repository: the quota is checked as part of admitting
+      // the Run, not before it, so the double cannot pass a test the database
+      // implementation would fail.
+      if (activeRunQuota != null) {
+        var active = runs.values().stream()
+            .filter(existing -> existing.tenantId().equals(run.tenantId()))
+            .count();
+        if (active >= activeRunQuota) {
+          throw new TenantQuotaExceeded(
+              "tenant is at its concurrent run limit of " + activeRunQuota, 30);
+        }
+      }
       runs.put(key(run.tenantId(), applicationId, run.idempotencyKey()), run);
       return run;
+    }
+
+    private Integer activeRunQuota;
+
+    void setActiveRunQuota(int limit) {
+      this.activeRunQuota = limit;
     }
 
     @Override
@@ -147,5 +167,68 @@ class RunServiceTest {
     private String key(UUID tenantId, UUID applicationId, String idempotencyKey) {
       return tenantId + ":" + applicationId + ":" + idempotencyKey;
     }
+  }
+
+  // A tenant could create Runs without limit. The only concurrency bound in the
+  // system was subagent admission's per-parent cap, which protects a parent from
+  // its own children and says nothing about one tenant taking every Worker slot.
+  @Test
+  void aTenantAtItsConcurrencyQuotaCannotCreateAnotherRun() {
+    var repository = new InMemoryRunRepository();
+    repository.setActiveRunQuota(2);
+    var service = new RunService(repository);
+    var tenantId = UUID.randomUUID();
+    var applicationId = UUID.randomUUID();
+
+    for (var index = 0; index < 2; index++) {
+      service.create(tenantId, applicationId, "key-" + index, command());
+    }
+
+    var refused = assertThrows(
+        TenantQuotaExceeded.class,
+        () -> service.create(tenantId, applicationId, "key-over", command()));
+    assertThat(refused.retryAfterSeconds()).isPositive();
+  }
+
+  // The quota bounds a tenant, not the platform. One tenant at its limit must
+  // not stop another from working, which is the whole point of it being per
+  // tenant rather than global.
+  @Test
+  void oneTenantAtItsQuotaDoesNotBlockAnother() {
+    var repository = new InMemoryRunRepository();
+    repository.setActiveRunQuota(1);
+    var service = new RunService(repository);
+    var applicationId = UUID.randomUUID();
+    var busy = UUID.randomUUID();
+    var other = UUID.randomUUID();
+
+    service.create(busy, applicationId, "busy-1", command());
+    assertThrows(
+        TenantQuotaExceeded.class, () -> service.create(busy, applicationId, "busy-2", command()));
+
+    assertDoesNotThrow(() -> service.create(other, applicationId, "other-1", command()));
+  }
+
+  // Retrying with the same idempotency key is not a new Run, so it must not be
+  // refused for capacity the caller already holds. Otherwise a client that
+  // retries a timed-out request gets a quota error for its own Run.
+  @Test
+  void anIdempotentRetryIsNotChargedAgainstTheQuota() {
+    var repository = new InMemoryRunRepository();
+    repository.setActiveRunQuota(1);
+    var service = new RunService(repository);
+    var tenantId = UUID.randomUUID();
+    var applicationId = UUID.randomUUID();
+
+    var first = service.create(tenantId, applicationId, "same-key", command());
+    var retried = service.create(tenantId, applicationId, "same-key", command());
+
+    assertThat(retried.id()).isEqualTo(first.id());
+  }
+
+  private static CreateRunCommand command() {
+    return new CreateRunCommand(
+        UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+        "hello", 1000, 100, 60);
   }
 }
