@@ -13,8 +13,9 @@ use crate::ProviderExecutionError;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Oaep, RsaPrivateKey};
+use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
+use rsa::traits::PublicKeyParts;
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -125,13 +126,26 @@ pub struct McpFederationClient {
 }
 
 impl McpFederationClient {
+    /// The key id is derived from the key rather than supplied.
+    ///
+    /// Taking it as a parameter is a way to configure a mismatch that shows up
+    /// only as envelopes that will not open, and the model credential path
+    /// already derives it the same way. The 3072-bit floor matches that path
+    /// too: a weaker key must not be acceptable here just because this is the
+    /// newer code.
     pub fn from_pkcs8_pem(
         pem: &str,
-        key_id: impl Into<String>,
         request_timeout: Duration,
     ) -> Result<Self, McpFederationError> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(pem)
             .map_err(|_| McpFederationError::CredentialUnopenable)?;
+        if private_key.n().bits() < 3072 || request_timeout.is_zero() {
+            return Err(McpFederationError::CredentialUnopenable);
+        }
+        let public_der = RsaPublicKey::from(&private_key)
+            .to_public_key_der()
+            .map_err(|_| McpFederationError::CredentialUnopenable)?;
+        let key_id = hex::encode(Sha256::digest(public_der.as_ref()));
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             // A federated server is the only host reachable for its own calls,
@@ -142,7 +156,7 @@ impl McpFederationClient {
             .map_err(|error| McpFederationError::Unreachable(error.to_string()))?;
         Ok(Self {
             private_key,
-            key_id: key_id.into(),
+            key_id,
             http,
         })
     }

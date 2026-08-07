@@ -5,6 +5,9 @@ use agent_model_gateway::{
     OpenAiResponsesAdapter, OpenAiResponsesConfig, ProviderAdapter, ProviderCredential,
     ProviderPricing, ProviderProtocol, WorkloadTokenVerifier,
 };
+use agent_model_gateway::mcp::McpFederationClient;
+use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
+use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecutionServer;
 use agent_runtime_health::{HealthState, serve as serve_health};
 use std::net::SocketAddr;
@@ -88,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         required_environment("AGENT_RUNTIME_GRPC_CLIENT_CA_CERT")?,
     )?;
     let mut service = ModelExecutionGrpcService::new(adapter, credential, verifier);
+    let mut mcp_federation: Option<McpFederationGrpcService> = None;
     if let Ok(private_key_path) =
         std::env::var("AGENT_RUNTIME_MODEL_GATEWAY_CREDENTIAL_PRIVATE_KEY_PATH")
     {
@@ -100,6 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             response_timeout,
             stream_idle_timeout,
         )?);
+        // The same key opens MCP credentials, so federation is available only
+        // where model credentials already are. A gateway that could open one but
+        // not the other would be a surprising half-configured state.
+        mcp_federation = Some(McpFederationGrpcService::new(
+            McpFederationClient::from_pkcs8_pem(&private_key_pem, response_timeout)?,
+        ));
     }
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     health.set_ready(true);
@@ -108,9 +118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         %bind_address,
         "model gateway listening"
     );
-    Server::builder()
-        .tls_config(tls.into_tonic())?
-        .add_service(ModelExecutionServer::new(service))
+    let mut server = Server::builder().tls_config(tls.into_tonic())?;
+    let router = server.add_service(ModelExecutionServer::new(service));
+    let router = match mcp_federation {
+        Some(federation) => router.add_service(McpFederationServer::new(federation)),
+        None => router,
+    };
+    router
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())

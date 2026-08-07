@@ -15,8 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-const TEST_KEY_ID: &str = "mcp-test-key";
-
 /// Generated once for the whole suite rather than committed as a file. A private
 /// key in the repository is a private key in the repository even when it is only
 /// for tests, and RSA keygen is slow enough that per-test generation would
@@ -25,7 +23,7 @@ fn test_key_pem() -> &'static str {
     static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
-        RsaPrivateKey::new(&mut OsRng, 2048)
+        RsaPrivateKey::new(&mut OsRng, 3072)
             .unwrap()
             .to_pkcs8_pem(LineEnding::LF)
             .unwrap()
@@ -105,8 +103,7 @@ async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<At
 }
 
 fn client() -> McpFederationClient {
-    McpFederationClient::from_pkcs8_pem(test_key_pem(), TEST_KEY_ID, Duration::from_secs(5))
-        .unwrap()
+    McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5)).unwrap()
 }
 
 fn open_server(endpoint: String) -> McpServerRef {
@@ -319,9 +316,8 @@ async fn a_sealed_credential_is_opened_and_sent_as_a_bearer_token() {
 
     let state = behaviour(&["web_search"]);
     let (endpoint, _) = spawn_server(Arc::clone(&state)).await;
-    let client =
-        McpFederationClient::from_pkcs8_pem(test_key_pem(), key_id, Duration::from_secs(5))
-            .unwrap();
+    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5))
+        .unwrap();
 
     client
         .list_tools(
@@ -395,9 +391,8 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
     .to_string();
 
     let (endpoint, _) = spawn_server(behaviour(&["web_search"])).await;
-    let client =
-        McpFederationClient::from_pkcs8_pem(test_key_pem(), key_id, Duration::from_secs(5))
-            .unwrap();
+    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5))
+        .unwrap();
 
     let refused = client
         .list_tools(
@@ -414,5 +409,27 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
     assert!(
         matches!(refused, McpFederationError::CredentialUnopenable),
         "expected CredentialUnopenable, got {refused:?}"
+    );
+}
+
+/// A key too weak for model credentials must be too weak for MCP credentials.
+/// A newer code path is not a reason to accept less.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_below_the_model_credential_floor_is_refused() {
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+
+    let weak = RsaPrivateKey::new(&mut OsRng, 2048)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+
+    assert!(
+        McpFederationClient::from_pkcs8_pem(&weak, Duration::from_secs(5)).is_err(),
+        "a 2048-bit key must be refused, as it is for model credentials"
+    );
+    assert!(
+        McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(0)).is_err(),
+        "a zero timeout must be refused"
     );
 }

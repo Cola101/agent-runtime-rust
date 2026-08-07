@@ -138,3 +138,64 @@ enum ModelErrorKind {
   MODEL_ERROR_KIND_CAPABILITY_MISMATCH = 7;
   MODEL_ERROR_KIND_UNAVAILABLE = 8;
 }
+
+// Federated MCP tool calls (ADR-0040).
+//
+// Served by the same process as ModelExecution because that process is where
+// sealed credentials are opened. A Worker that could open them would be a Worker
+// holding a tenant's third-party credentials while executing a model's
+// suggestions.
+service McpFederation {
+  rpc ListTools(McpListToolsRequest) returns (McpListToolsResponse);
+  rpc CallTool(McpCallToolRequest) returns (McpCallToolResponse);
+}
+
+message McpServerRef {
+  string server_id = 1;
+  // Namespace in qualified tool names: mcp:<name>/<tool>.
+  string name = 2;
+  // The only host the federation client may reach for this server.
+  string endpoint = 3;
+  // Sealed. Opened by the gateway and by nothing else.
+  bytes credential_envelope_json = 4;
+}
+
+message McpListToolsRequest {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string run_id = 3;
+  McpServerRef server = 4;
+}
+
+message McpTool {
+  string qualified_name = 1;
+  string description = 2;
+  bytes input_schema_json = 3;
+}
+
+message McpListToolsResponse {
+  uint32 schema_version = 1;
+  repeated McpTool tools = 2;
+  // What the Run freezes and presents on every later call.
+  string catalog_digest = 3;
+}
+
+message McpCallToolRequest {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string run_id = 3;
+  McpServerRef server = 4;
+  string qualified_name = 5;
+  bytes arguments_json = 6;
+  // The digest discovered at Run start. A server whose catalog changed since
+  // then does not get to change what this Run may do.
+  string frozen_catalog_digest = 7;
+}
+
+message McpCallToolResponse {
+  uint32 schema_version = 1;
+  bytes content_json = 2;
+  // The server reported the call failed. Distinct from a transport failure: the
+  // model should see this, and nothing should be retried.
+  bool is_error = 3;
+}

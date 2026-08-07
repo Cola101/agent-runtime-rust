@@ -581,6 +581,73 @@ pub fn prepare_trusted_workspace_tool(
     }))
 }
 
+/// Turns a discovered MCP catalog into Tool definitions the kernel accepts.
+///
+/// This is the joint between federation and the kernel. Everything about a
+/// federated Tool that matters for safety is decided here, in one place, rather
+/// than being whatever the server happened to send:
+///
+/// - `SandboxClass::Federated`, which is what stops any approval exemption
+///   reaching it (ADR-0040 decision 6, enforced in the kernel).
+/// - `ApprovalMode::Ask` and `ToolEffect::Unknown`, because its effects are
+///   unknown by construction -- that is what third-party means.
+/// - the frozen catalog digest as the implementation digest, so a Checkpoint
+///   restore recomputes it and refuses when the catalog moved.
+/// - `tool:mcp:<server>` as the required scope, so a Skill still cannot reach a
+///   server the AgentVersion never delegated.
+pub fn federated_tool_definitions(
+    server_name: &str,
+    frozen_catalog_digest: &str,
+    tools: impl IntoIterator<Item = (String, String, serde_json::Value)>,
+) -> Result<Vec<WorkerToolDefinition>, WorkerAssignmentError> {
+    if frozen_catalog_digest.len() != 64
+        || !frozen_catalog_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(WorkerAssignmentError::ToolConfiguration(
+            "federated tools need the frozen catalog digest as their implementation digest".into(),
+        ));
+    }
+    let prefix = format!("mcp:{server_name}/");
+    let mut definitions = Vec::new();
+    for (qualified_name, description, input_schema) in tools {
+        // A catalog entry naming a tool outside this server's namespace would
+        // register a Tool under a namespace nobody delegated. The gateway
+        // already qualifies names, so reaching here means something upstream is
+        // wrong and guessing would be worse than refusing.
+        if !qualified_name.starts_with(&prefix) {
+            return Err(WorkerAssignmentError::ToolConfiguration(format!(
+                "federated tool {qualified_name} is not namespaced under {prefix}"
+            )));
+        }
+        definitions.push(WorkerToolDefinition {
+            descriptor: ToolDescriptor {
+                name: qualified_name,
+                effect: ToolEffect::Unknown,
+                approval: ApprovalMode::Ask,
+                sandbox: SandboxClass::Federated,
+                implementation_digest: frozen_catalog_digest.to_owned(),
+                required_scopes: BTreeSet::from([format!("tool:mcp:{server_name}")]),
+            },
+            description: if description.trim().is_empty() {
+                // register_tool refuses a blank description, and a server is
+                // entitled to omit one. Refusing the whole catalog over a
+                // missing sentence would be the wrong failure.
+                "Federated MCP tool".to_owned()
+            } else {
+                description
+            },
+            input_schema: if input_schema.is_object() {
+                input_schema
+            } else {
+                serde_json::json!({ "type": "object" })
+            },
+        });
+    }
+    Ok(definitions)
+}
+
 pub fn materialize_native_workspace(
     workspace_base: &Path,
     tenant_id: Uuid,
@@ -956,6 +1023,15 @@ impl WorkerProcessor {
             tool_definitions: BTreeMap::new(),
             skill_artifact_verifier: None,
         })
+    }
+
+    /// Read-only view of the registered Tools.
+    ///
+    /// Shared so a test can ask what the kernel would decide, rather than
+    /// asserting on the descriptor and calling that the same thing. It is the
+    /// planning decision that matters, and only the registry makes it.
+    pub fn tool_registry(&self) -> &ToolRegistry {
+        &self.tool_registry
     }
 
     pub fn set_skill_artifact_verifier(&mut self, verifier: SkillArtifactVerifier) {
