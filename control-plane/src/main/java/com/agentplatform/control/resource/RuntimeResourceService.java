@@ -15,6 +15,20 @@ public final class RuntimeResourceService {
    */
   private static final Set<String> BETA_DELEGATED_SCOPES =
       Set.of("tool:workspace.read", "tool:workspace.write", "tool:shell.exec");
+  /**
+   * Approval policies a tenant may set, keyed by the Tool they apply to.
+   *
+   * <p>The value must be a name the runtime knows. An unrecognised value is
+   * rejected rather than defaulted, because a permissive fallback is how a typo
+   * becomes a grant.
+   */
+  private static final Set<String> TOOL_APPROVAL_POLICIES =
+      Set.of("never", "provably_read_only_shell_command");
+  /** The scope a Tool needs, so a policy can be checked against what is delegated. */
+  private static final java.util.Map<String, String> TOOL_SCOPES = java.util.Map.of(
+      "workspace.read_text", "tool:workspace.read",
+      "workspace.write_text", "tool:workspace.write",
+      "shell.exec", "tool:shell.exec");
   private static final Set<String> PROVIDER_PROTOCOLS = Set.of(
       "openai_compatible", "openai_responses", "anthropic_messages");
   private static final Set<String> SKILL_PLATFORMS = Set.of(
@@ -93,6 +107,21 @@ public final class RuntimeResourceService {
       List<String> delegatedScopes,
       List<UUID> skillVersionIds,
       List<SubagentRoleDefinition> subagentRoles) {
+    return createAgentVersion(
+        tenantId, applicationId, agentId, instructions, delegatedScopes, skillVersionIds,
+        subagentRoles, java.util.Map.of());
+  }
+
+  public AgentVersionResource createAgentVersion(
+      UUID tenantId,
+      UUID applicationId,
+      UUID agentId,
+      String instructions,
+      List<String> delegatedScopes,
+      List<UUID> skillVersionIds,
+      List<SubagentRoleDefinition> subagentRoles,
+      java.util.Map<String, String> toolApprovalPolicies) {
+    Objects.requireNonNull(toolApprovalPolicies, "toolApprovalPolicies");
     Objects.requireNonNull(delegatedScopes, "delegatedScopes");
     Objects.requireNonNull(skillVersionIds, "skillVersionIds");
     Objects.requireNonNull(subagentRoles, "subagentRoles");
@@ -108,6 +137,22 @@ public final class RuntimeResourceService {
         || !BETA_DELEGATED_SCOPES.containsAll(normalizedScopes)) {
       throw new IllegalArgumentException("delegated scopes contain duplicates or unsupported entries");
     }
+    // A policy only means something for a Tool this AgentVersion can actually
+    // reach. Storing one for anything else would either be a mistake or a
+    // pre-authorisation that a later scope change would silently activate.
+    if (toolApprovalPolicies.size() > TOOL_SCOPES.size()) {
+      throw new IllegalArgumentException("tool approval policies contain unknown tools");
+    }
+    toolApprovalPolicies.forEach((tool, policy) -> {
+      var requiredScope = TOOL_SCOPES.get(tool);
+      if (requiredScope == null || !normalizedScopes.contains(requiredScope)) {
+        throw new IllegalArgumentException(
+            "tool approval policy names a tool this AgentVersion does not delegate: " + tool);
+      }
+      if (policy == null || !TOOL_APPROVAL_POLICIES.contains(policy)) {
+        throw new IllegalArgumentException("unsupported tool approval policy: " + policy);
+      }
+    });
     var normalizedSkills = skillVersionIds.stream().map(this::required).distinct().toList();
     if (normalizedSkills.size() != skillVersionIds.size() || normalizedSkills.size() > 16) {
       throw new IllegalArgumentException("skill version ids contain duplicates or exceed 16 entries");
