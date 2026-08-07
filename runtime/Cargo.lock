@@ -235,6 +235,7 @@ dependencies = [
  "object_store",
  "prost",
  "rcgen",
+ "rsa",
  "semver",
  "serde",
  "serde_json",

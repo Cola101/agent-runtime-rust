@@ -40,11 +40,15 @@ use uuid::Uuid;
 
 mod checkpoint_gateway;
 mod execution_supervisor;
+mod mcp_gateway;
 mod model_gateway;
 mod tool_execution_supervisor;
 
 pub use checkpoint_gateway::GrpcCheckpointPayloadStore;
 pub use execution_supervisor::{ModelExecutionSupervisor, ModelExecutionUpdate};
+pub use mcp_gateway::{
+    DiscoveredCatalog, DiscoveredTool, GrpcMcpFederationClient, McpGatewayClientError,
+};
 pub use model_gateway::{GrpcModelGatewayClient, ModelGatewayClientError};
 pub use tool_execution_supervisor::{ToolExecutionSupervisor, ToolExecutionUpdate};
 

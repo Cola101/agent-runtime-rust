@@ -35,6 +35,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rsa.workspace = true
 tempfile = "3.23.0"
 agent-checkpoint-gateway = { path = "../checkpoint-gateway" }
 object_store.workspace = true
