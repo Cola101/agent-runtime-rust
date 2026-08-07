@@ -8,6 +8,13 @@ docs/third-party-sources.md, and update this NOTICE file before merge.
 Adapted designs (no source copied)
 ----------------------------------
 
+runtime/crates/tool-runtime/src/lib.rs adapts process-group reaping from OpenAI
+Codex (Apache-2.0), codex-rs/utils/pty/src/process_group.rs: the child leads its
+own process group, and the group rather than the single pid is signalled so a
+timeout ends everything a Tool started. Codex escalates SIGTERM to SIGKILL; this
+project sends SIGKILL directly. No Codex source is copied. See
+docs/third-party-sources.md.
+
 runtime/crates/tool-runtime/src/seatbelt.rs adapts the macOS Seatbelt containment
 approach from OpenAI Codex (Apache-2.0), codex-rs/sandboxing: invoking
 /usr/bin/sandbox-exec by absolute path, passing filesystem paths as profile
