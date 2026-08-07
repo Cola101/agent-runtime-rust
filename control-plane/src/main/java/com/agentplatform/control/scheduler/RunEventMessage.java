@@ -21,7 +21,7 @@ public record RunEventMessage(
   private static final Set<String> SUPPORTED_TYPES = Set.of(
       "run.started", "model.output.delta", "model.tool_call", "model.usage",
       "model.turn.completed", "tool.execution.requested", "tool.execution.started",
-      "tool.result", "tool.denied",
+      "tool.result", "tool.denied", "tool.execution.auto_approved",
       "tool.retry_requested", "approval.required", "approval.rebound",
       "subagent.spawn.requested", "subagent.result.received", "run.restored", "run.resumed",
       "run.steer.applied",

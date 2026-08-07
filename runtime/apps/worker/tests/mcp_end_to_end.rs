@@ -11,8 +11,12 @@ use agent_kernel::ToolPlan;
 use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
-use agent_protocol::{AutoApproval, McpServerSnapshot, SandboxClass, ToolCall};
 use agent_protocol::RunExecutionCommand;
+use agent_protocol::{AutoApproval, McpServerSnapshot, SandboxClass, ToolCall};
+use agent_runtime_worker::FederationIdentity;
+use agent_workload_identity::{WorkloadIdentityClaims, WorkloadTokenVerifier};
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
 use agent_runtime_worker::{
     discover_federated_tools, federated_tool_definitions, GrpcMcpFederationClient,
     WorkerProcessor,
@@ -80,15 +84,16 @@ async fn spawn_mcp_server(tools: Arc<Mutex<Vec<String>>>) -> String {
 /// No mTLS here: this test is about the federation path, and the transport
 /// security of the gateway has its own coverage. Saying so rather than leaving
 /// it to be inferred.
-async fn spawn_gateway(private_key_pem: &str) -> String {
-    let client = McpFederationClient::from_pkcs8_pem(private_key_pem, Duration::from_secs(5))
+async fn spawn_gateway(private_key_pem: &str, signing_key: &SigningKey) -> String {
+    let client = McpFederationClient::from_pkcs8_pem(private_key_pem, Duration::from_secs(5), true)
         .expect("gateway federation client");
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
             .add_service(McpFederationServer::new(McpFederationGrpcService::new(
-                client,
+                client, verifier,
             )))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -104,12 +109,19 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
         .to_pkcs8_pem(LineEnding::LF)
         .unwrap()
         .to_string();
+    let signing_key = SigningKey::from_bytes(&[71; 32]);
     let tools = Arc::new(Mutex::new(vec!["web_search".to_owned()]));
     let mcp_endpoint = spawn_mcp_server(Arc::clone(&tools)).await;
-    let gateway_endpoint = spawn_gateway(&private_key_pem).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem, &signing_key).await;
 
-    let tenant_id = Uuid::now_v7();
-    let run_id = Uuid::now_v7();
+    let identity = FederationIdentity {
+        tenant_id: Uuid::now_v7(),
+        run_id: Uuid::now_v7(),
+        attempt_id: Uuid::now_v7(),
+        worker_id: Uuid::now_v7(),
+        worker_incarnation_id: Uuid::now_v7(),
+    };
+    let token = signed_identity(&signing_key, &identity);
     // No credential: an open server, which is the case that needs no key
     // material in a test and exercises the same path.
     let server = McpServerSnapshot {
@@ -125,7 +137,7 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
 
     // 1. Discovery, through the gateway, from the real MCP server.
     let catalog = client
-        .list_tools(tenant_id, run_id, &server, "test-workload-token")
+        .list_tools(&identity, &server, &token)
         .await
         .expect("discovery should succeed");
     assert_eq!(catalog.tools.len(), 1);
@@ -178,13 +190,12 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
     // 4. Approved, the call reaches the MCP server and the result comes back.
     let (content, is_error) = client
         .call_tool(
-            tenant_id,
-            run_id,
+            &identity,
             &server,
             "mcp:search/web_search",
             &serde_json::json!({ "query": "agent runtime" }),
             &catalog.digest,
-            "test-workload-token",
+            &token,
         )
         .await
         .expect("an approved call should reach the server");
@@ -201,13 +212,12 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
         .push("delete_everything".to_owned());
     let refused = client
         .call_tool(
-            tenant_id,
-            run_id,
+            &identity,
             &server,
             "mcp:search/web_search",
             &serde_json::json!({ "query": "agent runtime" }),
             &catalog.digest,
-            "test-workload-token",
+            &token,
         )
         .await
         .expect_err("a changed catalog must be refused end to end");
@@ -243,8 +253,9 @@ async fn a_run_discovers_and_freezes_its_servers_from_the_command() {
         .to_pkcs8_pem(LineEnding::LF)
         .unwrap()
         .to_string();
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
     let reachable = spawn_mcp_server(Arc::new(Mutex::new(vec!["web_search".to_owned()]))).await;
-    let gateway_endpoint = spawn_gateway(&private_key_pem).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem, &signing_key).await;
     let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
         .await
         .unwrap();
@@ -277,13 +288,9 @@ async fn a_run_discovers_and_freezes_its_servers_from_the_command() {
     )
     .unwrap();
 
-    let federated = discover_federated_tools(
-        worker.tool_registry(),
-        &mut client,
-        &command,
-        "test-workload-token",
-    )
-    .await;
+    let token = signed_identity(&signing_key, &FederationIdentity::from_command(&command));
+    let federated =
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, &token).await;
 
     assert_eq!(federated.definitions.len(), 1);
     assert_eq!(
@@ -330,8 +337,9 @@ async fn two_runs_hold_different_freezes_of_the_same_server() {
         .unwrap()
         .to_string();
     let tools = Arc::new(Mutex::new(vec!["web_search".to_owned()]));
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
     let endpoint = spawn_mcp_server(Arc::clone(&tools)).await;
-    let gateway_endpoint = spawn_gateway(&private_key_pem).await;
+    let gateway_endpoint = spawn_gateway(&private_key_pem, &signing_key).await;
     let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
         .await
         .unwrap();
@@ -352,11 +360,12 @@ async fn two_runs_hold_different_freezes_of_the_same_server() {
         serde_json::json!(["tool:mcp:search"]),
     );
 
+    let token = signed_identity(&signing_key, &FederationIdentity::from_command(&command));
     let first =
-        discover_federated_tools(worker.tool_registry(), &mut client, &command, "token").await;
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, &token).await;
     tools.lock().unwrap().push("summarise".to_owned());
     let second =
-        discover_federated_tools(worker.tool_registry(), &mut client, &command, "token").await;
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, &token).await;
 
     assert_eq!(first.definitions.len(), 1);
     assert_eq!(second.definitions.len(), 2);
@@ -364,4 +373,32 @@ async fn two_runs_hold_different_freezes_of_the_same_server() {
         first.frozen_digests["search"], second.frozen_digests["search"],
         "each Run freezes what it discovered, not what the other did"
     );
+}
+
+/// A workload token bound to the identity the calls will present.
+///
+/// The federation RPCs verify this now, so a test that skipped it would only be
+/// proving the chain works for a caller nobody authenticated.
+fn signed_identity(signing_key: &SigningKey, identity: &FederationIdentity) -> String {
+    let now = chrono::Utc::now().timestamp_millis();
+    let claims = WorkloadIdentityClaims {
+        schema_version: 2,
+        tenant_id: identity.tenant_id,
+        run_id: identity.run_id,
+        attempt_id: identity.attempt_id,
+        worker_id: identity.worker_id,
+        worker_incarnation_id: identity.worker_incarnation_id,
+        model_policy_id: Uuid::now_v7(),
+        model_policy_digest: String::new(),
+        audiences: std::collections::BTreeSet::from(["model-gateway".to_owned()]),
+        scopes: std::collections::BTreeSet::from(["mcp.federate".to_owned()]),
+        issued_at_unix_ms: now,
+        expires_at_unix_ms: now + 60_000,
+    };
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).unwrap());
+    let signing_input = format!("v2.{payload}");
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(signing_key.sign(signing_input.as_bytes()).to_bytes());
+    format!("{signing_input}.{signature}")
 }

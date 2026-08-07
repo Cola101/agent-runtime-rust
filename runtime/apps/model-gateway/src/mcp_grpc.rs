@@ -10,19 +10,86 @@ use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederation;
 use agent_model_gateway_protocol::v1::{
     McpCallToolRequest, McpCallToolResponse, McpListToolsRequest, McpListToolsResponse, McpTool,
 };
+use agent_workload_identity::{
+    RequiredCapability, WorkloadIdentityBinding, WorkloadIdentityClaims, WorkloadTokenVerifier,
+};
+use chrono::Utc;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u32 = 1;
 
+/// Federation is its own capability.
+///
+/// A token that can execute a model is not automatically a token that may reach
+/// a tenant's third-party servers and have their sealed credential opened. Two
+/// scopes means a future policy can withhold one without withholding the other;
+/// one scope means it never can.
+const FEDERATION_SCOPE: &str = "mcp.federate";
+
 pub struct McpFederationGrpcService {
     client: McpFederationClient,
+    verifier: WorkloadTokenVerifier,
 }
 
 impl McpFederationGrpcService {
-    pub fn new(client: McpFederationClient) -> Self {
-        Self { client }
+    pub fn new(client: McpFederationClient, verifier: WorkloadTokenVerifier) -> Self {
+        Self { client, verifier }
     }
+
+    /// Verifies the bearer token and binds it to the identity the request
+    /// asserts.
+    ///
+    /// The first version of this service took `tenant_id` from the request body
+    /// and used it, so anything that could reach the port could name any tenant
+    /// and have that tenant's credential opened. The claims are the authority
+    /// now: the body must agree with them, and the values used downstream come
+    /// from the token.
+    fn authenticate<T>(
+        &self,
+        request: &Request<T>,
+        asserted: &AssertedIdentity,
+    ) -> Result<WorkloadIdentityClaims, Status> {
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or_else(|| Status::unauthenticated("missing workload bearer token"))?;
+        let claims = self
+            .verifier
+            .verify(
+                bearer,
+                RequiredCapability::new("model-gateway", FEDERATION_SCOPE, true),
+                Utc::now().timestamp_millis(),
+            )
+            .map_err(|_| Status::unauthenticated("invalid workload token"))?;
+        let binding = WorkloadIdentityBinding {
+            tenant_id: asserted.tenant_id,
+            run_id: asserted.run_id,
+            attempt_id: asserted.attempt_id,
+            worker_id: asserted.worker_id,
+            worker_incarnation_id: asserted.worker_incarnation_id,
+        };
+        if !claims.authorizes(&binding) {
+            // Deliberately not Unauthenticated: the token is valid, and the
+            // caller is asking to act as an identity it does not hold. Saying
+            // "authenticate again" would send it round a loop that cannot help.
+            return Err(Status::permission_denied(
+                "workload token does not authorize this tenant, run, attempt or worker",
+            ));
+        }
+        Ok(claims)
+    }
+}
+
+/// What the request says about itself, before anything has verified it.
+struct AssertedIdentity {
+    tenant_id: Uuid,
+    run_id: Uuid,
+    attempt_id: Uuid,
+    worker_id: Uuid,
+    worker_incarnation_id: Uuid,
 }
 
 #[tonic::async_trait]
@@ -31,12 +98,24 @@ impl McpFederation for McpFederationGrpcService {
         &self,
         request: Request<McpListToolsRequest>,
     ) -> Result<Response<McpListToolsResponse>, Status> {
+        let asserted = AssertedIdentity {
+            tenant_id: parse_uuid(&request.get_ref().tenant_id, "tenant_id")?,
+            run_id: parse_uuid(&request.get_ref().run_id, "run_id")?,
+            attempt_id: parse_uuid(&request.get_ref().attempt_id, "attempt_id")?,
+            worker_id: parse_uuid(&request.get_ref().worker_id, "worker_id")?,
+            worker_incarnation_id: parse_uuid(
+                &request.get_ref().worker_incarnation_id,
+                "worker_incarnation_id",
+            )?,
+        };
+        let claims = self.authenticate(&request, &asserted)?;
         let request = request.into_inner();
-        let tenant_id = parse_uuid(&request.tenant_id, "tenant_id")?;
         let server = server_ref(request.server)?;
+        // From the claims, not the body. If the two ever diverge the signed one
+        // is the one that means something.
         let catalog = self
             .client
-            .list_tools(tenant_id, &server)
+            .list_tools(claims.tenant_id, &server)
             .await
             .map_err(to_status)?;
         Ok(Response::new(McpListToolsResponse {
@@ -58,15 +137,25 @@ impl McpFederation for McpFederationGrpcService {
         &self,
         request: Request<McpCallToolRequest>,
     ) -> Result<Response<McpCallToolResponse>, Status> {
+        let asserted = AssertedIdentity {
+            tenant_id: parse_uuid(&request.get_ref().tenant_id, "tenant_id")?,
+            run_id: parse_uuid(&request.get_ref().run_id, "run_id")?,
+            attempt_id: parse_uuid(&request.get_ref().attempt_id, "attempt_id")?,
+            worker_id: parse_uuid(&request.get_ref().worker_id, "worker_id")?,
+            worker_incarnation_id: parse_uuid(
+                &request.get_ref().worker_incarnation_id,
+                "worker_incarnation_id",
+            )?,
+        };
+        let claims = self.authenticate(&request, &asserted)?;
         let request = request.into_inner();
-        let tenant_id = parse_uuid(&request.tenant_id, "tenant_id")?;
         let server = server_ref(request.server)?;
         let arguments = std::str::from_utf8(&request.arguments_json)
             .map_err(|_| Status::invalid_argument("arguments_json is not utf-8"))?;
         let result = self
             .client
             .call_tool(
-                tenant_id,
+                claims.tenant_id,
                 &server,
                 &request.qualified_name,
                 arguments,

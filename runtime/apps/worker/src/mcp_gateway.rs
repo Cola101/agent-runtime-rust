@@ -49,6 +49,33 @@ impl McpGatewayClientError {
     }
 }
 
+/// The Run identity every federation call is bound to.
+///
+/// Taken from the execution command, never assembled by a caller. The gateway
+/// checks all five against the signed workload token, so a request cannot name a
+/// tenant it was not issued for -- which is exactly what it could do when only
+/// tenant_id travelled and nothing verified it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FederationIdentity {
+    pub tenant_id: Uuid,
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub worker_id: Uuid,
+    pub worker_incarnation_id: Uuid,
+}
+
+impl FederationIdentity {
+    pub fn from_command(command: &agent_protocol::RunExecutionCommand) -> Self {
+        Self {
+            tenant_id: command.tenant_id,
+            run_id: command.run_id,
+            attempt_id: command.attempt_id,
+            worker_id: command.worker_id,
+            worker_incarnation_id: command.worker_incarnation_id,
+        }
+    }
+}
+
 /// One federated tool as the gateway described it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredTool {
@@ -90,15 +117,17 @@ impl GrpcMcpFederationClient {
 
     pub async fn list_tools(
         &mut self,
-        tenant_id: Uuid,
-        run_id: Uuid,
+        identity: &FederationIdentity,
         server: &McpServerSnapshot,
         workload_token: &str,
     ) -> Result<DiscoveredCatalog, McpGatewayClientError> {
         let mut request = tonic::Request::new(McpListToolsRequest {
             schema_version: SCHEMA_VERSION,
-            tenant_id: tenant_id.to_string(),
-            run_id: run_id.to_string(),
+            tenant_id: identity.tenant_id.to_string(),
+            run_id: identity.run_id.to_string(),
+            attempt_id: identity.attempt_id.to_string(),
+            worker_id: identity.worker_id.to_string(),
+            worker_incarnation_id: identity.worker_incarnation_id.to_string(),
             server: Some(wire_server(server)?),
         });
         authorize(&mut request, workload_token)?;
@@ -137,8 +166,7 @@ impl GrpcMcpFederationClient {
 
     pub async fn call_tool(
         &mut self,
-        tenant_id: Uuid,
-        run_id: Uuid,
+        identity: &FederationIdentity,
         server: &McpServerSnapshot,
         qualified_name: &str,
         arguments: &serde_json::Value,
@@ -147,8 +175,11 @@ impl GrpcMcpFederationClient {
     ) -> Result<(serde_json::Value, bool), McpGatewayClientError> {
         let mut request = tonic::Request::new(McpCallToolRequest {
             schema_version: SCHEMA_VERSION,
-            tenant_id: tenant_id.to_string(),
-            run_id: run_id.to_string(),
+            tenant_id: identity.tenant_id.to_string(),
+            run_id: identity.run_id.to_string(),
+            attempt_id: identity.attempt_id.to_string(),
+            worker_id: identity.worker_id.to_string(),
+            worker_incarnation_id: identity.worker_incarnation_id.to_string(),
             server: Some(wire_server(server)?),
             qualified_name: qualified_name.to_owned(),
             arguments_json: arguments.to_string().into_bytes().into(),
@@ -248,8 +279,9 @@ pub async fn discover_federated_tools(
     let mut unavailable = Vec::new();
 
     for server in &command.mcp_servers {
+        let identity = FederationIdentity::from_command(command);
         let catalog = match client
-            .list_tools(command.tenant_id, command.run_id, server, workload_token)
+            .list_tools(&identity, server, workload_token)
             .await
         {
             Ok(catalog) => catalog,

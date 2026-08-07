@@ -103,7 +103,7 @@ async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<At
 }
 
 fn client() -> McpFederationClient {
-    McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5)).unwrap()
+    McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true).unwrap()
 }
 
 fn open_server(endpoint: String) -> McpServerRef {
@@ -316,7 +316,7 @@ async fn a_sealed_credential_is_opened_and_sent_as_a_bearer_token() {
 
     let state = behaviour(&["web_search"]);
     let (endpoint, _) = spawn_server(Arc::clone(&state)).await;
-    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5))
+    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true)
         .unwrap();
 
     client
@@ -391,7 +391,7 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
     .to_string();
 
     let (endpoint, _) = spawn_server(behaviour(&["web_search"])).await;
-    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5))
+    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true)
         .unwrap();
 
     let refused = client
@@ -425,11 +425,11 @@ async fn a_key_below_the_model_credential_floor_is_refused() {
         .to_string();
 
     assert!(
-        McpFederationClient::from_pkcs8_pem(&weak, Duration::from_secs(5)).is_err(),
+        McpFederationClient::from_pkcs8_pem(&weak, Duration::from_secs(5), true).is_err(),
         "a 2048-bit key must be refused, as it is for model credentials"
     );
     assert!(
-        McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(0)).is_err(),
+        McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(0), true).is_err(),
         "a zero timeout must be refused"
     );
 }

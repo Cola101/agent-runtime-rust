@@ -48,6 +48,7 @@ pub use checkpoint_gateway::GrpcCheckpointPayloadStore;
 pub use execution_supervisor::{ModelExecutionSupervisor, ModelExecutionUpdate};
 pub use mcp_gateway::{
     discover_federated_tools, DiscoveredCatalog, DiscoveredTool, FederatedRunTools,
+    FederationIdentity,
     GrpcMcpFederationClient, McpGatewayClientError,
 };
 pub use model_gateway::{GrpcModelGatewayClient, ModelGatewayClientError};

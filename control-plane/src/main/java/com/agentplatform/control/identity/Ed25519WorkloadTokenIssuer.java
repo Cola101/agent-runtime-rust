@@ -52,7 +52,12 @@ public final class Ed25519WorkloadTokenIssuer implements WorkloadTokenIssuer {
     payload.put("model_policy_id", claims.modelPolicyId().toString());
     if (snapshotBound) payload.put("model_policy_digest", claims.modelPolicyDigest());
     payload.put("audiences", List.of("model-gateway", "checkpoint-gateway"));
-    payload.put("scopes", List.of("model.execute", "checkpoint.read", "checkpoint.write"));
+    // mcp.federate is separate from model.execute on purpose: reaching a
+    // tenant's third-party MCP server and opening its sealed credential is a
+    // different capability from calling a model, and one scope could never be
+    // withheld without withholding the other.
+    payload.put("scopes", List.of(
+        "model.execute", "mcp.federate", "checkpoint.read", "checkpoint.write"));
     payload.put("issued_at_unix_ms", issuedAt.toEpochMilli());
     payload.put("expires_at_unix_ms", claims.expiresAt().toEpochMilli());
     try {

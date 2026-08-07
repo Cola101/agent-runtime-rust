@@ -123,6 +123,9 @@ pub struct McpFederationClient {
     private_key: RsaPrivateKey,
     key_id: String,
     http: reqwest::Client,
+    /// Whether a tenant may register a loopback endpoint. Off unless the
+    /// deployment says otherwise.
+    loopback_permitted: bool,
 }
 
 impl McpFederationClient {
@@ -136,6 +139,7 @@ impl McpFederationClient {
     pub fn from_pkcs8_pem(
         pem: &str,
         request_timeout: Duration,
+        loopback_permitted: bool,
     ) -> Result<Self, McpFederationError> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(pem)
             .map_err(|_| McpFederationError::CredentialUnopenable)?;
@@ -158,6 +162,7 @@ impl McpFederationClient {
             private_key,
             key_id,
             http,
+            loopback_permitted,
         })
     }
 
@@ -297,7 +302,7 @@ impl McpFederationClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, McpFederationError> {
-        require_permitted_endpoint(&server.endpoint)?;
+        require_permitted_endpoint(&server.endpoint, self.loopback_permitted)?;
         let mut request = self
             .http
             .post(&server.endpoint)
@@ -411,18 +416,97 @@ impl McpFederationClient {
     }
 }
 
-/// The registry already refuses anything but HTTPS or loopback HTTP. Checked
-/// again here because this is the process that actually opens the connection,
-/// and it is the last place a bad endpoint can still be stopped.
-fn require_permitted_endpoint(endpoint: &str) -> Result<(), McpFederationError> {
+/// Refuses an endpoint before the scheme is even considered a permission.
+///
+/// Scheme alone is not a boundary. `https://169.254.169.254/` is HTTPS and is
+/// the cloud metadata service; `https://10.0.0.1/` is HTTPS and is inside the
+/// deployment's own network. A tenant registering either would make this
+/// gateway a request forwarder into infrastructure the tenant cannot otherwise
+/// reach, with the gateway's own network position.
+///
+/// So the host is resolved and every address it resolves to is checked. A name
+/// that resolves to one public address and one private one is refused on the
+/// private one: allowing it because "at least one was fine" is the shape a DNS
+/// rebinding attack needs.
+///
+/// Loopback is refused unless the deployment opts in. It is not harmless: a
+/// tenant registering `http://127.0.0.1:8080` would make the gateway call its
+/// own localhost, which is where admin and debug ports live. Development and
+/// tests need it, so it is a configuration switch rather than a carve-out --
+/// default deny, opted into where it is safe.
+fn require_permitted_endpoint(
+    endpoint: &str,
+    loopback_permitted: bool,
+) -> Result<(), McpFederationError> {
     let parsed = reqwest::Url::parse(endpoint)
         .map_err(|_| McpFederationError::EndpointNotPermitted(endpoint.to_owned()))?;
-    let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
-    let permitted = parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback);
-    if !permitted || !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(McpFederationError::EndpointNotPermitted(endpoint.to_owned()));
+    let refuse = || McpFederationError::EndpointNotPermitted(endpoint.to_owned());
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(refuse());
     }
-    Ok(())
+    let host = parsed.host_str().ok_or_else(refuse)?;
+    // An explicit literal only, never a name that merely resolves to loopback:
+    // that is the same rebinding trick in a different place.
+    let declared_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    if declared_loopback {
+        return if loopback_permitted {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    }
+    if parsed.scheme() != "https" {
+        return Err(refuse());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let resolved = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)).map_err(|_| refuse())?;
+    let mut any = false;
+    for address in resolved {
+        any = true;
+        if !is_publicly_routable(address.ip()) {
+            return Err(refuse());
+        }
+    }
+    // A name that resolves to nothing is not "fine by default".
+    if any { Ok(()) } else { Err(refuse()) }
+}
+
+/// Whether an address is one a tenant could have reached without us.
+///
+/// Written as a deny-by-default match over the ranges that are not, rather than
+/// an allow-list of the ones that are: a range nobody thought about should end
+/// up refused, and with an allow-list it would end up permitted.
+fn is_publicly_routable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                // 169.254.169.254 is link-local and already covered, but
+                // carrier-grade NAT (100.64/10) and the benchmarking range are
+                // not, and both sit inside real deployments.
+                || matches!(v4.octets(), [100, b, ..] if (64..128).contains(&b))
+                || matches!(v4.octets(), [198, 18..=19, ..])
+                || matches!(v4.octets(), [192, 0, 0, _])
+                || v4.octets()[0] == 0)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique local (fc00::/7) and link-local (fe80::/10).
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped: judge the address it actually reaches.
+                || v6.to_ipv4_mapped().is_some_and(|mapped| {
+                    !is_publicly_routable(std::net::IpAddr::V4(mapped))
+                }))
+        }
+    }
 }
 
 fn catalog_digest(tools: &[McpTool]) -> String {
@@ -442,14 +526,60 @@ mod tests {
 
     #[test]
     fn a_plain_http_endpoint_off_loopback_is_refused() {
-        assert!(require_permitted_endpoint("http://mcp.example.com/rpc").is_err());
-        assert!(require_permitted_endpoint("https://mcp.example.com/rpc").is_ok());
-        assert!(require_permitted_endpoint("http://127.0.0.1:8931/rpc").is_ok());
+        assert!(require_permitted_endpoint("http://mcp.example.com/rpc", true).is_err());
+        assert!(require_permitted_endpoint("http://127.0.0.1:8931/rpc", true).is_ok());
+    }
+
+    /// Loopback is a deployment decision, not a property of the URL. The gateway
+    /// can reach its own admin ports; a tenant must not be able to make it.
+    #[test]
+    fn loopback_is_refused_unless_the_deployment_permits_it() {
+        for endpoint in [
+            "http://127.0.0.1:8931/rpc",
+            "http://localhost:8080/rpc",
+            "https://[::1]/rpc",
+        ] {
+            assert!(
+                require_permitted_endpoint(endpoint, false).is_err(),
+                "{endpoint} must be refused when loopback is not permitted"
+            );
+            assert!(
+                require_permitted_endpoint(endpoint, true).is_ok(),
+                "{endpoint} must be allowed when it is"
+            );
+        }
+    }
+
+    /// HTTPS is not a permission. Each of these is a valid HTTPS URL that the
+    /// first version accepted, and each points somewhere a tenant could not
+    /// otherwise reach.
+    #[test]
+    fn https_to_infrastructure_the_tenant_cannot_otherwise_reach_is_refused() {
+        for hostile in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[fd00::1]/rpc",
+            "https://10.0.0.1/rpc",
+            "https://192.168.1.1/rpc",
+            "https://172.16.0.1/rpc",
+            "https://100.64.0.1/rpc",
+            "https://0.0.0.0/rpc",
+            "https://[::ffff:10.0.0.1]/rpc",
+        ] {
+            assert!(
+                require_permitted_endpoint(hostile, true).is_err(),
+                "{hostile} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_address_is_still_permitted() {
+        assert!(require_permitted_endpoint("https://93.184.216.34/rpc", false).is_ok());
     }
 
     #[test]
     fn credentials_in_the_endpoint_are_refused() {
-        assert!(require_permitted_endpoint("https://user:pass@mcp.example.com/rpc").is_err());
+        assert!(require_permitted_endpoint("https://user:pass@mcp.example.com/rpc", true).is_err());
     }
 
     /// Two catalogs differing only in a tool's input schema must not share a

@@ -165,6 +165,12 @@ message McpListToolsRequest {
   string tenant_id = 2;
   string run_id = 3;
   McpServerRef server = 4;
+  // Carried so the workload token can be bound to the whole identity rather
+  // than to a tenant a caller asserted about itself. The server checks these
+  // against the signed claims and refuses on any mismatch.
+  string attempt_id = 5;
+  string worker_id = 6;
+  string worker_incarnation_id = 7;
 }
 
 message McpTool {
@@ -190,6 +196,9 @@ message McpCallToolRequest {
   // The digest discovered at Run start. A server whose catalog changed since
   // then does not get to change what this Run may do.
   string frozen_catalog_digest = 7;
+  string attempt_id = 8;
+  string worker_id = 9;
+  string worker_incarnation_id = 10;
 }
 
 message McpCallToolResponse {

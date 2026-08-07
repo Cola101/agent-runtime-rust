@@ -43,7 +43,11 @@ class Ed25519WorkloadTokenIssuerTest {
         .containsExactlyInAnyOrder("model-gateway", "checkpoint-gateway");
     assertThat(StreamSupport.stream(json.path("scopes").spliterator(), false)
         .map(node -> node.asText()).toList())
-        .containsExactlyInAnyOrder("model.execute", "checkpoint.read", "checkpoint.write");
+        // Exactly, not "contains": every scope in a workload token is authority
+        // the bearer gains, so adding one must be a deliberate edit here rather
+        // than something a looser assertion would let through unnoticed.
+        .containsExactlyInAnyOrder(
+            "model.execute", "mcp.federate", "checkpoint.read", "checkpoint.write");
     assertThat(json.path("expires_at_unix_ms").asLong()).isEqualTo(now.plusSeconds(30).toEpochMilli());
     assertThat(json.path("issued_at_unix_ms").asLong()).isEqualTo(now.toEpochMilli());
     var verifier = Signature.getInstance("Ed25519");

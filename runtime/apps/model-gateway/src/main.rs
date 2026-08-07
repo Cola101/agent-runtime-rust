@@ -108,7 +108,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // where model credentials already are. A gateway that could open one but
         // not the other would be a surprising half-configured state.
         mcp_federation = Some(McpFederationGrpcService::new(
-            McpFederationClient::from_pkcs8_pem(&private_key_pem, response_timeout)?,
+            McpFederationClient::from_pkcs8_pem(
+                &private_key_pem,
+                response_timeout,
+                // Default deny. A deployment that needs a loopback MCP server --
+                // local development, mostly -- says so; production says nothing
+                // and gets the safe answer.
+                environment("AGENT_RUNTIME_MCP_ALLOW_LOOPBACK", "false") == "true",
+            )?,
+            WorkloadTokenVerifier::from_base64(&required_environment(
+                "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
+            )?)?,
         ));
     }
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
