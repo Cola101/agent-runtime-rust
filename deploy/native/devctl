@@ -475,9 +475,19 @@ bootstrap_native_tools() {
     return
   fi
 
+  # `auto` prefers the pinned archive. Both paths produce the same binary, but
+  # they do not fail the same way: the archive is one download verified against
+  # a SHA256 pinned in this repository, while `go install` needs
+  # proxy.golang.org and sum.golang.org reachable and healthy at that moment.
+  # On at least one developer network they were not -- three attempts, three
+  # different failures -- while the archive succeeded first try. Preferring Go
+  # turned a working setup into a reported blocker.
+  #
+  # The Go path stays and stays selectable with `go`; it is only no longer the
+  # default. The archive is also the stronger supply-chain story, because the
+  # digest is a constant here rather than whatever a service returns today.
   bootstrap_method=${AGENT_RUNTIME_NATS_BOOTSTRAP_METHOD:-auto}
-  if [ "$bootstrap_method" != "archive" ] && \
-      [ -z "${AGENT_RUNTIME_NATS_ARCHIVE_PATH:-}" ] && command -v go >/dev/null 2>&1; then
+  if [ "$bootstrap_method" = "go" ] && command -v go >/dev/null 2>&1; then
     mkdir -p "$LOCAL_ROOT/cache/go/pkg/mod" "$LOCAL_ROOT/cache/go/build"
     GOBIN="$LOCAL_ROOT/toolchain" \
       GOMODCACHE="$LOCAL_ROOT/cache/go/pkg/mod" \

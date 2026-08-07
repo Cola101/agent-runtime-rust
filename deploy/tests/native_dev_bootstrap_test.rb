@@ -71,6 +71,10 @@ Dir.mktmpdir("agent-runtime-native-bootstrap-") do |temporary|
   go_environment = {
     "AGENT_RUNTIME_LOCAL_ROOT" => go_root,
     "AGENT_RUNTIME_DOWNLOAD_PROXY" => "http://127.0.0.1:10808",
+    # Explicit now that the archive is the default. This test is about the Go
+    # path keeping its caches inside project state, not about which path `auto`
+    # picks -- that is pinned separately below.
+    "AGENT_RUNTIME_NATS_BOOTSTRAP_METHOD" => "go",
     "PATH" => "#{go_bin}:#{ENV.fetch('PATH')}"
   }
   go_output, go_error, go_status = Open3.capture3(
@@ -123,6 +127,64 @@ Dir.mktmpdir("agent-runtime-native-bootstrap-") do |temporary|
   %w[--connect-timeout --max-time --retry --retry-all-errors].each do |argument|
     raise "curl is missing bounded retry argument #{argument}" unless arguments.lines.map(&:chomp).include?(argument)
   end
+  begin
+    ordering_root = File.join(temporary, "local-ordering")
+    ordering_bin = File.join(temporary, "ordering-bin")
+    FileUtils.mkdir_p(ordering_bin)
+    # A `go` that fails loudly if it is ever consulted.
+    go_marker = File.join(temporary, "go-was-used")
+    fake_go = File.join(ordering_bin, "go")
+    File.write(fake_go, <<~SH)
+      #!/bin/sh
+      : > '#{go_marker}'
+      exit 1
+    SH
+    FileUtils.chmod(0o755, fake_go)
+
+    ordering_curl_arguments = File.join(temporary, "ordering-curl-arguments")
+    fake_curl = File.join(ordering_bin, "curl")
+    File.write(fake_curl, <<~SH)
+      #!/bin/sh
+      set -eu
+      printf '%s\\n' "$@" > '#{ordering_curl_arguments}'
+      output=''
+      while [ "$#" -gt 0 ]; do
+        [ "$1" = '-o' ] && output="$2" && break
+        shift
+      done
+      cp '#{archive}' "$output"
+    SH
+    FileUtils.chmod(0o755, fake_curl)
+
+    # No AGENT_RUNTIME_NATS_BOOTSTRAP_METHOD and no archive path: the default.
+    ordering_output, ordering_error, ordering_status = Open3.capture3(
+      {
+        "AGENT_RUNTIME_LOCAL_ROOT" => ordering_root,
+        "AGENT_RUNTIME_NATS_ARCHIVE_SHA256" => digest,
+        "PATH" => "#{ordering_bin}:#{ENV.fetch('PATH')}"
+      },
+      DEVCTL, "bootstrap", chdir: ROOT
+    )
+    unless ordering_status.success?
+      raise "default bootstrap failed: #{ordering_output}#{ordering_error}"
+    end
+    if File.exist?(go_marker)
+      raise "the default bootstrap invoked go before trying the pinned archive"
+    end
+end
+
+# `auto` must reach for the pinned archive before it reaches for a Go build.
+#
+# Both paths produce the same binary, but they do not fail the same way. The
+# archive is one download with a SHA256 pinned in this repository. `go install`
+# depends on proxy.golang.org and sum.golang.org being reachable and healthy at
+# that moment, and on this network they were not: three attempts, three
+# failures (connection reset, unexpected EOF, then a ten-minute hang), while the
+# archive succeeded first try. `auto` preferring Go turned a working setup into
+# a reported blocker.
+#
+# Pinned as an ordering, not as "Go is unavailable": the Go path stays, and
+# stays selectable.
 end
 
 puts "validated native NATS bootstrap"
