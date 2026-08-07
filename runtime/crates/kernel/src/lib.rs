@@ -5,7 +5,8 @@ pub use read_only_shell::{ShellCommandClass, classify_shell_command};
 use agent_protocol::{
     ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope, ModelErrorKind,
     ModelFinishReason, ModelStreamEvent, RunStatus, SubagentResultDelivery, SubagentSpawnRequest,
-    ToolApprovalPolicySnapshot, ToolApprovalRequest, ToolCall, ToolDescriptor, ToolEffect,
+    SandboxClass, ToolApprovalPolicySnapshot, ToolApprovalRequest, ToolCall, ToolDescriptor,
+    ToolEffect,
     ToolExecutionRequest,
 };
 use serde_json::json;
@@ -169,6 +170,17 @@ impl ToolRegistry {
         // the exemption travels with the Tool definition and is recorded in the
         // policy snapshot below, so it stays auditable.
         let exempt = descriptor.approval == ApprovalMode::Ask
+            // No exemption reaches a federated Tool (ADR-0040 decision 6). The
+            // read-only exemption rests on knowing the command cannot write, and
+            // nothing is known about third-party code by construction. Without
+            // this, a federated tool taking an argument called `command` -- an
+            // entirely ordinary thing for a tool to take -- would be exempted by
+            // a classifier written for a shell it is not.
+            //
+            // Checked on the descriptor's sandbox class rather than on a name
+            // prefix: a name is a string a registration chooses, and the class
+            // is what the platform decided about how the Tool is confined.
+            && descriptor.sandbox != SandboxClass::Federated
             && auto_approval == AutoApproval::ProvablyReadOnlyShellCommand
             && execution
                 .call

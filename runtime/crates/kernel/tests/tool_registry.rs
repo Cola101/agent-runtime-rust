@@ -479,3 +479,73 @@ fn the_approval_policy_comes_from_the_run_not_from_the_registered_tool() {
         ToolPlan::ApprovalRequired(_)
     ));
 }
+
+fn federated_tool() -> ToolDescriptor {
+    ToolDescriptor {
+        // Namespaced, so a federated tool can never be registered under the name
+        // of a native one whose safety this platform vouches for.
+        name: "mcp:search/web_search".into(),
+        // Unknown by construction -- that is what third-party means.
+        effect: ToolEffect::Unknown,
+        approval: ApprovalMode::Ask,
+        sandbox: SandboxClass::Federated,
+        // The frozen catalog digest stands in for an implementation digest: it
+        // is what identifies the thing being called, and it is what a changed
+        // catalog would change.
+        implementation_digest: "c".repeat(64),
+        required_scopes: BTreeSet::from(["tool:mcp:search".into()]),
+    }
+}
+
+/// A federated tool is reachable only when its server's scope is delegated.
+#[test]
+fn a_federated_tool_needs_its_server_scope_delegated() {
+    let mut registry = ToolRegistry::default();
+    registry.register(federated_tool()).unwrap();
+
+    assert!(registry
+        .authorize("mcp:search/web_search", &BTreeSet::from(["tool:mcp:other".into()]))
+        .is_err());
+    assert!(registry
+        .authorize("mcp:search/web_search", &BTreeSet::from(["tool:mcp:search".into()]))
+        .is_ok());
+}
+
+/// ADR-0040 decision 6: every federated tool asks, on every call.
+///
+/// A tenant may configure an approval policy for any Tool, and the kernel
+/// applies what it was told -- except here. The read-only exemption rests on
+/// knowing a command cannot write, and nothing is known about a federated tool.
+/// A policy naming one must therefore not take effect, even though it is the
+/// tenant's own configuration and even though every other Tool honours it.
+#[test]
+fn an_approval_policy_cannot_exempt_a_federated_tool() {
+    let mut registry = ToolRegistry::default();
+    registry.register(federated_tool()).unwrap();
+    let scopes = BTreeSet::from(["tool:mcp:search".into()]);
+    let policies = std::collections::BTreeMap::from([(
+        "mcp:search/web_search".to_owned(),
+        AutoApproval::ProvablyReadOnlyShellCommand,
+    )]);
+
+    let plan = registry
+        .plan(
+            ToolCall {
+                id: "call-1".into(),
+                name: "mcp:search/web_search".into(),
+                // Shaped to trigger the one exemption that exists: a
+                // `command` argument the shell classifier calls read-only. A
+                // federated tool named `command` in its schema is entirely
+                // ordinary, and the kernel must not read it as a shell command.
+                arguments: serde_json::json!({ "command": "ls -la" }),
+            },
+            &scopes,
+            &policies,
+        )
+        .unwrap();
+
+    assert!(
+        matches!(plan, ToolPlan::ApprovalRequired(_)),
+        "a federated tool must ask regardless of configured policy, got {plan:?}"
+    );
+}

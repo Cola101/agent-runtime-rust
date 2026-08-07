@@ -1285,6 +1285,14 @@ pub enum SandboxClass {
     RestrictedContainer,
     Kata,
     TrustedNative,
+    /// Runs on someone else's machine (ADR-0040).
+    ///
+    /// Its own variant rather than reusing a container class, because those
+    /// name containment this platform applies and none of it applies here.
+    /// Anything reading a descriptor to decide how a Tool is confined must be
+    /// able to tell "confined by us" from "not ours to confine", and a borrowed
+    /// variant would answer that question wrongly.
+    Federated,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
