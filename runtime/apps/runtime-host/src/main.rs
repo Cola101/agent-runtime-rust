@@ -99,7 +99,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "serve" => {
             let config = load_config()?;
             let socket = default_socket_path(&config.state_root);
-            let listener = LocalRuntimeDaemon::bind(&socket).await?;
+            let listener = match LocalRuntimeDaemon::bind(&socket).await {
+                Ok(listener) => listener,
+                // Not a broken installation: a host is already serving this
+                // state root, and a client should talk to that one. Said
+                // plainly here because a desktop client started twice is the
+                // ordinary way to reach this.
+                Err(error @ agent_runtime_host::LocalRuntimeError::AlreadyRunning(_)) => {
+                    eprintln!("{error}");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             let daemon = LocalRuntimeDaemon::new(config);
             // Pick up whatever an earlier daemon left unfinished before taking
             // new work, so a restart never strands a Run that has a Checkpoint.

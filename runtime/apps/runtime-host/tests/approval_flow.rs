@@ -121,13 +121,16 @@ async fn wait_for<F: Fn() -> bool>(label: &str, predicate: F) {
     panic!("timed out waiting for {label}");
 }
 
-async fn start(config: LocalRuntimeConfig) -> PathBuf {
+/// Returns the socket and the serving task. Aborting the task drops the
+/// listener, which closes the socket exactly as a host process exiting would --
+/// the only faithful way to simulate a restart inside one process.
+async fn start(config: LocalRuntimeConfig) -> (PathBuf, tokio::task::JoinHandle<()>) {
     let socket = default_socket_path(&config.state_root);
     let listener = LocalRuntimeDaemon::bind(&socket).await.expect("bind");
     let daemon = LocalRuntimeDaemon::new(config);
     daemon.recover_unfinished().await.expect("recovery");
-    tokio::spawn(daemon.serve(listener));
-    socket
+    let serving = tokio::spawn(daemon.serve(listener));
+    (socket, serving)
 }
 
 fn fixture_workspace() -> tempfile::TempDir {
@@ -148,7 +151,7 @@ async fn a_run_parked_on_an_approval_is_not_recorded_as_finished() {
     let state = tempfile::tempdir().expect("state");
     let workspace = fixture_workspace();
     let state_root = state.path().to_path_buf();
-    let socket = start(config(
+    let (socket, _serving) = start(config(
         state_root.clone(),
         workspace.path().canonicalize().expect("canonical"),
         spawn_provider().await,
@@ -190,7 +193,7 @@ async fn approving_over_ipc_lets_the_parked_run_execute_its_tool_and_finish() {
     let state = tempfile::tempdir().expect("state");
     let workspace = fixture_workspace();
     let state_root = state.path().to_path_buf();
-    let socket = start(config(
+    let (socket, _serving) = start(config(
         state_root.clone(),
         workspace.path().canonicalize().expect("canonical"),
         spawn_provider().await,
@@ -259,7 +262,7 @@ async fn a_restarted_daemon_keeps_a_parked_run_approvable() {
     let state_root = state.path().to_path_buf();
     let workspace_root = workspace.path().canonicalize().expect("canonical");
     let endpoint = spawn_provider().await;
-    let socket = start(config(
+    let (socket, _serving) = start(config(
         state_root.clone(),
         workspace_root.clone(),
         endpoint.clone(),
@@ -285,9 +288,17 @@ async fn a_restarted_daemon_keeps_a_parked_run_approvable() {
     })
     .await;
 
+    // Stop the first daemon before starting its replacement. This test used to
+    // skip that step, so it never restarted anything -- it started a second
+    // daemon beside the first and passed only because `bind` would take a live
+    // socket. That is the defect single_instance.rs now pins, and this test was
+    // depending on it.
+    _serving.abort();
+    let _ = _serving.await;
+
     // A replacement daemon must leave the Run parked, not skip it and not
     // restart it, and must still accept the decision.
-    let socket = start(config(state_root.clone(), workspace_root, endpoint)).await;
+    let (socket, _replacement) = start(config(state_root.clone(), workspace_root, endpoint)).await;
     let record = LocalRuntimeHost::read_run_record(&state_root, run_id)
         .expect("readable")
         .expect("present");
@@ -338,7 +349,7 @@ async fn denying_over_ipc_never_executes_the_tool() {
     let state = tempfile::tempdir().expect("state");
     let workspace = fixture_workspace();
     let state_root = state.path().to_path_buf();
-    let socket = start(config(
+    let (socket, _serving) = start(config(
         state_root.clone(),
         workspace.path().canonicalize().expect("canonical"),
         spawn_provider().await,
@@ -400,7 +411,7 @@ async fn cancelling_a_parked_run_closes_it_without_executing_the_tool() {
     let state = tempfile::tempdir().expect("state");
     let workspace = fixture_workspace();
     let state_root = state.path().to_path_buf();
-    let socket = start(config(
+    let (socket, _serving) = start(config(
         state_root.clone(),
         workspace.path().canonicalize().expect("canonical"),
         spawn_provider().await,

@@ -256,6 +256,7 @@ dependencies = [
  "agent-protocol",
  "chrono",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -55,6 +55,7 @@ semver = "1.0.28"
 sha2 = "0.10.9"
 thiserror = "2.0.12"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+libc = "0.2.180"
 tokio-util = "0.7.16"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tonic = { version = "0.14.3", features = ["transport", "tls-ring"] }

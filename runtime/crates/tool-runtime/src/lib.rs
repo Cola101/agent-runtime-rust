@@ -231,14 +231,20 @@ impl RestrictedContainerExecutor {
         context: ToolExecutionContext,
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let launch = self.prepare(&request, &context)?;
-        let mut child = Command::new(&launch.program)
+        let mut command = Command::new(&launch.program);
+        command
             .args(&launch.args)
             .env_clear()
             .envs(launch.env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Same reason as the native executor: a container engine invocation is
+        // a process tree, so a timeout has to reach the whole group.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
             .map_err(|error| ToolExecutionError::Engine(error.to_string()))?;
         let mut stdin = child
@@ -287,13 +293,11 @@ impl RestrictedContainerExecutor {
                 status.map_err(|error| ToolExecutionError::Engine(error.to_string()))?
             }
             Completion::TimedOut => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                reap_process_tree(&mut child).await;
                 return Err(ToolExecutionError::TimedOut);
             }
             Completion::Cancelled => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                reap_process_tree(&mut child).await;
                 return Err(ToolExecutionError::Cancelled);
             }
         };
@@ -482,7 +486,8 @@ impl TrustedNativeExecutor {
         context: ToolExecutionContext,
     ) -> Result<ToolExecutionResult, ToolExecutionError> {
         let launch = self.prepare(&request, &context)?;
-        let mut child = Command::new(&launch.program)
+        let mut command = Command::new(&launch.program);
+        command
             .args(&launch.args)
             .env_clear()
             .envs(launch.env.iter().cloned())
@@ -490,7 +495,15 @@ impl TrustedNativeExecutor {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Its own process group, so a timeout can end everything the Tool
+        // started rather than only the process we hold a handle to. Before
+        // `shell.exec` the two were the same thing; a shell command is
+        // `sandbox-exec -> tool -> sh -c -> whatever the model wrote`, and
+        // anything backgrounded behind that survived with no owner.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
             .spawn()
             .map_err(|error| ToolExecutionError::Engine(error.to_string()))?;
         let mut stdin = child
@@ -537,13 +550,11 @@ impl TrustedNativeExecutor {
                 status.map_err(|error| ToolExecutionError::Engine(error.to_string()))?
             }
             Completion::TimedOut => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                reap_process_tree(&mut child).await;
                 return Err(ToolExecutionError::TimedOut);
             }
             Completion::Cancelled => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                reap_process_tree(&mut child).await;
                 return Err(ToolExecutionError::Cancelled);
             }
         };
@@ -609,6 +620,34 @@ impl ToolExecutor for TrustedNativeExecutor {
     {
         Box::pin(TrustedNativeExecutor::execute(self, request, context))
     }
+}
+
+/// Ends the child and everything it started.
+///
+/// `Child::kill` signals one pid. A Tool that spawned anything -- the normal
+/// case for `shell.exec` -- leaves those processes running with no owner and
+/// nothing watching them. Signalling the group reaches the whole tree.
+///
+/// Approach adapted from OpenAI Codex (Apache-2.0),
+/// `codex-rs/utils/pty/src/process_group.rs`: the child leads its own group via
+/// `process_group(0)`, and the group is signalled by its id. Codex escalates
+/// SIGTERM to SIGKILL; this sends SIGKILL directly, because a Tool that has hit
+/// its timeout or been cancelled has already lost its chance to exit tidily,
+/// and the platform's ambiguous-failure rule governs what it left behind.
+async fn reap_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // The group is signalled *before* waiting: killing only the direct
+        // child would leave grandchildren holding the stdout pipe, and the wait
+        // below would then block on a tree that is still alive.
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        // Never signal our own group -- that would take the Worker with it.
+        if pgid > 0 && pgid != unsafe { libc::getpgrp() } {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 fn digest_file(path: &Path) -> Result<String, std::io::Error> {

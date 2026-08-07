@@ -60,6 +60,10 @@ pub enum LocalRuntimeError {
     Configuration(String),
     #[error("local state root is not usable: {0}")]
     StateRoot(String),
+    /// Distinct from StateRoot on purpose: a client that sees this should
+    /// connect to the running host, not report a broken installation.
+    #[error("another runtime host is already serving this state root at {0}")]
+    AlreadyRunning(String),
     #[error("local execution was refused: {0}")]
     Execution(String),
     #[error("model provider call failed: {0}")]

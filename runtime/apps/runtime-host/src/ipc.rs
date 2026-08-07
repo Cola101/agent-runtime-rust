@@ -89,6 +89,14 @@ impl LocalRuntimeDaemon {
         })
     }
 
+    /// Releases the control socket on a clean shutdown. Removing it after the
+    /// listener is gone means the next start sees nothing to reason about; a
+    /// socket left behind is indistinguishable from a live one until probed.
+    pub fn release(socket_path: &Path, listener: UnixListener) {
+        drop(listener);
+        let _ = std::fs::remove_file(socket_path);
+    }
+
     /// Binds the control socket. The socket is created with owner-only
     /// permissions because whoever can talk to it can spend the provider
     /// credential this host holds.
@@ -97,10 +105,27 @@ impl LocalRuntimeDaemon {
             std::fs::create_dir_all(parent)
                 .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         }
-        // A stale socket from a crashed host would otherwise make bind fail.
+        // A socket left by a crashed host and a socket held by a live one look
+        // identical on disk. Deleting either unconditionally -- which is what
+        // this used to do -- let a second daemon take a live state root, and
+        // then two hosts owned the same Runs and the same durable records. A
+        // desktop client started twice is the ordinary way to reach that.
+        //
+        // Connecting is the only way to tell the two apart. If something
+        // answers, refuse; if nothing does, the file is debris and is removed.
         if socket_path.exists() {
-            std::fs::remove_file(socket_path)
-                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            match UnixStream::connect(socket_path).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Err(LocalRuntimeError::AlreadyRunning(
+                        socket_path.display().to_string(),
+                    ));
+                }
+                Err(_) => {
+                    std::fs::remove_file(socket_path)
+                        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+                }
+            }
         }
         let listener = UnixListener::bind(socket_path)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
