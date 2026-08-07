@@ -1,6 +1,7 @@
 package com.agentplatform.control.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.agentplatform.control.run.Run;
@@ -629,6 +630,110 @@ class JdbcRunRepositoryIntegrationTest {
     assertThat(jdbc.queryForObject(
         "select count(*) from runs where tenant_id = ?", Integer.class, ids.tenantId()))
         .isEqualTo(2);
+  }
+
+  // Concurrency stops a tenant taking every Worker slot; it does nothing about
+  // cost. A tenant staying inside two concurrent Runs can spend without bound,
+  // one Run after another. Usage is read from the model.usage events already in
+  // run_events rather than a second ledger that could drift from them.
+  @Test
+  void aTenantOverItsDailySpendCeilingCannotStartAnotherRun() throws Exception {
+    var ids = seedResourceChain();
+    var dataSource = new DriverManagerDataSource(
+        DATABASE.jdbcUrl(), DATABASE.username(), DATABASE.password());
+    var jdbc = new JdbcTemplate(dataSource);
+    var repository = new JdbcRunRepository(
+        jdbc, new TransactionTemplate(new DataSourceTransactionManager(dataSource)));
+    jdbc.update(
+        "insert into tenant_run_quotas (tenant_id, max_active_runs, max_cost_micros_per_day)"
+            + " values (?, 64, 1000) on conflict (tenant_id) do update"
+            + " set max_active_runs = 64, max_cost_micros_per_day = 1000",
+        ids.tenantId());
+
+    var spender = repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "spender", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now()));
+    recordUsage(jdbc, ids.tenantId(), spender.id(), 1500, Instant.now());
+
+    assertThatThrownBy(() -> repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "over-budget", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now())))
+        .isInstanceOf(TenantQuotaExceeded.class)
+        .hasMessageContaining("spend");
+  }
+
+  // The ceiling is a rolling window, not a running total. Spend from two days
+  // ago must not hold a tenant out forever.
+  @Test
+  void spendOutsideTheWindowDoesNotCountAgainstTheCeiling() throws Exception {
+    var ids = seedResourceChain();
+    var dataSource = new DriverManagerDataSource(
+        DATABASE.jdbcUrl(), DATABASE.username(), DATABASE.password());
+    var jdbc = new JdbcTemplate(dataSource);
+    var repository = new JdbcRunRepository(
+        jdbc, new TransactionTemplate(new DataSourceTransactionManager(dataSource)));
+    jdbc.update(
+        "insert into tenant_run_quotas (tenant_id, max_active_runs, max_cost_micros_per_day)"
+            + " values (?, 64, 1000) on conflict (tenant_id) do update"
+            + " set max_active_runs = 64, max_cost_micros_per_day = 1000",
+        ids.tenantId());
+
+    var old = repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "old-spender", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now()));
+    recordUsage(jdbc, ids.tenantId(), old.id(), 5000, Instant.now().minus(Duration.ofDays(2)));
+
+    assertThatCode(() -> repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "today", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now())))
+        .doesNotThrowAnyException();
+  }
+
+  // A tenant with no ceiling configured is unlimited, which is what every
+  // existing tenant is on deploy. A null must not read as zero.
+  @Test
+  void anUnsetSpendCeilingMeansUnlimitedRatherThanNothingAllowed() throws Exception {
+    var ids = seedResourceChain();
+    var dataSource = new DriverManagerDataSource(
+        DATABASE.jdbcUrl(), DATABASE.username(), DATABASE.password());
+    var jdbc = new JdbcTemplate(dataSource);
+    var repository = new JdbcRunRepository(
+        jdbc, new TransactionTemplate(new DataSourceTransactionManager(dataSource)));
+
+    var first = repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "unmetered", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now()));
+    recordUsage(jdbc, ids.tenantId(), first.id(), 9_999_999, Instant.now());
+
+    assertThatCode(() -> repository.save(ids.applicationId(), new Run(
+        UUID.randomUUID(), ids.tenantId(), ids.sessionId(), ids.agentVersionId(),
+        ids.workspaceId(), ids.modelPolicyId(), "still-fine", "hello", RunStatus.QUEUED,
+        1000, 100, 60, Instant.now())))
+        .doesNotThrowAnyException();
+  }
+
+  private void recordUsage(
+      JdbcTemplate jdbc, UUID tenantId, UUID runId, long costMicros, Instant occurredAt) {
+    jdbc.queryForObject(
+        "select set_config('app.tenant_id', ?, false)", String.class, tenantId.toString());
+    jdbc.update("""
+        insert into run_events (
+          tenant_id, run_id, session_id, event_id, sequence, schema_version, attempt_id,
+          occurred_at, trace_id, type, payload, digest)
+        select ?, ?, r.session_id, ?, coalesce(max(e.sequence),0) + 1, 1, ?, ?,
+               'trace-usage', 'model.usage', ?::jsonb, ?
+          from runs r left join run_events e on e.tenant_id = r.tenant_id and e.run_id = r.id
+         where r.tenant_id = ? and r.id = ?
+         group by r.session_id
+        """,
+        tenantId, runId, UUID.randomUUID(), UUID.randomUUID(), Timestamp.from(occurredAt),
+        "{\"input_tokens\":10,\"output_tokens\":5,\"cost_micros\":" + costMicros + "}",
+        "d".repeat(64), tenantId, runId);
   }
 
   private record WorkerTarget(UUID attemptId, UUID workerId, UUID workerIncarnationId) {}

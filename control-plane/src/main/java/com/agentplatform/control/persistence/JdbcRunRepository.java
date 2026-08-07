@@ -34,6 +34,9 @@ public class JdbcRunRepository implements RunRepository {
   private static final int DEFAULT_MAX_ACTIVE_RUNS = 64;
   /** Long enough that a client retrying is not itself the load problem. */
   private static final long TENANT_QUOTA_RETRY_AFTER_SECONDS = 30;
+  /** Longer than the concurrency hint: a spend ceiling frees as the window
+   * rolls, not as Runs finish, so retrying sooner cannot help. */
+  private static final long TENANT_SPEND_RETRY_AFTER_SECONDS = 300;
 
   private static final String SELECT_BY_KEY = """
       select id, tenant_id, session_id, agent_version_id, workspace_id, model_policy_id, idempotency_key,
@@ -525,8 +528,9 @@ public class JdbcRunRepository implements RunRepository {
       return;
     }
     var limits = jdbc.query(
-        "select max_active_runs from tenant_run_quotas where tenant_id = ? for update",
-        (row, rowNumber) -> row.getInt("max_active_runs"), tenantId);
+        "select max_active_runs, max_cost_micros_per_day, max_tokens_per_day"
+            + " from tenant_run_quotas where tenant_id = ? for update",
+        JdbcRunRepository::mapQuota, tenantId);
     if (limits.isEmpty()) {
       // No row means no configured limit for this tenant. Inserting the default
       // here rather than treating absence as unlimited keeps the lock target
@@ -536,19 +540,76 @@ public class JdbcRunRepository implements RunRepository {
               + " on conflict (tenant_id) do nothing",
           tenantId, DEFAULT_MAX_ACTIVE_RUNS);
       limits = jdbc.query(
-          "select max_active_runs from tenant_run_quotas where tenant_id = ? for update",
-          (row, rowNumber) -> row.getInt("max_active_runs"), tenantId);
+          "select max_active_runs, max_cost_micros_per_day, max_tokens_per_day"
+              + " from tenant_run_quotas where tenant_id = ? for update",
+          JdbcRunRepository::mapQuota, tenantId);
     }
-    var limit = limits.isEmpty() ? DEFAULT_MAX_ACTIVE_RUNS : limits.get(0);
+    var quota = limits.isEmpty()
+        ? new TenantQuota(DEFAULT_MAX_ACTIVE_RUNS, null, null)
+        : limits.get(0);
     var active = jdbc.queryForObject(
         "select count(*) from runs where tenant_id = ? and status in "
             + "('queued','running','waiting_approval','suspended')",
         Integer.class, tenantId);
-    if (active != null && active >= limit) {
+    if (active != null && active >= quota.maxActiveRuns()) {
       throw new TenantQuotaExceeded(
-          "tenant is at its concurrent run limit of " + limit,
+          "tenant is at its concurrent run limit of " + quota.maxActiveRuns(),
           TENANT_QUOTA_RETRY_AFTER_SECONDS);
     }
+    admitWithinSpendCeiling(tenantId, quota);
+  }
+
+  /**
+   * Refuses admission when the tenant has already spent its rolling day.
+   *
+   * <p>Consumption is read from the {@code model.usage} events the Worker
+   * already writes, not from a separate ledger. A second store would be a second
+   * truth, and the two would diverge the first time an event was replayed or a
+   * write was lost.
+   *
+   * <p>The ceiling is checked before a Run starts, not while it runs, so a
+   * single Run can still overshoot it: this bounds how much work a tenant can
+   * begin, not how much any one Run consumes. Per-Run budgets already bound the
+   * latter.
+   */
+  private void admitWithinSpendCeiling(UUID tenantId, TenantQuota quota) {
+    if (quota.maxCostMicrosPerDay() == null && quota.maxTokensPerDay() == null) {
+      return;
+    }
+    var usage = jdbc.queryForObject("""
+        select coalesce(sum((payload->>'cost_micros')::bigint), 0) as cost_micros,
+               coalesce(sum((payload->>'input_tokens')::bigint
+                          + (payload->>'output_tokens')::bigint), 0) as tokens
+          from run_events
+         where tenant_id = ? and type = 'model.usage'
+           and occurred_at >= now() - interval '24 hours'
+        """, (row, rowNumber) -> new long[] {row.getLong("cost_micros"), row.getLong("tokens")},
+        tenantId);
+    if (usage == null) {
+      return;
+    }
+    if (quota.maxCostMicrosPerDay() != null && usage[0] >= quota.maxCostMicrosPerDay()) {
+      throw new TenantQuotaExceeded(
+          "tenant has reached its daily spend ceiling of "
+              + quota.maxCostMicrosPerDay() + " micros",
+          TENANT_SPEND_RETRY_AFTER_SECONDS);
+    }
+    if (quota.maxTokensPerDay() != null && usage[1] >= quota.maxTokensPerDay()) {
+      throw new TenantQuotaExceeded(
+          "tenant has reached its daily spend ceiling of "
+              + quota.maxTokensPerDay() + " tokens",
+          TENANT_SPEND_RETRY_AFTER_SECONDS);
+    }
+  }
+
+  /** Null ceilings mean unlimited, which is what every tenant is before one is set. */
+  private record TenantQuota(int maxActiveRuns, Long maxCostMicrosPerDay, Long maxTokensPerDay) {}
+
+  private static TenantQuota mapQuota(java.sql.ResultSet row, int rowNumber)
+      throws java.sql.SQLException {
+    var cost = row.getObject("max_cost_micros_per_day", Long.class);
+    var tokens = row.getObject("max_tokens_per_day", Long.class);
+    return new TenantQuota(row.getInt("max_active_runs"), cost, tokens);
   }
 
   private void setTenant(UUID tenantId) {
