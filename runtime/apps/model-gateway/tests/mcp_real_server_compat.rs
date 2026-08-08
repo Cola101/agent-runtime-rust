@@ -25,6 +25,22 @@ use rsa::RsaPrivateKey;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Every server this machine has been pointed at, comma separated.
+///
+/// Discovery only. These may be servers wired to real systems -- a mailbox, an
+/// internal API -- and calling a tool on one would do whatever that tool does.
+/// `tools/list` reads nothing outside the server itself, which is what protocol
+/// compatibility actually needs.
+fn discovery_endpoints() -> Vec<String> {
+    std::env::var("AGENT_RUNTIME_MCP_COMPAT_ENDPOINTS")
+        .expect("set AGENT_RUNTIME_MCP_COMPAT_ENDPOINTS to a comma-separated list of /mcp URLs")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn endpoint() -> String {
     std::env::var("AGENT_RUNTIME_MCP_COMPAT_ENDPOINT")
         .expect("set AGENT_RUNTIME_MCP_COMPAT_ENDPOINT to the reference server's /mcp URL")
@@ -141,4 +157,62 @@ async fn a_tool_call_round_trips_against_the_reference_server() {
         refused.to_string().contains("catalog changed"),
         "expected the catalog refusal, got {refused}"
     );
+}
+
+/// The same client against every third-party server available here.
+///
+/// One server proves the fixes work; several written by different people prove
+/// they were fixes to the protocol rather than to one implementation's quirks.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs third-party MCP servers running; see the module comment"]
+async fn discovery_works_against_every_configured_server() {
+    let client = client();
+    let endpoints = discovery_endpoints();
+    assert!(
+        !endpoints.is_empty(),
+        "the list must name at least one server, or this asserts nothing"
+    );
+
+    for endpoint in endpoints {
+        let server = McpServerRef {
+            server_id: Uuid::now_v7(),
+            name: "compat".into(),
+            endpoint: endpoint.clone(),
+            credential_envelope_json: String::new(),
+        };
+        let catalog = client
+            .list_tools(Uuid::now_v7(), &server)
+            .await
+            .unwrap_or_else(|error| panic!("discovery against {endpoint} failed: {error}"));
+
+        assert!(
+            !catalog.tools.is_empty(),
+            "{endpoint} advertised no tools, so nothing about the parse was exercised"
+        );
+        assert_eq!(catalog.digest.len(), 64, "{endpoint} digest");
+        for tool in &catalog.tools {
+            assert!(
+                tool.qualified_name.starts_with("mcp:compat/"),
+                "{endpoint} produced an unnamespaced tool: {}",
+                tool.qualified_name
+            );
+            // The schema is what the model is shown, so it has to survive as an
+            // object rather than as whatever the server happened to send.
+            let schema: serde_json::Value = serde_json::from_str(&tool.input_schema_json)
+                .unwrap_or_else(|error| {
+                    panic!("{endpoint} tool {} has an unparseable schema: {error}",
+                        tool.qualified_name)
+                });
+            assert!(
+                schema.is_object(),
+                "{endpoint} tool {} schema is not an object",
+                tool.qualified_name
+            );
+        }
+        println!(
+            "compat: {endpoint} -> {} tools, digest {}",
+            catalog.tools.len(),
+            &catalog.digest[..16]
+        );
+    }
 }

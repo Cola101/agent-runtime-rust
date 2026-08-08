@@ -2,7 +2,10 @@
 
 日期：2026-08-08
 主机：MacBookPro18,3 / Apple M1 Pro / 16GB / macOS Darwin 25.5.0
-被测服务器：`@modelcontextprotocol/server-everything` 2026.7.4，Streamable HTTP 传输
+被测服务器：三台，全部 Streamable HTTP 传输
+- `@modelcontextprotocol/server-everything` 2026.7.4（官方参考实现）
+- `mcp-archery`（用户自有，SDK ^1.24.3）
+- `mcp-email`（用户自有，SDK ^1.24.3）
 
 ## 结论先说：我们的客户端此前**无法与任何符合规范的服务器通话**
 
@@ -52,6 +55,37 @@ AGENT_RUNTIME_MCP_COMPAT_ENDPOINT=http://127.0.0.1:3001/mcp \
   cargo test -p agent-model-gateway --test mcp_real_server_compat -- --ignored
 ```
 
+## 三台服务器，不是一台
+
+只对一台服务器验证，证明的是「修好了那一台」。用户环境里还有两台**别人写的**
+服务器（`mcp-archery`、`mcp-email`），一并测了发现路径：
+
+```
+compat: http://127.0.0.1:3001/mcp   -> 8 tools, digest d98c443032…
+compat: http://127.0.0.1:17829/mcp  -> 8 tools, digest 61332f09b7…
+```
+
+对这两台同样注入验证：
+
+| 注入 | 结果 |
+| --- | --- |
+| Accept 只写 `application/json` | `HTTP 406` |
+| 不回带 `mcp-session-id` | `HTTP 404`（该实现对未知会话回 404 而非 400） |
+
+**这才让「修的是协议不是某个实现的怪癖」这句话有依据。**
+注意第二条两处返回码不同（参考实现 400、这两台 404），
+所以我们的错误处理不能依赖具体状态码——目前也确实没有依赖。
+
+## 只做发现，不调用工具
+
+这两台连着真实系统（`mcp-email` 走 IMAP 接真实邮箱）。
+`tools/list` 只读服务器自身，而 `tools/call` 会做那个工具该做的事。
+协议兼容性需要的是前者，所以多服务器用例**只做发现**，
+这一点写在测试的文档注释里而不是留给人推断。
+
+启动前确认 3001 / 17829 空闲；用完按**进程工作目录**核对确属本会话启动的那两个再停，
+没有按名字或端口盲杀。
+
 ## 顺带量到的真实目录形状
 
 参考服务器 12 个工具，名字如 `echo`、`get-annotated-message`、`gzip-file-as-resource`。
@@ -81,15 +115,16 @@ suite 变大之后就不再成立。
 ## 检查结果
 
 ```
-真实服务器兼容（--ignored）  2 通过 / 0 失败
+真实服务器兼容（--ignored）  3 通过 / 0 失败（参考实现发现+调用，三台发现）
 Rust（cargo test --workspace）335 通过 / 0 失败
 Java（run-java-tests）        167 通过 / 0 失败 / 1 跳过（连跑两次）
 ```
 
 ## 明确不声称
 
-- **只验证了一台服务器、一种传输。** Streamable HTTP + 参考实现。
-  SSE 独立传输（`node dist/index.js sse`）、stdio 传输、以及其他厂商的实现都未测。
+- **三台服务器都是 Streamable HTTP，且两台用同一版官方 SDK。**
+  独立 SSE 传输、stdio 传输，以及非 SDK 实现（自己手写协议的服务器）都未测。
+- **工具调用只在参考实现上验证过。** 另两台只跑了发现，因为它们连着真实系统。
 - **OAuth 完全未测。** 参考服务器不要求鉴权，所以密封凭据这条路径在**真实服务器上
   从未走通过**——本轮验证的是无凭据的开放服务器。
 - **会话恢复（`Last-Event-ID`）未测。** 参考服务器支持它，我们没用。
