@@ -173,10 +173,19 @@ impl McpFederationClient {
         server: &McpServerRef,
     ) -> Result<McpCatalog, McpFederationError> {
         let credential = self.open_credential(tenant_id, server)?;
-        self.initialize(server, credential.as_deref().map(String::as_str)).await?;
-        let result = self
-            .call_json_rpc(server, credential.as_deref().map(String::as_str), "tools/list", serde_json::json!({}))
+        let session = self
+            .initialize(server, credential.as_deref().map(String::as_str))
             .await?;
+        let result = self
+            .call_json_rpc(
+                server,
+                credential.as_deref().map(String::as_str),
+                session.as_deref(),
+                "tools/list",
+                serde_json::json!({}),
+            )
+            .await?
+            .0;
         let listed = result
             .get("tools")
             .and_then(serde_json::Value::as_array)
@@ -256,14 +265,22 @@ impl McpFederationClient {
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
             .map_err(|error| McpFederationError::Protocol(error.to_string()))?;
         let credential = self.open_credential(tenant_id, server)?;
+        // A fresh session per call. Reusing one across calls would mean holding
+        // server-side state whose lifetime we do not control, and a call that
+        // silently ran in an expired session is worse than one extra handshake.
+        let session = self
+            .initialize(server, credential.as_deref().map(String::as_str))
+            .await?;
         let result = self
             .call_json_rpc(
                 server,
                 credential.as_deref().map(String::as_str),
+                session.as_deref(),
                 "tools/call",
                 serde_json::json!({ "name": bare, "arguments": arguments }),
             )
-            .await?;
+            .await?
+            .0;
         Ok(McpToolResult {
             is_error: result
                 .get("isError")
@@ -276,53 +293,124 @@ impl McpFederationClient {
         })
     }
 
+    /// Opens a session and completes the handshake.
+    ///
+    /// Returns the server's `Mcp-Session-Id` when it issues one. Streamable HTTP
+    /// servers that keep session state refuse every later request without it --
+    /// the reference implementation answers 400 -- so this is not optional for
+    /// anything beyond a stateless server.
     async fn initialize(
         &self,
         server: &McpServerRef,
         credential: Option<&str>,
-    ) -> Result<(), McpFederationError> {
-        self.call_json_rpc(
-            server,
-            credential,
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "agent-runtime-platform", "version": "1" }
-            }),
-        )
-        .await
-        .map(|_| ())
+    ) -> Result<Option<String>, McpFederationError> {
+        let (_, session) = self
+            .call_json_rpc(
+                server,
+                credential,
+                None,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "agent-runtime-platform", "version": "1" }
+                }),
+            )
+            .await?;
+        // The spec has the client confirm initialization. It is a notification,
+        // so there is no result to wait for and a server that ignores it is
+        // still conformant; failing the whole discovery over it would be worse
+        // than sending it and moving on.
+        self.notify(server, credential, session.as_deref()).await?;
+        Ok(session)
     }
 
-    async fn call_json_rpc(
+    async fn notify(
         &self,
         server: &McpServerRef,
         credential: Option<&str>,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, McpFederationError> {
+        session: Option<&str>,
+    ) -> Result<(), McpFederationError> {
         require_permitted_endpoint(&server.endpoint, self.loopback_permitted)?;
+        let request = self
+            .request_builder(server, credential, session)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }));
+        let response = request
+            .send()
+            .await
+            .map_err(|error| McpFederationError::Unreachable(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(McpFederationError::Unreachable(format!(
+                "server answered HTTP {} to the initialized notification",
+                response.status().as_u16()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Headers every Streamable HTTP request needs.
+    ///
+    /// `Accept` must name both JSON and SSE. Sending only `application/json`
+    /// gets a 406 from a conformant server -- the reference implementation
+    /// answers "Client must accept both" -- because the transport may reply
+    /// either way and the client has to be able to read both.
+    fn request_builder(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+        session: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let mut request = self
             .http
             .post(&server.endpoint)
             .header("content-type", "application/json")
-            .header("accept", "application/json")
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+        if let Some(secret) = credential {
+            request = request.bearer_auth(secret);
+        }
+        if let Some(session) = session {
+            request = request.header("mcp-session-id", session);
+        }
+        request
+    }
+
+    /// Returns the result and the session id the server issued, if any.
+    async fn call_json_rpc(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+        session: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(serde_json::Value, Option<String>), McpFederationError> {
+        require_permitted_endpoint(&server.endpoint, self.loopback_permitted)?;
+        let request = self
+            .request_builder(server, credential, session)
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": method,
                 "params": params,
             }));
-        if let Some(secret) = credential {
-            request = request.bearer_auth(secret);
-        }
         let response = request
             .send()
             .await
             .map_err(|error| McpFederationError::Unreachable(error.to_string()))?;
         let status = response.status();
+        let issued_session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
         // Read the length hint first so an oversized body is refused before it
         // is pulled into memory, not after.
         if response
@@ -346,14 +434,19 @@ impl McpFederationClient {
                 status.as_u16()
             )));
         }
-        let decoded: JsonRpcResponse = serde_json::from_slice(&body)
-            .map_err(|error| McpFederationError::Protocol(error.to_string()))?;
+        let decoded = if sse {
+            decode_event_stream(&body)?
+        } else {
+            serde_json::from_slice(&body)
+                .map_err(|error| McpFederationError::Protocol(error.to_string()))?
+        };
         if let Some(error) = decoded.error {
             return Err(McpFederationError::Protocol(error.message));
         }
-        decoded
-            .result
-            .ok_or_else(|| McpFederationError::Protocol("response carried neither result nor error".into()))
+        let result = decoded.result.ok_or_else(|| {
+            McpFederationError::Protocol("response carried neither result nor error".into())
+        })?;
+        Ok((result, issued_session))
     }
 
     fn open_credential(
@@ -507,6 +600,34 @@ fn is_publicly_routable(ip: std::net::IpAddr) -> bool {
                 }))
         }
     }
+}
+
+/// Reads a JSON-RPC response out of an SSE body.
+///
+/// Streamable HTTP lets a server answer a POST with `text/event-stream` instead
+/// of JSON, and the reference implementation always does. Parsing the raw body
+/// as JSON fails on the `event:` and `id:` lines, so a client that only handles
+/// JSON cannot talk to a conformant server at all.
+///
+/// The first frame carrying a result or an error wins. A stream may also carry
+/// notifications and progress frames, which are not the answer to this request.
+fn decode_event_stream(body: &[u8]) -> Result<JsonRpcResponse, McpFederationError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| McpFederationError::Protocol("event stream is not utf-8".into()))?;
+    for line in text.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(frame) = serde_json::from_str::<JsonRpcResponse>(payload.trim()) else {
+            continue;
+        };
+        if frame.result.is_some() || frame.error.is_some() {
+            return Ok(frame);
+        }
+    }
+    Err(McpFederationError::Protocol(
+        "event stream carried no jsonrpc result or error".into(),
+    ))
 }
 
 fn catalog_digest(tools: &[McpTool]) -> String {

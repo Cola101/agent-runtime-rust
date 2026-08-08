@@ -1137,7 +1137,12 @@ class JdbcSchedulerRepositoryIntegrationTest {
 
     var result = fixture.scheduler().reconcileExpired();
 
-    assertThat(result).isEqualTo(new ReconcileResult(1, 0));
+    // reconcileExpired sweeps every tenant, so an exact tally is a claim about
+    // what other tests left behind, not about this one. It held only while the
+    // suite happened to run in an order that left nothing else expired, and
+    // stopped holding as the suite grew. The three assertions below are scoped
+    // to this fixture and are what actually prove this run was requeued.
+    assertThat(result.requeued()).isGreaterThanOrEqualTo(1);
     assertThat(fixture.jdbc().queryForObject("""
         select state from run_dispatches
          where tenant_id = ? and run_id = ? and attempt_id = ?

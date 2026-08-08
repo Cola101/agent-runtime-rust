@@ -1,0 +1,144 @@
+//! Compatibility with a real third-party MCP server.
+//!
+//! Everything else in this repo tests against an MCP server this repo wrote,
+//! which proves the client agrees with itself. This one runs against the
+//! official reference implementation (`@modelcontextprotocol/server-everything`,
+//! Streamable HTTP transport) and found four ways the client was wrong.
+//!
+//! Ignored by default because it needs that server running. Bring it up and run:
+//!
+//! ```text
+//! npm pack @modelcontextprotocol/server-everything && tar xzf modelcontext*.tgz
+//! (cd package && npm install --omit=dev --ignore-scripts && node dist/index.js streamableHttp)
+//! AGENT_RUNTIME_MCP_COMPAT_ENDPOINT=http://127.0.0.1:3001/mcp \
+//!   cargo test -p agent-model-gateway --test mcp_real_server_compat -- --ignored
+//! ```
+//!
+//! Ignored rather than skipped-when-unset on purpose: a skip counts as a pass in
+//! the summary, and "the compatibility suite passed" would then be true on a
+//! machine where it never ran.
+
+use agent_model_gateway::mcp::{McpFederationClient, McpServerRef};
+use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+use rsa::rand_core::OsRng;
+use rsa::RsaPrivateKey;
+use std::time::Duration;
+use uuid::Uuid;
+
+fn endpoint() -> String {
+    std::env::var("AGENT_RUNTIME_MCP_COMPAT_ENDPOINT")
+        .expect("set AGENT_RUNTIME_MCP_COMPAT_ENDPOINT to the reference server's /mcp URL")
+}
+
+fn client() -> McpFederationClient {
+    let pem = RsaPrivateKey::new(&mut OsRng, 3072)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    McpFederationClient::from_pkcs8_pem(&pem, Duration::from_secs(20), true).unwrap()
+}
+
+fn server() -> McpServerRef {
+    McpServerRef {
+        server_id: Uuid::now_v7(),
+        name: "everything".into(),
+        endpoint: endpoint(),
+        credential_envelope_json: String::new(),
+    }
+}
+
+/// Discovery against the reference server.
+///
+/// This is the test that failed four times before the client was conformant:
+/// the Accept header had to name SSE as well as JSON (406 otherwise), the
+/// response arrives as `text/event-stream` and has to be parsed as one, the
+/// `Mcp-Session-Id` from initialize has to be echoed (400 otherwise), and the
+/// initialized notification has no result to wait for.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the reference MCP server running; see the module comment"]
+async fn discovery_works_against_the_reference_server() {
+    let catalog = client()
+        .list_tools(Uuid::now_v7(), &server())
+        .await
+        .expect("discovery against the reference server should succeed");
+
+    assert!(
+        !catalog.tools.is_empty(),
+        "the reference server advertises tools"
+    );
+    assert_eq!(catalog.digest.len(), 64);
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .all(|tool| tool.qualified_name.starts_with("mcp:everything/")),
+        "every tool must be namespaced under its server"
+    );
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .any(|tool| tool.qualified_name == "mcp:everything/echo"),
+        "the reference server's echo tool should be discovered, got {:?}",
+        catalog
+            .tools
+            .iter()
+            .map(|tool| &tool.qualified_name)
+            .collect::<Vec<_>>()
+    );
+    // Its input schemas must survive the round trip as objects, since they are
+    // what the model is shown.
+    let echo = catalog
+        .tools
+        .iter()
+        .find(|tool| tool.qualified_name == "mcp:everything/echo")
+        .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&echo.input_schema_json).unwrap();
+    assert_eq!(schema["type"], "object");
+}
+
+/// A real call, and the freeze holding against a real server.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the reference MCP server running; see the module comment"]
+async fn a_tool_call_round_trips_against_the_reference_server() {
+    let client = client();
+    let server = server();
+    let tenant = Uuid::now_v7();
+    let catalog = client.list_tools(tenant, &server).await.unwrap();
+
+    let result = client
+        .call_tool(
+            tenant,
+            &server,
+            "mcp:everything/echo",
+            r#"{"message":"agent runtime platform"}"#,
+            &catalog.digest,
+        )
+        .await
+        .expect("echo should round trip");
+
+    assert!(!result.is_error);
+    assert!(
+        result.content_json.contains("agent runtime platform"),
+        "the server's own answer should come back, got {}",
+        result.content_json
+    );
+
+    // A digest this Run never froze must be refused even though the tool exists
+    // and the server is perfectly healthy.
+    let refused = client
+        .call_tool(
+            tenant,
+            &server,
+            "mcp:everything/echo",
+            r#"{"message":"x"}"#,
+            &"0".repeat(64),
+        )
+        .await
+        .expect_err("a stale frozen digest must be refused");
+    assert!(
+        refused.to_string().contains("catalog changed"),
+        "expected the catalog refusal, got {refused}"
+    );
+}
