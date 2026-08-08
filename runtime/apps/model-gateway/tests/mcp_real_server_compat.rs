@@ -216,3 +216,119 @@ async fn discovery_works_against_every_configured_server() {
         );
     }
 }
+
+/// The sealed credential path, against a server that actually checks it.
+///
+/// Every other test here runs against an open server, so the credential code
+/// could have been silently broken and nothing would have noticed. This one
+/// seals a real bearer token into a real envelope, has the client open it, and
+/// talks to a server that answers 401 without it.
+///
+/// The unauthenticated half is the load-bearing part: without it this test would
+/// pass even if the envelope were ignored entirely, which is exactly the shape
+/// of a test that checks nothing.
+///
+/// ```text
+/// AGENT_RUNTIME_MCP_COMPAT_AUTH_ENDPOINT=https://api.githubcopilot.com/mcp/ \
+/// AGENT_RUNTIME_MCP_COMPAT_BEARER="$(gh auth token)" \
+///   cargo test -p agent-model-gateway --test mcp_real_server_compat -- --ignored sealed
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs an authenticating public MCP server and a token; see the doc comment"]
+async fn a_sealed_credential_opens_against_an_authenticating_server() {
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use base64::Engine;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
+    use rsa::rand_core::RngCore;
+    use rsa::{Oaep, RsaPublicKey};
+    use sha2::{Digest, Sha256};
+
+    let endpoint = std::env::var("AGENT_RUNTIME_MCP_COMPAT_AUTH_ENDPOINT")
+        .expect("set AGENT_RUNTIME_MCP_COMPAT_AUTH_ENDPOINT");
+    let bearer = std::env::var("AGENT_RUNTIME_MCP_COMPAT_BEARER")
+        .expect("set AGENT_RUNTIME_MCP_COMPAT_BEARER");
+
+    let pem = RsaPrivateKey::new(&mut OsRng, 3072)
+        .unwrap()
+        .to_pkcs8_pem(LineEnding::LF)
+        .unwrap()
+        .to_string();
+    let private_key = RsaPrivateKey::from_pkcs8_pem(&pem).unwrap();
+    let public_key = RsaPublicKey::from(&private_key);
+    let key_id = hex::encode(Sha256::digest(
+        public_key.to_public_key_der().unwrap().as_ref(),
+    ));
+    let client = McpFederationClient::from_pkcs8_pem(&pem, Duration::from_secs(30), false).unwrap();
+
+    let tenant = Uuid::now_v7();
+    let server_id = Uuid::now_v7();
+    let mut data_key = [0_u8; 32];
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut data_key);
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted_key = public_key
+        .encrypt(&mut OsRng, Oaep::new::<Sha256>(), &data_key)
+        .unwrap();
+    let aad = format!("{tenant}:{server_id}");
+    let ciphertext = Aes256Gcm::new_from_slice(&data_key)
+        .unwrap()
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: bearer.as_bytes(),
+                aad: aad.as_bytes(),
+            },
+        )
+        .unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "key_id": key_id,
+        "algorithm": "RSA-OAEP-256+A256GCM",
+        "encrypted_key": base64.encode(&encrypted_key),
+        "nonce": base64.encode(nonce),
+        "ciphertext": base64.encode(&ciphertext),
+    })
+    .to_string();
+
+    // Without the envelope the server must refuse, or the sealed run below
+    // proves nothing about the sealing.
+    let open = McpServerRef {
+        server_id,
+        name: "github".into(),
+        endpoint: endpoint.clone(),
+        credential_envelope_json: String::new(),
+    };
+    let refused = client
+        .list_tools(tenant, &open)
+        .await
+        .expect_err("an authenticating server must refuse an unauthenticated client");
+    assert!(
+        refused.to_string().contains("401"),
+        "expected an auth refusal, got {refused}"
+    );
+
+    let sealed = McpServerRef {
+        credential_envelope_json: envelope,
+        ..open
+    };
+    let catalog = client
+        .list_tools(tenant, &sealed)
+        .await
+        .expect("a sealed credential should open and authenticate");
+
+    assert!(!catalog.tools.is_empty());
+    assert!(
+        catalog
+            .tools
+            .iter()
+            .all(|tool| tool.qualified_name.starts_with("mcp:github/")),
+        "every tool must be namespaced under its server"
+    );
+    println!(
+        "compat: {endpoint} authenticated -> {} tools, digest {}",
+        catalog.tools.len(),
+        &catalog.digest[..16]
+    );
+}

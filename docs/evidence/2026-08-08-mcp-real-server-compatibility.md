@@ -2,10 +2,11 @@
 
 日期：2026-08-08
 主机：MacBookPro18,3 / Apple M1 Pro / 16GB / macOS Darwin 25.5.0
-被测服务器：三台，全部 Streamable HTTP 传输
-- `@modelcontextprotocol/server-everything` 2026.7.4（官方参考实现）
-- `mcp-archery`（用户自有，SDK ^1.24.3）
-- `mcp-email`（用户自有，SDK ^1.24.3）
+被测服务器：四台，全部 Streamable HTTP 传输
+- `@modelcontextprotocol/server-everything` 2026.7.4（官方参考实现，无鉴权）
+- `mcp-archery`（用户自有，SDK ^1.24.3，无鉴权）
+- `mcp-email`（用户自有，SDK ^1.24.3，无鉴权）
+- **GitHub 官方 MCP**（`https://api.githubcopilot.com/mcp/`，**要求 bearer 鉴权**）
 
 ## 结论先说：我们的客户端此前**无法与任何符合规范的服务器通话**
 
@@ -86,11 +87,59 @@ compat: http://127.0.0.1:17829/mcp  -> 8 tools, digest 61332f09b7…
 启动前确认 3001 / 17829 空闲；用完按**进程工作目录**核对确属本会话启动的那两个再停，
 没有按名字或端口盲杀。
 
+## 密封凭据路径：首次在真实鉴权服务器上跑通
+
+在此之前四片证据里我一直写着同一句「密封凭据这条路径在真实服务器上从未走通过」——
+因为前三台都是开放服务器，凭据代码就算整个坏掉也没人会发现。
+
+GitHub 官方 MCP 要求 bearer：
+
+```
+无凭据 → HTTP 401
+www-authenticate: Bearer error="invalid_request",
+  error_description="No access token was provided in this request"
+```
+
+于是把一个真实令牌按生产同一套方案密封（RSA-OAEP-256 + AES-256-GCM，
+AAD = `{tenant_id}:{server_id}`），交给我们自己的客户端去解封并调用：
+
+```
+compat: https://api.githubcopilot.com/mcp/ authenticated -> 44 tools, digest 3043cff13b…
+```
+
+**这条用例里「无凭据必须 401」那一半是承重的**：没有它，
+即使客户端把信封整个忽略掉，用例照样会绿——正是今天已经撞过四次的那种空转形态。
+
+注入验证：让客户端拿到凭据也不发 `Authorization`——
+
+```
+a sealed credential should open and authenticate: Unreachable("server answered HTTP 401")
+```
+
+也就是说「开放请求 401、密封请求 200」这个组合，**只有在解封确实产出了正确令牌时才成立**。
+
+顺带，这也是 SSRF 判据第一次对着真实公网主机跑：`api.githubcopilot.com`
+解析到公网地址、被放行，且该用例是以 `loopback_permitted = false` 运行的。
+
+### 令牌去了哪里
+
+发给 GitHub 自己——**令牌的签发方**，不是任何第三方。令牌取自本机已有的
+`gh auth token`，没有写进源码、测试或 git，测试从环境变量读。
+
 ## 顺带量到的真实目录形状
 
-参考服务器 12 个工具，名字如 `echo`、`get-annotated-message`、`gzip-file-as-resource`。
-**没有一个包含 `/` 或 `:`**，`MAX_TOOLS = 64` 也宽裕。
-这两条此前只是我的假设，现在有一个真实实现的数据。
+| 服务器 | 工具数 | 含 `/` 或 `:` |
+| --- | ---: | --- |
+| 参考实现 | 12 | 无 |
+| mcp-archery | 8 | 无 |
+| mcp-email | 8 | 无 |
+| **GitHub 官方** | **44** | 无 |
+
+**GitHub 那台已经占到 `MAX_TOOLS = 64` 的 69%。** 这个上限此前是我拍的，
+现在有了真实参照：一台生产服务器就用掉了三分之二。它不是马上会出问题，
+但也不再是「远得看不见」的余量——**这条值得在下次调整前先看一眼**。
+
+名字里没有一个包含分隔符，最长 33 字符，限定名规则对真实生态成立。
 
 ## 一个既有缺陷，以及我先前两次绿灯报告需要更正
 
@@ -115,7 +164,10 @@ suite 变大之后就不再成立。
 ## 检查结果
 
 ```
-真实服务器兼容（--ignored）  3 通过 / 0 失败（参考实现发现+调用，三台发现）
+真实服务器兼容（--ignored）  4 通过 / 0 失败
+  · 参考实现：发现 + 工具调用 + 目录冻结拒绝
+  · 三台无鉴权服务器：发现
+  · GitHub 官方：密封凭据解封 + 鉴权发现
 Rust（cargo test --workspace）335 通过 / 0 失败
 Java（run-java-tests）        167 通过 / 0 失败 / 1 跳过（连跑两次）
 ```
@@ -125,8 +177,10 @@ Java（run-java-tests）        167 通过 / 0 失败 / 1 跳过（连跑两次�
 - **三台服务器都是 Streamable HTTP，且两台用同一版官方 SDK。**
   独立 SSE 传输、stdio 传输，以及非 SDK 实现（自己手写协议的服务器）都未测。
 - **工具调用只在参考实现上验证过。** 另两台只跑了发现，因为它们连着真实系统。
-- **OAuth 完全未测。** 参考服务器不要求鉴权，所以密封凭据这条路径在**真实服务器上
-  从未走通过**——本轮验证的是无凭据的开放服务器。
+- **验证的是 bearer 静态令牌，不是 OAuth 流程。** GitHub MCP 接受 PAT，
+  所以走通的是「密封 → 解封 → `Authorization: Bearer`」。
+  `WWW-Authenticate` 里给出的 `resource_metadata` OAuth 发现流程、授权码交换、
+  令牌刷新**全部未实现也未测**。租户注册一台需要 OAuth 的服务器目前无法工作。
 - **会话恢复（`Last-Event-ID`）未测。** 参考服务器支持它，我们没用。
 - 长连接 / 服务器主动推送的通知与进度帧只是被解析器跳过，没有被消费，
   也没有用例覆盖「跳过它们之后仍能拿到正确结果」之外的行为。
