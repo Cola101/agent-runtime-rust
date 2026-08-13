@@ -49,7 +49,12 @@ fn request() -> ToolExecutionRequest {
 fn context(workspace_root: PathBuf) -> ToolExecutionContext {
     ToolExecutionContext {
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::now_v7(),
+        workspace_id: Uuid::now_v7(),
+        agent_version_id: Uuid::now_v7(),
         attempt_id: Uuid::now_v7(),
         workspace_root,
         timeout: Duration::from_secs(30),
@@ -84,6 +89,11 @@ fn restricted_container_is_digest_pinned_non_networked_and_argument_safe() {
 
     assert_eq!(launch.program, "/usr/local/bin/docker");
     assert_eq!(launch.stdin_json["tool_call"]["id"], "call_http_7");
+    assert!(launch.stdin_json["application_id"].is_string());
+    assert!(launch.stdin_json["workload_identity_id"].is_string());
+    assert!(launch.stdin_json["session_id"].is_string());
+    assert!(launch.stdin_json["workspace_id"].is_string());
+    assert!(launch.stdin_json["agent_version_id"].is_string());
     assert_eq!(
         launch.stdin_json["tool_call"]["arguments"]["url"],
         "https://example.com/a?token=secret"

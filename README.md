@@ -1,4 +1,52 @@
-# Agent Runtime Platform
+# Agent Runtime Rust
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/status-technical%20alpha-orange.svg)](docs/implementation-status.md)
+
+A protocol-neutral, multi-tenant Agent Runtime written primarily in Rust. It is designed to let
+SaaS teams embed durable agent execution without coupling their applications to one model provider
+or requiring a heavyweight control plane. The Rust runtime owns the agent loop, model routing,
+Tool/MCP execution, approvals, checkpoints, recovery, subagents, budgets, and tenant-aware admission.
+
+The same headless runtime can be embedded behind Java applications or used by standalone CLI,
+desktop, cloud, and edge clients. The included Java control plane is a reference integration, not a
+runtime dependency. Model adapters currently cover OpenAI Responses, Anthropic Messages, and
+OpenAI-compatible Chat Completions through a shared model IR.
+
+> **Status:** technical alpha. The repository contains executable runtime paths, 659 passing Rust
+> tests, architecture decisions, threat modeling, and evidence records, but it is not yet production
+> ready and does not claim 1,000 active Runs, 99.9% availability, or SOC 2 certification. See the
+> [implementation status](docs/implementation-status.md) for verified and unverified boundaries.
+
+## Why this project
+
+- **Multi-tenant by design:** tenant, application, workspace, workload identity, budget, and
+  admission boundaries are part of runtime semantics rather than UI conventions.
+- **Provider-neutral execution:** one typed model IR and explicit safe-fallback rules avoid binding
+  the agent loop to a single vendor protocol.
+- **Durable and auditable:** event sequencing, checkpoints, approvals, fencing, side-effect
+  classification, and `indeterminate` outcomes make failure handling explicit.
+- **Embeddable and standalone:** the Rust host completes a Run without Java, Docker, Kubernetes,
+  PostgreSQL, or NATS; external control planes integrate through versioned contracts.
+- **Evidence over claims:** implemented milestones link to tests, ADRs, and evidence, while known
+  gaps remain public.
+
+## Runtime quick check
+
+```bash
+cd runtime
+cargo test --workspace
+```
+
+Local development does not require Docker. Build artifacts can be removed with `cargo clean` and
+all project-local runtime state is confined to the ignored `.local/` directory.
+
+Governance: [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE) ·
+[Third-party sources](docs/third-party-sources.md)
+
+---
+
+## 中文说明
 
 面向外部客户的多租户 Agent Runtime PaaS。仓库当前交付第一条可运行纵向主链：
 

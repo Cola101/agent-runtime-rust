@@ -3,17 +3,24 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use uuid::Uuid;
 
 pub const RUN_QUEUED_SCHEMA_VERSION: u32 = 1;
-pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 9;
+pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 20;
 pub const RUN_CANCELLATION_SCHEMA_VERSION: u32 = 2;
 pub const RUN_STEERING_SCHEMA_VERSION: u32 = 1;
 pub const RUN_STEERING_OUTCOME_SCHEMA_VERSION: u32 = 1;
 pub const TOOL_APPROVAL_DECISION_SCHEMA_VERSION: u32 = 2;
+pub const TOOL_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
+pub const TOOL_RECONCILIATION_MAX_CONTENT_BYTES: usize = 256 * 1024;
+pub const MCP_INPUT_REQUIRED_SCHEMA_VERSION: u32 = 1;
+pub const MCP_INPUT_RESOLUTION_SCHEMA_VERSION: u32 = 1;
 pub const WORKER_HEARTBEAT_SCHEMA_VERSION: u32 = 2;
 pub const RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_INVOCATION_SCHEMA_VERSION: u32 = 1;
+pub const EDGE_TASK_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +43,324 @@ pub struct RunBudget {
     pub max_tokens: u64,
     pub max_cost_cents: u64,
     pub max_duration_seconds: u64,
+}
+
+/// Immutable customer-resource boundary selected before a Run enters Runtime
+/// admission.
+///
+/// This is deliberately smaller than `RunExecutionCommand`: an embedding
+/// adapter supplies and authenticates this context, while the Runtime allocates
+/// Run/attempt/worker identity and the short-lived workload token afterwards.
+/// Keeping it provider- and transport-neutral lets an in-process Java bridge,
+/// a sidecar, a desktop client, and an edge node invoke the same Rust contract.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInvocationContext {
+    pub schema_version: u32,
+    pub tenant_id: Uuid,
+    pub application_id: Uuid,
+    /// Stable non-secret principal selected by the authenticating embedding
+    /// adapter. Rotating bearer credentials are never persisted here.
+    pub workload_identity_id: Uuid,
+    pub workspace_id: Uuid,
+    pub agent_version_id: Uuid,
+    pub model_policy_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RuntimeInvocationValidationError {
+    #[error("unsupported Runtime invocation schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("Runtime invocation resource identity is incomplete")]
+    IncompleteIdentity,
+}
+
+impl RuntimeInvocationContext {
+    pub fn validate(&self) -> Result<(), RuntimeInvocationValidationError> {
+        if self.schema_version != RUNTIME_INVOCATION_SCHEMA_VERSION {
+            return Err(RuntimeInvocationValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        if [
+            self.tenant_id,
+            self.application_id,
+            self.workload_identity_id,
+            self.workspace_id,
+            self.agent_version_id,
+            self.model_policy_id,
+        ]
+        .iter()
+        .any(Uuid::is_nil)
+        {
+            return Err(RuntimeInvocationValidationError::IncompleteIdentity);
+        }
+        Ok(())
+    }
+}
+
+/// Control-plane-authorized work addressed to one enrolled Edge Node
+/// generation. Version 2 additionally binds the approved Enrollment and node
+/// capability surface. It deliberately maps one task to one standalone Run;
+/// persistent Session turns need a later contract that the embedded Runtime can
+/// represent without changing identity at the execution boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeTaskClaims {
+    pub schema_version: u32,
+    pub task_id: Uuid,
+    pub enrollment_id: Uuid,
+    pub node_id: Uuid,
+    pub node_generation: u64,
+    pub capability_manifest_digest: String,
+    pub required_capabilities: BTreeSet<String>,
+    pub issued_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub invocation: RuntimeInvocationContext,
+    pub run_id: Uuid,
+    pub session_id: Uuid,
+    pub workspace_owner_epoch: u64,
+    pub input: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum EdgeTaskValidationError {
+    #[error("unsupported edge task schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("edge task identity is incomplete")]
+    IncompleteIdentity,
+    #[error("edge task node generation must be positive")]
+    InvalidNodeGeneration,
+    #[error("edge task Enrollment binding is invalid")]
+    InvalidEnrollmentBinding,
+    #[error("edge task capability requirements are invalid")]
+    InvalidCapabilities,
+    #[error("edge task Workspace owner epoch must be positive")]
+    InvalidOwnerEpoch,
+    #[error("edge task Session identity is unsupported by schema v1")]
+    UnsupportedSessionIdentity,
+    #[error("edge task authority is expired or has an invalid lifetime")]
+    InvalidLifetime,
+    #[error("edge task input must be nonblank and at most 32000 bytes")]
+    InvalidInput,
+}
+
+impl EdgeTaskClaims {
+    pub fn validate_at(&self, now_unix_ms: i64) -> Result<(), EdgeTaskValidationError> {
+        if self.schema_version != EDGE_TASK_SCHEMA_VERSION {
+            return Err(EdgeTaskValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        if self.task_id.is_nil()
+            || self.enrollment_id.is_nil()
+            || self.node_id.is_nil()
+            || self.run_id.is_nil()
+            || self.session_id.is_nil()
+            || self.invocation.validate().is_err()
+        {
+            return Err(EdgeTaskValidationError::IncompleteIdentity);
+        }
+        if self.node_generation == 0 {
+            return Err(EdgeTaskValidationError::InvalidNodeGeneration);
+        }
+        if !is_lower_hex_sha256(&self.capability_manifest_digest) {
+            return Err(EdgeTaskValidationError::InvalidEnrollmentBinding);
+        }
+        if self.required_capabilities.is_empty()
+            || self.required_capabilities.len() > 64
+            || self
+                .required_capabilities
+                .iter()
+                .any(|capability| !valid_edge_capability(capability))
+        {
+            return Err(EdgeTaskValidationError::InvalidCapabilities);
+        }
+        if self.workspace_owner_epoch == 0 {
+            return Err(EdgeTaskValidationError::InvalidOwnerEpoch);
+        }
+        if self.session_id != self.run_id {
+            return Err(EdgeTaskValidationError::UnsupportedSessionIdentity);
+        }
+        const MAX_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
+        let lifetime_ms = self.expires_at_unix_ms.checked_sub(self.issued_at_unix_ms);
+        if self.issued_at_unix_ms > now_unix_ms
+            || self.expires_at_unix_ms <= now_unix_ms
+            || self.expires_at_unix_ms <= self.issued_at_unix_ms
+            || lifetime_ms.is_none_or(|lifetime| lifetime > MAX_LIFETIME_MS)
+        {
+            return Err(EdgeTaskValidationError::InvalidLifetime);
+        }
+        if self.input.trim().is_empty() || self.input.len() > 32_000 {
+            return Err(EdgeTaskValidationError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_edge_capability(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b':' | b'_' | b'-' | b'/')
+        })
+}
+
+/// The protocol-neutral execution semantics one Run freezes before admission.
+///
+/// Provider credentials, tenant routing and Tool grants live in their own
+/// snapshots. This one binds the host-level scheduling decisions that used to
+/// be constants in three different processes and could therefore drift when a
+/// Run moved or resumed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecutionPolicySnapshot {
+    pub schema_version: u32,
+    pub mcp_discovery: McpDiscoveryPolicySnapshot,
+    pub model_failover: ModelFailoverPolicySnapshot,
+    pub tool_execution: ToolExecutionPolicySnapshot,
+    /// Provider-neutral model-context bounds. Disabled is the only valid value
+    /// for policy schemas before v3, so an older scheduler cannot accidentally
+    /// opt a Run into semantics it does not understand.
+    #[serde(default)]
+    pub context_compaction: ContextCompactionPolicySnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpDiscoveryPolicySnapshot {
+    pub max_concurrent_servers: u8,
+    pub per_server_timeout_ms: u64,
+    pub total_timeout_ms: u64,
+    /// Total safe discovery attempts for one server, including the first.
+    /// Tool calls never consume this budget and are never automatically replayed.
+    #[serde(default = "single_mcp_discovery_attempt")]
+    pub max_attempts_per_server: u8,
+    /// Initial delay between retryable discovery failures. Later delays double
+    /// while the per-server deadline remains the hard outer bound.
+    #[serde(default)]
+    pub initial_retry_backoff_ms: u64,
+}
+
+const fn single_mcp_discovery_attempt() -> u8 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelFailoverPolicySnapshot {
+    pub max_provider_attempts: u8,
+    pub fallback_on: std::collections::BTreeSet<ModelErrorKind>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolExecutionPolicySnapshot {
+    pub timeout_ms: u64,
+    /// Maximum number of replay-safe Tool calls admitted in one ordered batch.
+    /// Older policy schemas deserialize to one and therefore remain serial.
+    #[serde(default = "single_concurrent_tool")]
+    pub max_concurrent_tools: u8,
+}
+
+const fn single_concurrent_tool() -> u8 {
+    1
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextCompactionPolicySnapshot {
+    pub enabled: bool,
+    pub trigger_bytes: u64,
+    pub retain_bytes: u64,
+    pub max_summary_tokens: u64,
+}
+
+impl Default for RuntimeExecutionPolicySnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: 4,
+            mcp_discovery: McpDiscoveryPolicySnapshot {
+                max_concurrent_servers: 4,
+                per_server_timeout_ms: 3_000,
+                total_timeout_ms: 10_000,
+                max_attempts_per_server: 2,
+                initial_retry_backoff_ms: 100,
+            },
+            model_failover: ModelFailoverPolicySnapshot {
+                max_provider_attempts: 8,
+                fallback_on: std::collections::BTreeSet::from([
+                    ModelErrorKind::RateLimited,
+                    ModelErrorKind::Timeout,
+                    ModelErrorKind::Unavailable,
+                ]),
+            },
+            tool_execution: ToolExecutionPolicySnapshot {
+                timeout_ms: 30_000,
+                max_concurrent_tools: 4,
+            },
+            context_compaction: ContextCompactionPolicySnapshot::default(),
+        }
+    }
+}
+
+impl RuntimeExecutionPolicySnapshot {
+    #[must_use]
+    pub fn is_bounded_and_safe(&self) -> bool {
+        matches!(self.schema_version, 1..=4)
+            && (1..=16).contains(&self.mcp_discovery.max_concurrent_servers)
+            && (1..=60_000).contains(&self.mcp_discovery.per_server_timeout_ms)
+            && self.mcp_discovery.total_timeout_ms >= self.mcp_discovery.per_server_timeout_ms
+            && self.mcp_discovery.total_timeout_ms <= 300_000
+            && match self.schema_version {
+                1 => {
+                    self.mcp_discovery.max_attempts_per_server == 1
+                        && self.mcp_discovery.initial_retry_backoff_ms == 0
+                }
+                2..=4 => {
+                    (1..=4).contains(&self.mcp_discovery.max_attempts_per_server)
+                        && self.mcp_discovery.initial_retry_backoff_ms <= 5_000
+                }
+                _ => false,
+            }
+            && (1..=8).contains(&self.model_failover.max_provider_attempts)
+            && self.model_failover.fallback_on.iter().all(|kind| {
+                matches!(
+                    kind,
+                    ModelErrorKind::RateLimited
+                        | ModelErrorKind::Timeout
+                        | ModelErrorKind::Unavailable
+                )
+            })
+            && (1..=3_600_000).contains(&self.tool_execution.timeout_ms)
+            && match self.schema_version {
+                1..=3 => self.tool_execution.max_concurrent_tools == 1,
+                4 => (1..=16).contains(&self.tool_execution.max_concurrent_tools),
+                _ => false,
+            }
+            && match self.schema_version {
+                1 | 2 => self.context_compaction == ContextCompactionPolicySnapshot::default(),
+                3 | 4 if !self.context_compaction.enabled => {
+                    self.context_compaction == ContextCompactionPolicySnapshot::default()
+                }
+                3 | 4 => {
+                    (4_096..=67_108_864).contains(&self.context_compaction.trigger_bytes)
+                        && (1_024..self.context_compaction.trigger_bytes)
+                            .contains(&self.context_compaction.retain_bytes)
+                        && (64..=8_192).contains(&self.context_compaction.max_summary_tokens)
+                }
+                _ => false,
+            }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,6 +442,19 @@ pub struct RunExecutionCommand {
     pub schema_version: u32,
     pub message_id: Uuid,
     pub tenant_id: Uuid,
+    /// Immutable application boundary selected before admission.
+    ///
+    /// Added in v20. Older commands deserialize to nil for rolling read
+    /// compatibility, but a v20 producer must never omit it: tenant identity
+    /// alone cannot distinguish two customer applications that share one
+    /// Runtime deployment.
+    #[serde(default)]
+    pub application_id: Uuid,
+    /// Stable non-secret identity of the invoking workload. The short-lived
+    /// signed token rotates independently and is never written to events or
+    /// Checkpoints.
+    #[serde(default)]
+    pub workload_identity_id: Uuid,
     pub run_id: Uuid,
     pub session_id: Uuid,
     pub workspace_id: Uuid,
@@ -167,11 +505,377 @@ pub struct RunExecutionCommand {
     /// a tenant with no servers registered both mean the same safe thing.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSnapshot>,
+    /// Effective host-level execution semantics, frozen before admission.
+    ///
+    /// Added in v10. `None` is accepted only for older commands so an upgrade
+    /// remains read-compatible; a v10 Run without the snapshot is ambiguous and
+    /// is rejected rather than inheriting whichever defaults this Worker has.
+    #[serde(default)]
+    pub runtime_policy: Option<RuntimeExecutionPolicySnapshot>,
+    /// Completed turns inherited by a continuation child Run.
+    ///
+    /// This stays provider-neutral: the Worker adapter converts each turn into
+    /// native user/assistant messages. Keeping it out of `agent_instructions`
+    /// prevents conversation data from silently becoming higher-authority
+    /// system input.
+    #[serde(default)]
+    pub subagent_history: Vec<SubagentConversationTurn>,
+    /// Explicit lower-authority history import. This is repaired at admission
+    /// and never used as an implicit fallback for malformed Checkpoint state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_import: Option<HistoryImport>,
+    /// Authoritative completed-turn prefix for a root Session branch.
+    ///
+    /// Unlike `history_import`, this state is produced and integrity-checked by
+    /// the Runtime itself. The Worker may expose it to the model as ordinary
+    /// conversation context, but historical Tool calls are never scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_branch: Option<SessionBranchSnapshot>,
     pub input: String,
     pub budget: RunBudget,
 }
 
 /// One federated MCP server as the Worker sees it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum McpProtocolRevision {
+    /// Stateful initialize/session protocol retained for compatibility.  It has
+    /// no client-side reverse capabilities unless a future schema explicitly
+    /// adds a separately recoverable legacy policy.
+    #[default]
+    #[serde(rename = "2025-06-18")]
+    V2025_06_18,
+    /// Stateless MCP core with multi round-trip requests (MRTR).
+    #[serde(rename = "2026-07-28")]
+    V2026_07_28,
+}
+
+impl McpProtocolRevision {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V2025_06_18 => "2025-06-18",
+            Self::V2026_07_28 => "2026-07-28",
+        }
+    }
+}
+
+/// Authority the Runtime is prepared to exercise on behalf of an MCP server.
+/// This is frozen per Run and intentionally separate from the server's own
+/// advertised capabilities: an untrusted peer cannot grant itself client work.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpClientCapability {
+    Elicitation,
+}
+
+/// One user interaction requested by an MCP server in a stateless MRTR round.
+/// Form data is deliberately restricted to non-sensitive, bounded structured
+/// input; sensitive workflows belong in URL mode and never pass through the
+/// Runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum McpElicitationRequest {
+    Form {
+        message: String,
+        requested_schema: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+    },
+    Url {
+        message: String,
+        url: String,
+        elicitation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpInputAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpInputResponse {
+    pub action: McpInputAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpInputContinuation {
+    pub round: u8,
+    pub request_state: String,
+    pub responses: std::collections::BTreeMap<String, McpInputResponse>,
+}
+
+/// Durable, Run-bound projection of an MCP `input_required` result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpInputRequired {
+    pub schema_version: u32,
+    pub input_id: Uuid,
+    pub server_id: Uuid,
+    pub server_name: String,
+    pub tool_call_id: String,
+    pub binding_digest: String,
+    pub round: u8,
+    /// Opaque server continuation token. It must be replayed byte-for-byte.
+    pub request_state: String,
+    pub requests: std::collections::BTreeMap<String, McpElicitationRequest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum McpInputRequiredValidationError {
+    #[error("unsupported MCP input-required schema version")]
+    UnsupportedSchemaVersion,
+    #[error("MCP input-required binding is invalid")]
+    InvalidBinding,
+    #[error("MCP input-required round or opaque state is invalid")]
+    InvalidContinuation,
+    #[error("MCP input-required request set is malformed or unbounded")]
+    InvalidRequests,
+    #[error("MCP form elicitation attempted to request sensitive information")]
+    SensitiveForm,
+}
+
+impl McpInputRequired {
+    pub fn validate(&self) -> Result<(), McpInputRequiredValidationError> {
+        if self.schema_version != MCP_INPUT_REQUIRED_SCHEMA_VERSION {
+            return Err(McpInputRequiredValidationError::UnsupportedSchemaVersion);
+        }
+        if self.input_id.is_nil()
+            || self.server_id.is_nil()
+            || !portable_identifier(&self.server_name, 64)
+            || self.tool_call_id.trim().is_empty()
+            || self.tool_call_id.len() > 256
+            || !is_sha256(&self.binding_digest)
+        {
+            return Err(McpInputRequiredValidationError::InvalidBinding);
+        }
+        if !(1..=10).contains(&self.round)
+            || self.request_state.is_empty()
+            || self.request_state.len() > 64 * 1024
+        {
+            return Err(McpInputRequiredValidationError::InvalidContinuation);
+        }
+        if self.requests.is_empty()
+            || self.requests.len() > 8
+            || serde_json::to_vec(&self.requests).map_or(true, |encoded| encoded.len() > 128 * 1024)
+        {
+            return Err(McpInputRequiredValidationError::InvalidRequests);
+        }
+        for (key, request) in &self.requests {
+            if !portable_identifier(key, 128) || !request.is_bounded_and_safe()? {
+                return Err(McpInputRequiredValidationError::InvalidRequests);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl McpElicitationRequest {
+    pub fn validate(&self) -> Result<(), McpInputRequiredValidationError> {
+        if self.is_bounded_and_safe()? {
+            Ok(())
+        } else {
+            Err(McpInputRequiredValidationError::InvalidRequests)
+        }
+    }
+
+    fn is_bounded_and_safe(&self) -> Result<bool, McpInputRequiredValidationError> {
+        let (message, meta) = match self {
+            Self::Form {
+                message,
+                requested_schema,
+                meta,
+            } => {
+                let Some(object) = requested_schema.as_object() else {
+                    return Ok(false);
+                };
+                if object.get("type").and_then(Value::as_str) != Some("object")
+                    || serde_json::to_vec(requested_schema)
+                        .map_or(true, |encoded| encoded.len() > 32 * 1024)
+                {
+                    return Ok(false);
+                }
+                if object
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| {
+                        properties.len() > 32
+                            || properties.keys().any(|name| sensitive_form_property(name))
+                    })
+                {
+                    return Err(McpInputRequiredValidationError::SensitiveForm);
+                }
+                (message, meta)
+            }
+            Self::Url {
+                message,
+                url,
+                elicitation_id,
+                meta,
+            } => {
+                if !url.starts_with("https://")
+                    || url.len() > 2_048
+                    || url.chars().any(char::is_whitespace)
+                    || elicitation_id.trim().is_empty()
+                    || elicitation_id.len() > 256
+                {
+                    return Ok(false);
+                }
+                (message, meta)
+            }
+        };
+        Ok(!message.trim().is_empty()
+            && message.len() <= 2_048
+            && meta.as_ref().is_none_or(|meta| {
+                serde_json::to_vec(meta).is_ok_and(|encoded| encoded.len() <= 16 * 1024)
+            }))
+    }
+}
+
+fn sensitive_form_property(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace(['-', '.'], "_");
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "private_key",
+        "credential",
+    ]
+    .iter()
+    .any(|term| normalized == *term || normalized.ends_with(&format!("_{term}")))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpInputResolutionCommand {
+    pub schema_version: u32,
+    pub message_id: Uuid,
+    pub tenant_id: Uuid,
+    pub run_id: Uuid,
+    pub attempt_id: Uuid,
+    pub worker_id: Uuid,
+    pub worker_incarnation_id: Uuid,
+    pub input_id: Uuid,
+    pub input_version: u32,
+    pub binding_digest: String,
+    pub responses: std::collections::BTreeMap<String, McpInputResponse>,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum McpInputResolutionValidationError {
+    #[error("unsupported MCP input resolution schema version")]
+    UnsupportedSchemaVersion,
+    #[error("MCP input resolution identity or binding is invalid")]
+    InvalidBinding,
+    #[error("MCP input resolution validity window is invalid")]
+    InvalidValidityWindow,
+    #[error("MCP input resolution does not answer the exact pending request set")]
+    InvalidResponses,
+}
+
+impl McpInputResolutionCommand {
+    pub fn validate_for(
+        &self,
+        pending: &McpInputRequired,
+    ) -> Result<(), McpInputResolutionValidationError> {
+        if self.schema_version != MCP_INPUT_RESOLUTION_SCHEMA_VERSION {
+            return Err(McpInputResolutionValidationError::UnsupportedSchemaVersion);
+        }
+        if self.message_id.is_nil()
+            || self.tenant_id.is_nil()
+            || self.run_id.is_nil()
+            || self.attempt_id.is_nil()
+            || self.worker_id.is_nil()
+            || self.worker_incarnation_id.is_nil()
+            || self.input_id != pending.input_id
+            || self.input_version != 1
+            || self.binding_digest != pending.binding_digest
+        {
+            return Err(McpInputResolutionValidationError::InvalidBinding);
+        }
+        if self.expires_at <= self.issued_at
+            || self.expires_at - self.issued_at > chrono::Duration::minutes(5)
+        {
+            return Err(McpInputResolutionValidationError::InvalidValidityWindow);
+        }
+        if self.responses.len() != pending.requests.len()
+            || self.responses.keys().ne(pending.requests.keys())
+            || serde_json::to_vec(&self.responses)
+                .map_or(true, |encoded| encoded.len() > 128 * 1024)
+        {
+            return Err(McpInputResolutionValidationError::InvalidResponses);
+        }
+        for (key, response) in &self.responses {
+            let request = &pending.requests[key];
+            let valid = match response.action {
+                McpInputAction::Decline | McpInputAction::Cancel => response.content.is_none(),
+                McpInputAction::Accept => match request {
+                    McpElicitationRequest::Form {
+                        requested_schema, ..
+                    } => response
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| form_content_matches(requested_schema, content)),
+                    McpElicitationRequest::Url { .. } => response.content.is_none(),
+                },
+            } && response.meta.as_ref().is_none_or(|meta| {
+                serde_json::to_vec(meta).is_ok_and(|encoded| encoded.len() <= 16 * 1024)
+            });
+            if !valid {
+                return Err(McpInputResolutionValidationError::InvalidResponses);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn form_content_matches(schema: &Value, content: &Value) -> bool {
+    let (Some(schema), Some(content)) = (schema.as_object(), content.as_object()) else {
+        return false;
+    };
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .any(|name| name.as_str().is_none_or(|name| !content.contains_key(name)))
+        })
+    {
+        return false;
+    }
+    content.iter().all(|(name, value)| {
+        properties
+            .get(name)
+            .is_some_and(|field| match field.get("type").and_then(Value::as_str) {
+                Some("string") => value.is_string(),
+                Some("boolean") => value.is_boolean(),
+                Some("number") => value.is_number(),
+                Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+                Some("array") => value.is_array(),
+                Some("object") => value.is_object(),
+                Some("null") => value.is_null(),
+                _ => false,
+            })
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpServerSnapshot {
     pub server_id: Uuid,
@@ -182,6 +886,25 @@ pub struct McpServerSnapshot {
     /// Sealed. Base64 of the envelope, opaque here and opened at the egress hop.
     #[serde(default)]
     pub credential_envelope_base64: String,
+    /// A required server is part of the Run's accepted capability contract.
+    /// Discovery failure therefore stops before model egress rather than
+    /// silently presenting a smaller Tool catalog.
+    #[serde(default)]
+    pub required: bool,
+    /// Operator-owned replay semantics keyed by the server-local Tool name.
+    ///
+    /// This is deliberately separate from MCP Tool annotations: remote output
+    /// is untrusted input and cannot lower the Runtime's side-effect boundary.
+    /// An absent entry always means `ToolEffect::Unknown`.
+    #[serde(default)]
+    pub tool_effect_overrides: std::collections::BTreeMap<String, ToolEffect>,
+    /// Exact wire revision selected before Run admission.  Older commands
+    /// decode to the legacy revision but cannot carry modern capabilities.
+    #[serde(default)]
+    pub protocol_revision: McpProtocolRevision,
+    /// Run-frozen client authority available to MRTR input requests.
+    #[serde(default)]
+    pub client_capabilities: std::collections::BTreeSet<McpClientCapability>,
 }
 
 impl McpServerSnapshot {
@@ -200,15 +923,18 @@ impl McpServerSnapshot {
             if first.is_ascii_lowercase() || first.is_ascii_digit())
             && bytes.len() <= 64
             && bytes.iter().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || *byte == b'-'
-                    || *byte == b'_'
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
             })
     }
 
     fn scope(&self) -> String {
         format!("tool:mcp:{}", self.name)
+    }
+
+    fn capability_scope(&self, capability: McpClientCapability) -> String {
+        match capability {
+            McpClientCapability::Elicitation => format!("mcp:elicitation:{}", self.name),
+        }
     }
 }
 
@@ -251,6 +977,114 @@ pub struct SubagentRole {
     pub delegated_scopes: std::collections::BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSpawnMode {
+    /// Compatibility path: the spawning Tool call receives the terminal child
+    /// result. New interactive agents should use `Async`.
+    #[default]
+    Inline,
+    /// Return a durable handle immediately and observe the child through the
+    /// explicit agent lifecycle Tools.
+    Async,
+}
+
+pub const SUBAGENT_HISTORY_MAX_TURNS: usize = 128;
+pub const SUBAGENT_HISTORY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// One completed turn in the durable conversation owned by an asynchronous
+/// subagent handle. `message_sequence` is caller acceptance order while
+/// `activation_ordinal` is actual execution order; an interrupt can make those
+/// orders differ.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentConversationTurn {
+    pub activation_ordinal: u64,
+    pub message_sequence: u64,
+    pub child_run_id: Uuid,
+    pub input: String,
+    pub result: SubagentResultDelivery,
+}
+
+/// Immutable provenance for a new persistent handle derived from a completed
+/// prefix of another handle. The receipt is provider-neutral and contains no
+/// live child, mailbox or process state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentForkReceipt {
+    pub tool_call_id: String,
+    pub tool_binding_digest: String,
+    pub source_agent_id: Uuid,
+    pub source_generation: u64,
+    pub through_activation_ordinal: u64,
+    pub source_history_digest: String,
+    pub agent_id: Uuid,
+    pub generation: u64,
+    pub role: String,
+    pub budget: RunBudget,
+}
+
+impl SubagentForkReceipt {
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        !self.tool_call_id.trim().is_empty()
+            && self.tool_call_id.len() <= 256
+            && is_sha256(&self.tool_binding_digest)
+            && !self.source_agent_id.is_nil()
+            && self.source_generation > 0
+            && is_sha256(&self.source_history_digest)
+            && !self.agent_id.is_nil()
+            && self.agent_id != self.source_agent_id
+            && self.generation > 0
+            && self.role != "primary"
+            && portable_identifier(&self.role, 80)
+            && self.budget.is_positive_and_finite()
+    }
+}
+
+/// Immutable audit receipt for replacing a stable handle's active history head
+/// with a completed prefix. The superseded generation remains addressable; the
+/// new generation fences every continuation binding created under the old head.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentRollbackReceipt {
+    pub tool_call_id: String,
+    pub tool_binding_digest: String,
+    pub agent_id: Uuid,
+    pub from_generation: u64,
+    pub generation: u64,
+    pub through_activation_ordinal: u64,
+    pub previous_history_digest: String,
+    pub restored_history_digest: String,
+}
+
+impl SubagentRollbackReceipt {
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        !self.tool_call_id.trim().is_empty()
+            && self.tool_call_id.len() <= 256
+            && is_sha256(&self.tool_binding_digest)
+            && !self.agent_id.is_nil()
+            && self.from_generation > 0
+            && self
+                .from_generation
+                .checked_add(1)
+                .is_some_and(|generation| generation == self.generation)
+            && is_sha256(&self.previous_history_digest)
+            && is_sha256(&self.restored_history_digest)
+            && self.previous_history_digest != self.restored_history_digest
+    }
+}
+
+#[must_use]
+pub fn subagent_conversation_history_digest(history: &[SubagentConversationTurn]) -> String {
+    let material = serde_json::to_vec(&("agent-runtime-subagent-history-v1", history))
+        .expect("subagent history digest material is serializable");
+    hex::encode(Sha256::digest(material))
+}
+
+#[must_use]
+pub fn subagent_conversation_history_is_well_formed(history: &[SubagentConversationTurn]) -> bool {
+    valid_subagent_conversation_history(history)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SubagentSpawnRequest {
     pub tool_call_id: String,
@@ -259,6 +1093,12 @@ pub struct SubagentSpawnRequest {
     pub input: String,
     pub budget: RunBudget,
     pub binding_digest: String,
+    #[serde(default)]
+    pub mode: SubagentSpawnMode,
+    /// Snapshot of completed turns at activation time. Queued input is first
+    /// accepted as an intent and receives this final snapshot when promoted.
+    #[serde(default)]
+    pub conversation_history: Vec<SubagentConversationTurn>,
 }
 
 impl SubagentSpawnRequest {
@@ -273,6 +1113,7 @@ impl SubagentSpawnRequest {
             && self.input.len() <= 32_000
             && self.budget.is_positive_and_finite()
             && is_sha256(&self.binding_digest)
+            && valid_subagent_conversation_history(&self.conversation_history)
     }
 }
 
@@ -343,7 +1184,10 @@ impl SkillSnapshot {
             && !self.instructions.trim().is_empty()
             && self.instructions.len() <= 32_000
             && sorted_unique(&self.tool_names, 32)
-            && self.tool_names.iter().all(|name| skill_tool_name(name, 120))
+            && self
+                .tool_names
+                .iter()
+                .all(|name| skill_tool_name(name, 120))
             && sorted_unique(&self.supported_platforms, 8)
             && !self.supported_platforms.is_empty()
             && self.supported_platforms.iter().all(|platform| {
@@ -460,6 +1304,8 @@ pub enum RunExecutionValidationError {
     MissingModelPolicy,
     #[error("execution workload token is malformed")]
     InvalidWorkloadToken,
+    #[error("v20 execution invocation identity is incomplete")]
+    InvalidInvocationIdentity,
     #[error("execution delegated scopes are malformed or exceed the contract limit")]
     InvalidDelegatedScopes,
     #[error("v3 execution agent instructions are blank or exceed 32000 bytes")]
@@ -478,6 +1324,28 @@ pub enum RunExecutionValidationError {
     InvalidToolApprovalPolicies,
     #[error("v9 federated MCP servers are malformed, undelegated, or carried by an older schema")]
     InvalidMcpServers,
+    #[error("v10 execution runtime policy is missing, malformed, or carried by an older schema")]
+    InvalidRuntimePolicy,
+    #[error(
+        "v11 MCP availability and discovery retry policy cannot be carried by an older execution schema"
+    )]
+    InvalidMcpAvailabilityPolicy,
+    #[error("v17 parallel Tool policy is malformed or carried by an older execution schema")]
+    InvalidParallelToolPolicy,
+    #[error(
+        "v18 MCP Tool effect overrides are malformed, undeclared, or carried by an older execution schema"
+    )]
+    InvalidMcpToolEffectOverrides,
+    #[error(
+        "v19 MCP protocol revision or client capability policy is malformed, undelegated, or carried by an older execution schema"
+    )]
+    InvalidMcpProtocolPolicy,
+    #[error("v12 subagent conversation history is malformed or carried by an older schema")]
+    InvalidSubagentHistory,
+    #[error("v15 explicit history import is malformed, ambiguous, or carried by an older schema")]
+    InvalidHistoryImport,
+    #[error("v16 root Session branch is malformed, ambiguous, or carried by an older schema")]
+    InvalidSessionBranch,
 }
 
 impl RunExecutionCommand {
@@ -486,6 +1354,25 @@ impl RunExecutionCommand {
             return Err(RunExecutionValidationError::UnsupportedSchemaVersion(
                 self.schema_version,
             ));
+        }
+        if self.schema_version >= 20
+            && [
+                self.tenant_id,
+                self.application_id,
+                self.workload_identity_id,
+                self.run_id,
+                self.session_id,
+                self.workspace_id,
+                self.agent_version_id,
+                self.attempt_id,
+                self.worker_id,
+                self.worker_incarnation_id,
+                self.fencing_token,
+            ]
+            .iter()
+            .any(Uuid::is_nil)
+        {
+            return Err(RunExecutionValidationError::InvalidInvocationIdentity);
         }
         if self.schema_version >= 2 && self.worker_incarnation_id.is_nil() {
             return Err(RunExecutionValidationError::MissingWorkerIncarnation);
@@ -549,6 +1436,90 @@ impl RunExecutionCommand {
         {
             return Err(RunExecutionValidationError::InvalidMcpServers);
         }
+        if (self.schema_version < 18
+            && self
+                .mcp_servers
+                .iter()
+                .any(|server| !server.tool_effect_overrides.is_empty()))
+            || (self.schema_version >= 18 && !self.valid_mcp_tool_effect_overrides())
+        {
+            return Err(RunExecutionValidationError::InvalidMcpToolEffectOverrides);
+        }
+        if (self.schema_version < 19
+            && self.mcp_servers.iter().any(|server| {
+                server.protocol_revision != McpProtocolRevision::V2025_06_18
+                    || !server.client_capabilities.is_empty()
+            }))
+            || (self.schema_version >= 19 && !self.valid_mcp_protocol_policy())
+        {
+            return Err(RunExecutionValidationError::InvalidMcpProtocolPolicy);
+        }
+        if (self.schema_version < 10 && self.runtime_policy.is_some())
+            || (self.schema_version >= 10
+                && !self
+                    .runtime_policy
+                    .as_ref()
+                    .is_some_and(RuntimeExecutionPolicySnapshot::is_bounded_and_safe))
+        {
+            return Err(RunExecutionValidationError::InvalidRuntimePolicy);
+        }
+        let policy_schema = self
+            .runtime_policy
+            .as_ref()
+            .map(|policy| policy.schema_version)
+            .unwrap_or_default();
+        if (self.schema_version < 11
+            && (policy_schema >= 2 || self.mcp_servers.iter().any(|server| server.required)))
+            || ((11..13).contains(&self.schema_version) && policy_schema != 2)
+            || ((13..17).contains(&self.schema_version) && policy_schema != 3)
+        {
+            return Err(RunExecutionValidationError::InvalidMcpAvailabilityPolicy);
+        }
+        if (self.schema_version < 17 && policy_schema >= 4)
+            || (self.schema_version >= 17 && policy_schema != 4)
+        {
+            return Err(RunExecutionValidationError::InvalidParallelToolPolicy);
+        }
+        let carries_typed_subagent_history = self
+            .subagent_history
+            .iter()
+            .any(|turn| !turn.result.transcript.is_empty());
+        let has_legacy_subagent_turn = self
+            .subagent_history
+            .iter()
+            .any(|turn| turn.result.transcript.is_empty());
+        if (self.schema_version < 12 && !self.subagent_history.is_empty())
+            || ((12..14).contains(&self.schema_version) && carries_typed_subagent_history)
+            || (self.schema_version >= 12
+                && (!valid_subagent_conversation_history(&self.subagent_history)
+                    || (!self.subagent_history.is_empty() && self.lineage.depth == 0)))
+            || (self.schema_version >= 14 && has_legacy_subagent_turn)
+        {
+            return Err(RunExecutionValidationError::InvalidSubagentHistory);
+        }
+        let root_execution = self.lineage.depth == 0;
+        if (self.schema_version < 16 && self.session_branch.is_some())
+            || (self.schema_version >= 16
+                && ((root_execution
+                    && !self
+                        .session_branch
+                        .as_ref()
+                        .is_some_and(SessionBranchSnapshot::is_well_formed))
+                    || (!root_execution && self.session_branch.is_some())
+                    || (self.session_branch.is_some()
+                        && (self.history_import.is_some() || !self.subagent_history.is_empty()))))
+        {
+            return Err(RunExecutionValidationError::InvalidSessionBranch);
+        }
+        if (self.schema_version < 15 && self.history_import.is_some())
+            || (self.history_import.is_some() && !self.subagent_history.is_empty())
+            || self
+                .history_import
+                .as_ref()
+                .is_some_and(|history| repair_imported_history(history).is_err())
+        {
+            return Err(RunExecutionValidationError::InvalidHistoryImport);
+        }
         if !self.budget.is_positive_and_finite() {
             return Err(RunExecutionValidationError::InvalidBudget);
         }
@@ -570,6 +1541,39 @@ impl RunExecutionCommand {
                 // pre-authorisation waiting for a scope change to activate it.
                 && self.delegated_scopes.contains(&server.scope())
                 && seen.insert(server.name.clone())
+        })
+    }
+
+    fn valid_mcp_tool_effect_overrides(&self) -> bool {
+        let declared_tools = self
+            .skill_snapshots
+            .iter()
+            .flat_map(|skill| skill.tool_names.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        let override_count = self
+            .mcp_servers
+            .iter()
+            .map(|server| server.tool_effect_overrides.len())
+            .sum::<usize>();
+        override_count <= 512
+            && self.mcp_servers.iter().all(|server| {
+                server.tool_effect_overrides.keys().all(|tool_name| {
+                    portable_identifier(tool_name, 120)
+                        && declared_tools.contains(&format!("mcp:{}/{tool_name}", server.name))
+                })
+            })
+    }
+
+    fn valid_mcp_protocol_policy(&self) -> bool {
+        self.mcp_servers.iter().all(|server| {
+            if server.protocol_revision == McpProtocolRevision::V2025_06_18 {
+                return server.client_capabilities.is_empty();
+            }
+            !server.client_capabilities.is_empty()
+                && server.client_capabilities.iter().all(|capability| {
+                    self.delegated_scopes
+                        .contains(&server.capability_scope(*capability))
+                })
         })
     }
 
@@ -604,6 +1608,7 @@ impl RunExecutionCommand {
         self.skill_snapshots.iter().all(|skill| {
             ids.insert(skill.skill_version_id)
                 && names.insert(skill.name.as_str())
+                && (self.schema_version < 20 || skill.application_id == self.application_id)
                 && skill.validate(self.tenant_id)
         })
     }
@@ -926,7 +1931,7 @@ impl RunSteeringOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolApprovalDecision {
     AllowOnce,
@@ -1006,6 +2011,100 @@ impl ToolApprovalDecisionCommand {
             || self.expires_at - self.issued_at > chrono::Duration::minutes(5)
         {
             return Err(ToolApprovalDecisionValidationError::InvalidValidityWindow);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum ToolReconciliationDecision {
+    Applied {
+        content: serde_json::Value,
+        is_error: bool,
+    },
+    NotApplied,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolReconciliationCommand {
+    pub schema_version: u32,
+    pub reconciliation_id: Uuid,
+    pub version: u32,
+    pub tenant_id: Uuid,
+    pub source_run_id: Uuid,
+    pub source_terminal_event_id: Uuid,
+    pub tool_call_id: String,
+    pub binding_digest: String,
+    pub operator_id: String,
+    pub decision: ToolReconciliationDecision,
+    pub continuation_input: Option<String>,
+    pub issued_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ToolReconciliationValidationError {
+    #[error("unsupported Tool reconciliation schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("Tool reconciliation identity must be complete")]
+    MissingIdentity,
+    #[error("Tool reconciliation version must start at 1")]
+    InvalidVersion,
+    #[error("Tool reconciliation binding digest must be lowercase SHA-256")]
+    InvalidBindingDigest,
+    #[error("Tool reconciliation text fields are invalid")]
+    InvalidText,
+    #[error("Tool reconciliation result content is too large")]
+    InvalidContent,
+    #[error("Tool reconciliation continuation input does not match its decision")]
+    InvalidContinuationInput,
+}
+
+impl ToolReconciliationCommand {
+    pub fn validate(&self) -> Result<(), ToolReconciliationValidationError> {
+        if self.schema_version != TOOL_RECONCILIATION_SCHEMA_VERSION {
+            return Err(ToolReconciliationValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+        if self.reconciliation_id.is_nil()
+            || self.tenant_id.is_nil()
+            || self.source_run_id.is_nil()
+            || self.source_terminal_event_id.is_nil()
+        {
+            return Err(ToolReconciliationValidationError::MissingIdentity);
+        }
+        if self.version == 0 {
+            return Err(ToolReconciliationValidationError::InvalidVersion);
+        }
+        if !is_sha256(&self.binding_digest) {
+            return Err(ToolReconciliationValidationError::InvalidBindingDigest);
+        }
+        if self.tool_call_id.trim().is_empty()
+            || self.tool_call_id.len() > 256
+            || self.operator_id.trim().is_empty()
+            || self.operator_id.len() > 256
+        {
+            return Err(ToolReconciliationValidationError::InvalidText);
+        }
+        if let ToolReconciliationDecision::Applied { content, .. } = &self.decision
+            && serde_json::to_vec(content).map_or(true, |encoded| {
+                encoded.len() > TOOL_RECONCILIATION_MAX_CONTENT_BYTES
+            })
+        {
+            return Err(ToolReconciliationValidationError::InvalidContent);
+        }
+        let valid_continuation = match (&self.decision, &self.continuation_input) {
+            (ToolReconciliationDecision::Unresolved, None) => true,
+            (
+                ToolReconciliationDecision::Applied { .. } | ToolReconciliationDecision::NotApplied,
+                Some(input),
+            ) => !input.trim().is_empty() && input.len() <= 32_000,
+            _ => false,
+        };
+        if !valid_continuation {
+            return Err(ToolReconciliationValidationError::InvalidContinuationInput);
         }
         Ok(())
     }
@@ -1165,7 +2264,38 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// Opaque continuation state returned by one provider protocol.
+///
+/// `data` is durable runtime state, not user-visible reasoning.  The origin
+/// binding prevents an adapter from replaying it to a different provider or
+/// model merely because both happen to accept similarly shaped JSON.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderPrivateState {
+    pub provider_id: String,
+    pub protocol: String,
+    pub model: String,
+    pub format: String,
+    pub data: String,
+}
+
+impl ProviderPrivateState {
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        !self.provider_id.trim().is_empty()
+            && self.provider_id.len() <= 128
+            && !self.protocol.trim().is_empty()
+            && self.protocol.len() <= 64
+            && !self.model.trim().is_empty()
+            && self.model.len() <= 256
+            && !self.format.trim().is_empty()
+            && self.format.len() <= 128
+            && !self.data.is_empty()
+            && self.data.len() <= 1_048_576
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text {
@@ -1188,12 +2318,389 @@ pub enum ContentPart {
         name: String,
         arguments: Value,
     },
+    /// Provider-authored summary is intentionally distinct from opaque state.
+    /// The latter is retained for same-provider continuation but must never be
+    /// rendered as assistant text or copied into public runtime events.
+    Reasoning {
+        summary: Vec<String>,
+        private_state: Option<ProviderPrivateState>,
+    },
+    Refusal {
+        text: String,
+    },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentPart>,
+}
+
+pub const SESSION_HISTORY_MAX_TURNS: usize = 128;
+pub const SESSION_HISTORY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// One immutable completed root Turn. The transcript starts with the user
+/// input for this Turn and contains every assistant Tool Call and bound Tool
+/// Result through the terminal assistant message. It never contains System
+/// authority or messages inherited from earlier Turns.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConversationTurn {
+    pub turn_ordinal: u64,
+    pub run_id: Uuid,
+    pub transcript: Vec<Message>,
+    pub digest: String,
+}
+
+impl SessionConversationTurn {
+    #[must_use]
+    pub fn new(turn_ordinal: u64, run_id: Uuid, transcript: Vec<Message>) -> Self {
+        let mut turn = Self {
+            turn_ordinal,
+            run_id,
+            transcript,
+            digest: String::new(),
+        };
+        turn.digest = turn.calculate_digest();
+        turn
+    }
+
+    #[must_use]
+    pub fn verify_digest(&self) -> bool {
+        self.digest == self.calculate_digest()
+    }
+
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.turn_ordinal > 0
+            && !self.run_id.is_nil()
+            && valid_subagent_transcript(&self.transcript)
+            && self
+                .transcript
+                .last()
+                .is_some_and(|message| message.role == Role::Assistant)
+            && self.verify_digest()
+    }
+
+    fn calculate_digest(&self) -> String {
+        let material = serde_json::to_vec(&(
+            "agent-runtime-session-turn-v1",
+            self.turn_ordinal,
+            self.run_id,
+            &self.transcript,
+        ))
+        .expect("Session Turn digest material is serializable");
+        hex::encode(Sha256::digest(material))
+    }
+}
+
+/// The exact effective head used to start one root Run. `session_id` remains
+/// stable outside this value; sibling branches have distinct `branch_id`s and
+/// Rollback advances `generation` without mutating archived history.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBranchSnapshot {
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub history: Vec<SessionConversationTurn>,
+    pub history_digest: String,
+}
+
+impl SessionBranchSnapshot {
+    #[must_use]
+    pub fn new(branch_id: Uuid, generation: u64, history: Vec<SessionConversationTurn>) -> Self {
+        let history_digest = session_conversation_history_digest(&history);
+        Self {
+            branch_id,
+            generation,
+            history,
+            history_digest,
+        }
+    }
+
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        !self.branch_id.is_nil()
+            && self.generation > 0
+            && valid_session_conversation_history(&self.history)
+            && self.history_digest == session_conversation_history_digest(&self.history)
+    }
+}
+
+#[must_use]
+pub fn session_conversation_history_digest(history: &[SessionConversationTurn]) -> String {
+    let material = serde_json::to_vec(&("agent-runtime-session-history-v1", history))
+        .expect("Session history digest material is serializable");
+    hex::encode(Sha256::digest(material))
+}
+
+fn valid_session_conversation_history(history: &[SessionConversationTurn]) -> bool {
+    if history.len() > SESSION_HISTORY_MAX_TURNS
+        || serde_json::to_vec(history)
+            .map_or(true, |encoded| encoded.len() > SESSION_HISTORY_MAX_BYTES)
+    {
+        return false;
+    }
+    let mut run_ids = std::collections::BTreeSet::new();
+    history.iter().enumerate().all(|(index, turn)| {
+        turn.turn_ordinal == u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1)
+            && run_ids.insert(turn.run_id)
+            && turn.is_well_formed()
+    })
+}
+
+pub const HISTORY_IMPORT_MAX_MESSAGES: usize = 1_024;
+pub const HISTORY_IMPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Why a caller is explicitly importing model-visible history. This is not
+/// used for authoritative Checkpoint restore, whose malformed state remains a
+/// hard failure.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryImportSource {
+    External,
+    Truncated,
+}
+
+/// Raw, lower-authority conversation history supplied through an explicit
+/// import boundary. The Worker repairs only Tool pairing; it never promotes an
+/// imported message to System authority or executes a historical Tool call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryImport {
+    pub schema_version: u32,
+    pub source: HistoryImportSource,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistoryRepairReport {
+    pub schema_version: u32,
+    pub source: HistoryImportSource,
+    pub source_digest: String,
+    pub repaired_digest: String,
+    pub inserted_missing_results: u32,
+    pub dropped_orphan_results: u32,
+    pub dropped_duplicate_results: u32,
+    pub moved_results: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairedHistory {
+    pub messages: Vec<Message>,
+    pub report: HistoryRepairReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HistoryRepairError {
+    #[error("unsupported history import schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("imported history is empty or exceeds its message/byte limit")]
+    InvalidSize,
+    #[error("imported history must not contain System messages")]
+    SystemAuthority,
+    #[error("imported history contains malformed role content")]
+    InvalidRoleContent,
+    #[error("imported history repeats Tool Call id {0}")]
+    DuplicateToolCallId(String),
+    #[error("repaired imported history is not a valid model transcript")]
+    InvalidRepairedHistory,
+}
+
+/// Repairs only the replay shape of explicitly imported lower-authority
+/// history. Results are moved only to a unique earlier Tool Call, missing
+/// results become explicit synthetic errors, and results with no owner are
+/// dropped. No Tool is invoked by this function.
+pub fn repair_imported_history(
+    history: &HistoryImport,
+) -> Result<RepairedHistory, HistoryRepairError> {
+    if history.schema_version != 1 {
+        return Err(HistoryRepairError::UnsupportedSchemaVersion(
+            history.schema_version,
+        ));
+    }
+    if history.messages.is_empty()
+        || history.messages.len() > HISTORY_IMPORT_MAX_MESSAGES
+        || serde_json::to_vec(&history.messages)
+            .map_or(true, |encoded| encoded.len() > HISTORY_IMPORT_MAX_BYTES)
+    {
+        return Err(HistoryRepairError::InvalidSize);
+    }
+
+    let mut call_positions = std::collections::BTreeMap::<String, usize>::new();
+    let mut call_order = std::collections::BTreeMap::<usize, Vec<String>>::new();
+    let mut result_candidates = std::collections::BTreeMap::<String, Vec<(usize, Message)>>::new();
+    for (message_index, message) in history.messages.iter().enumerate() {
+        if message.content.is_empty() || message.role == Role::System {
+            return Err(if message.role == Role::System {
+                HistoryRepairError::SystemAuthority
+            } else {
+                HistoryRepairError::InvalidRoleContent
+            });
+        }
+        match message.role {
+            Role::System => return Err(HistoryRepairError::SystemAuthority),
+            Role::User => {
+                if message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
+                    )
+                }) {
+                    return Err(HistoryRepairError::InvalidRoleContent);
+                }
+            }
+            Role::Assistant => {
+                for part in &message.content {
+                    match part {
+                        ContentPart::ToolResult { .. } => {
+                            return Err(HistoryRepairError::InvalidRoleContent);
+                        }
+                        ContentPart::ToolCall {
+                            tool_call_id, name, ..
+                        } => {
+                            if tool_call_id.trim().is_empty()
+                                || tool_call_id.len() > 256
+                                || name.trim().is_empty()
+                                || name.len() > 256
+                            {
+                                return Err(HistoryRepairError::InvalidRoleContent);
+                            }
+                            if call_positions
+                                .insert(tool_call_id.clone(), message_index)
+                                .is_some()
+                            {
+                                return Err(HistoryRepairError::DuplicateToolCallId(
+                                    tool_call_id.clone(),
+                                ));
+                            }
+                            call_order
+                                .entry(message_index)
+                                .or_default()
+                                .push(tool_call_id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Role::Tool => {
+                let [
+                    ContentPart::ToolResult {
+                        tool_call_id,
+                        content: _,
+                    },
+                ] = message.content.as_slice()
+                else {
+                    return Err(HistoryRepairError::InvalidRoleContent);
+                };
+                if tool_call_id.trim().is_empty() || tool_call_id.len() > 256 {
+                    return Err(HistoryRepairError::InvalidRoleContent);
+                }
+                result_candidates
+                    .entry(tool_call_id.clone())
+                    .or_default()
+                    .push((message_index, message.clone()));
+            }
+        }
+    }
+
+    let mut inserted_missing_results = 0_u32;
+    let mut dropped_orphan_results = 0_u32;
+    let mut dropped_duplicate_results = 0_u32;
+    let mut moved_results = 0_u32;
+    let mut selected_results = std::collections::BTreeMap::<String, Message>::new();
+    for (tool_call_id, candidates) in &result_candidates {
+        let Some(call_index) = call_positions.get(tool_call_id).copied() else {
+            dropped_orphan_results = dropped_orphan_results
+                .saturating_add(u32::try_from(candidates.len()).unwrap_or(u32::MAX));
+            continue;
+        };
+        let mut after_call = candidates
+            .iter()
+            .filter(|(result_index, _)| *result_index > call_index);
+        let Some((selected_index, selected)) = after_call.next() else {
+            dropped_orphan_results = dropped_orphan_results
+                .saturating_add(u32::try_from(candidates.len()).unwrap_or(u32::MAX));
+            continue;
+        };
+        let before_or_at = candidates
+            .iter()
+            .filter(|(result_index, _)| *result_index <= call_index)
+            .count();
+        dropped_orphan_results =
+            dropped_orphan_results.saturating_add(u32::try_from(before_or_at).unwrap_or(u32::MAX));
+        dropped_duplicate_results = dropped_duplicate_results
+            .saturating_add(u32::try_from(after_call.count()).unwrap_or(u32::MAX));
+        let call_offset = call_order
+            .get(&call_index)
+            .and_then(|calls| calls.iter().position(|id| id == tool_call_id))
+            .unwrap_or_default();
+        if *selected_index != call_index.saturating_add(call_offset).saturating_add(1) {
+            moved_results = moved_results.saturating_add(1);
+        }
+        selected_results.insert(tool_call_id.clone(), selected.clone());
+    }
+
+    let mut repaired =
+        Vec::with_capacity(history.messages.len().saturating_add(call_positions.len()));
+    for (message_index, message) in history.messages.iter().enumerate() {
+        if message.role == Role::Tool {
+            continue;
+        }
+        repaired.push(message.clone());
+        for tool_call_id in call_order.get(&message_index).into_iter().flatten() {
+            if let Some(result) = selected_results.remove(tool_call_id) {
+                repaired.push(result);
+            } else {
+                inserted_missing_results = inserted_missing_results.saturating_add(1);
+                repaired.push(Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        content: serde_json::json!({
+                            "error": {
+                                "kind": "history_repair_missing_tool_result",
+                                "message": "Tool result was unavailable in the imported history.",
+                                "synthetic": true
+                            }
+                        }),
+                    }],
+                });
+            }
+        }
+    }
+    if !valid_subagent_transcript(&repaired)
+        || serde_json::to_vec(&repaired)
+            .map_or(true, |encoded| encoded.len() > HISTORY_IMPORT_MAX_BYTES)
+    {
+        return Err(HistoryRepairError::InvalidRepairedHistory);
+    }
+
+    let source_material = serde_json::to_vec(&(
+        "agent-runtime-history-import-v1",
+        history.source,
+        &history.messages,
+    ))
+    .expect("bounded imported history is serializable");
+    let repaired_material = serde_json::to_vec(&(
+        "agent-runtime-history-repaired-v1",
+        history.source,
+        &repaired,
+    ))
+    .expect("bounded repaired history is serializable");
+    Ok(RepairedHistory {
+        messages: repaired,
+        report: HistoryRepairReport {
+            schema_version: 1,
+            source: history.source,
+            source_digest: hex::encode(Sha256::digest(source_material)),
+            repaired_digest: hex::encode(Sha256::digest(repaired_material)),
+            inserted_missing_results,
+            dropped_orphan_results,
+            dropped_duplicate_results,
+            moved_results,
+        },
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1220,7 +2727,7 @@ pub struct ModelRequest {
     pub max_output_tokens: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
     Authentication,
@@ -1253,6 +2760,20 @@ pub enum ModelStreamEvent {
         name: String,
         arguments: Value,
     },
+    Reasoning {
+        summary: Vec<String>,
+        private_state: Option<ProviderPrivateState>,
+    },
+    Refusal {
+        text: String,
+    },
+    /// An audit observation emitted when opaque continuation state cannot be
+    /// replayed to the selected provider. It deliberately contains no state.
+    PrivateStateOmitted {
+        origin_provider_id: String,
+        target_provider_id: String,
+        format: String,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -1266,6 +2787,15 @@ pub enum ModelStreamEvent {
         retryable: bool,
         message: String,
     },
+}
+
+impl ModelStreamEvent {
+    /// Whether forwarding this event means provider output was committed to
+    /// the caller. Audit-only observations must not disable safe fallback.
+    #[must_use]
+    pub const fn commits_provider_output(&self) -> bool {
+        !matches!(self, Self::PrivateStateOmitted { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1289,6 +2819,21 @@ impl RunStatus {
             self,
             Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Indeterminate
         )
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Suspended => "suspended",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Indeterminate => "indeterminate",
+        }
     }
 }
 
@@ -1500,6 +3045,7 @@ impl CheckpointSnapshot {
 pub const RUN_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 pub const RUN_RECOVERY_SCHEMA_VERSION: u32 = 3;
 pub const SUBAGENT_RESULT_MAX_BYTES: usize = 256 * 1024;
+pub const SUBAGENT_TRANSCRIPT_MAX_BYTES: usize = 1024 * 1024;
 pub const INLINE_CHECKPOINT_MAX_BYTES: usize = 512 * 1024;
 pub const CHECKPOINT_MAX_UNCOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1802,6 +3348,12 @@ pub struct SubagentResultOutcome {
     pub is_error: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentBudgetUsage {
+    pub tokens: u64,
+    pub cost_micros: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SubagentResultDelivery {
     pub tool_call_id: String,
@@ -1812,6 +3364,16 @@ pub struct SubagentResultDelivery {
     pub terminal_status: RunStatus,
     pub content: Value,
     pub is_error: bool,
+    /// Actual child model usage, settled into the parent when the bound result
+    /// is accepted. Older receipts deserialize as zero and keep their legacy
+    /// digest valid.
+    #[serde(default)]
+    pub usage: SubagentBudgetUsage,
+    /// Exact provider-neutral messages visible to the child model, excluding
+    /// the current role instructions. Empty means a legacy receipt written
+    /// before typed continuation history was available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<Message>,
     pub digest: String,
 }
 
@@ -1827,8 +3389,35 @@ impl SubagentResultDelivery {
             terminal_status: outcome.terminal_status,
             content: outcome.content,
             is_error: outcome.is_error,
+            usage: SubagentBudgetUsage::default(),
+            transcript: Vec::new(),
             digest: String::new(),
         };
+        result.digest = result.calculate_digest();
+        result
+    }
+
+    #[must_use]
+    pub fn new_with_usage_and_transcript(
+        source: SubagentResultSource,
+        outcome: SubagentResultOutcome,
+        usage: SubagentBudgetUsage,
+        transcript: Vec<Message>,
+    ) -> Self {
+        let mut result = Self::new_with_usage(source, outcome, usage);
+        result.transcript = transcript;
+        result.digest = result.calculate_digest();
+        result
+    }
+
+    #[must_use]
+    pub fn new_with_usage(
+        source: SubagentResultSource,
+        outcome: SubagentResultOutcome,
+        usage: SubagentBudgetUsage,
+    ) -> Self {
+        let mut result = Self::new(source, outcome);
+        result.usage = usage;
         result.digest = result.calculate_digest();
         result
     }
@@ -1838,18 +3427,56 @@ impl SubagentResultDelivery {
         self.digest == self.calculate_digest()
     }
 
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.validate()
+    }
+
     fn calculate_digest(&self) -> String {
-        let material = serde_json::to_vec(&(
-            &self.tool_call_id,
-            self.delegation_id,
-            &self.binding_digest,
-            self.child_run_id,
-            self.child_terminal_event_id,
-            self.terminal_status,
-            &self.content,
-            self.is_error,
-        ))
-        .expect("subagent result digest material is serializable");
+        let material = if !self.transcript.is_empty() {
+            serde_json::to_vec(&(
+                "agent-runtime-subagent-result-v3",
+                &self.tool_call_id,
+                self.delegation_id,
+                &self.binding_digest,
+                self.child_run_id,
+                self.child_terminal_event_id,
+                self.terminal_status,
+                &self.content,
+                self.is_error,
+                self.usage,
+                &self.transcript,
+            ))
+            .expect("typed subagent result digest material is serializable")
+        } else if self.usage == SubagentBudgetUsage::default() {
+            // Preserve verification of schema-less result receipts written by
+            // Runtime versions before child usage became part of settlement.
+            serde_json::to_vec(&(
+                &self.tool_call_id,
+                self.delegation_id,
+                &self.binding_digest,
+                self.child_run_id,
+                self.child_terminal_event_id,
+                self.terminal_status,
+                &self.content,
+                self.is_error,
+            ))
+            .expect("legacy subagent result digest material is serializable")
+        } else {
+            serde_json::to_vec(&(
+                "agent-runtime-subagent-result-v2",
+                &self.tool_call_id,
+                self.delegation_id,
+                &self.binding_digest,
+                self.child_run_id,
+                self.child_terminal_event_id,
+                self.terminal_status,
+                &self.content,
+                self.is_error,
+                self.usage,
+            ))
+            .expect("subagent result digest material is serializable")
+        };
         hex::encode(Sha256::digest(material))
     }
 
@@ -1864,8 +3491,106 @@ impl SubagentResultDelivery {
             && self.is_error == (self.terminal_status != RunStatus::Succeeded)
             && serde_json::to_vec(&self.content)
                 .is_ok_and(|content| content.len() <= SUBAGENT_RESULT_MAX_BYTES)
+            && (self.transcript.is_empty()
+                || (valid_subagent_transcript(&self.transcript)
+                    && serde_json::to_vec(&self.transcript)
+                        .is_ok_and(|transcript| transcript.len() <= SUBAGENT_TRANSCRIPT_MAX_BYTES)
+                    && (self.terminal_status != RunStatus::Succeeded
+                        || self
+                            .transcript
+                            .last()
+                            .is_some_and(|message| message.role == Role::Assistant))))
             && self.verify_digest()
     }
+}
+
+fn valid_subagent_transcript(transcript: &[Message]) -> bool {
+    if transcript.is_empty() || transcript.first().map(|message| message.role) != Some(Role::User) {
+        return false;
+    }
+    let mut calls = std::collections::BTreeSet::new();
+    let mut results = std::collections::BTreeSet::new();
+    for message in transcript {
+        if message.content.is_empty() || message.role == Role::System {
+            return false;
+        }
+        match message.role {
+            Role::System => return false,
+            Role::User => {
+                if message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. }
+                    )
+                }) {
+                    return false;
+                }
+            }
+            Role::Assistant => {
+                for part in &message.content {
+                    match part {
+                        ContentPart::ToolResult { .. } => return false,
+                        ContentPart::ToolCall {
+                            tool_call_id, name, ..
+                        } if tool_call_id.trim().is_empty()
+                            || tool_call_id.len() > 256
+                            || name.trim().is_empty()
+                            || name.len() > 256
+                            || !calls.insert(tool_call_id.as_str()) =>
+                        {
+                            return false;
+                        }
+                        ContentPart::ToolCall { .. } => {}
+                        _ => {}
+                    }
+                }
+            }
+            Role::Tool => {
+                let [
+                    ContentPart::ToolResult {
+                        tool_call_id,
+                        content: _,
+                    },
+                ] = message.content.as_slice()
+                else {
+                    return false;
+                };
+                if tool_call_id.trim().is_empty()
+                    || tool_call_id.len() > 256
+                    || !calls.contains(tool_call_id.as_str())
+                    || !results.insert(tool_call_id.as_str())
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    calls == results
+}
+
+fn valid_subagent_conversation_history(history: &[SubagentConversationTurn]) -> bool {
+    if history.len() > SUBAGENT_HISTORY_MAX_TURNS
+        || serde_json::to_vec(history)
+            .map_or(true, |encoded| encoded.len() > SUBAGENT_HISTORY_MAX_BYTES)
+    {
+        return false;
+    }
+    let mut previous_activation = None;
+    let mut message_sequences = std::collections::BTreeSet::new();
+    history.iter().all(|turn| {
+        let ordered = previous_activation
+            .map(|previous| turn.activation_ordinal > previous)
+            .unwrap_or(true);
+        previous_activation = Some(turn.activation_ordinal);
+        ordered
+            && message_sequences.insert(turn.message_sequence)
+            && !turn.child_run_id.is_nil()
+            && !turn.input.trim().is_empty()
+            && turn.input.len() <= 32_000
+            && turn.result.child_run_id == turn.child_run_id
+            && turn.result.delegation_id == turn.child_run_id
+            && turn.result.validate()
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

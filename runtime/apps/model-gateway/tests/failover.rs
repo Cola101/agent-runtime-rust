@@ -2,12 +2,13 @@ mod support;
 
 use agent_model_gateway::{
     OpenAiCompatibleAdapter, OpenAiCompatibleConfig, ProviderCredential, ProviderExecutionError,
-    ProviderPricing, ProviderRoute, execute_with_safe_failover,
+    ProviderPricing, ProviderRoute, execute_with_frozen_failover, execute_with_safe_failover,
 };
 use agent_protocol::{
-    ContentPart, Message, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
-    ReasoningPolicy, Role,
+    ContentPart, Message, ModelErrorKind, ModelFailoverPolicySnapshot, ModelFinishReason,
+    ModelRequest, ModelStreamEvent, ProviderPrivateState, ReasoningPolicy, Role,
 };
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -112,6 +113,122 @@ async fn rate_limit_before_output_falls_back_to_the_next_provider() {
     );
     primary_server.await.unwrap();
     fallback_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn private_state_omission_is_audited_but_does_not_block_safe_fallback() {
+    let (primary_endpoint, primary_request, primary_server) = spawn_http_server(
+        "/v1/chat/completions",
+        429,
+        r#"{"error":{"message":"busy"}}"#,
+    )
+    .await;
+    let response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"fallback\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (fallback_endpoint, fallback_request, fallback_server) =
+        spawn_http_server("/v1/chat/completions", 200, response).await;
+    let routes = vec![
+        route("compatible-primary", primary_endpoint),
+        route("compatible-fallback", fallback_endpoint),
+    ];
+    let mut rich_request = request();
+    rich_request.messages.insert(
+        0,
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::Reasoning {
+                summary: vec!["Safe public summary.".into()],
+                private_state: Some(ProviderPrivateState {
+                    provider_id: "openai-origin".into(),
+                    protocol: "openai_responses".into(),
+                    model: "gpt-agent".into(),
+                    format: "openai.responses.reasoning.v1".into(),
+                    data: "opaque-must-not-cross".into(),
+                }),
+            }],
+        },
+    );
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+
+    let selected =
+        execute_with_safe_failover(&routes, &rich_request, CancellationToken::new(), events_tx)
+            .await
+            .unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        events.push(event);
+    }
+
+    assert_eq!(selected.provider_id, "compatible-fallback");
+    assert_eq!(selected.failed_provider_ids, ["compatible-primary"]);
+    assert!(matches!(
+        events[0],
+        ModelStreamEvent::PrivateStateOmitted { ref target_provider_id, .. }
+            if target_provider_id == "compatible-primary"
+    ));
+    assert!(matches!(
+        events[1],
+        ModelStreamEvent::PrivateStateOmitted { ref target_provider_id, .. }
+            if target_provider_id == "compatible-fallback"
+    ));
+    assert!(matches!(events[2], ModelStreamEvent::TextDelta { .. }));
+    let primary = primary_request.await.unwrap();
+    let fallback = fallback_request.await.unwrap();
+    assert!(!primary.body.to_string().contains("opaque-must-not-cross"));
+    assert!(!fallback.body.to_string().contains("opaque-must-not-cross"));
+    primary_server.await.unwrap();
+    fallback_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn the_frozen_run_policy_caps_provider_attempts_before_any_output() {
+    let (primary_endpoint, primary_request, primary_server) = spawn_http_server(
+        "/v1/chat/completions",
+        429,
+        r#"{"error":{"message":"busy"}}"#,
+    )
+    .await;
+    let routes = vec![
+        route("primary", primary_endpoint),
+        route(
+            "must-not-run",
+            "http://127.0.0.1:9/v1/chat/completions".into(),
+        ),
+    ];
+    let policy = ModelFailoverPolicySnapshot {
+        max_provider_attempts: 1,
+        fallback_on: BTreeSet::from([ModelErrorKind::RateLimited]),
+    };
+    let (events_tx, _events_rx) = mpsc::channel(16);
+
+    let error = execute_with_frozen_failover(
+        &routes,
+        &request(),
+        &policy,
+        CancellationToken::new(),
+        events_tx,
+    )
+    .await
+    .expect_err("a one-attempt Run must not inherit the gateway's wider default");
+
+    assert!(matches!(
+        error,
+        ProviderExecutionError::Provider {
+            kind: ModelErrorKind::RateLimited,
+            ..
+        }
+    ));
+    assert!(
+        primary_request
+            .await
+            .unwrap()
+            .head
+            .contains("secret-primary")
+    );
+    primary_server.await.unwrap();
 }
 
 #[tokio::test]

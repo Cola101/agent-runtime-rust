@@ -5,9 +5,14 @@
 //! credential actually reaches the server, whether a changed catalog is really
 //! refused, and whether an oversized body is stopped rather than read.
 
-use agent_model_gateway::mcp::{McpFederationClient, McpFederationError, McpServerRef};
-use rsa::rand_core::OsRng;
+use agent_model_gateway::mcp::{
+    McpFederationClient, McpFederationError, McpRoundTripContinuation, McpServerRef,
+    McpToolCallOutcome,
+};
+use agent_protocol::{McpClientCapability, McpInputAction, McpInputResponse, McpProtocolRevision};
 use rsa::RsaPrivateKey;
+use rsa::rand_core::OsRng;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,6 +45,12 @@ struct ServerBehaviour {
     seen_authorization: Vec<Option<String>>,
     /// Bytes of filler appended to a tools/call result.
     padding: usize,
+    /// Handshake protocol selected by the server.
+    protocol_version: String,
+    /// Whether the server negotiated the tools capability before tool traffic.
+    advertise_tools: bool,
+    /// JSON-RPC response id echoed by the fixture.
+    response_id: u64,
 }
 
 async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<AtomicUsize>) {
@@ -81,14 +92,26 @@ async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<At
                             })
                             .collect::<Vec<_>>()
                             .join(",");
-                        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{tools}]}}}}"#)
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"tools":[{tools}]}}}}"#,
+                            state.response_id
+                        )
                     } else if request.contains("\"tools/call\"") {
                         let filler = "x".repeat(state.padding);
                         format!(
-                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"ok{filler}"}}],"isError":false}}}}"#
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"content":[{{"type":"text","text":"ok{filler}"}}],"isError":false}}}}"#,
+                            state.response_id
                         )
                     } else {
-                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.to_owned()
+                        let capabilities = if state.advertise_tools {
+                            r#"{"tools":{}}"#
+                        } else {
+                            r#"{}"#
+                        };
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"{}","capabilities":{capabilities}}}}}"#,
+                            state.response_id, state.protocol_version
+                        )
                     }
                 };
                 let response = format!(
@@ -112,7 +135,189 @@ fn open_server(endpoint: String) -> McpServerRef {
         name: "search".into(),
         endpoint,
         credential_envelope_json: String::new(),
+        protocol_revision: McpProtocolRevision::V2025_06_18,
+        client_capabilities: BTreeSet::new(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_http_mrtr_preserves_opaque_state_and_uses_a_fresh_request_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let recorded = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                assert!(headers.contains("mcp-protocol-version: 2026-07-28"));
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while bytes.len() - header_end < content_length {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .unwrap();
+                recorded.lock().unwrap().push(body.clone());
+                let result = match body["method"].as_str().unwrap() {
+                    "server/discover" => serde_json::json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "tools/list" => serde_json::json!({
+                        "resultType": "complete",
+                        "tools": [{
+                            "name": "confirm",
+                            "description": "confirm",
+                            "inputSchema": {"type": "object"}
+                        }],
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "tools/call" if body.pointer("/params/inputResponses").is_none() => {
+                        serde_json::json!({
+                            "resultType": "input_required",
+                            "inputRequests": {
+                                "confirmation": {
+                                    "method": "elicitation/create",
+                                    "params": {
+                                        "mode": "form",
+                                        "message": "Confirm",
+                                        "requestedSchema": {
+                                            "type": "object",
+                                            "properties": {"confirmed": {"type": "boolean"}},
+                                            "required": ["confirmed"]
+                                        }
+                                    }
+                                }
+                            },
+                            "requestState": " opaque/\u{2603}/=?base64?literal?=\n"
+                        })
+                    }
+                    "tools/call" => {
+                        assert_eq!(
+                            body.pointer("/params/requestState"),
+                            Some(&serde_json::json!(" opaque/\u{2603}/=?base64?literal?=\n"))
+                        );
+                        assert_eq!(
+                            body.pointer("/params/inputResponses/confirmation/action"),
+                            Some(&serde_json::json!("accept"))
+                        );
+                        serde_json::json!({
+                            "resultType": "complete",
+                            "content": [{"type": "text", "text": "confirmed"}],
+                            "isError": false
+                        })
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                let response_body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": result
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+
+    let server = McpServerRef {
+        server_id: Uuid::now_v7(),
+        name: "modern".into(),
+        endpoint,
+        credential_envelope_json: String::new(),
+        protocol_revision: McpProtocolRevision::V2026_07_28,
+        client_capabilities: BTreeSet::from([McpClientCapability::Elicitation]),
+    };
+    let client = client();
+    let tenant = Uuid::now_v7();
+    let catalog = client.list_tools(tenant, &server).await.unwrap();
+    let first = client
+        .call_tool_round(
+            tenant,
+            &server,
+            "mcp:modern/confirm",
+            "{}",
+            &catalog.digest,
+            None,
+        )
+        .await
+        .unwrap();
+    let McpToolCallOutcome::InputRequired(required) = first else {
+        panic!("first round must request input")
+    };
+    assert_eq!(required.round, 1);
+    assert_eq!(
+        required.request_state,
+        " opaque/\u{2603}/=?base64?literal?=\n"
+    );
+
+    let continuation = McpRoundTripContinuation {
+        round: 2,
+        request_state: required.request_state,
+        responses: BTreeMap::from([(
+            "confirmation".into(),
+            McpInputResponse {
+                action: McpInputAction::Accept,
+                content: Some(serde_json::json!({"confirmed": true})),
+                meta: None,
+            },
+        )]),
+    };
+    let completed = client
+        .call_tool_round(
+            tenant,
+            &server,
+            "mcp:modern/confirm",
+            "{}",
+            &catalog.digest,
+            Some(&continuation),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(completed, McpToolCallOutcome::Complete(_)));
+
+    let calls = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| body["method"] == "tools/call")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0]["id"], calls[1]["id"]);
 }
 
 fn behaviour(tools: &[&str]) -> Arc<Mutex<ServerBehaviour>> {
@@ -120,7 +325,63 @@ fn behaviour(tools: &[&str]) -> Arc<Mutex<ServerBehaviour>> {
         tools: tools.iter().map(|name| (*name).to_owned()).collect(),
         seen_authorization: Vec::new(),
         padding: 0,
+        protocol_version: "2025-06-18".into(),
+        advertise_tools: true,
+        response_id: 1,
     }))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_refuses_a_server_that_selects_an_unsupported_protocol() {
+    let state = behaviour(&["web_search"]);
+    state.lock().unwrap().protocol_version = "2025-03-26".into();
+    let (endpoint, requests) = spawn_server(state).await;
+
+    let refused = client()
+        .list_tools(Uuid::now_v7(), &open_server(endpoint))
+        .await
+        .expect_err("an unsupported negotiated protocol must fail closed");
+
+    assert!(matches!(refused, McpFederationError::Protocol(_)));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "no initialized notification or tools/list may follow a rejected handshake"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_refuses_tool_traffic_without_a_negotiated_tools_capability() {
+    let state = behaviour(&["web_search"]);
+    state.lock().unwrap().advertise_tools = false;
+    let (endpoint, requests) = spawn_server(state).await;
+
+    let refused = client()
+        .list_tools(Uuid::now_v7(), &open_server(endpoint))
+        .await
+        .expect_err("tools/list must require the server's tools capability");
+
+    assert!(matches!(refused, McpFederationError::Protocol(_)));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "no initialized notification or tools/list may follow a rejected handshake"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_refuses_a_response_for_another_json_rpc_request() {
+    let state = behaviour(&["web_search"]);
+    state.lock().unwrap().response_id = 9;
+    let (endpoint, requests) = spawn_server(state).await;
+
+    let refused = client()
+        .list_tools(Uuid::now_v7(), &open_server(endpoint))
+        .await
+        .expect_err("a response with the wrong JSON-RPC id must not be accepted");
+
+    assert!(matches!(refused, McpFederationError::Protocol(_)));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -154,11 +415,7 @@ async fn a_call_is_refused_once_the_server_changes_its_catalog() {
     let (endpoint, _) = spawn_server(Arc::clone(&state)).await;
     let server = open_server(endpoint);
     let tenant = Uuid::now_v7();
-    let frozen = client()
-        .list_tools(tenant, &server)
-        .await
-        .unwrap()
-        .digest;
+    let frozen = client().list_tools(tenant, &server).await.unwrap().digest;
 
     // Same call succeeds while the catalog matches.
     client()
@@ -316,8 +573,8 @@ async fn a_sealed_credential_is_opened_and_sent_as_a_bearer_token() {
 
     let state = behaviour(&["web_search"]);
     let (endpoint, _) = spawn_server(Arc::clone(&state)).await;
-    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true)
-        .unwrap();
+    let client =
+        McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true).unwrap();
 
     client
         .list_tools(
@@ -327,6 +584,8 @@ async fn a_sealed_credential_is_opened_and_sent_as_a_bearer_token() {
                 name: "search".into(),
                 endpoint,
                 credential_envelope_json: envelope,
+                protocol_revision: McpProtocolRevision::V2025_06_18,
+                client_capabilities: BTreeSet::new(),
             },
         )
         .await
@@ -391,8 +650,8 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
     .to_string();
 
     let (endpoint, _) = spawn_server(behaviour(&["web_search"])).await;
-    let client = McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true)
-        .unwrap();
+    let client =
+        McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true).unwrap();
 
     let refused = client
         .list_tools(
@@ -402,6 +661,8 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
                 name: "search".into(),
                 endpoint,
                 credential_envelope_json: envelope,
+                protocol_revision: McpProtocolRevision::V2025_06_18,
+                client_capabilities: BTreeSet::new(),
             },
         )
         .await

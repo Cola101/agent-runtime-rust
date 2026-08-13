@@ -1,6 +1,6 @@
 use agent_protocol::{
-    ContentPart, Message, ModelErrorKind, ModelRequest, ModelStreamEvent, ReasoningPolicy, Role,
-    ToolSpec,
+    ContentPart, Message, ModelErrorKind, ModelRequest, ModelStreamEvent, ProviderPrivateState,
+    ReasoningPolicy, Role, ToolSpec,
 };
 use serde_json::json;
 
@@ -49,4 +49,55 @@ fn provider_failures_have_policy_safe_categories() {
     assert_eq!(encoded["type"], "failed");
     assert_eq!(encoded["kind"], "context_overflow");
     assert_eq!(encoded["retryable"], false);
+}
+
+#[test]
+fn rich_model_items_separate_public_summary_from_provider_private_state() {
+    let private_state = ProviderPrivateState {
+        provider_id: "openai-primary".into(),
+        protocol: "openai_responses".into(),
+        model: "gpt-agent".into(),
+        format: "openai.responses.reasoning.v1".into(),
+        data: "opaque-encrypted-state".into(),
+    };
+    assert!(private_state.is_well_formed());
+
+    let part = ContentPart::Reasoning {
+        summary: vec!["Checked the constraints.".into()],
+        private_state: Some(private_state.clone()),
+    };
+    let encoded = serde_json::to_value(&part).unwrap();
+    assert_eq!(encoded["type"], "reasoning");
+    assert_eq!(encoded["summary"][0], "Checked the constraints.");
+    assert_eq!(encoded["private_state"]["provider_id"], "openai-primary");
+
+    assert!(
+        ModelStreamEvent::Reasoning {
+            summary: vec!["Checked the constraints.".into()],
+            private_state: Some(private_state),
+        }
+        .commits_provider_output()
+    );
+    assert!(
+        ModelStreamEvent::Refusal {
+            text: "I cannot help with that.".into(),
+        }
+        .commits_provider_output()
+    );
+}
+
+#[test]
+fn private_state_omission_is_a_non_committing_audit_event_without_opaque_data() {
+    let event = ModelStreamEvent::PrivateStateOmitted {
+        origin_provider_id: "openai-primary".into(),
+        target_provider_id: "anthropic-fallback".into(),
+        format: "openai.responses.reasoning.v1".into(),
+    };
+
+    assert!(!event.commits_provider_output());
+    let encoded = serde_json::to_value(event).unwrap();
+    assert_eq!(encoded["type"], "private_state_omitted");
+    assert_eq!(encoded["origin_provider_id"], "openai-primary");
+    assert_eq!(encoded["target_provider_id"], "anthropic-fallback");
+    assert!(encoded.get("data").is_none());
 }

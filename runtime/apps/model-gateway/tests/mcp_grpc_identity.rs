@@ -7,22 +7,23 @@
 
 use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
+use agent_model_gateway_protocol::mcp_server_authorization_digest;
 use agent_model_gateway_protocol::v1::mcp_federation_client::McpFederationClient as WireClient;
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
 use agent_model_gateway_protocol::v1::{McpListToolsRequest, McpServerRef};
 use agent_workload_identity::{WorkloadIdentityClaims, WorkloadTokenVerifier};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
+use rsa::RsaPrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
-use rsa::RsaPrivateKey;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 use tonic::Code;
+use tonic::transport::Server;
 use uuid::Uuid;
 
 fn claims_for(tenant_id: Uuid, run_id: Uuid, scopes: &[&str]) -> WorkloadIdentityClaims {
@@ -30,12 +31,18 @@ fn claims_for(tenant_id: Uuid, run_id: Uuid, scopes: &[&str]) -> WorkloadIdentit
     WorkloadIdentityClaims {
         schema_version: 2,
         tenant_id,
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id,
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: Uuid::now_v7(),
         worker_id: Uuid::now_v7(),
         worker_incarnation_id: Uuid::now_v7(),
         model_policy_id: Uuid::now_v7(),
         model_policy_digest: String::new(),
+        authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["model-gateway".to_owned()]),
         scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
         issued_at_unix_ms: now,
@@ -73,7 +80,7 @@ async fn spawn_mcp_server() -> String {
                 let body = if request.contains("\"tools/list\"") {
                     r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"web_search","description":"d","inputSchema":{"type":"object"}}]}}"#
                 } else {
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}"#
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -92,7 +99,8 @@ async fn spawn_gateway(signing_key: &SigningKey) -> String {
         .to_pkcs8_pem(LineEnding::LF)
         .unwrap()
         .to_string();
-    let federation = McpFederationClient::from_pkcs8_pem(&pem, Duration::from_secs(5), true).unwrap();
+    let federation =
+        McpFederationClient::from_pkcs8_pem(&pem, Duration::from_secs(5), true).unwrap();
     let service = McpFederationGrpcService::new(
         federation,
         WorkloadTokenVerifier::new(signing_key.verifying_key()),
@@ -122,11 +130,18 @@ fn list_request(
         attempt_id: claims.attempt_id.to_string(),
         worker_id: claims.worker_id.to_string(),
         worker_incarnation_id: claims.worker_incarnation_id.to_string(),
+        application_id: String::new(),
+        workload_identity_id: String::new(),
+        session_id: String::new(),
+        workspace_id: String::new(),
+        agent_version_id: String::new(),
         server: Some(McpServerRef {
             server_id: Uuid::now_v7().to_string(),
             name: "search".into(),
             endpoint,
-            credential_envelope_json: Vec::new().into(),
+            credential_envelope_json: Vec::new(),
+            protocol_revision: "2025-06-18".into(),
+            client_capabilities: Vec::new(),
         }),
     }
 }
@@ -149,12 +164,7 @@ async fn a_request_without_a_workload_token_is_refused() {
     let claims = claims_for(Uuid::now_v7(), Uuid::now_v7(), &["mcp.federate"]);
 
     let status = client
-        .list_tools(list_request(
-            claims.tenant_id,
-            claims.run_id,
-            &claims,
-            mcp,
-        ))
+        .list_tools(list_request(claims.tenant_id, claims.run_id, &claims, mcp))
         .await
         .expect_err("an unauthenticated request must be refused");
     assert_eq!(status.code(), Code::Unauthenticated);
@@ -243,4 +253,47 @@ async fn a_correctly_bound_token_is_accepted() {
         .await
         .expect("a correctly bound token should be accepted");
     assert_eq!(response.into_inner().tools.len(), 1);
+}
+
+/// The production break this catches is letting a valid Run token substitute
+/// a different endpoint or credential envelope for an allowed MCP server ID.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_v4_token_authorizes_only_the_exact_mcp_server_snapshot() {
+    let signing_key = SigningKey::from_bytes(&[46; 32]);
+    let mcp = spawn_mcp_server().await;
+    let gateway = spawn_gateway(&signing_key).await;
+    let mut client = WireClient::connect(gateway).await.unwrap();
+    let mut claims = claims_for(Uuid::now_v7(), Uuid::now_v7(), &["mcp.federate"]);
+    claims.schema_version = 4;
+    claims.application_id = Uuid::now_v7();
+    claims.workload_identity_id = Uuid::now_v7();
+    claims.session_id = Uuid::now_v7();
+    claims.workspace_id = Uuid::now_v7();
+    claims.agent_version_id = Uuid::now_v7();
+    claims.model_policy_digest = "a".repeat(64);
+    let mut request = list_request(claims.tenant_id, claims.run_id, &claims, mcp);
+    request.schema_version = 2;
+    request.application_id = claims.application_id.to_string();
+    request.workload_identity_id = claims.workload_identity_id.to_string();
+    request.session_id = claims.session_id.to_string();
+    request.workspace_id = claims.workspace_id.to_string();
+    request.agent_version_id = claims.agent_version_id.to_string();
+    let server = request.server.as_ref().unwrap();
+    claims.authorized_mcp_servers.insert(
+        Uuid::parse_str(&server.server_id).unwrap(),
+        mcp_server_authorization_digest(server),
+    );
+    let token = sign(&signing_key, &claims);
+
+    client
+        .list_tools(with_token(request.clone(), &token))
+        .await
+        .expect("the exact signed MCP server snapshot should be accepted");
+
+    request.server.as_mut().unwrap().endpoint = "http://127.0.0.1:9/substituted".into();
+    let status = client
+        .list_tools(with_token(request, &token))
+        .await
+        .expect_err("a substituted MCP snapshot must be refused before egress");
+    assert_eq!(status.code(), Code::PermissionDenied);
 }

@@ -9,6 +9,8 @@ rust-version.workspace = true
 agent-protocol.workspace = true
 prost.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 

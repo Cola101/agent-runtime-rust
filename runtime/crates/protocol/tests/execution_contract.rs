@@ -1,6 +1,8 @@
 use agent_protocol::{
-    Placement, RunExecutionAccepted, RunExecutionCommand, WorkerHeartbeat,
-    WorkloadIdentityRenewalCommand,
+    ContentPart, HistoryImportSource, Message, Placement, Role, RunExecutionAccepted,
+    RunExecutionCommand, RunStatus, RuntimeExecutionPolicySnapshot, RuntimeInvocationContext,
+    SubagentBudgetUsage, SubagentConversationTurn, SubagentResultDelivery, SubagentResultOutcome,
+    SubagentResultSource, WorkerHeartbeat, WorkloadIdentityRenewalCommand,
 };
 use chrono::{Duration, Utc};
 use std::collections::BTreeSet;
@@ -14,6 +16,28 @@ const EXECUTION_V4_EXAMPLE: &str =
     include_str!("../../../../contracts/events/run-execution-requested.v4.example.json");
 const EXECUTION_V6_EXAMPLE: &str =
     include_str!("../../../../contracts/events/run-execution-requested.v6.example.json");
+const EXECUTION_V10_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v10.example.json");
+const EXECUTION_V11_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v11.example.json");
+const EXECUTION_V12_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v12.example.json");
+const EXECUTION_V13_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v13.example.json");
+const EXECUTION_V14_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v14.example.json");
+const EXECUTION_V15_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v15.example.json");
+const EXECUTION_V16_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v16.example.json");
+const EXECUTION_V17_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v17.example.json");
+const EXECUTION_V18_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v18.example.json");
+const EXECUTION_V19_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v19.example.json");
+const EXECUTION_V20_EXAMPLE: &str =
+    include_str!("../../../../contracts/events/run-execution-requested.v20.example.json");
 const HEARTBEAT_EXAMPLE: &str =
     include_str!("../../../../contracts/events/worker-heartbeat.v2.example.json");
 const DRAINING_HEARTBEAT_EXAMPLE: &str =
@@ -53,7 +77,7 @@ fn execution_command_example_decodes_and_validates() {
         "WorkloadToken[REDACTED]"
     );
     assert_eq!(command.budget.max_tokens, 12_000);
-    assert!(command.validate().is_ok());
+    assert_eq!(command.validate(), Ok(()));
 }
 
 #[test]
@@ -170,6 +194,60 @@ fn v6_root_lineage_does_not_require_an_agent_to_bind_a_skill() {
 }
 
 #[test]
+fn v16_root_execution_binds_an_authoritative_session_branch_without_promoting_history() {
+    let command: RunExecutionCommand =
+        serde_json::from_str(EXECUTION_V16_EXAMPLE).expect("v16 example must decode");
+
+    assert_eq!(command.validate(), Ok(()));
+
+    let mut tampered = command.clone();
+    tampered.session_branch.as_mut().unwrap().history[0].transcript[1].content[0] =
+        ContentPart::Text {
+            text: "forged".into(),
+        };
+    assert_eq!(
+        tampered.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSessionBranch)
+    );
+
+    let mut ambiguous = command;
+    ambiguous.history_import = Some(agent_protocol::HistoryImport {
+        schema_version: 1,
+        source: HistoryImportSource::External,
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentPart::Text {
+                text: "external".into(),
+            }],
+        }],
+    });
+    assert_eq!(
+        ambiguous.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSessionBranch)
+    );
+
+    let mut downgraded: RunExecutionCommand =
+        serde_json::from_str(EXECUTION_V16_EXAMPLE).expect("v16 example must decode");
+    downgraded.schema_version = 15;
+    assert_eq!(
+        downgraded.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSessionBranch)
+    );
+
+    let mut child: RunExecutionCommand =
+        serde_json::from_str(EXECUTION_V16_EXAMPLE).expect("v16 example must decode");
+    child.lineage.root_run_id = Uuid::now_v7();
+    child.lineage.parent_run_id = Some(child.lineage.root_run_id);
+    child.lineage.delegation_id = Some(Uuid::now_v7());
+    child.lineage.depth = 1;
+    child.lineage.role = "reviewer".into();
+    assert_eq!(
+        child.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSessionBranch)
+    );
+}
+
+#[test]
 fn v7_execution_exposes_only_subagent_roles_within_the_current_authority() {
     let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
     value["schema_version"] = serde_json::json!(7);
@@ -230,6 +308,85 @@ fn v1_execution_contract_remains_read_compatible_during_upgrade() {
     assert!(command.worker_incarnation_id.is_nil());
     assert!(command.workload_token.as_str().starts_with("v1."));
     assert!(command.validate().is_ok());
+}
+
+#[test]
+fn v20_execution_binds_one_complete_application_scoped_invocation_identity() {
+    let command: RunExecutionCommand =
+        serde_json::from_str(EXECUTION_V20_EXAMPLE).expect("v20 application identity must decode");
+
+    assert_eq!(command.validate(), Ok(()));
+
+    let mut cross_application_skill = command.clone();
+    cross_application_skill.skill_snapshots[0].application_id = Uuid::now_v7();
+    assert_eq!(
+        cross_application_skill.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSkillSnapshot),
+        "a signed Skill from another application must not enter this invocation"
+    );
+
+    for missing in [
+        "tenant_id",
+        "application_id",
+        "workload_identity_id",
+        "run_id",
+        "session_id",
+        "workspace_id",
+        "agent_version_id",
+        "attempt_id",
+        "worker_id",
+        "worker_incarnation_id",
+        "fencing_token",
+    ] {
+        let mut invalid = command.clone();
+        match missing {
+            "tenant_id" => invalid.tenant_id = Uuid::nil(),
+            "application_id" => invalid.application_id = Uuid::nil(),
+            "workload_identity_id" => invalid.workload_identity_id = Uuid::nil(),
+            "run_id" => invalid.run_id = Uuid::nil(),
+            "session_id" => invalid.session_id = Uuid::nil(),
+            "workspace_id" => invalid.workspace_id = Uuid::nil(),
+            "agent_version_id" => invalid.agent_version_id = Uuid::nil(),
+            "attempt_id" => invalid.attempt_id = Uuid::nil(),
+            "worker_id" => invalid.worker_id = Uuid::nil(),
+            "worker_incarnation_id" => invalid.worker_incarnation_id = Uuid::nil(),
+            "fencing_token" => invalid.fencing_token = Uuid::nil(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            invalid.validate(),
+            Err(agent_protocol::RunExecutionValidationError::InvalidInvocationIdentity),
+            "{missing} must be immutable and non-nil in v20"
+        );
+    }
+}
+
+#[test]
+fn runtime_invocation_context_rejects_an_ambiguous_resource_boundary() {
+    let context = RuntimeInvocationContext {
+        schema_version: 1,
+        tenant_id: Uuid::now_v7(),
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
+        workspace_id: Uuid::now_v7(),
+        agent_version_id: Uuid::now_v7(),
+        model_policy_id: Uuid::now_v7(),
+    };
+
+    assert_eq!(context.validate(), Ok(()));
+
+    let mut invalid = context;
+    invalid.application_id = Uuid::nil();
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn v19_execution_without_application_identity_remains_read_compatible() {
+    let command: RunExecutionCommand =
+        serde_json::from_str(EXECUTION_V19_EXAMPLE).expect("v19 example must decode");
+
+    assert!(command.application_id.is_nil());
+    assert_eq!(command.validate(), Ok(()));
 }
 
 #[test]
@@ -504,6 +661,492 @@ fn an_mcp_server_name_that_could_forge_a_qualified_tool_name_is_refused() {
             "server name {hostile:?} must be refused"
         );
     }
+}
+
+/// Runtime scheduling is part of the Run's meaning, not a Worker preference.
+///
+/// Before v10, MCP discovery concurrency/deadlines, model failover and Tool
+/// execution timeout lived in three different processes as constants. Moving a
+/// Run to another host could therefore change all three without changing the
+/// command that was accepted. v10 freezes the effective values before any
+/// network discovery or model work starts.
+#[test]
+fn v10_execution_requires_one_bounded_runtime_policy_snapshot() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V10_EXAMPLE).unwrap();
+
+    let command: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert!(command.validate().is_ok());
+
+    value.as_object_mut().unwrap().remove("runtime_policy");
+    let missing: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        missing.validate().unwrap_err().to_string(),
+        "v10 execution runtime policy is missing, malformed, or carried by an older schema"
+    );
+
+    value["runtime_policy"] = serde_json::json!({
+        "schema_version": 1,
+        "mcp_discovery": {
+            "max_concurrent_servers": 17,
+            "per_server_timeout_ms": 3_000,
+            "total_timeout_ms": 10_000
+        },
+        "model_failover": {
+            "max_provider_attempts": 9,
+            "fallback_on": ["authentication"]
+        },
+        "tool_execution": {
+            "timeout_ms": 0
+        }
+    });
+    let unbounded: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        unbounded.validate().unwrap_err().to_string(),
+        "v10 execution runtime policy is missing, malformed, or carried by an older schema"
+    );
+}
+
+/// A downgraded command must not smuggle a policy past a runtime that believes
+/// policy is still host-local. This is the same anti-downgrade boundary as the
+/// v8 approval policy and v9 MCP server catalog.
+#[test]
+fn a_pre_v10_execution_carrying_runtime_policy_is_refused() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(9);
+    value["runtime_policy"] = serde_json::json!({
+        "schema_version": 1,
+        "mcp_discovery": {
+            "max_concurrent_servers": 4,
+            "per_server_timeout_ms": 3_000,
+            "total_timeout_ms": 10_000
+        },
+        "model_failover": {
+            "max_provider_attempts": 1,
+            "fallback_on": []
+        },
+        "tool_execution": {
+            "timeout_ms": 30_000
+        }
+    });
+
+    let command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        command.validate().unwrap_err().to_string(),
+        "v10 execution runtime policy is missing, malformed, or carried by an older schema"
+    );
+}
+
+/// The production break this catches is an older Worker silently treating a
+/// required server as optional, or silently dropping the retry budget because
+/// both fields were added without a schema fence.
+#[test]
+fn v11_execution_binds_required_mcp_and_bounded_discovery_retries() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V11_EXAMPLE).unwrap();
+
+    let command: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert!(command.validate().is_ok());
+
+    value["schema_version"] = serde_json::json!(10);
+    let downgraded: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        downgraded.validate().unwrap_err().to_string(),
+        "v11 MCP availability and discovery retry policy cannot be carried by an older execution schema"
+    );
+}
+
+/// Existing v10 commands remain optional and single-attempt. This catches a
+/// compatibility regression where serde defaults accidentally grant retries
+/// or turn an old server into a required dependency.
+#[test]
+fn v10_mcp_policy_defaults_to_optional_single_attempt_discovery() {
+    let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V10_EXAMPLE).unwrap();
+    assert!(command.validate().is_ok());
+    assert_eq!(
+        command
+            .runtime_policy
+            .unwrap()
+            .mcp_discovery
+            .max_attempts_per_server,
+        1
+    );
+}
+
+/// The production break this catches is context compaction silently inheriting
+/// host-local thresholds, or an older policy schema accepting thresholds it
+/// does not understand. Either would make the same Run build different model
+/// context after placement or recovery.
+#[test]
+fn runtime_policy_v3_binds_bounded_protocol_neutral_compaction() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V13_EXAMPLE).unwrap();
+
+    let command: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(command.schema_version, 13);
+    assert!(command.validate().is_ok());
+
+    value["schema_version"] = serde_json::json!(12);
+    let downgraded: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert!(downgraded.validate().is_err());
+
+    value["schema_version"] = serde_json::json!(13);
+    value["runtime_policy"]["schema_version"] = serde_json::json!(2);
+    let old_policy: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert!(old_policy.validate().is_err());
+
+    value["runtime_policy"]["schema_version"] = serde_json::json!(3);
+    value["runtime_policy"]["context_compaction"]["retain_bytes"] = serde_json::json!(4_096);
+    let non_shrinking: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(non_shrinking.validate().is_err());
+}
+
+/// The production break this catches is a host-local or unbounded Tool fan-out
+/// changing the same Run's behavior after placement or Checkpoint recovery.
+#[test]
+fn runtime_policy_v4_binds_a_bounded_parallel_tool_limit() {
+    let policy = RuntimeExecutionPolicySnapshot::default();
+    assert_eq!(policy.schema_version, 4);
+    assert_eq!(policy.tool_execution.max_concurrent_tools, 4);
+    assert!(policy.is_bounded_and_safe());
+
+    let mut unbounded = policy.clone();
+    unbounded.tool_execution.max_concurrent_tools = 17;
+    assert!(!unbounded.is_bounded_and_safe());
+
+    let mut legacy = policy;
+    legacy.schema_version = 3;
+    assert!(
+        !legacy.is_bounded_and_safe(),
+        "an older policy schema must not silently accept parallel Tool semantics"
+    );
+    legacy.tool_execution.max_concurrent_tools = 1;
+    assert!(legacy.is_bounded_and_safe());
+}
+
+/// The production break this catches is a v16 Worker accepting a parallel
+/// scheduling policy whose Checkpoint state it does not know how to preserve.
+#[test]
+fn execution_v17_fences_parallel_tool_policy_from_older_workers() {
+    let current: RunExecutionCommand = serde_json::from_str(EXECUTION_V17_EXAMPLE).unwrap();
+    assert!(current.validate().is_ok());
+
+    let mut value = serde_json::to_value(current).unwrap();
+    value["schema_version"] = serde_json::json!(16);
+
+    let downgraded: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert!(downgraded.validate().is_err());
+
+    value["schema_version"] = serde_json::json!(17);
+    value["runtime_policy"]["schema_version"] = serde_json::json!(3);
+    value["runtime_policy"]["tool_execution"]["max_concurrent_tools"] = serde_json::json!(1);
+    let old_policy: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert!(old_policy.validate().is_err());
+}
+
+/// An MCP Tool's replay semantics come from the operator-owned Run snapshot,
+/// never from an annotation supplied by the remote MCP server. The snapshot
+/// must survive decode/encode intact or a command can appear accepted while the
+/// Worker silently falls back to `unknown`.
+#[test]
+fn v18_execution_preserves_operator_owned_mcp_tool_effect_overrides() {
+    let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V18_EXAMPLE).unwrap();
+    assert!(command.validate().is_ok());
+    let encoded = serde_json::to_value(command).unwrap();
+
+    assert_eq!(
+        encoded["mcp_servers"][0]["tool_effect_overrides"]["web_search"], "idempotent",
+        "the Run-frozen operator policy was silently discarded"
+    );
+}
+
+#[test]
+fn mcp_tool_effect_overrides_are_versioned_and_limited_to_declared_tools() {
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V17_EXAMPLE).unwrap();
+    let signed_skill_source: serde_json::Value =
+        serde_json::from_str(EXECUTION_V6_EXAMPLE).unwrap();
+    value["skill_snapshots"] = signed_skill_source["skill_snapshots"].clone();
+    value["schema_version"] = serde_json::json!(18);
+    value["delegated_scopes"] = serde_json::json!(["tool:mcp:search"]);
+    value["mcp_servers"] = serde_json::json!([{
+        "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+        "name": "search",
+        "endpoint": "https://mcp.example.com/rpc",
+        "credential_envelope_base64": "",
+        "required": true,
+        "tool_effect_overrides": {
+            "web_search": "idempotent"
+        }
+    }]);
+    let mut command: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    command.skill_snapshots[0]
+        .tool_names
+        .push("mcp:search/web_search".into());
+    command.skill_snapshots[0].tool_names.sort();
+    command.skill_snapshots[0].artifact_digest =
+        command.skill_snapshots[0].expected_artifact_digest(command.tenant_id);
+    assert!(
+        command.validate().is_ok(),
+        "valid v18 override was refused: {:?}",
+        command.validate()
+    );
+
+    let mut downgraded = command.clone();
+    downgraded.schema_version = 17;
+    assert!(
+        downgraded.validate().is_err(),
+        "a pre-v18 command smuggled an effect override"
+    );
+
+    let mut undeclared = command;
+    undeclared.mcp_servers[0].tool_effect_overrides = std::collections::BTreeMap::from([(
+        "delete_everything".into(),
+        agent_protocol::ToolEffect::Pure,
+    )]);
+    assert!(
+        undeclared.validate().is_err(),
+        "an override outside the signed Skill declaration was accepted"
+    );
+}
+
+/// MCP 2026-07-28 removes the stateful initialize session and replaces reverse
+/// client requests with MRTR.  A Run must freeze that choice: inferring it from
+/// whichever server answers after recovery would change both the wire protocol
+/// and the authority available to the server.
+#[test]
+fn v19_freezes_the_mcp_protocol_revision_and_client_capabilities() {
+    let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V19_EXAMPLE).unwrap();
+    assert_eq!(command.validate(), Ok(()));
+    assert_eq!(
+        serde_json::to_value(&command).unwrap()["mcp_servers"][0]["protocol_revision"],
+        "2026-07-28"
+    );
+
+    let mut downgraded = command.clone();
+    downgraded.schema_version = 18;
+    assert_eq!(
+        downgraded.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpProtocolPolicy)
+    );
+
+    let mut undelegated = command.clone();
+    undelegated
+        .delegated_scopes
+        .remove("mcp:elicitation:search");
+    assert_eq!(
+        undelegated.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpProtocolPolicy)
+    );
+
+    let mut legacy_with_mrtr = command;
+    legacy_with_mrtr.mcp_servers[0].protocol_revision =
+        agent_protocol::McpProtocolRevision::V2025_06_18;
+    assert_eq!(
+        legacy_with_mrtr.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpProtocolPolicy)
+    );
+}
+
+#[test]
+fn legacy_mcp_servers_decode_to_the_explicit_default_deny_policy() {
+    let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V18_EXAMPLE).unwrap();
+    let server = &command.mcp_servers[0];
+
+    assert_eq!(
+        server.protocol_revision,
+        agent_protocol::McpProtocolRevision::V2025_06_18
+    );
+    assert!(server.client_capabilities.is_empty());
+}
+
+#[test]
+fn v12_child_history_is_role_preserving_bounded_and_downgrade_safe() {
+    let mut command: RunExecutionCommand = serde_json::from_str(EXECUTION_V12_EXAMPLE).unwrap();
+    assert!(command.validate().is_ok());
+    let root_run_id = command.run_id;
+    command.run_id = Uuid::now_v7();
+    command.lineage.root_run_id = root_run_id;
+    command.lineage.parent_run_id = Some(root_run_id);
+    command.lineage.delegation_id = Some(command.run_id);
+    command.lineage.depth = 1;
+    command.lineage.role = "worker".into();
+    let prior_child_run_id = Uuid::now_v7();
+    let result = SubagentResultDelivery::new(
+        SubagentResultSource {
+            tool_call_id: "agent.send:handle:1".into(),
+            delegation_id: prior_child_run_id,
+            binding_digest: "a".repeat(64),
+            child_run_id: prior_child_run_id,
+            child_terminal_event_id: Uuid::now_v7(),
+        },
+        SubagentResultOutcome {
+            terminal_status: RunStatus::Succeeded,
+            content: serde_json::json!({"text": "first answer"}),
+            is_error: false,
+        },
+    );
+    command.subagent_history = vec![SubagentConversationTurn {
+        activation_ordinal: 0,
+        message_sequence: 0,
+        child_run_id: prior_child_run_id,
+        input: "first question".into(),
+        result,
+    }];
+    assert!(command.validate().is_ok());
+
+    command.schema_version = 11;
+    assert_eq!(
+        command.validate().unwrap_err().to_string(),
+        "v12 subagent conversation history is malformed or carried by an older schema"
+    );
+}
+
+#[test]
+fn v14_requires_digest_bound_typed_subagent_history_and_rejects_downgrade() {
+    let mut command: RunExecutionCommand = serde_json::from_str(EXECUTION_V14_EXAMPLE).unwrap();
+    assert_eq!(command.schema_version, 14);
+    assert!(command.validate().is_ok());
+    let root_run_id = command.run_id;
+    command.run_id = Uuid::now_v7();
+    command.lineage.root_run_id = root_run_id;
+    command.lineage.parent_run_id = Some(root_run_id);
+    command.lineage.delegation_id = Some(command.run_id);
+    command.lineage.depth = 1;
+    command.lineage.role = "worker".into();
+    let prior_child_run_id = Uuid::now_v7();
+    let rich_result = SubagentResultDelivery::new_with_usage_and_transcript(
+        SubagentResultSource {
+            tool_call_id: "agent.send:handle:1".into(),
+            delegation_id: prior_child_run_id,
+            binding_digest: "a".repeat(64),
+            child_run_id: prior_child_run_id,
+            child_terminal_event_id: Uuid::now_v7(),
+        },
+        SubagentResultOutcome {
+            terminal_status: RunStatus::Succeeded,
+            content: serde_json::json!({"text": "first answer"}),
+            is_error: false,
+        },
+        SubagentBudgetUsage {
+            tokens: 12,
+            cost_micros: 34,
+        },
+        vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: "first question".into(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::Text {
+                    text: "first answer".into(),
+                }],
+            },
+        ],
+    );
+    command.subagent_history = vec![SubagentConversationTurn {
+        activation_ordinal: 0,
+        message_sequence: 0,
+        child_run_id: prior_child_run_id,
+        input: "first question".into(),
+        result: rich_result,
+    }];
+
+    command.schema_version = 14;
+    assert!(command.validate().is_ok());
+
+    let mut downgraded = command.clone();
+    downgraded.schema_version = 13;
+    assert_eq!(
+        downgraded.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSubagentHistory)
+    );
+
+    let mut incomplete = command;
+    incomplete.subagent_history[0].result = SubagentResultDelivery::new(
+        SubagentResultSource {
+            tool_call_id: "agent.send:handle:1".into(),
+            delegation_id: prior_child_run_id,
+            binding_digest: "a".repeat(64),
+            child_run_id: prior_child_run_id,
+            child_terminal_event_id: Uuid::now_v7(),
+        },
+        SubagentResultOutcome {
+            terminal_status: RunStatus::Succeeded,
+            content: serde_json::json!({"text": "first answer"}),
+            is_error: false,
+        },
+    );
+    assert_eq!(
+        incomplete.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidSubagentHistory)
+    );
+}
+
+#[test]
+fn v15_separates_explicit_lower_authority_history_import_from_subagent_history() {
+    let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V15_EXAMPLE).unwrap();
+    assert_eq!(command.schema_version, 15);
+    assert_eq!(
+        command.history_import.as_ref().map(|import| import.source),
+        Some(HistoryImportSource::Truncated)
+    );
+    assert!(command.validate().is_ok());
+
+    let mut downgraded = command.clone();
+    downgraded.schema_version = 14;
+    assert_eq!(
+        downgraded.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidHistoryImport)
+    );
+
+    let mut ambiguous_order = command;
+    let root_run_id = ambiguous_order.run_id;
+    ambiguous_order.run_id = Uuid::now_v7();
+    ambiguous_order.lineage.root_run_id = root_run_id;
+    ambiguous_order.lineage.parent_run_id = Some(root_run_id);
+    ambiguous_order.lineage.delegation_id = Some(ambiguous_order.run_id);
+    ambiguous_order.lineage.depth = 1;
+    ambiguous_order.lineage.role = "worker".into();
+    let child_run_id = Uuid::now_v7();
+    ambiguous_order.subagent_history = vec![SubagentConversationTurn {
+        activation_ordinal: 0,
+        message_sequence: 0,
+        child_run_id,
+        input: "child input".into(),
+        result: SubagentResultDelivery::new_with_usage_and_transcript(
+            SubagentResultSource {
+                tool_call_id: "call_child".into(),
+                delegation_id: child_run_id,
+                binding_digest: "a".repeat(64),
+                child_run_id,
+                child_terminal_event_id: Uuid::now_v7(),
+            },
+            SubagentResultOutcome {
+                terminal_status: RunStatus::Succeeded,
+                content: serde_json::json!({"text": "child answer"}),
+                is_error: false,
+            },
+            SubagentBudgetUsage::default(),
+            vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "child input".into(),
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::Text {
+                        text: "child answer".into(),
+                    }],
+                },
+            ],
+        ),
+    }];
+    assert_eq!(
+        ambiguous_order.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidHistoryImport)
+    );
 }
 
 /// A Skill has to be able to declare a federated tool by its qualified name.

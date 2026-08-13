@@ -10,7 +10,7 @@ use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
-    LocalProviderConfig, LocalRunState, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
+    LocalModelRoutingConfig, LocalRunState, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
     WORKSPACE_READ_SCOPE,
 };
 use std::collections::BTreeSet;
@@ -84,12 +84,16 @@ fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> Loc
         workspace_root,
         agent_instructions: "Explain evidence before conclusions.".into(),
         delegated_scopes: BTreeSet::from([WORKSPACE_READ_SCOPE.to_owned()]),
-        provider: LocalProviderConfig {
+        subagent_roles: Vec::new(),
+        model_routing: LocalModelRoutingConfig::single_openai_compatible(
             endpoint,
-            model: "local-test-model".into(),
-            api_key: "local-test-key".into(),
-        },
+            "local-test-model",
+            "local-test-key",
+        ),
+        mcp_servers: Vec::new(),
+        mcp_lifecycle: agent_runtime_host::LocalMcpLifecycleConfig::default(),
         trusted_workspace_tool: trusted_tool_binary(),
+        process_session: None,
         // The gate under test.
         consent: LocalToolConsent::Ask,
         budget: RunBudget {
@@ -97,6 +101,7 @@ fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> Loc
             max_cost_cents: 100,
             max_duration_seconds: 600,
         },
+        runtime_policy: agent_protocol::RuntimeExecutionPolicySnapshot::default(),
     }
 }
 
@@ -263,6 +268,72 @@ async fn approving_over_ipc_lets_the_parked_run_execute_its_tool_and_finish() {
     assert!(
         types.iter().any(|event| event == "tool.execution.started"),
         "the approved Tool must actually run: {types:?}"
+    );
+}
+
+#[tokio::test]
+async fn approval_wait_does_not_consume_the_run_duration_budget() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let mut local_config = config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider().await,
+    );
+    local_config.budget.max_duration_seconds = 2;
+    let (socket, _serving) = start(local_config).await;
+
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+    let probe = state_root.clone();
+    wait_for("the bounded run to park on approval", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+        )
+    })
+    .await;
+
+    let checkpoint =
+        LocalRuntimeHost::load_checkpoint(&LocalRuntimeHost::checkpoint_path(&state_root, run_id))
+            .expect("parked checkpoint");
+    let state: serde_json::Value =
+        serde_json::from_slice(&checkpoint.state).expect("checkpoint state");
+    assert_eq!(
+        state["execution_time"]["active"], false,
+        "the approval checkpoint must durably stop the execution clock"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let response = request(&socket, &LocalRequest::Approve { run_id }).await;
+    assert!(matches!(response, LocalResponse::Accepted { .. }));
+    let probe = state_root.clone();
+    wait_for("the post-wait approved run to finish", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::Finished { .. })
+        )
+    })
+    .await;
+
+    let record = LocalRuntimeHost::read_run_record(&state_root, run_id)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(
+        record.state,
+        LocalRunState::Finished {
+            status: "succeeded".into()
+        },
+        "operator think time must not turn an approved Run into a timeout"
     );
 }
 

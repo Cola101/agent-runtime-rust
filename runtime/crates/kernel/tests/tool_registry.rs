@@ -503,12 +503,22 @@ fn a_federated_tool_needs_its_server_scope_delegated() {
     let mut registry = ToolRegistry::default();
     registry.register(federated_tool()).unwrap();
 
-    assert!(registry
-        .authorize("mcp:search/web_search", &BTreeSet::from(["tool:mcp:other".into()]))
-        .is_err());
-    assert!(registry
-        .authorize("mcp:search/web_search", &BTreeSet::from(["tool:mcp:search".into()]))
-        .is_ok());
+    assert!(
+        registry
+            .authorize(
+                "mcp:search/web_search",
+                &BTreeSet::from(["tool:mcp:other".into()])
+            )
+            .is_err()
+    );
+    assert!(
+        registry
+            .authorize(
+                "mcp:search/web_search",
+                &BTreeSet::from(["tool:mcp:search".into()])
+            )
+            .is_ok()
+    );
 }
 
 /// ADR-0040 decision 6: every federated tool asks, on every call.

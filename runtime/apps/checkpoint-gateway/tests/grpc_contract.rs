@@ -71,6 +71,36 @@ async fn token_cannot_cross_tenant_or_worker_incarnation_boundaries() {
     fixture.stop().await;
 }
 
+/// The production break this catches is authorizing a v20 checkpoint through
+/// only tenant/Run/Worker fields. A token for one Workspace must not store into
+/// another Workspace even when every legacy field is unchanged.
+#[tokio::test]
+async fn v2_checkpoint_binding_rejects_a_different_workspace() {
+    let fixture = GatewayFixture::start().await;
+    let claims = claims_v4();
+    let payload = b"workspace-bound checkpoint".to_vec();
+    let digest = hex::encode(Sha256::digest(&payload));
+    let payload_ref = format!("checkpoint://sha256/{digest}");
+    let mut wrong = binding(&claims);
+    wrong.workspace_id = Uuid::now_v7().to_string();
+    let request = PutCheckpointRequest {
+        schema_version: 2,
+        binding: Some(wrong),
+        payload_ref,
+        payload,
+    };
+    let mut request = Request::new(request);
+    authorize(&mut request, &sign(&fixture.signing_key, &claims));
+    let mut client = CheckpointStorageClient::connect(fixture.endpoint.clone())
+        .await
+        .unwrap();
+
+    let error = client.put_checkpoint(request).await.unwrap_err();
+
+    assert_eq!(error.code(), Code::PermissionDenied);
+    fixture.stop().await;
+}
+
 #[tokio::test]
 async fn missing_checkpoint_is_reported_as_not_found() {
     let fixture = GatewayFixture::start().await;
@@ -375,11 +405,28 @@ fn authorize<T>(request: &mut Request<T>, token: &str) {
 fn binding(claims: &WorkloadIdentityClaims) -> WorkloadBinding {
     WorkloadBinding {
         tenant_id: claims.tenant_id.to_string(),
+        application_id: claims.application_id.to_string(),
+        workload_identity_id: claims.workload_identity_id.to_string(),
         run_id: claims.run_id.to_string(),
+        session_id: claims.session_id.to_string(),
+        workspace_id: claims.workspace_id.to_string(),
+        agent_version_id: claims.agent_version_id.to_string(),
         attempt_id: claims.attempt_id.to_string(),
         worker_id: claims.worker_id.to_string(),
         worker_incarnation_id: claims.worker_incarnation_id.to_string(),
     }
+}
+
+fn claims_v4() -> WorkloadIdentityClaims {
+    let mut claims = claims();
+    claims.schema_version = 4;
+    claims.application_id = Uuid::now_v7();
+    claims.workload_identity_id = Uuid::now_v7();
+    claims.session_id = Uuid::now_v7();
+    claims.workspace_id = Uuid::now_v7();
+    claims.agent_version_id = Uuid::now_v7();
+    claims.model_policy_digest = "a".repeat(64);
+    claims
 }
 
 fn claims() -> WorkloadIdentityClaims {
@@ -387,12 +434,18 @@ fn claims() -> WorkloadIdentityClaims {
     WorkloadIdentityClaims {
         schema_version: 2,
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: Uuid::now_v7(),
         worker_id: Uuid::now_v7(),
         worker_incarnation_id: Uuid::now_v7(),
         model_policy_id: Uuid::now_v7(),
         model_policy_digest: String::new(),
+        authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["checkpoint-gateway".into()]),
         scopes: BTreeSet::from(["checkpoint.read".into(), "checkpoint.write".into()]),
         issued_at_unix_ms: now,

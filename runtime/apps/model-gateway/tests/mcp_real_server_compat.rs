@@ -19,9 +19,11 @@
 //! machine where it never ran.
 
 use agent_model_gateway::mcp::{McpFederationClient, McpServerRef};
+use agent_protocol::McpProtocolRevision;
+use rsa::RsaPrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
-use rsa::RsaPrivateKey;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -61,6 +63,8 @@ fn server() -> McpServerRef {
         name: "everything".into(),
         endpoint: endpoint(),
         credential_envelope_json: String::new(),
+        protocol_revision: McpProtocolRevision::V2025_06_18,
+        client_capabilities: BTreeSet::new(),
     }
 }
 
@@ -179,6 +183,8 @@ async fn discovery_works_against_every_configured_server() {
             name: "compat".into(),
             endpoint: endpoint.clone(),
             credential_envelope_json: String::new(),
+            protocol_revision: McpProtocolRevision::V2025_06_18,
+            client_capabilities: BTreeSet::new(),
         };
         let catalog = client
             .list_tools(Uuid::now_v7(), &server)
@@ -200,8 +206,10 @@ async fn discovery_works_against_every_configured_server() {
             // object rather than as whatever the server happened to send.
             let schema: serde_json::Value = serde_json::from_str(&tool.input_schema_json)
                 .unwrap_or_else(|error| {
-                    panic!("{endpoint} tool {} has an unparseable schema: {error}",
-                        tool.qualified_name)
+                    panic!(
+                        "{endpoint} tool {} has an unparseable schema: {error}",
+                        tool.qualified_name
+                    )
                 });
             assert!(
                 schema.is_object(),
@@ -299,6 +307,8 @@ async fn a_sealed_credential_opens_against_an_authenticating_server() {
         name: "github".into(),
         endpoint: endpoint.clone(),
         credential_envelope_json: String::new(),
+        protocol_revision: McpProtocolRevision::V2025_06_18,
+        client_capabilities: BTreeSet::new(),
     };
     let refused = client
         .list_tools(tenant, &open)
@@ -311,6 +321,8 @@ async fn a_sealed_credential_opens_against_an_authenticating_server() {
 
     let sealed = McpServerRef {
         credential_envelope_json: envelope,
+        protocol_revision: McpProtocolRevision::V2025_06_18,
+        client_capabilities: BTreeSet::new(),
         ..open
     };
     let catalog = client

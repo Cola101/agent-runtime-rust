@@ -3,7 +3,7 @@ use agent_model_gateway_protocol::v1::model_execution_client::ModelExecutionClie
 use agent_model_gateway_protocol::v1::{
     FinishReason, ModelErrorKind as WireErrorKind, ModelEvent, ModelInvocation,
 };
-use agent_protocol::{ModelErrorKind, ModelFinishReason, ModelStreamEvent};
+use agent_protocol::{ModelErrorKind, ModelFinishReason, ModelStreamEvent, ProviderPrivateState};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
@@ -131,6 +131,33 @@ fn decode_event(event: ModelEvent) -> Result<ModelStreamEvent, ModelGatewayClien
                     "tool-call arguments are not valid JSON".into(),
                 )
             })?,
+        }),
+        Some(Body::Reasoning(reasoning)) => {
+            let private_state = reasoning.private_state.map(|state| ProviderPrivateState {
+                provider_id: state.provider_id,
+                protocol: state.protocol,
+                model: state.model,
+                format: state.format,
+                data: state.data,
+            });
+            if private_state
+                .as_ref()
+                .is_some_and(|state| !state.is_well_formed())
+            {
+                return Err(ModelGatewayClientError::InvalidEvent(
+                    "provider-private model state is malformed".into(),
+                ));
+            }
+            Ok(ModelStreamEvent::Reasoning {
+                summary: reasoning.summary,
+                private_state,
+            })
+        }
+        Some(Body::Refusal(refusal)) => Ok(ModelStreamEvent::Refusal { text: refusal.text }),
+        Some(Body::PrivateStateOmitted(omission)) => Ok(ModelStreamEvent::PrivateStateOmitted {
+            origin_provider_id: omission.origin_provider_id,
+            target_provider_id: omission.target_provider_id,
+            format: omission.format,
         }),
         None => Err(ModelGatewayClientError::InvalidEvent(
             "event body is missing".into(),

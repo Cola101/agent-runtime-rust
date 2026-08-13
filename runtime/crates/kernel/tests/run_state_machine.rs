@@ -84,6 +84,8 @@ fn durable_subagent_request_suspends_the_parent_before_child_admission() {
             max_duration_seconds: 20,
         },
         binding_digest: "a".repeat(64),
+        mode: agent_protocol::SubagentSpawnMode::Inline,
+        conversation_history: Vec::new(),
     };
 
     let event = run
@@ -126,6 +128,8 @@ fn unknown_non_idempotent_tool_result_becomes_indeterminate() {
 
     assert_eq!(run.status(), RunStatus::Indeterminate);
     assert_eq!(event.event_type, "run.indeterminate");
+    assert_eq!(event.payload["effect"], "non_idempotent");
+    assert_eq!(event.payload["replay_safe"], false);
 }
 
 #[test]

@@ -59,7 +59,12 @@ fn request() -> ToolExecutionRequest {
 fn context(workspace_root: PathBuf) -> ToolExecutionContext {
     ToolExecutionContext {
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: Uuid::now_v7(),
         workspace_root,
         timeout: Duration::from_secs(5),
@@ -241,7 +246,12 @@ async fn a_trusted_native_tool_cannot_write_outside_its_workspace() {
             request(),
             ToolExecutionContext {
                 tenant_id: Uuid::now_v7(),
+                application_id: Uuid::nil(),
+                workload_identity_id: Uuid::nil(),
                 run_id: Uuid::now_v7(),
+                session_id: Uuid::nil(),
+                workspace_id: Uuid::nil(),
+                agent_version_id: Uuid::nil(),
                 attempt_id: Uuid::now_v7(),
                 workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),
@@ -287,7 +297,12 @@ async fn a_trusted_native_tool_cannot_reach_the_network() {
             request(),
             ToolExecutionContext {
                 tenant_id: Uuid::now_v7(),
+                application_id: Uuid::nil(),
+                workload_identity_id: Uuid::nil(),
                 run_id: Uuid::now_v7(),
+                session_id: Uuid::nil(),
+                workspace_id: Uuid::nil(),
+                agent_version_id: Uuid::nil(),
                 attempt_id: Uuid::now_v7(),
                 workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),

@@ -212,12 +212,42 @@ fn authorize_request(
         binding.ok_or_else(|| Status::invalid_argument("workload binding is required"))?;
     let parsed = WorkloadIdentityBinding {
         tenant_id: parse_uuid(&binding.tenant_id)?,
+        application_id: if schema_version == 2 {
+            parse_uuid(&binding.application_id)?
+        } else {
+            Uuid::nil()
+        },
+        workload_identity_id: if schema_version == 2 {
+            parse_uuid(&binding.workload_identity_id)?
+        } else {
+            Uuid::nil()
+        },
         run_id: parse_uuid(&binding.run_id)?,
+        session_id: if schema_version == 2 {
+            parse_uuid(&binding.session_id)?
+        } else {
+            Uuid::nil()
+        },
+        workspace_id: if schema_version == 2 {
+            parse_uuid(&binding.workspace_id)?
+        } else {
+            Uuid::nil()
+        },
+        agent_version_id: if schema_version == 2 {
+            parse_uuid(&binding.agent_version_id)?
+        } else {
+            Uuid::nil()
+        },
         attempt_id: parse_uuid(&binding.attempt_id)?,
         worker_id: parse_uuid(&binding.worker_id)?,
         worker_incarnation_id: parse_uuid(&binding.worker_incarnation_id)?,
     };
-    if schema_version != 1 || !claims.authorizes(&parsed) {
+    let compatible_schema = match schema_version {
+        1 => matches!(claims.schema_version, 2 | 3),
+        2 => claims.schema_version == 4,
+        _ => false,
+    };
+    if !compatible_schema || !claims.authorizes(&parsed) {
         return Err(Status::permission_denied(
             "workload identity does not authorize this checkpoint request",
         ));

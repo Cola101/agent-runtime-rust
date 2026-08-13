@@ -4,8 +4,8 @@ use agent_protocol::Placement;
 use agent_runtime_health::{HealthState, serve as serve_health};
 use agent_runtime_worker::{
     GrpcCheckpointPayloadStore, GrpcMcpFederationClient, NatsWorker, SkillArtifactVerifier,
-    WorkerAdmissionFence,
-    WorkerPollResult, WorkerProcessor, load_or_create_worker_id, prepare_trusted_workspace_tool,
+    WorkerAdmissionFence, WorkerPollResult, WorkerProcessor, load_or_create_worker_id,
+    prepare_trusted_workspace_tool,
 };
 use agent_workload_identity::WorkloadTokenVerifier;
 use std::path::PathBuf;
@@ -180,6 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         health.set_ready(worker.is_accepting_work() && worker.nats_connection_is_ready());
         worker.publish_heartbeat().await?;
+        if worker.poll_duration_once().await? == WorkerPollResult::TimedOut {
+            info!(%worker_id, "execution duration budget exhausted");
+        }
         match worker
             .poll_identity_renewal_once(Duration::from_millis(100))
             .await?
@@ -193,10 +196,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | WorkerPollResult::Accepted
             | WorkerPollResult::Restored
             | WorkerPollResult::Cancelled
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::Steered
             | WorkerPollResult::ApprovalApplied
             | WorkerPollResult::ToolExecutionRequested
             | WorkerPollResult::ToolExecutionStarted
+            | WorkerPollResult::ToolResultStaged
             | WorkerPollResult::ToolResultPublished
             | WorkerPollResult::ModelEventPublished
             | WorkerPollResult::ModelExecutionFinished => {}
@@ -212,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WorkerPollResult::Accepted => info!(%worker_id, "execution accepted"),
                 WorkerPollResult::Restored => info!(%worker_id, "execution restored"),
                 WorkerPollResult::Cancelled => info!(%worker_id, "execution cancelled"),
+                WorkerPollResult::TimedOut => {}
                 WorkerPollResult::Steered => info!(%worker_id, "execution steered"),
                 WorkerPollResult::ApprovalApplied => info!(%worker_id, "tool approval applied"),
                 WorkerPollResult::ToolExecutionRequested => {
@@ -220,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WorkerPollResult::ToolExecutionStarted => {
                     info!(%worker_id, "tool execution started")
                 }
+                WorkerPollResult::ToolResultStaged => info!(%worker_id, "tool result staged"),
                 WorkerPollResult::ToolResultPublished => info!(%worker_id, "tool result published"),
                 WorkerPollResult::IdentityRenewed
                 | WorkerPollResult::ModelEventPublished
@@ -246,14 +253,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 | WorkerPollResult::Accepted
                 | WorkerPollResult::IdentityRenewed
                 | WorkerPollResult::Cancelled
+                | WorkerPollResult::TimedOut
                 | WorkerPollResult::Steered
                 | WorkerPollResult::ApprovalApplied
                 | WorkerPollResult::ToolExecutionRequested
                 | WorkerPollResult::ToolExecutionStarted
+                | WorkerPollResult::ToolResultStaged
                 | WorkerPollResult::ToolResultPublished
                 | WorkerPollResult::ModelEventPublished
                 | WorkerPollResult::ModelExecutionFinished => {}
             }
+        }
+        if worker.poll_duration_once().await? == WorkerPollResult::TimedOut {
+            info!(%worker_id, "execution duration budget exhausted");
         }
         match worker
             .poll_cancellation_once(Duration::from_millis(100))
@@ -265,10 +277,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | WorkerPollResult::Accepted
             | WorkerPollResult::IdentityRenewed
             | WorkerPollResult::Restored
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::Steered
             | WorkerPollResult::ApprovalApplied
             | WorkerPollResult::ToolExecutionRequested
             | WorkerPollResult::ToolExecutionStarted
+            | WorkerPollResult::ToolResultStaged
             | WorkerPollResult::ToolResultPublished
             | WorkerPollResult::ModelEventPublished
             | WorkerPollResult::ModelExecutionFinished
@@ -286,9 +300,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | WorkerPollResult::IdentityRenewed
             | WorkerPollResult::Restored
             | WorkerPollResult::Cancelled
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::ApprovalApplied
             | WorkerPollResult::ToolExecutionRequested
             | WorkerPollResult::ToolExecutionStarted
+            | WorkerPollResult::ToolResultStaged
             | WorkerPollResult::ToolResultPublished
             | WorkerPollResult::ModelEventPublished
             | WorkerPollResult::ModelExecutionFinished => {}
@@ -304,13 +320,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | WorkerPollResult::IdentityRenewed
             | WorkerPollResult::Restored
             | WorkerPollResult::Cancelled
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::Steered
             | WorkerPollResult::ToolExecutionRequested
             | WorkerPollResult::ToolExecutionStarted
+            | WorkerPollResult::ToolResultStaged
             | WorkerPollResult::ToolResultPublished
             | WorkerPollResult::ModelEventPublished
             | WorkerPollResult::ModelExecutionFinished
             | WorkerPollResult::RetryScheduled => {}
+        }
+        if worker.poll_duration_once().await? == WorkerPollResult::TimedOut {
+            info!(%worker_id, "execution duration budget exhausted");
         }
         match worker.poll_model_once(Duration::from_millis(100)).await? {
             WorkerPollResult::ModelEventPublished => {}
@@ -328,19 +349,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | WorkerPollResult::IdentityRenewed
             | WorkerPollResult::Restored
             | WorkerPollResult::Cancelled
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::Steered
             | WorkerPollResult::ApprovalApplied
+            | WorkerPollResult::ToolResultStaged
             | WorkerPollResult::ToolResultPublished
             | WorkerPollResult::RetryScheduled
             | WorkerPollResult::Terminated => {}
         }
         match worker.poll_tool_once(Duration::from_millis(100)).await? {
+            WorkerPollResult::ToolResultStaged => info!(%worker_id, "tool result staged"),
             WorkerPollResult::ToolResultPublished => info!(%worker_id, "tool result published"),
             WorkerPollResult::Idle
             | WorkerPollResult::Accepted
             | WorkerPollResult::IdentityRenewed
             | WorkerPollResult::Restored
             | WorkerPollResult::Cancelled
+            | WorkerPollResult::TimedOut
             | WorkerPollResult::Steered
             | WorkerPollResult::ApprovalApplied
             | WorkerPollResult::ToolExecutionRequested

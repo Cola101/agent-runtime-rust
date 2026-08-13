@@ -4,8 +4,8 @@ info:
   version: 0.1.0
   description: Multi-tenant resource API. Every operation is authorized against the tenant and application claims in the OIDC access token.
   license:
-    name: Proprietary
-    identifier: LicenseRef-Proprietary
+    name: Apache License 2.0
+    identifier: Apache-2.0
 servers:
   - url: /
 security:

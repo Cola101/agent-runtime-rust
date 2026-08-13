@@ -1,22 +1,25 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use agent_protocol::{ModelRequest, ModelStreamEvent};
+use agent_protocol::{ContentPart, ModelRequest, ModelStreamEvent};
 
-pub mod mcp;
-pub mod mcp_grpc;
 mod anthropic_messages;
 mod failover;
 mod grpc;
 mod invocation;
+pub mod mcp;
+pub mod mcp_grpc;
 mod openai_compatible;
 mod openai_responses;
 mod provider_registry;
 
 pub use agent_workload_identity::{WorkloadIdentityClaims, WorkloadTokenVerifier};
-pub use failover::{FailoverSelection, ProviderRoute, execute_with_safe_failover};
+pub use failover::{
+    FailoverSelection, ProviderRoute, execute_with_frozen_failover, execute_with_safe_failover,
+};
 pub use grpc::ModelExecutionGrpcService;
 pub use invocation::{ModelInvocationDecodeError, decode_model_invocation};
 pub use openai_compatible::{
@@ -26,7 +29,8 @@ pub use openai_compatible::{
 pub use openai_responses::{OpenAiResponsesAdapter, OpenAiResponsesConfig};
 pub use provider_registry::ModelPolicyRouteResolver;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
     OpenAiCompatible,
     OpenAiResponses,
@@ -58,29 +62,94 @@ pub enum ProviderAdapter {
 impl ProviderAdapter {
     pub async fn execute(
         &self,
+        provider_id: &str,
         request: &ModelRequest,
         credential: &ProviderCredential,
         cancellation: CancellationToken,
         events: mpsc::Sender<ModelStreamEvent>,
     ) -> Result<(), ProviderExecutionError> {
+        if provider_id.trim().is_empty() {
+            return Err(ProviderExecutionError::InvalidConfiguration(
+                "provider route id must not be blank".into(),
+            ));
+        }
+        let (request, omissions) =
+            prepare_request_for_provider(request, provider_id, self.protocol_name(), self.model())?;
+        for omission in omissions {
+            openai_compatible::emit(&events, omission).await?;
+        }
         match self {
             Self::OpenAiCompatible(adapter) => {
                 adapter
-                    .execute(request, credential, cancellation, events)
+                    .execute(&request, credential, cancellation, events)
                     .await
             }
             Self::OpenAiResponses(adapter) => {
                 adapter
-                    .execute(request, credential, cancellation, events)
+                    .execute_for_provider(provider_id, &request, credential, cancellation, events)
                     .await
             }
             Self::AnthropicMessages(adapter) => {
                 adapter
-                    .execute(request, credential, cancellation, events)
+                    .execute_for_provider(provider_id, &request, credential, cancellation, events)
                     .await
             }
         }
     }
+
+    fn protocol_name(&self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible(_) => "openai_compatible",
+            Self::OpenAiResponses(_) => "openai_responses",
+            Self::AnthropicMessages(_) => "anthropic_messages",
+        }
+    }
+
+    fn model(&self) -> &str {
+        match self {
+            Self::OpenAiCompatible(adapter) => adapter.model(),
+            Self::OpenAiResponses(adapter) => adapter.model(),
+            Self::AnthropicMessages(adapter) => adapter.model(),
+        }
+    }
+}
+
+fn prepare_request_for_provider(
+    request: &ModelRequest,
+    target_provider_id: &str,
+    target_protocol: &str,
+    target_model: &str,
+) -> Result<(ModelRequest, Vec<ModelStreamEvent>), ProviderExecutionError> {
+    let mut request = request.clone();
+    let mut omissions = Vec::new();
+    for message in &mut request.messages {
+        for part in &mut message.content {
+            let ContentPart::Reasoning { private_state, .. } = part else {
+                continue;
+            };
+            let Some(state) = private_state else {
+                continue;
+            };
+            if !state.is_well_formed() {
+                return Err(ProviderExecutionError::InvalidConfiguration(
+                    "provider-private model state is malformed".into(),
+                ));
+            }
+            if state.provider_id == target_provider_id
+                && state.protocol == target_protocol
+                && state.model == target_model
+            {
+                continue;
+            }
+            omissions.push(ModelStreamEvent::PrivateStateOmitted {
+                origin_provider_id: state.provider_id.clone(),
+                target_provider_id: target_provider_id.to_owned(),
+                format: state.format.clone(),
+            });
+            *private_state = None;
+        }
+    }
+    Ok((request, omissions))
 }
 
 impl From<OpenAiCompatibleAdapter> for ProviderAdapter {
@@ -101,7 +170,8 @@ impl From<AnthropicMessagesAdapter> for ProviderAdapter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DataClass {
     Public,
     Internal,
@@ -109,7 +179,8 @@ pub enum DataClass {
     Restricted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Capability {
     Text,
     Vision,

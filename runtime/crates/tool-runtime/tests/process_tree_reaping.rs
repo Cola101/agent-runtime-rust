@@ -77,7 +77,12 @@ fn request() -> ToolExecutionRequest {
 fn context(workspace_root: PathBuf, timeout: Duration) -> ToolExecutionContext {
     ToolExecutionContext {
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: Uuid::now_v7(),
         workspace_root,
         timeout,
@@ -143,22 +148,28 @@ async fn a_cancellation_reaps_the_whole_process_tree() {
     let mut execution_context = context(workspace.path().to_path_buf(), Duration::from_secs(30));
     let cancellation = execution_context.cancellation.clone();
     execution_context.cancellation = cancellation.clone();
-    // Long enough for the grandchild to have started touching. A shorter delay
-    // cancels before it exists, and the guard below then (correctly) reports
-    // that the test proved nothing.
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+    let cancellation_marker = marker.clone();
+    let cancellation_task = tokio::spawn(async move {
+        let grandchild_started = tokio::time::timeout(Duration::from_secs(10), async {
+            while !cancellation_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
         cancellation.cancel();
+        grandchild_started
     });
 
     let outcome = executor.execute(request(), execution_context).await;
+    let grandchild_started = cancellation_task.await.unwrap();
 
     assert!(
         matches!(outcome, Err(ToolExecutionError::Cancelled)),
         "expected a cancellation, got {outcome:?}"
     );
     assert!(
-        marker.exists(),
+        grandchild_started && marker.exists(),
         "the grandchild never started, so this proves nothing about reaping"
     );
     assert!(

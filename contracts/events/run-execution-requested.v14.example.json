@@ -1,0 +1,81 @@
+{
+  "schema_version": 14,
+  "message_id": "0198a5a6-a7a8-7def-8abc-0123456789ab",
+  "tenant_id": "0198a5a6-a7a8-7def-8abc-0123456789ac",
+  "run_id": "0198a5a6-a7a8-7def-8abc-0123456789ad",
+  "session_id": "0198a5a6-a7a8-7def-8abc-0123456789ae",
+  "workspace_id": "0198a5a6-a7a8-7def-8abc-0123456789af",
+  "agent_version_id": "0198a5a6-a7a8-7def-8abc-0123456789b0",
+  "model_policy_id": "0198a5a6-a7a8-7def-8abc-0123456789b4",
+  "attempt_id": "0198a5a6-a7a8-7def-8abc-0123456789b1",
+  "worker_id": "0198a5a6-a7a8-7def-8abc-0123456789b2",
+  "worker_incarnation_id": "0198a5a6-a7a8-7def-8abc-0123456789b7",
+  "owner_epoch": 7,
+  "fencing_token": "0198a5a6-a7a8-7def-8abc-0123456789b3",
+  "issued_at": "2026-01-15T12:00:00Z",
+  "lease_expires_at": "2026-01-15T12:05:00Z",
+  "workload_token": "v2.eyJleHAiOjE3Njg0Nzc0MDB9.c2lnbmF0dXJl",
+  "delegated_scopes": ["tool:workspace.read", "tool:mcp:search"],
+  "agent_instructions": "Review the workspace and explain evidence before conclusions.",
+  "model_policy_snapshot_base64": "eyJzY2hlbWFfdmVyc2lvbiI6MSwicm91dGluZyI6Im9yZGVyZWRfZmFpbG92ZXIiLCJjYW5kaWRhdGVzIjpbeyJwcm92aWRlcl9pZCI6Ijk5OTk5OTk5LTk5OTktNDk5OS04OTk5LTk5OTk5OTk5OTk5OSIsInByb3RvY29sIjoib3BlbmFpX2NvbXBhdGlibGUiLCJlbmRwb2ludCI6Imh0dHBzOi8vbW9kZWxzLmV4YW1wbGUudGVzdC92MS9jaGF0L2NvbXBsZXRpb25zIiwibW9kZWwiOiJ0ZXN0LW1vZGVsIiwiY3JlZGVudGlhbF9lbnZlbG9wZSI6eyJzY2hlbWFfdmVyc2lvbiI6MSwia2V5X2lkIjoiZ2F0ZXdheS1rZXkiLCJhbGdvcml0aG0iOiJSU0EtT0FFUC0yNTYrQTI1NkdDTSIsImVuY3J5cHRlZF9rZXkiOiJ3cmFwcGVkIiwibm9uY2UiOiJub25jZSIsImNpcGhlcnRleHQiOiJjaXBoZXJ0ZXh0In19XX0=",
+  "model_policy_digest": "1e3dde241fc39fae8dfb621bd3dd3d49ccf02a8400c418b88cf1b27b8dfea12a",
+  "skill_snapshots": [{
+    "schema_version": 1,
+    "application_id": "22222222-2222-4222-8222-222222222222",
+    "skill_version_id": "0198a5a6-a7a8-7def-8abc-0123456789c0",
+    "name": "workspace-review",
+    "semantic_version": "1.0.0",
+    "description": "Review workspace evidence",
+    "instructions": "Read files before answering.",
+    "tool_names": ["workspace.read_text"],
+    "supported_platforms": ["darwin-arm64", "linux-arm64", "linux-x86_64"],
+    "min_runtime_version": "0.1.0",
+    "artifact_digest": "b1d6368bf33925654794f16dfb25622375778cd65a7e49c15cd169759300bb34",
+    "signing_key_id": "local-skill-key",
+    "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }],
+  "mcp_servers": [{
+    "server_id": "6f1a9a1a-0000-4000-8000-000000000001",
+    "name": "search",
+    "endpoint": "https://mcp.example.com/rpc",
+    "credential_envelope_base64": "",
+    "required": true
+  }],
+  "lineage": {
+    "root_run_id": "0198a5a6-a7a8-7def-8abc-0123456789ad",
+    "parent_run_id": null,
+    "delegation_id": null,
+    "depth": 0,
+    "role": "primary"
+  },
+  "runtime_policy": {
+    "schema_version": 3,
+    "mcp_discovery": {
+      "max_concurrent_servers": 4,
+      "per_server_timeout_ms": 3000,
+      "total_timeout_ms": 10000,
+      "max_attempts_per_server": 3,
+      "initial_retry_backoff_ms": 100
+    },
+    "model_failover": {
+      "max_provider_attempts": 3,
+      "fallback_on": ["rate_limited", "timeout", "unavailable"]
+    },
+    "tool_execution": {
+      "timeout_ms": 30000
+    },
+    "context_compaction": {
+      "enabled": true,
+      "trigger_bytes": 4096,
+      "retain_bytes": 1024,
+      "max_summary_tokens": 256
+    }
+  },
+  "subagent_history": [],
+  "input": "Inspect the current changes and summarize risk.",
+  "budget": {
+    "max_tokens": 12000,
+    "max_cost_cents": 300,
+    "max_duration_seconds": 1800
+  }
+}

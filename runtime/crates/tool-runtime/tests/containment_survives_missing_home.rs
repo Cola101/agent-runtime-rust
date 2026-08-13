@@ -72,7 +72,12 @@ fn credential_denials_survive_an_unset_home_variable() {
             },
             &ToolExecutionContext {
                 tenant_id: Uuid::now_v7(),
+                application_id: Uuid::nil(),
+                workload_identity_id: Uuid::nil(),
                 run_id: Uuid::now_v7(),
+                session_id: Uuid::nil(),
+                workspace_id: Uuid::nil(),
+                agent_version_id: Uuid::nil(),
                 attempt_id: Uuid::now_v7(),
                 workspace_root: workspace.path().to_path_buf(),
                 timeout: Duration::from_secs(10),

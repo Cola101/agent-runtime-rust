@@ -1,6 +1,6 @@
 # 实施状态
 
-更新时间：2026-08-07
+更新时间：2026-08-14
 
 本文件区分“已实现并有证据”“仅有契约或骨架”“尚未实现”，避免把六个月目标误报为当前能力。
 
@@ -15,10 +15,320 @@
 | 坐标系 | 估计 | 依据 |
 | --- | --- | --- |
 | 十一项路线（`docs/project-goal.md` 后续顺序） | **约 40%** | runtime-host 与本地 IPC/恢复完成（1、2）；第 9 项落了「写文件 + 容器边界 + Shell」 |
-| Codex 已发布能力面 | **约 25–30%** | 工具面 3 : 约 18；MCP 0；并行调度 0；会话历史重建、Compaction/Fork/Rollback 均无 |
+| Codex 已发布能力面 | **约 25–30%** | 工具面 3 : 约 18；MCP 有 HTTP 与本地 stdio Tool 子集及进程内目录缓存；上下文压缩、typed transcript、显式历史修复和 handle Fork/Rollback 核心已实现，仍缺 OAuth/完整协议、rich provider item、通用 Thread Fork/Rollback |
 | 私有 Beta 可交付 | **约 70%** | 缺桌面客户端、命令白名单、Linux 容器化、真实厂商验收、调用方认证与配额 |
 
 三个数字差距大是正常的，因为分母不同。**引用时必须带上坐标系**，单说一个百分比没有意义。
+
+2026-08-09 新增的独立 Host HTTP/stdio MCP 闭环和 stdio 会话生命周期尚未触发一次完整能力面重算，
+因此不修改上述百分比；它证明两类 Transport 可脱离外部 Gateway 运行，并补齐 stdio 目录缓存、
+active lease、idle TTL 和 LRU，但 OAuth、完整 MCP 方法面和远端连接治理等分母仍然缺失。
+
+2026-08-14 Runtime 内核回归补齐两个活性边界：stdio MCP 的新鲜目录不再凭进程/actor 存活复用，必须由
+精确初始化会话在 deadline 内返回协议级 `ping`；活进程但协议卡死同样退役。Process Wait 仍保持每
+Session 一个共享观察器，但本地 write 在 durable intent 与真实副作用后直接通知观察器，50ms 文件扫描
+继续承担外部输出和 Host replacement 的恢复兜底。64 Session / 1024 wait 连续 3 轮 p50/p95/p100 均低于
+1 秒；PTY wire v3 的 pre-spawn generation fence 6 项与真实 TTY exact 连续 10 次保持通过。该数字不是
+1000 Agent Run 容量，也没有触发旧百分比重算。证据见 ADR-0107 与
+`docs/evidence/2026-08-14-runtime-liveness-and-process-wait.md`。
+
+2026-08-12 显式多租户调用与公平准入阶段完成第一段闭环：`RuntimeInvocationContext` 与 RunExecution v20
+冻结 tenant/application/non-secret workload identity/Workspace/AgentVersion/model policy；本地事件与 Worker
+Checkpoint 26 保存同一资源链，跨 application 恢复在模型前拒绝。`EmbeddedRuntime` 只使用预注册 Profile，
+未注册 Workspace 在 Host 或网络前拒绝；全局、tenant、Workspace active limit、全局/tenant queue limit、
+取消退队和 round-robin 已由真实 A1→B1→A2 回环 Provider 顺序证明。同一 tenant/application/Workspace
+可共享稳定根目录注册多个 AgentVersion，另一 Workspace 身份不能复用该目录。默认并行 workspace 测试、
+all-target check、Clippy `-D warnings`、格式、JSON 与差异门禁均通过。该能力是进程内 Runtime 准入，
+不是外部用户认证、分布式调度或云端配额。
+
+2026-08-13 完整工作负载身份阶段补齐上一段远端缺口：claims schema 4、ModelInvocation schema 5、
+MCP/Checkpoint binding schema 2 将 tenant/application/workload/Run/Session/Workspace/AgentVersion/
+attempt/Worker incarnation/ModelPolicy 连成同一签名授权链。MCP token 还绑定 server ID、name、endpoint、
+sealed credential envelope、protocol revision 与 client capabilities 的 canonical digest；带 MCP 的 v20
+任务在 Worker admission 即要求 `mcp.federate`。Tool context 继承完整身份，本地 daemon 只恢复和控制其
+不可变 invocation Profile 所有的记录；legacy 请求会清空可选身份字段，不能借兼容路径升级权限。
+当前仍不是外部调用方认证、主动 token 撤销、Java v20 producer 或分布式 Workspace owner。
+完整证据见 ADR-0103 与 `docs/evidence/2026-08-13-complete-workload-identity.md`。
+
+同日 Edge 本地持久基础层完成：`edge-task-v1` 使用 Ed25519 将完整多租户 invocation、目标 node/generation、
+Run、Workspace owner epoch、输入和最长 24 小时授权窗绑定为一个一次性任务。节点在执行前持久化 Accepted
+收据，经预注册 `EmbeddedRuntime` 跑真实 HTTP/SSE Agent Loop，再把完整 Runtime 事件与终态收据原子写入
+连续 outbox。节点重启后的重复任务不会再次调用 Provider；Runtime 已终态但 Edge receipt 未落盘的崩溃
+窄窗也能从事件恢复。state root 绑定精确 node/generation、Unix 单写者，拒绝事件/Outbox 缺口和超过 1 MiB
+的事件载荷；每个 Workspace 还持久执行 owner epoch 高水位，较旧 owner 在出网前被拒绝。Runtime profile
+会规范化状态目录避免租户路径别名，事件与 Checkpoint 提交点同步落盘且读取错误 fail-closed。该结论只是
+signed task + durable local outbox substrate。随后 ADR-0105 已补齐持久 Ed25519 设备密钥、challenge
+注册请求、控制面签名 grant、24 小时离线授权上限、capability manifest/批准子集、task schema 2 的
+enrollment 精确绑定，以及同设备同 node 的单调 generation 换代。`VerifiedEdgeEnrollment` 只能由验签器
+产生，不能由 embedding 伪造；本机真实闭环已覆盖 device identity → enrollment → signed task → Runtime
+→ outbox。ADR-0106 现已补齐真实 mTLS gRPC 出站流、设备 challenge proof、断线重连、精确批次签名
+ACK、持久在线撤销和可注册多个租户 Profile 的原生 daemon；Enrollment 过期不能建立新会话或启动新任务。
+当前控制面服务仍是测试夹具，尚无证书/Grant 自动轮换、heartbeat/presence、动态能力、审批续传。证据见
+ADR-0104、ADR-0105、`docs/evidence/2026-08-13-signed-edge-task-runtime-loop.md` 与
+`docs/evidence/2026-08-13-edge-device-enrollment.md`、ADR-0106 和
+`docs/evidence/2026-08-13-edge-authenticated-outbound-session.md`。
+
+同日协议中立上下文压缩阶段进一步完成：RunExecution schema 13 / runtime-policy schema 3 冻结压缩
+阈值，Checkpoint schema 17 保存待处理和已应用记录。真实 HTTP/SSE + MCP 证明旧 Tool 前缀进入无 Tool
+摘要请求、最近完整 Tool 对保留、摘要保持 user 权限；首个摘要 HTTP 503 后替代 Host 重发相同请求且
+Tool 不重放。当前目标测试为 Host standalone 20、Host subagent concurrency 17、Worker assignment 56、
+Protocol 64 项全绿。该段数字是压缩阶段完成时的历史快照；后续显式历史修复阶段已在下文重算。
+当时完整 workspace、Clippy 和残留门禁也已收口：**423 通过 / 0 失败 / 5 个外部 live
+用例显式忽略**，共 428 项；Clippy
+workspace/all-targets/all-features `-D warnings`、Rust 格式和差异门禁均通过。
+
+同日子代理完整 transcript 胶囊进一步完成：RunExecution schema 14 / result digest v3 绑定 assistant
+narrative、Tool Call、Tool Result 与终态 Assistant；Worker Checkpoint schema 18 可在终态事件发布前保存
+同一 typed transcript。真实回环 HTTP 模型 + 可信原生 Tool 证明后续 `agent.send` 精确继承历史；父结果
+写入前崩溃后，替代 Host 可从子终态 Checkpoint 恢复且不重放 Tool。通用历史修复、Fork/Rollback、
+provider reasoning/private item 与多模态仍未实现。
+
+同日显式历史修复阶段完成：RunExecution schema 15 只在 external/truncated import 边界修复 Tool 配对，
+禁止 System 注入和歧义 Call ID；Worker Checkpoint schema 19 绑定 source/repaired digest 与修复计数。真实
+HTTP 请求与替代 Host 恢复证明合成缺失 Result、移除孤立 Result 且不执行历史 Tool；修改原始导入会在
+模型前拒绝。自动修复权威 Checkpoint、重复 provider Call ID、通用 root Thread Fork 与 Rollback 仍未实现。
+本阶段最终全量门禁为 **428 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 433 项；
+Host standalone 22、Host subagent concurrency 17、Worker assignment 56，协议历史修复 2、执行契约 34
+均全绿。Clippy workspace/all-targets/all-features `-D warnings`、Rust 格式、JSON、差异与残留门禁通过。
+
+同日 generation-bound Fork 阶段完成：`agent.fork` 绑定 source generation 与 completed activation ordinal，
+创建独立 generation 1 句柄；Checkpoint schema 20 保存 generation 与幂等 Fork 收据。真实 HTTP + 原生
+`workspace.read_text` 证明 typed Tool 对继承且旧 Tool 不重放，源/分支历史独立；Fork 结果写入前替代
+Worker 恢复同一 handle/event。通用 root Thread Fork、before/latest boundary 和 Rollback 仍未实现。
+本阶段最终门禁为 **430 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 435 项；Worker assignment
+57、Host subagent concurrency 18 均全绿。Workspace check、Clippy workspace/all-targets/all-features
+`-D warnings`、Rust 格式、JSON、差异与残留门禁通过。
+
+同日 generation-fenced Rollback 阶段完成：`agent.rollback` 在同一稳定 handle 上从 generation 1 的
+`[0,1]` 创建 generation 2 head `[0]`，后续 Turn 使用不复用的 ordinal 2。Checkpoint schema 21 以唯一
+archived Turn 和 generation ordinal head 保存旧代，摘要篡改与无引用归档 fail-closed；`agent.history`
+可读取旧代，`agent.send` 新 schema 绑定调用方 generation，旧代命令与迟到结果不能落入新 head。真实
+HTTP + 原生 `workspace.read_text` 证明旧 Tool 总计只执行一次；Rollback 结果写入前替代 Worker 恢复同一
+receipt/event。通用 root Thread/Session Rollback 仍未实现，下一内核缺口是跨 handle 树级预算保留。
+
+2026-08-10 树级预算保留阶段完成：Checkpoint schema 22 新增父 Run 权威 reservation ledger，每个
+pending/active/queued 子执行精确占一个 Token、费用和时长预留；`agent.spawn`、`agent.send`、
+`agent.fork` 与父模型准入读取同一余额。结果结算、队列 close、父 cancel/timeout/终态释放预留；恢复会从
+待处理工作独立重算并拒绝缺失、额外或篡改账本。真实 HTTP Host 的两个稳定 handle 后续请求实测获得
+400 与 300 Token ceiling，终态账本归零。下一内核缺口改为通用 root Thread/Session Fork/Rollback。
+
+同日 root Thread/Session 不可变分支阶段完成：RunExecution schema 16 新增权威 `session_branch`，稳定
+Session 下的 sibling branch、generation、完成 Turn 与历史摘要不再和单次 Run 混用；Worker Checkpoint
+schema 23 绑定同一 head。独立 Host 的 Continue/Fork/Rollback 会先持久化 active Turn，拒绝活动 Turn、
+过期 generation、漂移 Checkpoint 与迟到终态提交；Rollback 归档旧 generation 后只移动有效 head。
+真实 HTTP/SSE + MCP 证明 source/Fork/Rollback 历史 Tool 总计只执行一次；Provider 503 后替代 Host 恢复，
+以及终态 Checkpoint 已发布但 Session head 尚未提交的崩溃窗口，均不会重放模型或 Tool。下一内核缺口
+改为独立 Host 的协议中立多 Provider 调度与安全故障转移。
+
+同日独立 Host 多 Provider 阶段完成：同一协议中立 IR 在进程内驱动 OpenAI Responses、Anthropic
+Messages 与 OpenAI-compatible；地域、数据等级、能力、健康和费用在网络前过滤，最多 8 个候选按 Run
+策略冻结。只有零事件的 retryable 策略内错误可跨 Provider，部分文本/Tool/Usage 后停止切换。原子 route
+journal 保存候选游标、失败摘要、选择和 staged events；替代 Host 可从 fallback cursor 继续或直接应用
+已收响应。普通回合与 context compaction 共用这条路径，二进制配置只保存 API Key 环境变量名。真实
+HTTP/SSE + MCP 已覆盖三协议连续切换、五类过滤、半途断流、两类崩溃窗口及摘要故障转移。下一内核缺口
+改为持久 Provider 健康、同 Provider 重试、退避、冷却和 half-open 探针。
+
+同日持久 Provider 生命周期阶段完成：route journal schema 2 在 egress 前保存同 Provider 总尝试次数、
+inflight 标记、退避记录和截止时间；替代 Host 把未决调用计为已消费，不能通过反复重启突破预算。独立
+健康文件只对 rate-limit、timeout、unavailable 累计失败，阈值或 `Retry-After` 打开 cooldown；到期后同一
+单写 state-root 只租出一个 invocation-bound half-open 探针。认证/账单失败不 fallback、不污染共享健康。
+真实 HTTP 已证明 503 后同 Provider 恢复、跨 Host 冷却、429 提前开路、并发单探针和认证隔离。下一内核
+缺口改为协议中立 Rich Model Item 与推理状态连续性。
+
+同日协议中立 Rich Model Item 阶段完成：Reasoning 将可读 summary 与来源绑定的 opaque private state 分离，
+Refusal 保持 typed item；OpenAI Responses 可回放 id/encrypted content，Anthropic thinking/signature 不会进入
+可见文本。private state 仅在 route、协议、模型和格式完全匹配时回放，否则在出网前剥离并产生不含数据的
+审计事件；该事件不算 committed output，不会误阻断安全 fallback。Protobuf、Worker transcript、Checkpoint
+replacement、compaction tail 和 root Session Continue/Fork/Rollback 均已验证保留。下一内核缺口改为有界
+并行 Tool 执行与确定性结果提交。
+
+同日有界并行 Tool 阶段完成：RunExecution schema 17 / runtime-policy schema 4 冻结 1–16 路、默认 4 路
+Tool 并发，Worker Checkpoint schema 24 保存 source-order commit queue 和乱序 staged results。当前仅相邻
+`Pure` Tool 可重叠，规划、scope、审批及所有副作用 Tool 均为串行屏障；started 事件和 Checkpoint 先于
+真实子进程启动。真实 HTTP/SSE + 两个真实子进程证明执行区间重叠但 Tool Result 仍按模型调用顺序回灌；
+第二个结果已暂存、首个仍运行时中断 Host，替代 Host 只重试未完成调用并确定性收敛。下一内核缺口改为
+模糊副作用的显式 `indeterminate` 终态与人工 reconciliation；可选 NATS 路径本轮未做外部服务实跑。
+
+同日模糊副作用 reconciliation 阶段完成：started 已持久但结果未知的 `NonIdempotent` / `Unknown` Tool
+不再作为 Host 内部恢复错误逸出，而是形成带 effect、binding、原 attempt 与 started event/sequence 的
+稳定 `run.indeterminate`，并保留 `replay_safe=false` 和终态 Checkpoint 证据。原 Run 永不复活；schema 1
+人工命令以连续版本记录 Applied/NotApplied/Unresolved，精确重复幂等、冲突 fail-closed，最终裁决只会把
+低权限 Tool Result 带入新的确定性 Run。真实 child write+fsync、Host abort、替代 Host、Applied 与
+Unresolved→NotApplied 已证明旧 Tool 不重放。下一内核缺口改为持久 Tool Process Session；NATS 适配共享
+终态代码但本轮未启动外部 broker。
+
+同日持久 Tool Process Session 第一阶段完成：显式可信可执行文件注册五个模型可见 Tool，稳定 UUID、
+tenant/Workspace/实现摘要、原子 digest Manifest、独立进程组、继承 identity lock、FIFO stdin 和双输出
+cursor 共同形成持久会话。真实 owner 测试进程直接退出后 replacement manager 继续原 PID；独立 Host 在
+start 结果进入 Checkpoint 后替换，Agent Loop 继续 write/poll/close 且 start 只发生一次。Manifest 篡改、
+越租户/Workspace、非法 cursor 均 fail-closed；close、SIGINT 与自然 leader 退出覆盖整个进程组，64 槽只
+统计活跃会话。下一内核缺口改为 session deadline/idle TTL、逐租户配额、orphan sweeper 与资源预算；PTY
+和 GUI 继续暂停。本阶段最终全量门禁为 **484 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共
+489 项；Clippy workspace/all-targets/all-features `-D warnings`、Rust 格式、JSON、差异与残留门禁通过。
+
+同日持久 Process Session 资源治理阶段完成：schema 2 将治理摘要、绝对 deadline、idle 活动、逐 stream
+输出上限、CPU 秒、可选内存上限和 typed termination reason 写入 digest Manifest。跨进程容量锁分别约束
+全局、tenant 与 canonical Workspace；满额只拒绝新会话，不淘汰 live process。真实 child 在无 poll 下按
+deadline 终止；stdin 延长 idle、poll 不延长；owner 测试进程 `exit(73)` 后 replacement sweeper 按原时钟
+终止同一 PID；真实 HTTP/SSE Agent Loop 看见 `execution_deadline` 并完成后续模型回合。macOS 只验证 CPU
+与 `RLIMIT_FSIZE`，显式内存限额会拒绝，Linux `RLIMIT_AS` 尚无 live 证据。本阶段全量门禁为 **494 通过 /
+0 失败 / 5 个外部 live 用例显式忽略**，共 499 项。下一内核缺口改为 Linux 硬资源边界与可移植进程
+监管后端；PTY 和 GUI 继续暂停。
+
+同日可移植资源 capability 第一阶段完成：`ProcessSessionResourceCapabilities` 明确区分 output-file、
+CPU-time、memory、process-count 与 whole-tree accounting；`max_processes` 和整树计量要求进入 governance
+及 Tool implementation digest。macOS `UnixRlimit` 只声明前两项，memory/PID/整树要求均在 state-root、
+Provider 和 child 创建前返回 typed capability 错误。真实 Host 3 项进程闭环保持全绿。本阶段全量门禁为
+**497 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 502 项。Linux cgroup v2 backend、Linux 构建和
+live 进程树资源证据仍未完成，不得把 capability contract 宣称为 Linux 隔离。
+
+同日 Linux cgroup v2 协议边界阶段完成：显式 backend config、五个限制控制文件的预校验/精确写入、
+`O_NOFOLLOW` 最终路径保护、当前进程 membership token 和严格 `usage_usec` 解析已有行为测试；非 Linux
+在 state-root 前拒绝，Linux 也保持 `backend_not_wired`，避免部分实现被误启用。真实 Host 进程闭环 3/3
+保持通过。第二次全量门禁为 **502 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 507 项。第一次
+全量曾出现一次子代理崩溃恢复 socket 关闭超时；聚焦、整套并发测试和全量复跑通过，但该稳定性风险尚未
+证明修复。当前仍无 Linux build/cgroupfs/live 证据，下一缺口是 Manifest identity、无竞态 membership、
+整树 CPU 监管、`cgroup.kill`、恢复/清理与真实 Linux 门禁。
+
+同日 Host-owned cancellation 阶段完成：测试先在 Tokio Runtime 仍存活时稳定复现 Host abort 后 parent/child
+模型 TCP 连接超过 5 秒不关闭；根因是 JoinHandle Drop 只 detach，Host Drop 未取消子树。Host 现在从 caller
+token 派生私有 child domain，正常 shutdown 先取消再等待，异常 Drop 取消并 abort 登记子任务。相同测试
+0.18 秒通过，replacement 恢复同一 `agent_id` 且不重放 spawn；四套关键 Host 测试 62/62，全工作区
+**502 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 507 项。此前 cgroup 阶段记录的 socket 风险现已
+闭环，下一缺口重新聚焦 cgroup Manifest/恢复/终止与真实 Linux 门禁。
+
+同日持久资源身份与 pre-exec membership 阶段完成：Process Session Manifest schema 3 新增确定性的
+`resource_identity` 和 `observed_cpu_usage_micros`；签名 schema 2 终态可安全迁移为 Unix rlimit 身份。
+父进程安全打开 membership fd，真实 child 在 exec 前用 `write(2)` 写 `0`；新组配置失败撤销空目录，既有
+组拒绝接管。Process Session/能力/治理/崩溃/Host 聚焦门禁分别 7/5/8/1/3 项全绿，全工作区
+**507 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 512 项。普通文件只证明协议和 pre-exec 次序；
+生产 cgroup 后端仍 fail-closed，下一缺口是 identity 驱动的 kill/recovery/CPU/cleanup 与真实 Linux 门禁。
+
+同日 cgroup 身份驱动监管阶段完成：安全读取 `cpu.stat usage_usec` 与 `cgroup.events populated`，schema 3
+Manifest 持久化单调整树 CPU 计数并在超额时形成 `cpu_limit`；Linux 身份终止写 `cgroup.kill=1`，等待
+populated 清零及 identity lease 释放。start supervisor、interact、recover 与 sweep 均携带冻结 backend，
+身份不一致 fail-closed。全工作区单线程门禁为 **511 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共
+516 项；check、Clippy `-D warnings` 与格式通过。默认并发全量曾使一条既有异步子代理恢复测试挂起；根因
+不是已证明的 socket 泄漏，而是测试在 Provider 接受父/子连接前只凭 Checkpoint 就触发 abort。增加真实
+建连就绪边与分阶段 deadline 后，并发套件连续 20 轮 400/400、默认并发全量 511/0/5 通过。普通文件仍
+不等于真实 cgroupfs，生产 backend 继续禁用。
+
+同日 fd-relative cgroup 生命周期阶段完成：delegated root 与 session group 均以目录 descriptor 作为权限
+锚点；创建/失败回滚、限制配置、pre-exec membership、CPU/存活观测和 `cgroup.kill` 全部改为
+`mkdirat/openat/unlinkat` 相对访问，旧 PathBuf 生命周期入口已删除。三类 rename/replacement 攻击测试均先
+RED 后 GREEN。包级并发门禁同时暴露并修复了 Tool timeout 回收时重新 `getpgid` 的 leader-exit 窗口，真实
+child/grandchild timeout/cancel 连续 10 轮 20/20。当前默认并发全工作区 **515 通过 / 0 失败 / 5 个外部
+live 用例显式忽略**，共 520 项；格式、check 与 Clippy `-D warnings` 通过。Manager 生命周期 root pinning、
+成功终态空组清理与真实 Linux cgroupfs 仍未完成，生产 backend 继续禁用。
+
+同日 Manager 生命周期 cgroup root identity 阶段完成：公开 backend config 与私有 resolved backend 分离，
+Manager 只打开一次 delegated root，并以 `Arc` 传播到 watcher、governance supervisor 和全部前台操作。路径在
+Manager 创建后被 rename/replacement，后续 sweep 仍读取原 root 的 2,000,000 微秒而非 replacement 的 7。
+`agent-tool-runtime` 69 项全绿；当前默认并发全工作区 **516 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，
+共 521 项；格式、check 与 Clippy `-D warnings` 通过。生产 Linux backend 仍 fail-closed；启动/终态组生命周期、
+active schema 2 replacement 和真实 Linux cgroupfs 未完成。
+
+同日 Linux cgroup 启动/终态生命周期阶段完成：`process.start` 先持久化 intent，再通过 Manager-owned root
+准备确定性组并安装 pre-exec `cgroup.procs=0`；准备、membership、spawn 失败会 fd-relative 回滚。终态先
+持久化，再幂等移除空组；watcher/close/governance 立即尝试，替代 Host 的 terminal sweep 继续重试。三条
+TDD 分别证明旧启动会真实绕过 cgroup、终态旧 sweep 会漏组，以及路径替换不能重定向 cleanup。
+`agent-tool-runtime` 72 项全绿；当前默认并发全工作区 **519 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，
+共 524 项；格式、check 与 Clippy `-D warnings` 通过。生产 Linux backend 仍 fail-closed；`Starting` 崩溃窗、
+cleanup journal、active schema 2 replacement 和真实 Linux cgroupfs 未完成。
+
+同日持久资源阶段与 `Starting` reconciliation 阶段完成：Process Session Manifest schema 4 新增摘要保护的
+resource phase，并约束 state/backend/phase 组合。Linux start 依次持久化 `unprepared/prepared/active`；终态
+先写 `cleanup_pending`，fd-relative 清理成功后再写 `cleaned`。替代 Host 对无身份且组缺失的 `Starting`
+收敛为 `RecoveredMissing`；对 populated 或控制器歧义组尝试 `cgroup.kill` 并持久化 `Indeterminate`，禁止
+自动重放可能已执行的 Tool。schema 1/2/3 迁移入口保留，schema 3 Linux `Starting` 只标记
+`legacy_unknown`。`agent-tool-runtime` 76 项全绿；默认并发全工作区 **523 通过 / 0 失败 / 5 个外部 live
+用例显式忽略**，共 528 项；格式、check 与 Clippy `-D warnings` 通过。生产 Linux backend 仍 fail-closed；
+直接 legacy migration 夹具和真实 Linux cgroupfs 门禁未完成。
+
+同日 schema 5 启动边界与旧 `Starting` 安全迁移阶段完成：Unix 与 Linux 都必须在 spawn 前独立持久化
+`prepared`，再发布 `Running/active`；schema 2/3/4 的旧 `Starting` 全部迁移为 `legacy_unknown`。替代 Host
+只有在当前 schema 明确为 `unprepared` 且身份缺失时才能形成 `RecoveredMissing`；prepared/legacy 即使
+资源为空或缺失也必须形成 `Indeterminate`，不得用进程消失推断 Tool 从未执行。真实 active schema-2 Unix
+进程已由替代 Manager 重附着原 PID 并原子升级为 schema 5，不会重启 Tool。`agent-tool-runtime` 82 项全绿；
+默认并发全工作区 **529 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 534 项；格式、check 与 Clippy
+`-D warnings` 通过。生产 Linux backend 仍 fail-closed，真实 cgroupfs 门禁和同步 spawn 失败的 typed
+`start_failed` 尚未完成。
+
+同日 schema 6 持久启动失败阶段完成：真实同步 `Command::spawn` 错误不再留下 `Starting/prepared`，而是先
+写入 `Terminated/start_failed` 和失败 Session ID，再清理资源；Linux 清理失败会保留 `cleanup_pending` 供
+替代 Host 重试。活动 schema-5 Unix 进程已通过摘要校验、原 PID 重附着和 schema-6 原子重写，未重启 Tool。
+全量门禁同时暴露并修复 `subagent_approval` Provider 单次 TCP read 假设；完整 `Content-Length` 请求读取后
+在全工作区并发环境复验通过。`agent-tool-runtime` 84 项全绿；默认并发全工作区 **531 通过 / 0 失败 / 5 个
+外部 live 用例显式忽略**，共 536 项；格式、check 与 Clippy `-D warnings` 通过。当前 Manager 层类型化错误
+仍在 ToolExecutor/Worker 边界被压平为通用执行失败；生产 Linux backend 继续 fail-closed。
+
+次日确定性启动失败的类型传播阶段完成：`ProcessSessionToolExecutor` 将 Manager 的 `StartFailed` 保持为
+带 Session ID 的 `ProcessSessionStartFailed`；共享转换器只把已证明未越过副作用边界的失败变成模型可见
+Tool Result，并剔除私有 OS 原因。Worker 事件使用稳定 `process_session_start_failed` 分类；独立 Host 的
+真实 loopback HTTP Agent Loop 已从失败 Tool 继续到成功终态，Provider 请求和持久 `tool.result` 内容一致。
+首次全量回归还发现取消进程树测试依赖固定 2 秒；改为观察真实孙进程启动后再取消，连续 10 轮全绿且
+继续验证孙进程停止活动。`agent-tool-runtime` 仍为 84 项；默认并发全工作区 **533 通过 / 0 失败 / 5 个
+外部 live 用例显式忽略**，共 538 项；格式、check 与 Clippy `-D warnings` 通过。生产 Linux backend 仍
+fail-closed。
+
+同日在线 Tool 执行失败的副作用确定性阶段完成：Worker/Host 新增统一的 effect-aware 入口，先校验
+attempt、Tool call、binding 与持久 started 证据；确定性未执行失败及 `Pure/Idempotent` 错误形成脱敏
+`tool.result`，其他 `NonIdempotent/Unknown` 错误形成 `run.indeterminate` 并保留人工 reconciliation 所需
+的原调用证据。真实 loopback HTTP Agent Loop 已执行一次文件写入后故障，返回 indeterminate、持久化终态
+Checkpoint，再经 `Applied` 裁决启动新 Run；原 Tool 总计只执行一次，私有执行器错误未进入事件或模型。
+本阶段新增 4 项运行语义测试和 1 项重启竞态守卫。首次默认并发全量暴露出故意终止 Host 后的零字节
+Provider 连接会被测试端误当成正式请求；现在只跳过完全未发送任何字节的废弃连接，半截 HTTP 仍然失败。
+原重启用例连续 10 轮通过。最终默认并发全工作区 **538 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 543 项。
+
+同日 MCP 接受调用后的响应丢失阶段完成：stdio client 只在请求未入队时重连；actor 已接受
+`tools/call` 后响应通道丢失会返回未知结果，不再启动 replacement process 重发。真实 Streamable HTTP
+MCP server 在执行一次副作用后截断响应，独立 Host 形成 `run.indeterminate`，终态 Checkpoint、单次
+`tool.execution.started`、零 `tool.result` 和单次 MCP 调用均已验证。本阶段新增 2 项测试；最终默认并发
+全工作区 **540 通过 / 0 失败 / 5 个外部 live 用例显式忽略**，共 545 项。
+
+同日操作员权威 MCP effect 阶段完成：RunExecution v18 在每个 server snapshot 内冻结按 Tool 名称配置的
+effect map；旧 schema 夹带、未被签名 Skill 声明或本地 allowlist 未授权的覆盖均 fail-closed。Worker 只从
+该 Run 快照读取 effect，所有 MCP Tool 仍保持 `Ask + Federated`；第三方 `readOnlyHint/idempotentHint`
+不会改变审批、失败或重放语义。effect map 进入 server binding digest，替代 Host 拒绝策略漂移。真实 HTTP
+MCP 在执行一次副作用后断流：缺省 Unknown 仍 indeterminate；显式 Idempotent 返回脱敏错误 Tool Result、
+进入第二模型回合并成功终止，两条路径均只调用 MCP 一次。最终全量计数见下方本次实测。
+
+同日取消/超时副作用确定性阶段完成：Worker 在普通 `cancelled/timed_out` 终态前检查已持久的 Tool start
+和冻结 effect；已开始的 `NonIdempotent/Unknown` Tool 形成 `run.indeterminate`，同时保存
+`interrupted_by` 与调用方请求状态，未开始或 replay-safe Tool 保持原终态。真实 Shell 进程树和
+Streamable HTTP MCP 连接均在中断后关闭；第二个 RED 证明旧终态事件背后的 Checkpoint 仍是 Running，
+现已改为先持久化 indeterminate Checkpoint 再发布事件。最终全量计数见下方本次实测。
+
+同日 MCP 请求级 cancellation/progress 阶段完成：Streamable HTTP 与 stdio `tools/call` 都携带唯一
+progress token，严格校验匹配、有限、单调进度，并经有界非阻塞队列形成持久
+`tool.execution.progress` 事件和 Checkpoint。真实 HTTP server 与 stdio fixture 均观察到绑定原 request ID
+的 `notifications/cancelled`；stdio 先给协作退出窗口，再以完整进程组回收兜底。Unknown Tool 取消后的
+最终状态仍是 `indeterminate`。云 gRPC 目前只能取消 unary RPC，尚未传输 MCP progress/cancel 通知。
+
+同日 MCP capability negotiation/default-deny 阶段完成：HTTP/stdio 初始化严格验证协议 `2025-06-18`
+和服务端 `tools` 能力；客户端仍不声明 sampling、elicitation 或 roots。真实 MCP peer 在 discovery 和
+`tools/call` 中发送越权反向请求，均收到精确 request ID 的 `-32601`，随后会话退役。发现违规零模型
+调用；已开始 Unknown Tool 的违规只调用模型一次并形成持久 `run.indeterminate`，后续伪造 success 不被
+接受。Resources/Prompts 属于客户端查询的服务端能力，旧分类已纠正。下一内核缺口是 Run-frozen、可审批
+且可恢复的 elicitation 回路；sampling/roots 继续关闭。
+
+同日 MCP 2026 MRTR 阶段完成：RunExecution v19 冻结 wire revision、`elicitation` capability 与 delegated
+scope；Checkpoint v25 分别保存 pending、resolved 与 continuation dispatch 证据。真实回环模型和 TCP MCP
+服务跨 Host replacement 完成 `input_required → 用户回答 → 原 Tool 续传 → Tool Result → 模型终态`，opaque
+state 原样返回。随后 ADR-0091 将同一无状态轮次接入 Worker↔Model Gateway gRPC：真实 TCP MCP 的输入
+请求、opaque state、回答与完成结果均穿过 Gateway 和 `FederatedToolExecutor`。旧 2025 反向 elicitation、
+sampling/roots 继续默认拒绝；NATS recovery poll 的自动续传调度仍未验证。ADR-0092 进一步新增显式
+`stdio2026`：内置真实子进程与 Codex 严格外部 fixture 均跨 Host replacement 完成两轮 Agent Loop；HTTP
+URL elicitation 同样跨 replacement 完成，且 Runtime 未承载外部授权 secret content。
+
+2026-08-12 Process Session 持久关闭恢复阶段完成：`process.close` 在任何终止副作用前持久化 tenant、
+canonical Workspace、run、原 attempt、Tool Call、binding、Session、参数摘要和 cursor 绑定的 close intent。
+Manifest 继续作为资源状态真相；替代 Host 可从 Running/Terminating 继续身份围栏 TERM→KILL，只在
+`Terminated/Closed` 后交付原 Tool 结果。真实忽略 TERM 的进程已证明 Host 在关闭中崩溃后，进程只启动
+一次、Provider 只收到 start/close，Run 最终成功。自然退出不制造关闭收据，一般 NonIdempotent 副作用仍
+进入 `indeterminate`。本轮聚焦全量为 `agent-tool-runtime` 103 通过、`agent-runtime-host` 125 通过、
+1 个外部 live fixture 按条件忽略；格式与两包 all-targets Clippy `-D warnings` 通过。独立 Host 仍使用
+固定本地 tenant，下一内核缺口转为显式多租户调用上下文与公平准入。
 
 拉低最多的两项是**工具面**和 **MCP**——它们决定「Agent 能干多少事」，而此前的投入几乎都在
 「Agent 跑得稳不稳」上。稳定性与安全性上本项目局部已超过 Codex（多租户、fencing、签名 Skill、
@@ -27,12 +337,12 @@
 ### 实测计数（本次重算时执行，非引用历史）
 
 ```
-cargo test --workspace              274 通过 / 0 失败
+cargo test --workspace 575 通过 / 0 失败 / 6 个外部 live 用例显式忽略
 deploy/native/run-java-tests        143 通过 / 0 失败 / 1 跳过
-ADR                                 38 份
-证据文件                            16 份
-常驻 live 门禁                      5 条
-模型可见工具                        3 个（workspace.read_text / workspace.write_text / shell.exec）
+ADR                                 94 份
+证据文件                            90 份
+常驻 live 门禁                      6 条
+模型可见工具                        3 个基础 Tool；显式配置后另有 6 个 process.* Tool
 ```
 
 Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中，也不得据此声称其状态。
@@ -41,13 +351,46 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 
 | 模块 | 当前能力 | 证据 |
 |---|---|---|
-| Rust Kernel | Run 状态机、终态保护、审批暂停/恢复、非幂等模糊结果、事件序号；累计 Token/费用预算越界形成不可重试的分类终态 | `runtime/crates/kernel/tests/run_state_machine.rs` |
-| Runtime IR | 供应商无关模型请求/流事件、错误分类、Tool 描述、assistant Tool Call / tool result 消息、事件信封 | `runtime/crates/protocol/tests/model_ir.rs`、`runtime/apps/model-gateway/tests/openai_compatible.rs` |
-| Tool 策略 / Checkpoint | AgentVersion delegated scope 快照、allow/deny/ask、隔离等级、调用与实现摘要联合绑定；审批携带完整策略快照、策略摘要和不含 call ID 的 Session scope 摘要；带摘要的检查点恢复 | `runtime/crates/kernel/tests/tool_registry.rs`、`runtime/apps/worker/tests/assignment.rs`、`checkpoint.rs` |
+| Rust Kernel | Run 状态机、终态保护、审批暂停/恢复、非幂等模糊结果、事件序号；累计 Token/费用预算越界形成不可重试的分类终态。模糊副作用终态显式携带 effect 与 `replay_safe=false` | `runtime/crates/kernel/tests/run_state_machine.rs`、`ADR-0069` |
+| 模糊 Tool 终态与人工裁决 | replacement Host 将唯一 unsafe started Tool 收敛为带完整执行证据的不可变 `run.indeterminate`；Applied/NotApplied/Unresolved 使用版本化协议和原子本地收据，最终裁决以 Tool Result 启动新 Run，旧 Tool 永不自动重放 | `ADR-0069`、`runtime/crates/protocol/tests/tool_reconciliation_contract.rs`、`runtime/apps/{worker,runtime-host}/tests/{assignment,standalone_run}.rs`、`docs/evidence/2026-08-10-indeterminate-tool-reconciliation.md` |
+| Tool 中断副作用确定性 | cancellation/时限先关闭真实执行资源，再按已持久 start 与冻结 effect 选终态；unsafe Tool 为带原始中断原因的 `run.indeterminate`，replay-safe/未开始工作保持 cancelled/timed-out；独立 Host 在事件前持久终态 Checkpoint | `ADR-0087`、`runtime/apps/worker/tests/assignment.rs`、`runtime/apps/runtime-host/tests/execution_cancellation.rs`、`docs/evidence/2026-08-11-interrupted-tool-uncertainty.md` |
+| MCP 请求取消与进度 | HTTP/stdio Tool call 携带唯一 progress token；匹配进度经 32 槽非阻塞队列写入单调 Run 事件并逐次 Checkpoint；取消发送绑定原 request ID 的 `notifications/cancelled`，再执行连接/进程组硬清理；unsafe Tool 仍 indeterminate | `ADR-0088`、`runtime/apps/{model-gateway,worker,runtime-host}/src`、`runtime/apps/runtime-host/tests/execution_cancellation.rs`、`docs/evidence/2026-08-11-mcp-request-cancellation-and-progress.md` |
+| MCP 能力协商与反向请求默认拒绝 | HTTP/stdio 只接受精确协议和服务端 `tools` capability；客户端空 capability 下的 sampling/elicitation/roots 请求按原 ID 回 `-32601` 并退役会话。发现违规阻止模型出口；已开始 unsafe Tool 保持 durable indeterminate，后续 success 不可信 | `ADR-0089`、`runtime/apps/{model-gateway,runtime-host}/src/{mcp.rs,stdio_mcp.rs}`、`runtime/apps/{model-gateway,runtime-host}/tests/{mcp_federation.rs,execution_cancellation.rs}`、`docs/evidence/2026-08-11-mcp-negotiated-capabilities-and-default-deny.md` |
+| MCP 2026 可恢复用户输入 | RunExecution v19 冻结 revision/capability/scope；Checkpoint v25 在询问、回答、续传三个边界持久化。HTTP form/url 与 stdio form 均跨 Host replacement 原样续传 opaque state；URL 不承载 secret content；Codex 严格外部 stdio fixture 已完成真实 Agent Loop。续传后的 Unknown 副作用模糊失败仍 indeterminate。无状态 gRPC 轮次桥已实跑真实 MCP→Gateway→Worker ToolExecutor；NATS recovery poll 自动续传仍未验证 | `ADR-0090`—`ADR-0092`、`contracts/events/run-execution-requested.v19.example.json`、`runtime/{crates/protocol,apps/model-gateway,apps/worker,apps/runtime-host}`、`standalone_run.rs`、`mcp_end_to_end.rs`、`docs/evidence/2026-08-11-{durable-mcp-mrtr,mcp-mrtr-grpc-bridge,mcp-2026-stdio-url-compatibility}.md` |
+| Runtime IR | 供应商无关模型请求/流事件、错误分类、Tool 描述、assistant Tool Call / tool result、Reasoning、Refusal 与来源绑定 private state；跨 Provider omission 是无 opaque 数据且不提交输出的审计事件 | `ADR-0067`、`runtime/crates/protocol/tests/model_ir.rs`、`runtime/apps/model-gateway/tests/{openai_responses,anthropic_messages,failover}.rs` |
+| Runtime 执行策略 | RunExecution v18 在权威 root Session branch 之上冻结 runtime-policy schema 4、有界 Tool 并发和操作员 MCP effect；ModelInvocation v4 带策略摘要传至 Gateway。Worker Checkpoint schema 24 进一步绑定 source-order Tool commit queue、未完成请求和 staged results；恢复拒绝策略、目录、审批、历史、branch、预算、并行或 MCP effect 语义漂移。独立 Rust Host 使用同一策略且不依赖控制面 | `ADR-0041`、`ADR-0047`、`ADR-0052`—`ADR-0068`、`ADR-0086`、`contracts/events/run-execution-requested.v18.example.json`、`execution_contract.rs`、`history_repair_contract.rs`、`assignment.rs`、`standalone_run.rs`、`subagent_concurrency.rs`、`multi_provider.rs`、`docs/evidence/2026-08-11-run-frozen-mcp-tool-effects.md` |
+| 独立 Host 多 Provider 路由与健康 | 同一 IR 驱动三协议候选；按健康、地域、数据等级、能力和费用过滤并冻结链。仅零事件且策略允许的 retryable 错误可重试/切换；部分输出禁止重放。route journal schema 2 原子保存 cursor、attempt/inflight、退避、失败摘要、选择与 staged events；Provider 健康状态跨 Host 保存 cooldown、`Retry-After` 和 half-open lease。普通 Turn 与压缩摘要共用路径；认证/账单不 fallback、不污染 circuit。CLI JSON 只引用密钥环境变量 | `ADR-0065`、`ADR-0066`、`runtime/apps/{model-gateway,runtime-host}/src/{openai_compatible.rs,lib.rs,main.rs}`、`runtime/apps/runtime-host/tests/{multi_provider,daemon_recovery,standalone_run}.rs`、`docs/evidence/2026-08-10-{standalone-multi-provider-safe-failover,persistent-provider-health-retry-cooldown}.md` |
+| Root Session 不可变分支 | 稳定 Session 与单次 Run 分离；每分支独立 generation、完成 Turn、typed Tool transcript 和摘要。Continue/Fork/Rollback 先落 active binding，Rollback 保留旧 generation；活动 Turn、旧 generation、漂移 Checkpoint 和迟到终态均拒绝。终态 transcript Checkpoint 先于事件；替代 Host 可在 Provider 失败和终态/head 提交窄窗恢复且不重放历史 Tool | `ADR-0064`、`contracts/events/run-execution-requested.v16.example.json`、`runtime/crates/protocol/{src/lib.rs,tests/execution_contract.rs}`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/{worker,runtime-host}/tests/{assignment,standalone_run}.rs`、`docs/evidence/2026-08-10-root-session-immutable-branches.md` |
+| 协议中立上下文压缩 | typed transcript 保留 assistant narrative、Tool Call 与绑定 Tool Result；只在移除前缀和保留尾部两侧 Tool 对都完整时切分。摘要请求不暴露 Tool，结果以普通 User 消息回灌并保留原 System；来源/前缀/尾部/策略摘要在 provider egress 前 Checkpoint。摘要现与普通 Turn 共用冻结多 Provider 路由；真实 HTTP 503 可切到 fallback，新 Host 也可使用同一边界恢复且不重放 Tool，用量计入原 Run 预算并产生 `context.compacted` | `ADR-0058`、`ADR-0065`、`contracts/events/run-execution-requested.v13.example.json`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/{worker,runtime-host}/tests/{assignment,standalone_run}.rs`、`docs/evidence/2026-08-09-protocol-neutral-context-compaction.md`、`docs/evidence/2026-08-10-standalone-multi-provider-safe-failover.md` |
+| 显式历史导入与修复 | schema 15 将 external/truncated 原始消息放在独立低权限边界；只移动唯一归属 Result、合成缺失 Result、丢弃孤立/重复 Result，System/非法角色/重复 Call ID fail-closed。source/repaired digest 与四类计数进入 Checkpoint v19 和本地结果；相同导入可跨 Host 恢复，漂移在模型前拒绝，历史 Tool 永不进入执行队列 | `ADR-0060`、`contracts/events/run-execution-requested.v15.example.json`、`runtime/crates/protocol/{src/lib.rs,tests/history_repair_contract.rs}`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/runtime-host/tests/standalone_run.rs`、`docs/evidence/2026-08-09-explicit-history-import-repair.md` |
+| MCP 共享准入 | gateway client 的全部 clone 共享默认 32 槽的进程内发现调度器；逐 tenant round-robin，保留逐 Run 冻结并发，整批 deadline 覆盖排队时间，超时取消立即归还容量；真实两租户/五服务器 socket 验证总上限、公平和取消后复用 | `ADR-0042`、`runtime/apps/worker/src/mcp_gateway.rs`、`runtime/apps/worker/tests/mcp_end_to_end.rs`、`docs/evidence/2026-08-09-mcp-fair-admission.md` |
+| MCP 异步发现与单写协调 | 无 NATS 依赖地并行执行逐 attempt 网络发现；后台任务只返回不可变结果。Coordinator 仅接受 attempt ID，从 Worker 权威状态取得命令与取消令牌，串行完成目录挂载；新 Run 挂载后才 Start，恢复 Run 挂载后必须通过 Checkpoint 目录与发现策略校验。真实慢 Run 阻塞时快 Run 进入 ModelInvocation，真实恢复只在精确目录重建后返回可恢复 | `ADR-0043`、`ADR-0044`、`mcp_discovery_supervisor.rs`、`mcp_discovery_coordinator.rs`、`mcp_end_to_end.rs`、`docs/evidence/2026-08-09-mcp-single-writer-coordinator.md` |
+| 独立 Host MCP 闭环 | `McpFederationBackend` 将 Kernel/Coordinator 与 gRPC 解耦；独立 Host 支持 credential-free HTTP 与持久 stdio session。真实模型自主调用 Tool，结果回灌后成功；新 Host 重建目录并恢复且不重放。v11 区分 required/optional，安全目录发现可在冻结预算内重试；schema 10 绑定 retry policy、required 与 server authority。stdio 目录缓存命中前要求真实 MCP `ping`，另有失败 session 替换、active lease、idle TTL、zero-lease LRU 和生命周期快照；Tool 调用不缓存、不重试，退出/失败/淘汰均回收完整进程组 | `ADR-0045`—`ADR-0048`、`ADR-0107`、`runtime-host/src/lib.rs`、`stdio_mcp.rs`、`standalone_run.rs`、`docs/evidence/2026-08-14-runtime-liveness-and-process-wait.md` |
+| 独立 Host 角色子代理（有界并发闭环） | 二进制读取有界角色 JSON；同一 Tool turn 的相邻 `agent.spawn` 最多 8 路真实并发，完整批次先写 Checkpoint，普通 Tool 保持顺序屏障。子 Run 使用独立 Worker、谱系、事件与 Checkpoint，只取得角色指令、权限/MCP/可再派生角色子集和预算；Token/费用预留按父余额累计，实际子用量经摘要结算且结果重放不重复计费。结果按原 Tool Call 顺序回送；单子失败保留兄弟结果。父取消关闭批次全部模型流；部分完成崩溃后只恢复无结果收据子任务。子 Tool 审批仍经父 IPC 持久路由并跨崩溃幂等恢复 | `ADR-0049`、`ADR-0050`、`ADR-0051`、`ADR-0052`、`runtime/apps/runtime-host/src/{lib,ipc}.rs`、`runtime/apps/runtime-host/tests/{standalone_run,subagent_approval,subagent_cancellation,subagent_concurrency}.rs`、`runtime/apps/worker/tests/assignment.rs`、`docs/evidence/2026-08-09-{standalone-role-subagent,standalone-nested-approval,bounded-parallel-subagents}.md` |
+| Host-owned cancellation | caller token 下派 Host 私有 child domain；显式 shutdown 取消后等待，异常 Drop 取消并 abort 未完成子任务。真实 parent/child HTTP 连接先关闭，replacement 再恢复同一 async handle，spawn 不重放 | `ADR-0074`、`runtime/apps/runtime-host/src/lib.rs`、`runtime/apps/runtime-host/tests/subagent_concurrency.rs`、`docs/evidence/2026-08-10-host-owned-cancellation-domain.md` |
+| 持久异步子代理会话 | 显式 async spawn 先写 Checkpoint 再返回稳定 `agent_id`；wait/send/close、FIFO 与 interrupt 保持有界幂等。`agent.fork` 从 completed ordinal 创建独立、预算收缩的新句柄；`agent.rollback` 在同一 handle 上递增 generation，旧代不可变保留。所有 handle 的 pending/active/queued 工作共享 schema-22 Token/费用/时长预留账本，result/close/cancel/恢复精确结算或重建。真实 HTTP + 原生 Tool 证明 Fork/Rollback 不重放，双 handle 实测只获 400+300 而非 400+400。仍缺 reasoning/private item、多模态和专用投递退避 | `ADR-0054`—`ADR-0063`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/runtime-host/tests/{standalone_run,subagent_concurrency}.rs`、`runtime/apps/worker/tests/assignment.rs`、`runtime/crates/protocol/tests/{subagent_recovery_contract,history_repair_contract}.rs`、`docs/evidence/2026-08-09-{subagent-transcript-capsule,explicit-history-import-repair,generation-bound-subagent-fork,generation-fenced-subagent-rollback}.md`、`docs/evidence/2026-08-10-tree-wide-subagent-budget-reservation.md` |
+| 可恢复执行时限 | Worker 用单调 active slice 计时，Checkpoint schema 12 保存累计执行时间、恢复桥和暂停态；活跃崩溃间隔保守计费，UTC 回拨 fail-closed，审批 required/rebound 暂停、决定后恢复。父时钟覆盖完整子树并下传剩余上限；到期沿共享 token 关闭模型、Shell 进程组、MCP discovery/call 与子代理，统一产生唯一 `run.timed_out`。独立 Host 全边界已实跑；可选 NATS Worker 已接线但本阶段未启动外部 NATS 验收 | `ADR-0053`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/runtime-host/tests/{approval_flow,daemon_recovery,execution_cancellation,subagent_concurrency}.rs`、`runtime/apps/worker/tests/assignment.rs`、`docs/evidence/2026-08-09-recoverable-tree-duration.md` |
+| Tool 策略 / Checkpoint | delegated scope、allow/deny/ask、副作用、隔离等级、调用与实现摘要联合绑定；审批保持顺序屏障。相邻 Pure 调用按冻结上限真实并发，乱序完成先暂存、按原 Tool Call 顺序提交；Checkpoint 恢复只重试未完成 Pure 调用 | `ADR-0068`、`runtime/crates/kernel/tests/tool_registry.rs`、`runtime/apps/worker/tests/assignment.rs`、`runtime/apps/runtime-host/tests/standalone_run.rs`、`checkpoint.rs` |
+| 持久进程会话治理 | schema 2 持久化绝对 deadline、idle、全局/tenant/Workspace 配额、CPU/输出/可选内存上限及终止原因；容量满 fail-closed，不 LRU 淘汰 live process。原 Host 动态监督，replacement sweep 按原预算终止同一 PID；真实 Agent Loop 看见 typed 终止结果。macOS 无内存硬限额，Linux 内存路径未 live 验证 | `ADR-0070`、`ADR-0071`、`runtime/crates/tool-runtime/tests/{persistent_process_session,process_session_governance,process_session_sweeper_crash}.rs`、`runtime/apps/runtime-host/tests/process_session_loop.rs`、`docs/evidence/2026-08-10-persistent-process-session-governance.md` |
+| 持久 Process Session / PTY | `process.start {tty:true}` 只有独立 supervisor 可持有 master；v3 Hello/Start 在 spawn 前绑定 expected generation。start/write/wait 共享有界 yield/cursor/observer，本地 write 在副作用后通知共享观察器，文件真相保留跨 Host fallback。start 使用唯一 Manifest 收据，write 使用提交后原子收据，close 使用副作用前 intent + `Terminated/Closed` Manifest；真实 Host replacement 已证明 start 只启动一次、write 只发送一次、关闭中崩溃后也不重发 close。64 live Session / 1024 wait 与 identity lease 门禁保持通过。仍缺 Windows、viewer/Node relay | `ADR-0094`—`ADR-0101`、`ADR-0107`、`runtime/crates/tool-runtime/src/{lib,process_session{,/pty_supervisor}}.rs`、`runtime/apps/runtime-host/{src/lib.rs,tests/process_session_loop.rs}`、`docs/evidence/2026-08-14-runtime-liveness-and-process-wait.md` |
+| 进程资源 capability | 公开 backend guarantee vector；operator 可要求 PID 上限和整树计量，缺少能力时在任何状态或进程创建前 typed fail-closed。capability 与要求进入治理/Tool 摘要。当前 Mac 只保证 CPU-time 与 coarse output-file，Linux cgroup 未实现 | `ADR-0072`、`runtime/crates/tool-runtime/tests/process_resource_capabilities.rs`、`docs/evidence/2026-08-10-explicit-process-resource-capabilities.md` |
+| Linux cgroup v2 协议边界 | 显式 backend config；预校验后写五个限制文件，最终组件拒绝 symlink，membership 写 `0`，CPU parser 要求唯一 `usage_usec`。非 Linux 和尚未接完生命周期的 Linux 均在状态创建前拒绝；普通文件测试不等于真实 cgroup enforcement | `ADR-0073`、`runtime/crates/tool-runtime/src/process_resources.rs`、`runtime/crates/tool-runtime/tests/process_resource_capabilities.rs`、`docs/evidence/2026-08-10-linux-cgroup-v2-protocol-boundary.md` |
+| 持久资源身份与 pre-exec membership | schema 3 摘要绑定确定性 backend identity 和 aggregate CPU 观测位；schema 2 终态迁移为 Unix rlimit。父进程预开 controller fd，真实 child 在 exec 前写 membership；配置失败回滚空组、既有组拒绝接管。生产 cgroup 仍禁用 | `ADR-0075`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`runtime/crates/tool-runtime/tests/{persistent_process_session,process_session_governance}.rs`、`docs/evidence/2026-08-10-durable-resource-identity-and-pre-exec-membership.md` |
+| cgroup 身份驱动监管与终止 | schema 3 identity 驱动 `cpu.stat` 单调计量、`cgroup.events` 存活和 `cgroup.kill` 整组终止；CPU 超额形成 durable `cpu_limit`，backend 与 Manifest 不一致拒绝访问。普通文件测试已完成，真实 Linux 与终态组清理未完成，生产后端仍禁用 | `ADR-0076`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`docs/evidence/2026-08-10-identity-driven-cgroup-observation-and-termination.md` |
+| fd-relative cgroup 生命周期 | root/group directory descriptor 固定单次操作权限边界；`mkdirat/openat/unlinkat` 覆盖创建、失败回滚、限制、membership、观测与 kill，路径替换不能重定向已打开操作。Manager pinning 与终态清理由 ADR-0078/0079 完成；真实 Linux 仍缺，生产后端禁用 | `ADR-0077`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`docs/evidence/2026-08-10-fd-relative-cgroup-lifecycle.md` |
+| Manager 生命周期 cgroup root identity | 公开配置与私有 resolved backend 分离；Manager 一次打开 root 并用 `Arc` 传播到 watcher/supervisor/前台操作，后续路径替换不能改变长生命周期权限锚点。启动/终态及崩溃资源阶段已由 ADR-0079/0080 接通；真实 Linux 仍缺，生产后端禁用 | `ADR-0078`、`runtime/crates/tool-runtime/src/process_session.rs`、`docs/evidence/2026-08-10-manager-lifetime-cgroup-root-identity.md` |
+| Linux cgroup 启动/终态生命周期 | start 在 spawn 前通过 Manager root 准备组并安装 pre-exec membership；pre-spawn 失败回滚。终态先持久化，再 fd-relative 幂等清理，替代 Host sweep 可重试。持久 cleanup phase 已由 ADR-0080 完成；真实 Linux 仍缺，生产后端禁用 | `ADR-0079`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`docs/evidence/2026-08-10-linux-cgroup-start-and-terminal-lifecycle.md` |
+| 持久资源阶段与 Starting reconciliation | Manifest schema 4 绑定 unprepared/prepared/active/cleanup_pending/cleaned；缺失组与控制器歧义分型。替代 Host 对干净 pre-spawn 崩溃收敛为 RecoveredMissing，对可能已执行的组先 kill 再持久化 Indeterminate，禁止自动重放。旧 schema 与跨 backend 歧义已由 ADR-0081 收紧；真实 Linux 仍缺 | `ADR-0080`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`runtime/crates/tool-runtime/tests/{persistent_process_session,process_session_governance}.rs`、`docs/evidence/2026-08-10-durable-process-resource-phase-and-starting-reconciliation.md` |
+| Schema 5 启动歧义与旧版本迁移 | 每个 backend 都在 spawn 前持久化 prepared；schema 2/3/4 Starting 迁移为 legacy_unknown。只有当前 unprepared 且无身份可判定 RecoveredMissing，prepared/legacy 的空、缺失或存活资源都保守形成 Indeterminate。真实 active schema-2 Unix 进程可由替代 Manager 重附着并升级，不会重启 Tool。同步 spawn 失败已由 ADR-0082 收口；真实 Linux 仍缺 | `ADR-0081`、`runtime/crates/tool-runtime/src/process_session.rs`、`runtime/crates/tool-runtime/tests/{persistent_process_session,process_session_governance}.rs`、`docs/evidence/2026-08-10-schema-five-launch-boundary-and-legacy-starting-safety.md` |
+| Schema 6 持久启动失败 | 同步 spawn 错误先持久化 Terminated/start_failed，再清理资源；调用方获得失败 Session ID。活动 schema 5 经摘要校验、原进程重附着并重写 schema 6。类型传播已由 ADR-0083 补齐；真实 Linux 仍缺 | `ADR-0082`、`runtime/crates/tool-runtime/src/process_session.rs`、`runtime/apps/runtime-host/tests/subagent_approval.rs`、`docs/evidence/2026-08-10-schema-six-durable-process-start-failure.md` |
+| 确定性启动失败类型传播 | ToolExecutor 保留 StartFailed 身份；Worker/Host 只公开安全 code/message/session_id。只有确定性 pre-side-effect 失败可回到 Agent Loop；其他模糊非幂等错误不通过该转换器。真实 loopback HTTP Agent Loop 与持久事件日志闭环已通过 | `ADR-0083`、`runtime/crates/tool-runtime/src/{lib,process_session}.rs`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`docs/evidence/2026-08-11-typed-deterministic-process-start-failure.md` |
+| 在线 Tool 失败确定性 | Worker/Host 按冻结 effect 和 durable started 证据分流执行器错误：确定性未执行及 Pure/Idempotent 返回脱敏 Tool Result，其他 NonIdempotent/Unknown 形成绑定 `run.indeterminate`。真实 HTTP Agent Loop 执行文件副作用后故障，终态 Checkpoint、Applied 裁决、独立 continuation 和零重放已闭环 | `ADR-0084`、`runtime/apps/worker/{src/lib.rs,tests/assignment.rs}`、`runtime/apps/runtime-host/src/lib.rs`、`docs/evidence/2026-08-11-effect-aware-live-tool-failure.md` |
+| MCP 接受后响应丢失 | stdio 只对未入队请求及安全 discovery 重连，已接受 `tools/call` 的 actor loss 禁止 replacement 重发；真实 Streamable HTTP MCP 执行副作用后截断响应，Host 持久 `run.indeterminate` 且调用一次、无 Tool Result | `ADR-0085`、`runtime/apps/runtime-host/src/stdio_mcp.rs`、`runtime/apps/runtime-host/tests/standalone_run.rs`、`docs/evidence/2026-08-11-mcp-accepted-call-response-loss.md` |
+| MCP Tool effect authority | RunExecution v18 仅接受操作员 Run 快照中的 per-server Tool effect；缺省 Unknown，签名 Skill/委派 scope/本地 allowlist 三重约束，MCP annotations 无权降级。所有 MCP Tool 仍 Ask + Federated；binding digest 拒绝恢复漂移。真实 HTTP 断流验证 Unknown/Idempotent 两条终态且均零自动重放 | `ADR-0086`、`contracts/events/run-execution-requested.v18.example.json`、`runtime/crates/protocol/tests/execution_contract.rs`、`runtime/apps/worker/tests/federated_tools.rs`、`runtime/apps/runtime-host/tests/standalone_run.rs`、`docs/evidence/2026-08-11-run-frozen-mcp-tool-effects.md` |
 | Model Routing / Provider Registry | 地域、数据等级、能力、健康和预算过滤；租户级三协议 Provider、写入即封装的 BYOK、最多 8 个有序候选；只在尚无输出且 429/超时/不可用时切换，认证/账单/协议错误或部分输出后禁止重放 | `ADR-0028`、`provider_registry.rs`、`failover.rs`、对应 Rust/Java 集成测试 |
 | OpenAI-compatible Adapter | 真实 HTTP/SSE、文本与 Tool Call 流、Tool Call/Result 多轮历史、用量计费、完成原因、取消、双层超时和错误分类；凭证及私有对象 URI 出口受控 | `runtime/apps/model-gateway/tests/openai_compatible.rs` |
-| OpenAI Responses Adapter | typed input items、Function Call/Output 历史、`text.format` 结构化输出、reasoning effort、typed SSE、Tool Call、用量计费和严格终止事件 | `runtime/apps/model-gateway/tests/openai_responses.rs` |
-| Anthropic Messages Adapter | `system`/Messages 转换、`x-api-key` 与版本头、Tool Use/Result 历史、分片 Tool JSON、用量计费、stop reason 和严格 `message_stop` | `runtime/apps/model-gateway/tests/anthropic_messages.rs` |
+| OpenAI Responses Adapter | typed input items、Function Call/Output 历史、`text.format`、reasoning effort、summary/encrypted continuation、typed refusal、Tool Call、用量计费和严格终止事件 | `ADR-0067`、`runtime/apps/model-gateway/tests/openai_responses.rs` |
+| Anthropic Messages Adapter | `system`/Messages 转换、Tool Use/Result、分片 Tool JSON、thinking/signature 与 redacted thinking 的私有保留/同源回放、用量和严格 `message_stop` | `ADR-0067`、`runtime/apps/model-gateway/tests/anthropic_messages.rs` |
 | Provider 协议选择 | Gateway 和原生 Supervisor 通过稳定协议名选择三类 Adapter；旧本地配置缺少协议时兼容默认 Chat Completions | `runtime/apps/model-gateway/tests/provider_protocol.rs`、`deploy/tests/native_supervisor_lifecycle_test.rb` |
 | Worker→Model Gateway | 版本化 gRPC 流、Ed25519 短期身份、tenant/run/attempt/worker/incarnation 精确绑定；v3 身份把不可变 ModelPolicy 快照摘要绑定到 RunExecution v4，Worker 只能转发密文，不能替换端点或解密 BYOK；真实双向 TLS、流式事件和取消；401 每代最多恢复一次 | `contracts/proto/model_gateway.proto`、`runtime/crates/workload-identity/tests/token_contract.rs`、`provider_registry.rs`、`model_gateway_transport.rs` |
 | Checkpoint Gateway | 独立 Rust gRPC 数据面；Worker 只持短期工作负载令牌，Gateway 独占 S3/MinIO 凭证；内容地址、大小、tenant/run/attempt/worker/incarnation 和 read/write scope 均验证；真实 mTLS、MinIO PUT/GET、跨租户/旧实例拒绝、对象缺失与损坏恢复分流已测试 | `contracts/proto/checkpoint_gateway.proto`、`runtime/apps/checkpoint-gateway/tests/grpc_contract.rs`、`minio_transport.rs`、`runtime/apps/worker/tests/checkpoint_gateway_transport.rs`、真实 NATS `transport.rs` |
@@ -73,7 +416,7 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 | Worker Execution Supervisor | 每 attempt 异步模型 RPC、主循环串行 Kernel 事件、并发取消、流错误分类、终态 PubAck 后释放容量 | `runtime/apps/worker/tests/model_gateway_transport.rs`、真实 NATS `transport.rs` |
 | Worker Tool Turn 编排边界 | Tool 定义按 delegated scope 暴露；完整 Tool Call 后规划策略；审批绑定调用摘要；Tool Result 保持 call ID 进入下一轮 ModelInvocation | `runtime/apps/worker/tests/assignment.rs`、`runtime/crates/kernel/tests/tool_registry.rs` |
 | 受限容器 Tool Runtime | OCI digest 固定、绝对引擎路径、无 Shell argv、只读 Workspace、断网/只读根文件系统/去 capability、stdin 参数传递、超时/取消、有界输出及结果双重绑定 | `runtime/crates/tool-runtime/tests/restricted_container.rs` |
-| 可信原生 Tool Runtime | 本地显式 opt-in；可信根目录、固定可执行文件 SHA-256、执行前重验、无 Shell、清空环境、JSON stdin、只读 Workspace、超时/取消和有界输出；`workspace.read_text` 拒绝绝对路径、遍历、符号链接、非 UTF-8 与大文件，默认 ask；执行器摘要必须与模型目录及审批摘要一致 | `ADR-0025`、`runtime/crates/tool-runtime/tests/trusted_native.rs`、`runtime/apps/trusted-workspace-tool/tests/read_text.rs`、`runtime/apps/worker/tests/assignment.rs` |
+| 可信原生 Tool Runtime | 本地显式 opt-in；可信根目录、固定可执行文件 SHA-256、执行前重验、无隐式 Shell、清空环境、Workspace 绑定、超时/取消和有界输出；一次性 `workspace.*` 与持久 `process.*` 都使用普通 scope/审批/绑定摘要。持久会话另有 UUID、digest Manifest、输出 cursor、跨 Host identity/PGID 恢复及整组回收 | `ADR-0025`、`ADR-0070`、`runtime/crates/tool-runtime/tests/{trusted_native,persistent_process_session}.rs`、`runtime/apps/runtime-host/tests/process_session_loop.rs` |
 | 原生 Skill/Provider/Tool/审批/恢复实跑 | API 动态发布签名 SkillVersion 并绑定 AgentVersion；模型精确收到合并后的 Agent + Skill 指令，只看到 Skill 声明的可信 Tool；两个 Provider 完成两次 429 安全切换；强杀 Worker 后 owner epoch 1→2，真实 Chrome 审批后 Tool 只执行一次，13 个 SSE 事件完整重放；独立临时根目录最终自动清理 | `docs/evidence/2026-08-02-native-signed-skill-activation.md`、`native_trusted_tool_recovery_live_test.rb`、Console 单元/三视口 E2E |
 | 自动 Tool 闭环 | 模型 Tool Call 完成后自动规划并持久化执行请求；Tool Result PubAck 后自动携带 tool-role 历史发起下一模型回合；策略/人工拒绝均生成模型可见错误 | `runtime/apps/worker/tests/transport.rs`、`assignment.rs`、`tool_execution_supervisor.rs` |
 | Tool Execution Ledger | V7 权威账本记录 planned/started/completed、调用摘要、副作用和沙箱；started PubAck 后才启动进程；结果摘要错配不入库；Worker 丢失会记录具体模糊副作用证据 | `JdbcSchedulerRepositoryIntegrationTest`、真实 NATS `transport.rs` |
@@ -98,7 +441,7 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 
 ## 只有契约或进程骨架
 
-- Scheduler 已下发 Provider 与签名 SkillVersion 快照；Worker 已动态激活 Skill 指令和预装可信 Tool 子集。当前仍不是任意制品装载器：不执行租户上传脚本，Edge Node 仍只有进程骨架。
+- Scheduler 已下发 Provider 与签名 SkillVersion 快照；Worker 已动态激活 Skill 指令和预装可信 Tool 子集。当前仍不是任意制品装载器：不执行租户上传脚本。Edge 已有签名任务、持久 outbox 和真实 mTLS 出站 daemon 核心；生产控制面服务与证书生命周期未实现。
 - Worker 已通过 `CheckpointPayloadStore` 接入独立 Checkpoint Gateway，并保证外部对象先于 Event/Checkpoint 发布；本地 MinIO、身份续期、双向 TLS 和 Kubernetes 双副本基线已验证。尚未在真实集群验证 Gateway 滚动维护、证书轮换和对象生命周期，因此仍不是生产闭环。
 - OpenAPI 与 Java 已实现 Workspace、Agent、AgentVersion、Provider、ModelPolicy 和 Session 创建 API；当前仍缺资源列表、详情、重命名/归档、失败后续建和删除治理，Console 动态步骤失败只会明确保留已成功资源，不会自动补偿或恢复到下一步。
 - Kubernetes Base 已有 Gateway Deployment/HPA/PDB、Worker StatefulSet/PVC、SecretProviderClass、网络策略和有界 draining 配置，并通过渲染契约；尚无云集群 apply、CSI/Vault 联调、镜像 digest Overlay、真实 eviction 与节点级故障注入证据。
@@ -113,8 +456,14 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 
 ## 尚未实现，不得对外声明
 
-- Provider 的能力档案、地域/数据等级与价格元数据尚未接入动态资源；健康探测、冷却/半开探针、熔断和按 Provider 精确出站策略仍未实现。当前安全候选切换只处理请求提交前的 429、超时与不可用。
-- Anthropic 首版尚未覆盖 OpenClaw 的模型特定 thinking/cache/refusal、OAuth/Foundry 与图片预算兼容层；结构化输出和图片输入会 fail-closed。
+- 模糊副作用在独立 Host 已有完整本地闭环；可选 NATS adapter 虽共享 `TerminateIndeterminate` 的发布、
+  Checkpoint 与 ack 顺序，本轮没有启动外部 NATS 验证 PubAck/重投递窗口。人工命令当前只有本地持久收据，
+  不包含 Java API、OIDC/RBAC、PostgreSQL RLS、审计 UI 或多副本事务，因此不得宣称生产控制面处置已完成。
+- 独立 Host 已可静态配置能力、地域/数据等级、健康和价格，并在出网前过滤；同 Provider 退避、
+  `Retry-After`、连续失败 cooldown、half-open 单探针及跨 Host 尝试预算已实现。仍缺后台主动健康探测、
+  Auth Profile/逐凭据轮换、专用 circuit 公共事件、按 Provider 精确出站策略和分布式健康状态。
+- Anthropic 已保留并同源回放 thinking/signature 与 redacted thinking，但仍未覆盖 OpenClaw 的 cache 控制、
+  thinking budget 激活、Provider 特定 refusal、OAuth/Foundry 与图片预算兼容层；结构化输出和图片输入会 fail-closed。
 - 工作负载令牌已完成 incarnation、audience、scope、ModelPolicy 摘要绑定、持久化代际续期与 401 有界恢复；gRPC mTLS、NATS TLS/角色 ACL 和租户 BYOK 密文边界已验证。尚缺主动撤销、签名密钥与证书自动轮换、逐操作最小授权、Vault/KMS 真实联调和 Provider 级精确出站策略。
 - Reconciler 已接通 SAFE Checkpoint 自动接管、持久恢复事故、按租户 SLO 快照及不含租户标签的全局 Prometheus 告警指标，Worker 也已实现计划内 draining；当前只有缩放租约、传输层故障和离线告警规则证据，真实 Prometheus/Alertmanager、Kubernetes 节点级故障注入、生产 15 分钟恢复时限证明、加权公平调度和多租户配额抢占尚未完成。
 - 受控出网 HTTP 与 MCP 的 Tool 制品；Kubernetes Job/Kata 沙箱生命周期及 OCI 签名验证。
@@ -126,28 +475,75 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
   重新启用的前提是策略成为**租户决定并签入执行快照**，而不是 Worker 里的常量。
 - **真实厂商云端主链已验证**（2026-08-07）：PostgreSQL + NATS + Java 控制面 + Worker +
   Model Gateway，模型自主决定工具调用。仅一个厂商一个模型；Anthropic Messages 与
-  OpenAI Responses 仍只有契约测试。
+  OpenAI Responses 已有真实回环 HTTP/SSE Adapter 和独立 Host 多协议切换证据，但未使用真实厂商端点。
   容器只对 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.config/gh` 拒读，其余用户可读文件仍可读，
   所以「Shell 已容器化」不得表述为「Shell 已隔离」。
-- Shell 没有交互式或长驻会话（Codex 的 `unified_exec` 对应物）。
-- **MCP 客户端未实现**，形态已定案（ADR-0040）：v1 只联邦 HTTP 传输的 server，不派生本地进程。
-  这是与 Codex 差距最大的单项。**代价要说清**：今天多数已发布的 MCP server 是本地 npm/Python 进程，
-  v1 支持不了它们——而支持它们需要一套「允许出网」的容器化方案，与 ADR-0036 现有 profile 不同。
+- 持久进程会话已具备 `start/write/resize/poll/wait/attach/interrupt/close`、普通 pipe 会话跨 Host reattach，
+  以及唯一独立 supervisor 持有 master 的 Unix PTY 跨 Host 续接。v2 能力握手、clean/unclean 生命周期、
+  有界尾部 attach、deadline、配额和输出上限均已验证；supervisor 丢失会回收并标记 `indeterminate`。
+  `process.wait` 可按 cursor 等待输出/终态并在 Host replacement 后安全恢复；同一 Session 的 1000 个 wait
+  已共享一个持久观察器，250ms 空闲观察与 2 秒全量唤醒门禁通过，最后一个取消者也会回收观察器。64 个
+  live Session / 1024 wait 的观察次数、取消隔离、p50/p95/p100 和进程回收已连续 10 轮通过；这证明有界
+  与无饥饿，不是整机 CPU 基准或生产加权公平调度。start/write/wait 的统一有界 yield 已补齐并通过真实
+  Agent Loop；start/write 的丢结果收据恢复已经完成，仍没有 close 终态收据、连接级 viewer、Node relay 或 Windows ConPTY，不能
+  宣称完整对齐 Codex `unified_exec` 或 OpenClaw Terminal/Node Host。OpenClaw 的 WebSocket 高低水位将在
+  未来存在 live viewer transport 时由适配层实现，不复制进当前 Kernel 日志层。
+- **MCP HTTP 联邦主链已实现**（ADR-0040）：逐 Run 发现、命名空间/委派作用域、逐次审批、目录冻结、
+  Gateway 代持凭据、DNS 地址固定、RunExecution v10 在接纳前冻结最多 4 台并发及 deadline，
+  Checkpoint schema 8 精确冻结运行策略，schema 9 进一步冻结工具目录、发现策略和 MCP Server
+  authority，schema 10 冻结 discovery retry 与 required 标记；恢复后执行器重建均有 Rust 测试。Worker 默认执行单服务器 3 秒、
+  整批 10 秒的双层 deadline；整批到期会保留已完成目录并取消其余请求。同目录若使用不同的并发或
+  deadline 策略恢复会 fail-closed。网关客户端 clone 还共享默认 32 槽的租户轮转调度器，两个真实
+  Run 的请求合计受限，取消后容量可立即复用。
+  协议中立 Supervisor 与单写 Coordinator 已证明慢、快 Run 并行发现；Coordinator 从已验收 attempt
+  取得权威命令，完成结果串行挂载 Kernel，新 Run 只在挂载后 Start，恢复 Run 只在精确目录和发现策略
+  重建后返回可恢复。当前 NATS Worker 的 assignment/recovery poll 尚未驱动 Coordinator，因此仍未
+  证明该可选传输的多 Run 异步接纳和 ack 顺序，慢 MCP 在该适配器里仍会延迟后续接单。
+  **独立 Host 已直连 credential-free HTTP 和本地 stdio MCP**：使用相同 Coordinator，真实完成 Tool
+  Call、结果回灌、新 Host 恢复且不重放；二进制可读取有界 JSON 配置。stdio 使用环境白名单、持久
+  session、初始化/请求取消和 TERM→KILL 进程组回收，command/args/env/cwd 纳入 authority digest。
+  RunExecution v11 已实现 required/optional、仅 discovery 的有限重试与逐 Server 启动状态；required
+  连续失败在模型前拒绝，optional 失败可观测并继续，重试等待不占共享准入槽。stdio 已实现默认 30 分钟
+  目录缓存；每次命中必须通过真实 MCP `ping`，失败 session 退休后只有新初始化会话成功探活才可复用；
+  另有 active lease、默认 10 分钟 idle TTL、默认 32 session 的
+  zero-lease LRU 以及显式/Drop 关闭。HTTP/stdio 请求级 cancel/progress 已进入持久事件链；独立 HTTP
+  Host 已支持 2026 MRTR form/url contract、持久输入和跨进程续传；显式 `stdio2026` 使用相同能力冻结、
+  metadata 与 MRTR parser，并已通过 Codex 外部严格服务。云 gRPC 仍保持 unary，但已能用新请求
+  传输下一 MRTR 轮次；NATS recovery poll 尚未自动调度该续传。仍未实现 remote stdio、OAuth onboarding、客户端查询的 Resources/Prompts、2025 held-open
+  elicitation、sampling/roots、Codex server cache opt-out、后台主动重连、requester 配置重验证/
+  撤销、pin-aware 显式代理、持续健康/熔断与真实外部 MCP 长稳验收，
+  因此生态广度仍明显落后 Codex/OpenClaw。v11 Run 不能从低于 schema 10 的 Checkpoint 恢复；任何
+  低于 schema 9 的 MCP Checkpoint 也因不能证明远端 authority 而 fail-closed。
 - 真实模型厂商端到端：**`openai_compatible` 已验证一次**（2026-08-07，DeepSeek 经网关，
-  `runtime-host` 路径，与云端共用协议转换代码）。**仍未验证**：Java 控制面 + PostgreSQL +
-  NATS 的完整云端链路对真实厂商（被 nats-server 构建的网络问题阻塞）、
-  `openai_responses` 与 `anthropic_messages` 两条协议、多 Provider 故障转移、
-  限流退避、真实错误响应分类。
-- 调用方认证与配额（谁能调用这个 Runtime、能用多少）尚未实现。
+  `runtime-host` 路径，与云端共用协议转换代码）。三协议与多 Provider 故障转移已由真实回环 HTTP/SSE
+  验证执行语义。**仍未验证**：Java 控制面 + PostgreSQL + NATS 的完整云端链路对真实厂商、真实厂商的
+  `openai_responses`/`anthropic_messages`，以及三协议对真实厂商限流、`Retry-After`、冷却/探针和错误响应的兼容矩阵。
+- 外部调用方认证尚未实现；进程内调用必须选择预注册的完整 invocation Profile，且已有全局/tenant/
+  Workspace active limit、全局/tenant queue limit 与 round-robin。signed workload token、远端
+  Model/MCP/Checkpoint gRPC、Tool context 与 daemon 已绑定完整 application/workload/Workspace 身份；
+  控制面 v20 producer、主动撤销/密钥轮换、持久配额与跨节点公平调度仍未实现。
 - Checkpoint 对象缺失、内容损坏及一次短暂 `Unavailable` 后 JetStream 重投递已做故障分流；尚缺对象保留/垃圾回收、真实 Gateway 进程或存储实例丢失和跨可用区故障注入。
 - Skill 的生产 OCI 制品上传、SBOM、恶意扫描、平台审核、租户签名链与公共/私有 ACL；当前已完成控制面签名的结构化 SkillVersion 和可信 Tool 激活，不接受上传脚本。
 - 子代理的 Worker 发起、父挂起检查点、原子子 Run 入队、Workspace 正反向租约交接、子结果回送、
-  父 Run 新围栏恢复、父取消向子树传播和同 Run 持久 steer 已经实现；wait/message 交互 API、独立 close 操作、完成附件、超时竞态、
-  专用投递退避与只读 Workspace 快照尚未实现，因此仍不得声明与 Codex/OpenClaw 等量的完整协作生命周期。
+  父 Run 新围栏恢复、父取消向子树传播和同 Run 持久 steer 已经在云控制面路径实现。独立 Rust Host
+  现已完成父→角色子 Run→原 Tool Call→父、活动子模型取消、取消意图跨进程持久化、Tool/MCP 在途
+  取消终态、在途同身份重启、结果回执恢复、子 Tool 审批的父路由/跨崩溃幂等恢复，以及单父最多 8 路
+  并发、累计预算预留/实际用量结算、批次取消、部分完成恢复和可恢复树级 active-time 时限。独立 Host
+  另已完成显式 async spawn、稳定句柄、非取消 wait、终态后 send、独立 close、关闭边恢复、父终态回收，
+  以及 Checkpoint-first 消息幂等收据、运行中有界队列、持久 interrupt、句柄级 typed transcript、只读
+  分页查询和三类确认后崩溃恢复。子 Run 的 narrative、Tool Call/Result 与终态 Assistant 已纳入 digest v3
+  和 Checkpoint v19，并能在父结果写入前崩溃后恢复。external/truncated 历史已有独立显式修复边界，
+  但不会改写句柄权威状态。handle Fork/Rollback、跨 handle 树级预算预留和 root Session Fork/Rollback
+  已完成；provider reasoning/private item 已能穿过同一 typed history；仍不含多模态附件、root Session
+  IPC/CLI 命令面、OpenClaw
+  式 reset/queue cleanup、专用投递退避与只读 Workspace 快照，因此不得声明与
+  Codex/OpenClaw 等量的完整协作生命周期。
 - Steer 的 API、控制面账本、Worker Checkpoint-first 应用、恢复重绑、过期/永久拒绝负回执和真实浏览器中途 steer 已实现；尚缺队列压缩、限速、富输入/附件和面向 generation 的运维治理。
-- Worker 已按模型 Usage 累计并 Checkpoint Token/费用，越界后不会再次调用模型；时长预算尚未由单调时钟强制执行，
-  控制面的子代理可委派预算也尚未扣除父 Run 自身已经实际消耗的用量，因此当前准入仍是保守分配账本，不是全局精确余额。
-- Edge Node mTLS 注册、离线任务、Workspace 三方合并。
+- Worker 已按模型 Usage 累计并 Checkpoint Token/费用，越界后不会再次调用模型；独立 Host 所有子代理 handle 已按父实际用量和
+  全树未完成预留统一准入，并将摘要绑定的子实际用量结算回父。时长预算现由可恢复的树级 active-time 时钟执行，审批等待不计时；
+  可选 NATS 发布路径尚无本轮外部服务实跑。控制面的子代理可委派 Token/费用预算仍未扣除父 Run 自身已经实际消耗的
+  用量，因此云端路径仍是保守分配账本，不是全局精确余额。
+- Edge Node 的生产控制面服务、证书/Enrollment 自动轮换、heartbeat/presence、动态能力上报、离线任务投递、审批/暂停续传、Accepted 任务自主扫描、安全收据 GC、非终态 generation 交接及 Workspace 三方合并。设备密钥、challenge enrollment、批准能力面、终态后的 generation 换代、签名任务信封、本地去重收据、Workspace epoch 高水位、持久 outbox、mTLS 出站重连、签名 ACK 与在线撤销已实现。
 - 1000 活跃 Run 压测、故障注入、Multi-AZ、备份恢复和 SOC 2 Ready 证据。
 
 达到私有 Beta 仍必须按 `docs/architecture/acceptance.md` 完成容量、安全、恢复和真实产品闭环验收。

@@ -2,42 +2,363 @@
 
 ## 唯一目标
 
-持续对标 Codex 与 OpenClaw 完善 Agent 架构与能力模块，并在 M1 Pro 16GB Mac 上交付完全不依赖
-Docker、虚拟机或 Kubernetes 的原生 Agent Runtime 开发环境。Java、Rust、Vue、PostgreSQL 和 NATS
-必须以 macOS ARM64 原生进程运行，Checkpoint 本地使用文件系统，只允许可信 Tool 在本机执行；
-一条命令启动真实 Agent 主链，一条命令停止并清除全部项目进程、端口、日志、临时数据、测试密钥
-和构建产物，整套环境常驻内存不得超过 4GB。
+持续对标 Codex 的 Agent 执行内核与 OpenClaw 的节点协同能力，交付一款**多租户、
+协议中立、可嵌入且可独立运行的 Rust Agent Runtime**。同一内核应支持云、边、端一致运行和
+受控协作，能被各类 Java 业务系统快速集成，也能形成独立 CLI、桌面 GUI、边缘节点和云端
+Runtime 服务。
+
+Runtime 必须保持 Headless（无头）与控制面中立：它自己拥有 Agent Loop、模型 IR 与调度、
+Tool/MCP、审批、Checkpoint、故障恢复、子代理、权限、预算和租户运行隔离语义；任何 GUI、
+Java 系统或控制面都只能通过稳定契约使用它，不得成为完成一次 Run 的必需依赖。
+
+## 对标与产品边界
+
+- **Codex 对标面**：Agent Loop、模型与 Tool 多轮调度、流式事件、审批与权限、上下文压缩、
+  会话生命周期、沙箱语义和子代理执行。
+- **OpenClaw 对标面**：Node 协议、设备能力发现、连接生命周期、模型容灾、离线任务、Workspace 协调
+  和跨平台运行。
+- **本项目必须增强的边界**：租户身份、模型凭证与策略隔离、配额和预算、租户间公平准入、
+  可审计恢复，以及不依赖单一控制面的标准适配能力。
+
+## 控制面与 Java 集成边界
+
+- 客户自有控制面与平台提供的 Java 控制面使用同一契约接入 Runtime，两者在运行时地位对等。
+- 标准控制面适配契约至少覆盖租户与工作负载身份、Agent/Skill/Workspace 快照、审批、预算、
+  调度与审计，不向 Runtime 泄漏某个 Java 系统的数据库模型或内部类型。
+- 控制面管理的模型必须转换为协议中立的不可变运行快照，至少包含 Provider/Endpoint 能力、租户级
+  凭证引用或 BYOK、地域与数据等级、路由/故障转移策略、价格与预算限制；Runtime 不直接依赖
+  控制面的模型表结构。
+- 平台自建的 Java 控制面是这套契约的完整参考实现和集成范本，不是 Rust Runtime 的唯一官方入口或
+  强制依赖。
+- Java 业务系统优先通过 Java SDK + gRPC/HTTP/SSE 或 Sidecar 嵌入 Runtime；进程内 JNI 只是可选形态，
+  不作为唯一公共契约。
+
+## 云、边、端与客户端形态
+
+- 云端 Runtime、边缘 Node、端侧/本地 Runtime、CLI、独立桌面 GUI 与 Java 嵌入形态共用同一内核语义和
+  版本化契约；GUI 是 Runtime 客户端，不拥有另一套 Agent 状态机。
+- “无缝协作”指身份、策略、Skill、事件、Checkpoint、Artifact 和 Workspace 分支协议一致，可以进行
+  放置、暂停、恢复和受控迁移。
+- 无缝协作不代表任意进程或已开始的外部副作用都能安全迁移；非幂等/Unknown Tool 的模糊结果必须
+  进入 `indeterminate` 或人工协调，离线 Workspace 冲突不得静默覆盖。
+
+## 当前实施阶段
+
+当前仍以 Rust 内核完善为唯一实施主线，不因最终产品目标扩大就立即扩展 GUI、Java 控制面、云边端节点或
+集群部署实现。当前阶段只完善 Agent Loop、模型 IR 与调度、Tool/MCP、审批、Checkpoint、故障恢复、
+子代理、权限、预算、租户运行隔离与容量治理；每项能力必须在 M1 Pro 16GB Mac 上以真实任务闭环验证。
+
+Runtime 不得依赖 Docker、虚拟机、Kubernetes、Java、PostgreSQL 或 NATS 才能启动和完成一次 Run。
+GUI、控制面、节点协议和部署编排可以驱动必要的稳定公共契约，但不得掩盖内核缺口或迫使内核依赖
+某个上层实现。
 
 ## 固定实施顺序
 
-1. **本机开发闭环**：全部组件使用项目管理的宿主机原生进程；PostgreSQL/NATS 不注册系统服务，
-   状态集中到 `.local/`；本地 Checkpoint 使用文件系统，开发流程不得调用 Docker。
-2. **云端真实主链**：从 UI/API 创建 Run，经模型调用、Tool 审批、Checkpoint、Worker 故障恢复、SSE
-   和制品输出完成一次可复查闭环。
-3. **多租户与容量**：完成 IAM、RLS、对象与消息隔离、配额、公平调度和 1000 Run/1 万 Session 压测。
-4. **Skill 与云边协同**：完成签名 OCI Skill、节点注册、离线任务、Workspace 分支合并和冲突处理。
-5. **私有 Beta 门禁**：完成真实 Kubernetes/Kata、Multi-AZ、备份恢复、安全攻防与 SOC 2 Ready 证据。
+1. **Agent Loop 与模型调度**：多轮模型/Tool 循环、协议中立 IR、流式事件、上下文与安全故障转移。
+2. **Tool/MCP 执行内核**：目录、权限、审批、副作用分类、取消、超时、进程树回收与协议生命周期。
+3. **持久恢复**：Checkpoint、不可变执行身份、重启恢复、重复/乱序输入和模糊副作用处理。
+4. **子代理与治理**：角色、深度/并发、权限与预算子集、父子结果回送、取消和恢复。
+5. **多租户容量与可观测性**：租户运行隔离、配额与预算、公平准入、背压、资源上限、健康和故障注入，
+   并以 1000 个并发 Run 证明不同租户间不串数据、不串凭证，也不会因单一租户占满资源而饿饿。
 
-在第 1、2 项尚未形成真实用户闭环前，不继续扩展 HPA、多地域、复杂微服务拆分或更多生产拓扑。
+前一项没有真实闭环证据时，不用 GUI、控制面或部署编排把它包装成“已完成”。
+
+## 当前里程碑
+
+独立 Rust Host 已完成角色子代理串行与最多 8 路有界并发闭环、嵌套审批、父子取消、Checkpoint 恢复、
+权限与预算子集约束，以及可恢复的父子树执行时限。持久异步生命周期的**第一阶段**也已落地：显式
+`agent.spawn(mode=async)` 在启动子任务前持久化并立即返回稳定句柄；`agent.wait` 可超时而不取消；
+`agent.send` 可在前一子回合终态后创建同一句柄下的后续 Run；`agent.close` 持久化不可逆关闭边，父终态
+会回收未关闭子任务；新 Host 可从父子 Checkpoint 恢复同一句柄。旧 `inline` 模式继续兼容。
+
+持久消息投递与运行中邮箱阶段也已完成：`agent.send` 要求调用方幂等键；schema 15 在 schema 14 收据上
+增加状态与逐句柄有界队列。普通消息在活动子回合后按 FIFO 激活；`interrupt=true` 先持久化收据和 Tool
+结果，再取消旧子 Run、结算实际用量并启动重定向消息。替换 Host 会先收敛待处理中断，再恢复普通活动
+请求；schema 14 可迁移，损坏的 schema 15 队列 fail-closed。
+
+句柄级对话历史阶段现已完成：RunExecution schema 12 以协议中立结构携带已完成问答轮次，Worker 将其
+还原为低权限 user/assistant 消息而非 system prompt；Checkpoint schema 16 按实际激活顺序保存历史及
+摘要绑定，interrupt 越过 FIFO 后仍保持真实时间线。`agent.history` 提供最多 50 条的只读游标分页；
+真实 HTTP 多轮、损坏状态拒绝和 Host 崩溃恢复均已通过。旧 schema 只能迁移可验证尾部，不伪造历史。
+
+协议中立上下文压缩阶段现已完成：RunExecution schema 13 / runtime-policy schema 3 冻结触发、保留和
+摘要预算；Checkpoint schema 17 持久化待处理/已应用压缩及来源、前缀、保留尾部摘要。摘要通过同一模型
+IR 请求但不暴露 Tool，以普通 user 消息回灌，原 system 指令和最近完整 Tool Call/Result 保持不变。
+真实 HTTP/SSE + MCP 已验证正常四回合、`context.compacted`、503 后替代 Host 使用同一边界恢复且 Tool
+不重放。该能力默认关闭，不用主机隐式阈值改变同一 Run 的语义。
+
+完整 transcript 胶囊与终态恢复阶段现已完成：RunExecution schema 14 让稳定子代理句柄继承子 Run 的
+assistant narrative、Tool Call、绑定 Tool Result 和终态 Assistant；结果 digest v3 绑定完整协议中立
+transcript，缺失、孤立或重复 Tool 对 fail-closed。Worker Checkpoint schema 18 保存同一 typed transcript；
+独立 Host 在发布子 Run 终态事件前先写终态 Checkpoint，因此父 Host 在结果收据落盘前崩溃后，替代 Host
+仍可从子 Checkpoint 恢复精确历史，且不会重放已完成 Tool。旧无 transcript 收据保持可读，但不会伪装为
+schema 14 保证。
+
+显式历史修复阶段现已完成：RunExecution schema 15 新增独立的低权限 `history_import`，只在调用方明确
+选择 external/truncated 导入时运行协议中立修复。缺失 Tool Result 会成为模型可见的合成错误，孤立或
+重复 Result 被丢弃，可唯一归属的错位 Result 移回对应 Call；System 注入、非法角色内容和重复 Call ID
+直接拒绝。修复前后摘要及四类计数写入 Worker Checkpoint schema 19 和本地 Run 结果；替代 Host 必须提交
+同一原始导入才能恢复。历史 Tool Call 从不进入执行队列，权威 Checkpoint 也不会隐式调用修复器。
+
+会话分支的 **Fork 阶段现已完成**：`agent.fork` 必须绑定调用方看到的 source generation 和一个已完成
+activation ordinal，创建 deterministic 新句柄与 generation 1。只复制协议中立的完成历史前缀，不复制
+active child、邮箱、收据、close 或进程状态；角色不可改变，预算 cap 不得超过源 cap 和父剩余预算。
+Checkpoint schema 20 保存 generation 与 Fork 收据，替代 Worker 在 Tool 结果写入前恢复同一 handle/event。
+真实 HTTP + 原生 `workspace.read_text` 证明源 Tool 只执行一次，Fork 上下文保留完整 Tool 对但不重放；
+源历史和分支历史随后独立追加。
+
+会话分支的 **Rollback 阶段现已完成**：`agent.rollback` 在同一稳定句柄上将 completed prefix 提升为
+generation N+1，不删除旧 generation。Checkpoint schema 21 以唯一 archived Turn + generation ordinal head
+保存旧版本并校验摘要，避免复制每份完整历史；旧 generation 命令和迟到结果被 binding fence 拒绝。
+真实 HTTP + 原生 `workspace.read_text` 已证明 generation 1 `[0,1]` 回滚为 generation 2 `[0]`，后续变为
+`[0,2]`，旧历史仍可读且 Tool 总计只执行一次。替代 Worker 在 Tool 结果前恢复同一 receipt/event。
+
+树级预算保留账本阶段现已完成：所有 pending/active/queued 子任务进入同一父 Run 预留域；不同 handle
+不能重复使用 Token、费用或时长余额。Checkpoint schema 22 独立保存并从权威待处理工作重算账本，缺失、
+额外或篡改记录 fail-closed；result、close、cancel 和终态释放精确预留。真实 HTTP Host 已证明两个稳定
+handle 的后续子 Run 分别获得 `400` 与剩余 `300` Token，而非各取 `400`，终态账本归零。
+
+root Thread/Session 的不可变分支与回滚现已完成：RunExecution schema 16 以独立的权威
+`session_branch` 绑定稳定 Session、分支、generation、完成 Turn 与历史摘要；Checkpoint schema 23 绑定
+同一 head。独立 Host 先持久化 active Turn，再执行 Run；Fork 复制完成前缀到独立 branch，Rollback 归档
+旧 generation 后只移动当前 head。活动 Turn、过期 generation、漂移 Checkpoint 与迟到终态提交均被围栏。
+终态 transcript Checkpoint 先于终态事件持久化，因此 Session head 提交前崩溃也无需重放模型或 Tool。
+真实 HTTP/SSE + MCP 已证明 source/Fork/Rollback 共用的历史 Tool 只执行一次，Provider 503 和终态提交窄窗
+均可由替代 Host 恢复。
+
+协议中立的独立 Host 多 Provider 调度与安全故障转移里程碑现已完成：Rust Host 不依赖 Java、NATS 或
+外部 Model Gateway 进程，使用同一模型 IR 驱动 OpenAI Responses、Anthropic Messages 与
+OpenAI-compatible 三类候选；按地域、数据等级、能力、健康和费用过滤，再冻结最多 8 个候选。只有模型
+尚未产生任何增量、Tool Call 或其他外部语义且错误分类在 Run 策略允许范围内时才切换；半途断流保留
+已产生内容并禁止跨 Provider 重放。普通 Agent 回合和上下文摘要请求共用同一路由路径。
+
+每次调用的候选链、游标、失败摘要、暂存响应和最终选择进入原子持久 route journal；对应失败/选择事件
+先进入 Kernel 事件序列和 Worker Checkpoint，再推进 journal。替代 Host 可从已知游标继续，也可直接应用
+已暂存的终态响应而不再次请求 Provider。二进制可读取密钥不落盘的多 Provider JSON，旧单 Provider 环境
+变量继续兼容。真实回环 HTTP/SSE 已覆盖三协议连续切换、能力/地域/费用过滤、半途断流、两类崩溃恢复和
+摘要请求故障转移；未使用 Docker、Java、PostgreSQL、NATS 或外部 API Key。
+
+持久 Provider 健康、重试与冷却治理现已完成：同 Provider 仅在零输出且策略允许时按持久次数预算重试，
+退避与 `Retry-After` 截止时间写入 route journal；连续的 rate-limit、timeout、unavailable 会打开原子健康
+状态，冷却到期后只租出一个 half-open 探针。替代 Host 保留候选链、尝试次数、inflight 模糊请求与冷却
+状态，不会因重启无限重放。认证和账单错误不切换 Provider，也不进入共享健康计数。真实回环 HTTP 已覆盖
+同 Provider 恢复、持久冷却、`Retry-After`、并发单探针、认证隔离和进程中断预算；未使用外部服务。
+
+协议中立 Rich Model Item 与推理状态连续性现已完成：OpenAI Responses reasoning summary、加密 continuation
+和 refusal，以及 Anthropic thinking/signature，均进入带 Provider route、协议、模型和格式来源绑定的 typed
+transcript item。相同来源可穿过 gRPC、Tool 回合、Checkpoint、compaction 保留尾部、Host replacement 及
+Session Continue/Fork/Rollback；不匹配来源只审计丢弃 opaque state，且该观察不会误阻断安全 fallback。
+private state 不进入公共事件或可见文本，typed refusal 也不会再形成空成功结果。真实回环 HTTP/SSE 与 gRPC
+已证明上述边界；真实厂商兼容、字段级 Checkpoint 加密和更多 Provider content item 仍单列为未验证。
+
+有界并行 Tool 执行与确定性结果提交阶段现已完成：RunExecution schema 17 / runtime-policy schema 4
+冻结最多 1–16 路、默认 4 路并发；只有相邻 `Pure` Tool 可重叠，规划、权限和审批仍串行。Worker
+Checkpoint schema 24 保存原始调用顺序、未完成请求和乱序暂存结果；所有 started 事件先落盘再启动进程，
+替代 Host 只重试未完成 Pure 调用。真实 HTTP/SSE 模型与真实子进程已证明执行区间重叠、后完成的首调用
+仍先进入 transcript，以及半批崩溃后恢复不乱序、不重放已暂存结果。NATS 适配已共享有序提交状态，但本轮
+未启动外部消息服务，不把它计作分布式验收。
+
+模糊副作用的显式 `indeterminate` 收敛与人工 reconciliation 现已完成：`non_idempotent` / `unknown`
+Tool 在“started 已持久、结果未知”窗口会形成绑定调用、实现、原 attempt 与 started event 的稳定终态，
+且明确标记 `replay_safe=false`。原 Run 保持不可变；“已生效 / 未生效 / 无法判定”使用幂等、连续版本的
+协议命令记录，只有前两者会把操作员证据作为低权限 Tool Result 带入一个新的确定性 Run。真实子进程、
+Host 中断、替代 Host 和两类人工裁决均已证明旧副作用不会重放。
+
+协议中立的持久 Tool Process Session 第一阶段现已完成：显式可信可执行文件通过
+`process.start/write/poll/interrupt/close` 暴露，稳定 UUID、tenant/Workspace/实现摘要绑定、原子 Manifest、
+stdout/stderr 字节游标和跨进程 identity lock 共同形成所有权证据。真实 owner 进程直接退出后替代 manager
+返回 `reattached` 并继续原 PID；独立 Host 在 start 结果落入 Checkpoint 后替换，也不会重放 start。显式
+close、SIGINT 和自然 leader 退出均覆盖整个进程组，TERM 后会升级 KILL；64 槽只统计活跃会话。
+
+持久 Process Session 的资源治理与可恢复孤儿监管现已完成：schema 2 将治理摘要、绝对执行 deadline、
+idle TTL、最后活动、CPU/输出及可选内存上限和终止原因写入 digest Manifest；跨进程准入分别约束全局、
+tenant 与 `(tenant, canonical Workspace)`，容量满只拒绝新会话，不淘汰其他租户的 live process。原 Host
+正常存活时按最近 deadline 动态监督；owner 进程直接退出后，替代 manager/Host 会按原 deadline sweep 同一
+PID。真实 Agent Loop 已让模型看到 `execution_deadline` 并完成后续回合。macOS 只验证 CPU 与文件大小硬
+限制，显式内存限制会被拒绝；Linux `RLIMIT_AS` 尚未做本机 live 证明，不能声称跨平台资源隔离完成。
+
+Linux 硬资源边界的第一阶段现已完成：Runtime 公开不可变的 process resource capability，区分 hard
+output-file、CPU-time、memory、process-count 和 whole-tree accounting；`max_processes` 与整树计量成为
+operator governance，进入 Tool 实现摘要。在当前 macOS `UnixRlimit` 后端上，memory、process-count 和
+whole-tree 均明确为 false，任何对应要求都会在 state-root、Provider 和 child 创建前 fail-closed。它只
+证明契约不说谎，不等于 Linux cgroup 已实现。
+
+Linux cgroup v2 的文件协议边界现已完成：配置显式区分 rlimit/cgroup，五个限制文件只打开既有普通文件、
+拒绝最终路径符号链接，membership 使用 `0`，`cpu.stat` 只接受唯一 `usage_usec`。非 Linux 会在状态创建前
+拒绝；Linux 也保持 `backend_not_wired`，所以这仍不是可用后端。普通文件测试只证明字节和路径协议，
+不证明 cgroupfs、delegation 或真实进程树限制。
+
+子代理崩溃 socket 风险现已闭环：旧测试依赖销毁整个 Tokio Runtime，掩盖了 Host 被 abort/drop 时
+JoinHandle 脱离且 CancellationToken 不自动取消的缺陷。Host 现在拥有 caller token 的独立 child domain；
+正常 shutdown 先取消再等待，异常 Drop 会取消并 abort 全部登记子任务。真实 loopback Provider 在 Runtime
+继续存活时确认 parent/child 两条 TCP 连接均关闭，replacement 恢复同一 handle 且不重放 spawn。
+
+cgroup 生命周期的持久身份与无逃逸启动边界现已完成：Process Session Manifest schema 3 保存摘要保护的
+resource identity 与预留 aggregate CPU 计数；schema 2 只能迁移为历史上真实存在的 Unix rlimit 身份。
+父进程预先安全打开 `cgroup.procs`，真实 child 在 exec 前通过 `write(2)` 写入 `0`；创建失败撤销空组，
+既有组一律拒绝接管。该测试使用普通文件证明 pre-exec 行为，不是 Linux cgroupfs 证明，生产 backend
+继续返回 `backend_not_wired`。
+
+cgroup 身份驱动的监管与终止阶段现已完成：每次 sweep 会从 schema 3 identity 对应的 `cpu.stat` 读取单调
+`usage_usec` 并持久化，达到预算时形成明确 `cpu_limit`；`cgroup.events: populated` 成为 Linux 身份存活信号，
+整组终止写 `cgroup.kill=1` 并等待 populated 清零及 identity lease 释放。Manager 的 start supervisor、
+interact、recover 和 sweep 均携带冻结 backend，backend 与 Manifest 身份不一致会拒绝访问。普通文件测试
+只证明协议与治理决策，生产 backend 仍返回 `backend_not_wired`。
+
+cgroup 的 fd-relative 生命周期边界现已完成：delegated root 与 session group 都持有目录 descriptor；创建、
+失败回滚、五项限制、pre-exec membership、CPU/存活观测和整组终止全部通过 `mkdirat/openat/unlinkat` 相对
+访问。根路径或组路径被 rename/replacement 后，原操作仍固定在已打开目录，replacement sentinel 不会被读写；
+旧 PathBuf 生命周期入口已删除。该结论仍只限单次已打开操作，Manager 生命周期级 root pinning、终态空组
+清理和真实 Linux cgroupfs 仍未证明，生产 backend 继续禁用。
+
+cgroup 的 Manager 生命周期身份现已固定：公开配置与运行期 backend 分离，Manager 创建时只打开一次
+delegated-root descriptor，并以 `Arc` 传播给 watcher、supervisor 与所有前台操作。Manager 创建后即使原路径
+被 rename 并替换，后续 sweep 仍读取原 root 的 `usage_usec=2000000`，不会读取 replacement 的 `7`。
+该结果仍是 macOS 普通文件协议证据；生产 Linux backend 继续 fail-closed。
+
+cgroup 的启动与终态生命周期现已接线：`process.start` 在 child spawn 前通过 Manager root 创建/配置确定性
+组并安装 pre-exec membership；准备、membership 或 spawn 失败会相对同一 root 回滚空组。终态先持久化，
+随后执行 fd-relative、幂等空组移除；替代 Host 的 terminal sweep 会重试，配置路径被替换也不会逃逸。
+本机 GREEN 路径因没有 cgroupfs 在 spawn 前 fail-closed，不能替代真实 Linux 验证。
+
+cgroup 的持久资源阶段与 `Starting` 崩溃恢复现已升级到 Process Session Manifest schema 5：Unix 与 Linux
+都必须在 spawn 前独立持久化 `prepared`，再发布 `Running/active`。schema 2/3/4 的旧 `Starting` 全部迁移为
+`legacy_unknown`；prepared/legacy 状态即使资源组为空或缺失，也只能收敛为 `Indeterminate`，因为快速 Tool
+可能已经执行并退出。只有当前 schema 明确的 `unprepared` 且身份缺失才能成为 `RecoveredMissing`。active
+schema 2 真实进程可由替代 Manager 重附着原 PID 并原子升级，不会重启 Tool。本机普通目录证据不等于
+真实 cgroupfs，生产 backend 继续 fail-closed。
+
+同步启动失败现已升级到 Process Session Manifest schema 6：`Command::spawn` 返回错误后，Manager 先持久化
+`Terminated/start_failed` 和失败 Session ID，再清理资源；Linux 清理失败保留 `cleanup_pending` 供替代 Host
+重试。活动 schema-5 Unix 进程经摘要校验后可重附着原 PID 并重写 schema 6。
+
+确定性启动失败的端到端类型传播现已完成：`ProcessSessionToolExecutor` 保留失败 Session ID 与私有 OS
+原因，Worker 事件与独立 Host 则只公开稳定的 `process_session_start_failed`、安全消息和 Session ID。只有
+能证明未越过外部副作用边界的错误可转换为模型可见 Tool Result；其他非幂等模糊错误继续走恢复或人工
+reconciliation。真实同步 OS spawn 失败、Worker 分类，以及 loopback HTTP 模型→Tool→错误结果→模型与
+持久事件日志均已验证；模型不可见私有 OS 原因。
+
+在线 Tool 执行失败的 effect-aware 收敛现已完成：Worker 与独立 Host 在持久 `started` 边界后同时读取冻结
+的 `ToolEffect`。确定性未执行失败以及 `Pure/Idempotent` 的其他失败可形成脱敏错误 Tool Result；
+`NonIdempotent/Unknown` 的未分类失败直接形成绑定的 `run.indeterminate`，不进入下一模型回合。真实
+loopback HTTP Agent Loop 已执行一次文件副作用后收到执行器错误，持久化 indeterminate Checkpoint，再由
+操作员确认已生效并启动独立 continuation；原 Tool 没有重放，私有错误没有进入事件或模型上下文。
+
+MCP 接受调用后的响应丢失也已完成真实闭环：Streamable HTTP MCP 服务执行一次副作用后截断响应，独立
+Host 形成 `run.indeterminate`、不伪造 `tool.result`、不启动下一模型回合。stdio actor 已接收
+`tools/call` 后丢失响应时不再建立新进程重发；只有发送失败且请求根本未入队，或 Health/`tools/list`
+这类安全操作，才允许重连。
+
+MCP Tool 的操作员权威 effect 已由 RunExecution v18 冻结：本地配置或受信执行命令可按 server-local Tool
+名称声明 `Pure/Idempotent/NonIdempotent`，缺省仍是 `Unknown`。覆盖项必须属于已签名 Skill 声明和已委派
+server scope；所有 MCP Tool 继续 `Ask + Federated`，第三方 `readOnlyHint/idempotentHint` 不能降低审批或
+改变重放语义。effect map 进入 MCP server binding digest，替代 Host 遇到策略漂移会在模型前拒绝恢复。
+真实 HTTP Agent Loop 已证明：伪装为只读/幂等的远端 annotation 在无 override 时仍 indeterminate；显式
+`Idempotent` override 时产生脱敏错误 Tool Result、继续模型并成功终止，两条路径都只调用 MCP 一次。
+
+取消/超时与已开始副作用的双重终态证据现已完成：Worker 在终止前检查持久
+`tool.execution.started` 与冻结 `ToolEffect`。已开始的 `NonIdempotent/Unknown` Tool 不再被
+`cancelled/timed_out` 掩盖，而是形成带 `interrupted_by` 和调用方请求状态的 `run.indeterminate`；未开始
+或 `Pure/Idempotent` 仍保持原终态。独立 Host 会先持久化 indeterminate Checkpoint，再发布终态事件。
+真实原生 Shell 进程树与 Streamable HTTP MCP 连接均已证明资源被关闭、结果不重放且不确定性未丢失。
+
+MCP 请求级生命周期现已完成：独立 Host 的 Streamable HTTP 与 stdio `tools/call` 都携带唯一
+`progressToken`，只接受有限、单调递增的匹配进度，并将其写成绑定 Tool call/实现摘要的
+`tool.execution.progress` 事件；每次事件后持久化 Checkpoint。Run 取消会向原 JSON-RPC request ID 发送
+`notifications/cancelled`，随后才以连接关闭或进程组回收兜底。真实 TCP/SSE 和本地 stdio 进程均已证明
+通知送达、进度可重放、无残留进程；Unknown Tool 的终态仍是 `indeterminate`，协议通知不伪装成副作用回滚。
+
+默认并发崩溃门禁的无界等待也已收口：测试必须同时观察父/子 Checkpoint 和 Provider 两条真实连接建立后
+才触发 Host abort；signal、socket close、replacement、Provider completion 与 shutdown 均有分阶段 deadline。
+并发子代理套件连续 20 轮 400/400；重启期间的空 Provider 连接也由独立竞态守卫覆盖。当前全工作区共 577 项：571 通过、0 失败、6 个外部 live
+用例显式忽略。该修复提高证据可信度，不新增生产能力。
+
+当前内核里程碑已改为：**把协议中立 Rust Runtime 的真实恢复闭环补齐，不扩 GUI/Java/云边范围**。
+ADR-0090 已完成 Run 内冻结、可持久恢复的 MCP 2026 MRTR 用户输入回路；独立 Host 可跨进程替换继续
+原 Tool，unsafe Tool 在续传发出后失联会 `indeterminate`。ADR-0091 又完成无状态
+Worker↔Model Gateway gRPC 轮次桥，真实 MCP 输入与回答可穿过 Gateway；这不等于 NATS recovery poll
+已经形成云端恢复闭环。ADR-0092 已新增显式 `stdio2026`，内置真实进程与 Codex 严格外部 fixture 均跨
+Host replacement 完成 MRTR；HTTP URL elicitation 也已证明 Runtime 不承载外部授权 secret content。
+
+ADR-0094 已取代 ADR-0093 的临时 Host-owned PTY 边界：最小本地 supervisor 持有 PTY master，Runtime
+Host 通过 owner-only token 与有界 Unix socket 执行 start/status/write/resize。owner Host 退出后替代 Host
+已实测续接同一 PID；supervisor 丢失则回收进程组并持久化 `indeterminate`。输出在冻结 byte budget 精确
+截断，Process Session 状态与内容目录收紧为 `0700/0600`，Manifest schema 升级为 7 并兼容迁移 1—6。
+
+ADR-0095 已完成单一 PTY ownership 收敛：无 supervisor 时禁止新建 PTY，v2 `Hello` 冻结精确协议和
+start/status/write/resize/lifecycle 能力；owner-only 生命周期持久化 clean/unclean 前任、活跃数与退出原因。
+模型可见的 Pure Tool `process.attach` 可按冻结上限读取 stdout/stderr 尾部并返回起止游标和截断标志，
+替代 Host 已实跑 attach 后继续交互与关闭。
+
+ADR-0096 复核后没有照搬 OpenClaw 的 WebSocket 高低水位：当前 PTY reader 同步落盘、没有用户态发送
+队列，磁盘阻塞会通过 PTY 内核缓冲自然反压。新增的 Pure Tool `process.wait` 可按显式 cursor 在同一 Tool
+调用内等待输出或终态，且 `yield_time_ms` 受 Run-frozen Tool timeout 约束；真实 Agent Loop 与 wait 中 Host
+replacement 已证明不重启 child、不重新请求模型 Tool Call。
+
+ADR-0097 已把同一 Session 的 wait 收敛为一个共享持久观察器：1000 个并发 wait、250ms 空闲文件观察、
+2 秒全量唤醒、取消回收、pipe、外部 PTY 和 Host replacement 均已实跑。实现采用 Codex 的共享通知原则，
+但不把原 Host 的内存 handle 当作恢复真相；新 Host 仍从 Manifest 和 durable logs 重建观察。
+
+ADR-0098 已完成 8 tenant / 64 Workspace / 64 个真实 Process Session / 1024 wait 的混合容量门禁：
+1024 waiter 只保留 64 observer，最终取证的 250ms 实测 295 次持久观察；每 Session 取消一个 wait 不影响
+其余 960 个，并发输入后的 p50 905.30ms、p95 982.02ms、p100 995.13ms，连续 10 轮通过。压力测试同时暴露
+旧 PGID 在身份租约释放后仍被终止的竞态；Unix TERM/KILL 现已绑定 identity lease，残留回收不再静默成功。
+
+ADR-0099 已将 `process.start` / `process.write` 与有界 yield 合并为统一交互语义：模型一次 Tool Call 可启动
+或写入后等待首批输出/终态；省略 yield 时保持立即返回。真实 Agent Loop 已完成 start-yield→write-yield→close，
+没有追加 poll/wait 模型回合；原有 cursor、冻结 timeout、取消、共享 observer、Host replacement 和 64 Session /
+1024 wait 容量边界保持通过。
+
+ADR-0100 已为副作用已接受、但 start/write yield 结果尚未返回时的 Host 崩溃建立持久交互收据。真实进程已
+证明 start 只启动一次、write 只发送一次；替代 Host 使用原 attempt 身份交付原 Session 的有界结果。缺失、
+损坏或不匹配的收据继续进入 `indeterminate`，不会自动重放非幂等操作。
+
+ADR-0101 已收敛 Process Session 的关闭语义：`process.close` 在 TERM/KILL 前持久化精确绑定的 close intent，
+Manifest 以 `Terminating/Closed → Terminated/Closed` 表达唯一终态；首个 Host 在终止过程中崩溃后，替代
+Host 可继续同一身份围栏关闭并交付原 Tool 结果。真实进程只启动一次、模型也只发一次 close。自然退出
+不伪造关闭收据，`interrupt` 仍保持信号型非幂等边界。
+
+ADR-0102 已完成第一段多租户 Runtime Invocation 闭环：RunExecution v20 和显式
+`RuntimeInvocationContext` 绑定 tenant/application/workload/Workspace/AgentVersion/model policy；事件与
+Worker Checkpoint 26 持久同一身份，换 application 的恢复在模型前拒绝。`EmbeddedRuntime` 只接受预注册
+Profile，不接受调用方路径或凭据；全局、tenant、Workspace active limit、全局/tenant queue limit、取消
+即时退队和 tenant round-robin 已通过真实 A1→B1→A2 Provider 顺序验证。同 Workspace 单写不会阻塞同
+租户另一 Workspace；同一 tenant/application/Workspace 可用稳定根目录注册多个 AgentVersion，而不同
+Workspace 身份不能复用持久根目录。默认 CLI 仍通过显式兼容 Profile 工作，执行主链不再直接读取
+`LOCAL_TENANT_ID`。默认并行的全 Rust workspace 门禁已经通过。
+
+ADR-0103 已补齐多租户身份的 Rust egress 与恢复授权链；ADR-0104 又建立了签名 Edge Task、真实
+`EmbeddedRuntime` 执行、重启去重、终态崩溃恢复和本地持久 outbox 基础层。
+
+下一优先目标固定为：**完成 Rust Edge Node 的可信联网边界**。先实现设备持久密钥与 enrollment、节点
+generation 变更授权、capability manifest/审批，再实现只出站的 mTLS 连接、重连/退避、outbox 上传与经过
+认证的累计 ACK；审批/暂停恢复必须使用新签名命令和更高 Workspace owner epoch，不得重投原任务自动
+续跑。完成这条边界后再以 1000 个混合调用验证公平性、队列内存上限、取消风暴和 Workspace 单写。
+该阶段仍不引入 Java、NATS、PostgreSQL、Docker 或 GUI；Java v20 producer parity、Windows ConPTY、
+MCP OAuth/Resources/Prompts、sampling/roots 与真实 Linux cgroup 门禁保留为后续明确缺口。
 
 ## 本地运行边界
 
-- Mac 本地开发命令禁止调用 Docker、虚拟机、Kubernetes、Vault 或 OCI Registry。
-- PostgreSQL 与 NATS 使用已安装或项目级校验下载的 ARM64 二进制，但不得注册 Homebrew Service。
-- 本地 Checkpoint 使用内容寻址文件系统；生产 S3 Gateway 契约保持独立，不进入本地依赖链。
+- Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault
+  或 OCI Registry。
+- 本地 Checkpoint 使用内容寻址文件系统；生产控制面、消息总线和对象存储通过可选适配器接入，
+  不进入独立 Runtime 的必需依赖链。
 - 只允许仓库内声明的可信 Tool 原生执行；macOS 本地限制不得冒充 Kata 级强隔离。
-- 所有可变状态必须位于 `.local/`，`make dev-clean` 后不得残留进程、端口、数据、日志、测试密钥或构建产物。
-- 生产 Dockerfile 与 Kubernetes 清单只作为未来交付材料，不得被本地 `dev`、`test` 或 `check` 路径调用。
+- 测试结束后不得残留进程、端口、临时目录、日志或测试密钥。Rust `target` 是可复用构建缓存，
+  与运行产物分开统计；未经用户明确授权不自动删除。
+- 生产 Dockerfile、Kubernetes 清单和 Java/Vue 模块不得被内核 `dev`、`test` 或 `check` 路径调用。
 
 ## 对标规则
 
 每个阶段完成时必须分别回答：
 
-- 相比 Codex，执行语义、工具审批、沙箱、事件与可观测性还差什么；哪些多租户能力是本平台新增。
-- 相比 OpenClaw，节点连接、断线恢复、模型容灾、Workspace 协调和跨平台运行还差什么。
+- 相比 Codex，Agent Loop、模型、Tool/MCP、审批、沙箱、Checkpoint、子代理和会话生命周期还差什么。
+- 相比 OpenClaw，模型容灾、连接生命周期、故障恢复、Workspace 协调和跨平台运行还差什么。
 - 如果采用不同实现，必须说明为何更适合多租户 PaaS；没有证据时不得宣称领先。
+- 每轮固定汇报：已验证能力、Codex 差距、OpenClaw 差距和下一优先缺口。
 
 ## 完成定义
 
-单元测试、静态门禁、HTTP 200 或 Kubernetes 清单渲染均不等于完成。只有真实 UI/API、持久数据、
-租户 allow/deny、模型和 Tool 结果、故障恢复、最终制品及审计证据共同成立，才可以提升对应能力状态。
+单元测试、静态门禁或 HTTP 200 均不等于完成。只有发布形态的本地 Runtime 完成真实模型或可审计
+回环模型、真实 Tool/MCP、权限 allow/deny、Checkpoint/故障恢复、最终事件与无残留退出，才可以提升
+对应内核能力状态。需要外部厂商凭据或服务的验收必须单列为未验证，不得用模拟结果替代。

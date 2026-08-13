@@ -1,5 +1,8 @@
 use crate::{ProviderAdapter, ProviderCredential, ProviderExecutionError};
-use agent_protocol::{ModelErrorKind, ModelRequest, ModelStreamEvent};
+use agent_protocol::{
+    ModelErrorKind, ModelFailoverPolicySnapshot, ModelRequest, ModelStreamEvent,
+    RuntimeExecutionPolicySnapshot,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -47,13 +50,43 @@ pub async fn execute_with_safe_failover(
     cancellation: CancellationToken,
     events: mpsc::Sender<ModelStreamEvent>,
 ) -> Result<FailoverSelection, ProviderExecutionError> {
+    execute_with_frozen_failover(
+        routes,
+        request,
+        &RuntimeExecutionPolicySnapshot::default().model_failover,
+        cancellation,
+        events,
+    )
+    .await
+}
+
+pub async fn execute_with_frozen_failover(
+    routes: &[ProviderRoute],
+    request: &ModelRequest,
+    policy: &ModelFailoverPolicySnapshot,
+    cancellation: CancellationToken,
+    events: mpsc::Sender<ModelStreamEvent>,
+) -> Result<FailoverSelection, ProviderExecutionError> {
     if routes.is_empty() {
         return Err(ProviderExecutionError::InvalidConfiguration(
             "model policy has no provider candidates".into(),
         ));
     }
+    if !(1..=8).contains(&policy.max_provider_attempts)
+        || policy.fallback_on.iter().any(|kind| {
+            !matches!(
+                kind,
+                ModelErrorKind::RateLimited | ModelErrorKind::Timeout | ModelErrorKind::Unavailable
+            )
+        })
+    {
+        return Err(ProviderExecutionError::InvalidConfiguration(
+            "runtime model failover policy is invalid".into(),
+        ));
+    }
 
     let mut failed_provider_ids = Vec::new();
+    let routes = &routes[..routes.len().min(usize::from(policy.max_provider_attempts))];
     for (index, route) in routes.iter().enumerate() {
         if route.id.trim().is_empty() {
             return Err(ProviderExecutionError::InvalidConfiguration(
@@ -66,19 +99,26 @@ pub async fn execute_with_safe_failover(
         let task_cancellation = attempt_cancellation.clone();
         let (attempt_tx, mut attempt_rx) = mpsc::channel(32);
         let model_request = request.clone();
+        let provider_id = route.id.clone();
         let provider_task = tokio::spawn(async move {
             adapter
-                .execute(&model_request, &credential, task_cancellation, attempt_tx)
+                .execute(
+                    &provider_id,
+                    &model_request,
+                    &credential,
+                    task_cancellation,
+                    attempt_tx,
+                )
                 .await
         });
-        let mut emitted_events = 0_u64;
+        let mut committed_events = 0_u64;
         while let Some(event) = attempt_rx.recv().await {
+            committed_events += u64::from(event.commits_provider_output());
             if events.send(event).await.is_err() {
                 attempt_cancellation.cancel();
                 let _ = provider_task.await;
                 return Err(ProviderExecutionError::ConsumerClosed);
             }
-            emitted_events += 1;
         }
         let result = provider_task.await.map_err(|error| {
             ProviderExecutionError::InvalidConfiguration(format!(
@@ -93,9 +133,9 @@ pub async fn execute_with_safe_failover(
                 });
             }
             Err(error)
-                if emitted_events == 0
+                if committed_events == 0
                     && index + 1 < routes.len()
-                    && is_safe_pre_output_failure(&error) =>
+                    && is_policy_fallback(&error, policy) =>
             {
                 warn!(
                     provider_id = %route.id,
@@ -113,15 +153,16 @@ pub async fn execute_with_safe_failover(
     ))
 }
 
-fn is_safe_pre_output_failure(error: &ProviderExecutionError) -> bool {
+fn is_policy_fallback(
+    error: &ProviderExecutionError,
+    policy: &ModelFailoverPolicySnapshot,
+) -> bool {
     matches!(
         error,
         ProviderExecutionError::Provider {
-            kind: ModelErrorKind::RateLimited
-                | ModelErrorKind::Timeout
-                | ModelErrorKind::Unavailable,
+            kind,
             retryable: true,
             ..
-        }
+        } if policy.fallback_on.contains(kind)
     )
 }

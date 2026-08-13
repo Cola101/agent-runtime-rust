@@ -188,6 +188,7 @@ async fn idle_provider_stream_is_classified_as_a_retryable_timeout() {
             kind: ModelErrorKind::Timeout,
             retryable: true,
             status: None,
+            retry_after_ms: None,
             message: "provider stream was idle beyond the configured timeout".into(),
         })
     );
@@ -228,6 +229,7 @@ async fn done_without_finish_reason_is_not_reported_as_success() {
             kind: ModelErrorKind::Protocol,
             retryable: false,
             status: None,
+            retry_after_ms: None,
             message: "provider stream completed without finish_reason".into(),
         }
     );
@@ -387,6 +389,7 @@ async fn private_object_storage_image_is_rejected_before_provider_egress() {
             kind: ModelErrorKind::CapabilityMismatch,
             retryable: false,
             status: None,
+            retry_after_ms: None,
             message:
                 "image source must be an HTTP(S) URL or data URL resolved by the model gateway"
                     .into(),

@@ -21,7 +21,7 @@ use tonic::transport::Server;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn worker_store_client_uses_its_bound_token_for_put_and_get() {
+async fn worker_store_client_uses_its_complete_v20_identity_for_put_and_get() {
     let signing_key = SigningKey::from_bytes(&[12; 32]);
     let service = CheckpointStorageGrpcService::new(
         Arc::new(InMemory::new()),
@@ -45,7 +45,12 @@ async fn worker_store_client_uses_its_bound_token_for_put_and_get() {
     let claims = claims();
     let context = CheckpointStoreContext {
         tenant_id: claims.tenant_id,
+        application_id: claims.application_id,
+        workload_identity_id: claims.workload_identity_id,
         run_id: claims.run_id,
+        session_id: claims.session_id,
+        workspace_id: claims.workspace_id,
+        agent_version_id: claims.agent_version_id,
         attempt_id: claims.attempt_id,
         worker_id: claims.worker_id,
         worker_incarnation_id: claims.worker_incarnation_id,
@@ -107,14 +112,20 @@ fn test_pki() -> (ServerMtlsMaterials, ClientMtlsMaterials) {
 fn claims() -> WorkloadIdentityClaims {
     let now = chrono::Utc::now().timestamp_millis();
     WorkloadIdentityClaims {
-        schema_version: 2,
+        schema_version: 4,
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::now_v7(),
+        workspace_id: Uuid::now_v7(),
+        agent_version_id: Uuid::now_v7(),
         attempt_id: Uuid::now_v7(),
         worker_id: Uuid::now_v7(),
         worker_incarnation_id: Uuid::now_v7(),
         model_policy_id: Uuid::now_v7(),
-        model_policy_digest: String::new(),
+        model_policy_digest: "a".repeat(64),
+        authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["checkpoint-gateway".into()]),
         scopes: BTreeSet::from(["checkpoint.read".into(), "checkpoint.write".into()]),
         issued_at_unix_ms: now,

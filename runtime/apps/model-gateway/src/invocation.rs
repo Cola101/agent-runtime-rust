@@ -8,7 +8,9 @@
 use agent_model_gateway_protocol::v1::{
     ModelInvocation, ModelRole, ReasoningPolicy as WireReasoningPolicy, content_part::Body,
 };
-use agent_protocol::{ContentPart, Message, ModelRequest, ReasoningPolicy, Role, ToolSpec};
+use agent_protocol::{
+    ContentPart, Message, ModelRequest, ProviderPrivateState, ReasoningPolicy, Role, ToolSpec,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ModelInvocationDecodeError {
@@ -18,6 +20,8 @@ pub enum ModelInvocationDecodeError {
     InvalidToolResultContent,
     #[error("tool call arguments are not valid JSON")]
     InvalidToolCallArguments,
+    #[error("provider-private model state is malformed")]
+    InvalidPrivateState,
     #[error("unsupported model content part")]
     UnsupportedContentPart,
     #[error("tool input schema is not valid JSON")]
@@ -63,6 +67,32 @@ pub fn decode_model_invocation(
                         name: call.name.clone(),
                         arguments: serde_json::from_slice(&call.arguments_json)
                             .map_err(|_| ModelInvocationDecodeError::InvalidToolCallArguments)?,
+                    }),
+                    Some(Body::Reasoning(reasoning)) => {
+                        let private_state =
+                            reasoning
+                                .private_state
+                                .as_ref()
+                                .map(|state| ProviderPrivateState {
+                                    provider_id: state.provider_id.clone(),
+                                    protocol: state.protocol.clone(),
+                                    model: state.model.clone(),
+                                    format: state.format.clone(),
+                                    data: state.data.clone(),
+                                });
+                        if private_state
+                            .as_ref()
+                            .is_some_and(|state| !state.is_well_formed())
+                        {
+                            return Err(ModelInvocationDecodeError::InvalidPrivateState);
+                        }
+                        Ok(ContentPart::Reasoning {
+                            summary: reasoning.summary.clone(),
+                            private_state,
+                        })
+                    }
+                    Some(Body::Refusal(refusal)) => Ok(ContentPart::Refusal {
+                        text: refusal.text.clone(),
                     }),
                     _ => Err(ModelInvocationDecodeError::UnsupportedContentPart),
                 })

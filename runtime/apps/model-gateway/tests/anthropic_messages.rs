@@ -1,8 +1,8 @@
 mod support;
 
 use agent_model_gateway::{
-    AnthropicMessagesAdapter, AnthropicMessagesConfig, ProviderCredential, ProviderExecutionError,
-    ProviderPricing,
+    AnthropicMessagesAdapter, AnthropicMessagesConfig, ProviderAdapter, ProviderCredential,
+    ProviderExecutionError, ProviderPricing,
 };
 use agent_protocol::{
     ContentPart, Message, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
@@ -159,6 +159,7 @@ async fn structured_output_is_rejected_before_network_egress() {
             kind: ModelErrorKind::CapabilityMismatch,
             retryable: false,
             status: None,
+            retry_after_ms: None,
             message: "structured output is not supported by the Anthropic Messages adapter".into(),
         }
     );
@@ -184,7 +185,111 @@ async fn eof_without_message_stop_is_a_protocol_failure() {
             kind: ModelErrorKind::Protocol,
             retryable: false,
             status: None,
+            retry_after_ms: None,
             message: "provider stream ended without message_stop".into(),
         }
+    );
+}
+
+#[tokio::test]
+async fn thinking_is_private_continuation_state_and_never_visible_text() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private thought\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-opaque\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Visible answer\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/messages", sse).await;
+    let adapter = AnthropicMessagesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+    ProviderAdapter::from(adapter)
+        .execute(
+            "anthropic-primary",
+            &request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    server.await.unwrap();
+
+    let ModelStreamEvent::Reasoning {
+        summary,
+        private_state: Some(private_state),
+    } = &events[0]
+    else {
+        panic!("first event must retain Anthropic thinking state");
+    };
+    assert!(summary.is_empty());
+    assert_eq!(private_state.provider_id, "anthropic-primary");
+    assert_eq!(private_state.protocol, "anthropic_messages");
+    assert_eq!(private_state.model, "claude-agent");
+    assert!(private_state.data.contains("private thought"));
+    assert!(private_state.data.contains("sig-opaque"));
+    assert_eq!(
+        events[1],
+        ModelStreamEvent::TextDelta {
+            text: "Visible answer".into()
+        }
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ModelStreamEvent::TextDelta { text } if text.contains("private thought")
+    )));
+
+    let replay_request = ModelRequest {
+        messages: vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::Reasoning {
+                summary: Vec::new(),
+                private_state: Some(private_state.clone()),
+            }],
+        }],
+        ..request()
+    };
+    let completed_sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (endpoint, captured, server) =
+        support::spawn_sse_server("/v1/messages", completed_sse).await;
+    let replay_adapter = AnthropicMessagesAdapter::new(config(endpoint)).unwrap();
+    let (events_tx, _events_rx) = mpsc::channel(8);
+    ProviderAdapter::from(replay_adapter)
+        .execute(
+            "anthropic-primary",
+            &replay_request,
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let captured = captured.await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        captured.body["messages"][0]["content"][0]["type"],
+        "thinking"
+    );
+    assert_eq!(
+        captured.body["messages"][0]["content"][0]["thinking"],
+        "private thought"
+    );
+    assert_eq!(
+        captured.body["messages"][0]["content"][0]["signature"],
+        "sig-opaque"
     );
 }

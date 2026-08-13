@@ -5,11 +5,13 @@ use agent_model_gateway::{
 };
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecutionServer;
 use agent_model_gateway_protocol::v1::{
-    ContentPart, ModelEvent, ModelInvocation, ModelMessage, ModelRole, ModelTool, ReasoningPolicy,
-    TextDelta, TextPart, content_part, model_event,
+    Completed, ContentPart, FinishReason, ModelEvent, ModelInvocation, ModelMessage, ModelRole,
+    ModelTool, PrivateStateOmitted, ProviderPrivateState as WireProviderPrivateState, Reasoning,
+    ReasoningPolicy, Refusal, TextDelta, TextPart, content_part, model_event,
 };
 use agent_protocol::{
-    ModelErrorKind, ModelFinishReason, ModelStreamEvent, Placement, RunExecutionCommand,
+    ModelErrorKind, ModelFinishReason, ModelStreamEvent, Placement, ProviderPrivateState,
+    RunExecutionCommand,
 };
 use agent_runtime_worker::{
     GrpcModelGatewayClient, ModelExecutionSupervisor, ModelExecutionUpdate,
@@ -503,6 +505,70 @@ async fn grpc_stream_that_ends_without_a_terminal_event_is_rejected() {
 }
 
 #[tokio::test]
+async fn grpc_transport_preserves_rich_items_and_audit_observations() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ModelExecutionServer::new(RichItemService))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+    let claims = claims();
+    let mut client = GrpcModelGatewayClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    client
+        .execute(
+            invocation(&claims),
+            &sign_token(&claims),
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events,
+        vec![
+            ModelStreamEvent::Reasoning {
+                summary: vec!["Checked transport.".into()],
+                private_state: Some(ProviderPrivateState {
+                    provider_id: "openai-primary".into(),
+                    protocol: "openai_responses".into(),
+                    model: "gpt-agent".into(),
+                    format: "openai.responses.reasoning.v1".into(),
+                    data: "opaque-state".into(),
+                }),
+            },
+            ModelStreamEvent::Refusal {
+                text: "typed refusal".into(),
+            },
+            ModelStreamEvent::PrivateStateOmitted {
+                origin_provider_id: "origin".into(),
+                target_provider_id: "fallback".into(),
+                format: "private.v1".into(),
+            },
+            ModelStreamEvent::Completed {
+                reason: ModelFinishReason::Stop,
+            },
+        ]
+    );
+    shutdown_tx.send(()).ok();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn model_gateway_client_presents_its_identity_over_mtls() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -692,6 +758,9 @@ async fn supervisor_turns_premature_gateway_close_into_non_retryable_protocol_fa
 struct EarlyCloseService;
 
 #[derive(Clone, Copy)]
+struct RichItemService;
+
+#[derive(Clone, Copy)]
 struct UnauthenticatedService;
 
 #[tonic::async_trait]
@@ -731,18 +800,67 @@ impl agent_model_gateway_protocol::v1::model_execution_server::ModelExecution
     }
 }
 
+#[tonic::async_trait]
+impl agent_model_gateway_protocol::v1::model_execution_server::ModelExecution for RichItemService {
+    type ExecuteStream =
+        Pin<Box<dyn Stream<Item = Result<ModelEvent, Status>> + Send + Sync + 'static>>;
+
+    async fn execute(
+        &self,
+        _request: Request<ModelInvocation>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let events = vec![
+            model_event::Body::Reasoning(Reasoning {
+                summary: vec!["Checked transport.".into()],
+                private_state: Some(WireProviderPrivateState {
+                    provider_id: "openai-primary".into(),
+                    protocol: "openai_responses".into(),
+                    model: "gpt-agent".into(),
+                    format: "openai.responses.reasoning.v1".into(),
+                    data: "opaque-state".into(),
+                }),
+            }),
+            model_event::Body::Refusal(Refusal {
+                text: "typed refusal".into(),
+            }),
+            model_event::Body::PrivateStateOmitted(PrivateStateOmitted {
+                origin_provider_id: "origin".into(),
+                target_provider_id: "fallback".into(),
+                format: "private.v1".into(),
+            }),
+            model_event::Body::Completed(Completed {
+                reason: FinishReason::Stop as i32,
+            }),
+        ];
+        let stream = tokio_stream::iter(events.into_iter().enumerate().map(|(index, body)| {
+            Ok(ModelEvent {
+                schema_version: 1,
+                sequence: u64::try_from(index + 1).unwrap(),
+                body: Some(body),
+            })
+        }));
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
 fn claims() -> WorkloadIdentityClaims {
     let now = Utc::now().timestamp_millis();
     let worker_id = Uuid::now_v7();
     WorkloadIdentityClaims {
         schema_version: 2,
         tenant_id: Uuid::now_v7(),
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id: Uuid::now_v7(),
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: Uuid::now_v7(),
         worker_id,
         worker_incarnation_id: worker_id,
         model_policy_id: Uuid::now_v7(),
         model_policy_digest: String::new(),
+        authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["model-gateway".into(), "checkpoint-gateway".into()]),
         scopes: BTreeSet::from([
             "model.execute".into(),
@@ -758,8 +876,12 @@ fn invocation(claims: &WorkloadIdentityClaims) -> ModelInvocation {
     ModelInvocation {
         schema_version: 2,
         tenant_id: claims.tenant_id.to_string(),
+        application_id: String::new(),
+        workload_identity_id: String::new(),
         run_id: claims.run_id.to_string(),
         session_id: Uuid::now_v7().to_string(),
+        workspace_id: String::new(),
+        agent_version_id: String::new(),
         attempt_id: claims.attempt_id.to_string(),
         worker_id: claims.worker_id.to_string(),
         model_policy_id: claims.model_policy_id.to_string(),
@@ -779,6 +901,8 @@ fn invocation(claims: &WorkloadIdentityClaims) -> ModelInvocation {
         worker_incarnation_id: claims.worker_incarnation_id.to_string(),
         model_policy_snapshot_json: Vec::new(),
         model_policy_digest: String::new(),
+        runtime_policy_snapshot_json: Vec::new(),
+        runtime_policy_digest: String::new(),
     }
 }
 

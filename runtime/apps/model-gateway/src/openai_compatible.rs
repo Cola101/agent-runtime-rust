@@ -69,6 +69,10 @@ pub enum ProviderExecutionError {
         kind: ModelErrorKind,
         retryable: bool,
         status: Option<u16>,
+        /// Parsed HTTP `Retry-After`, bounded later by the frozen Runtime
+        /// policy. Kept protocol-neutral so every Adapter reports the same
+        /// scheduling hint.
+        retry_after_ms: Option<u64>,
         message: String,
     },
 }
@@ -216,6 +220,10 @@ impl OpenAiCompatibleAdapter {
         }
     }
 
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     fn request_payload(&self, request: &ModelRequest) -> Result<Value, ProviderExecutionError> {
         let messages = request
             .messages
@@ -328,6 +336,15 @@ fn message_payload(message: &Message) -> Result<Value, ProviderExecutionError> {
             ContentPart::ToolCall { .. } => {
                 return Err(capability_error(
                     "tool calls are only valid in assistant-role messages",
+                ));
+            }
+            ContentPart::Reasoning { .. } => {}
+            ContentPart::Refusal { text } if message.role == Role::Assistant => {
+                content.push(json!({"type":"text","text":text}));
+            }
+            ContentPart::Refusal { .. } => {
+                return Err(capability_error(
+                    "refusals are only valid in assistant-role messages",
                 ));
             }
         }
@@ -495,6 +512,11 @@ pub(crate) async fn classify_http_error(
     credential: &ProviderCredential,
 ) -> ProviderExecutionError {
     let status = response.status();
+    let retry_after_ms = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_ms);
     let body = response
         .text()
         .await
@@ -511,7 +533,13 @@ pub(crate) async fn classify_http_error(
         _ if looks_like_context_overflow(&message) => (ModelErrorKind::ContextOverflow, false),
         _ => (ModelErrorKind::Protocol, false),
     };
-    provider_error(kind, retryable, Some(status.as_u16()), message)
+    ProviderExecutionError::Provider {
+        kind,
+        retryable,
+        status: Some(status.as_u16()),
+        retry_after_ms,
+        message,
+    }
 }
 
 pub(crate) fn classify_transport_error(error: reqwest::Error) -> ProviderExecutionError {
@@ -545,8 +573,18 @@ pub(crate) fn provider_error(
         kind,
         retryable,
         status,
+        retry_after_ms: None,
         message: message.into(),
     }
+}
+
+fn parse_retry_after_ms(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000));
+    }
+    let deadline = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    let remaining = deadline.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    u64::try_from(remaining.num_milliseconds().max(0)).ok()
 }
 
 fn looks_like_context_overflow(message: &str) -> bool {

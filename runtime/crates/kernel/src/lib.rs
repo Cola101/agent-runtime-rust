@@ -3,17 +3,27 @@ mod read_only_shell;
 pub use read_only_shell::{ShellCommandClass, classify_shell_command};
 
 use agent_protocol::{
-    ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope, ModelErrorKind,
-    ModelFinishReason, ModelStreamEvent, RunStatus, SubagentResultDelivery, SubagentSpawnRequest,
-    SandboxClass, ToolApprovalPolicySnapshot, ToolApprovalRequest, ToolCall, ToolDescriptor,
-    ToolEffect,
-    ToolExecutionRequest,
+    ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope,
+    McpInputContinuation, McpInputRequired, ModelErrorKind, ModelFinishReason, ModelStreamEvent,
+    RunStatus, SandboxClass, SubagentForkReceipt, SubagentResultDelivery, SubagentRollbackReceipt,
+    SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalPolicySnapshot, ToolApprovalRequest,
+    ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use uuid::Uuid;
+
+pub struct SubagentInputAcceptance<'a> {
+    pub agent_id: Uuid,
+    pub message_sequence: u64,
+    pub idempotency_key: &'a str,
+    pub submission_id: &'a str,
+    pub status: &'a str,
+    pub interrupt: bool,
+    pub request: &'a SubagentSpawnRequest,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunCommand {
@@ -22,6 +32,8 @@ pub enum RunCommand {
     Approve,
     Complete,
     Cancel,
+    RequestInput,
+    ResumeInput,
     ToolOutcomeUnknown { effect: ToolEffect },
 }
 
@@ -352,10 +364,47 @@ impl RunMachine {
         ))
     }
 
+    pub fn record_context_compacted(
+        &mut self,
+        binding_digest: &str,
+        source_transcript_digest: &str,
+        summary_digest: &str,
+        retained_tail_digest: &str,
+        source_message_count: u32,
+        retained_message_count: u32,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Start,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "context.compacted",
+            json!({
+                "status": RunStatus::Running,
+                "binding_digest": binding_digest,
+                "source_transcript_digest": source_transcript_digest,
+                "summary_digest": summary_digest,
+                "retained_tail_digest": retained_tail_digest,
+                "source_message_count": source_message_count,
+                "retained_message_count": retained_message_count,
+            }),
+        ))
+    }
+
     pub fn apply(&mut self, command: RunCommand) -> Result<EventEnvelope, TransitionError> {
         if self.status.is_terminal() {
             return Err(TransitionError::TerminalState(self.status));
         }
+        let unknown_tool_effect = match &command {
+            RunCommand::ToolOutcomeUnknown { effect } => Some(*effect),
+            _ => None,
+        };
 
         let (next_status, event_type) = match (self.status, command) {
             (RunStatus::Queued, RunCommand::Start) => (RunStatus::Running, "run.started"),
@@ -390,7 +439,12 @@ impl RunMachine {
             }
         };
 
-        Ok(self.emit(next_status, event_type, json!({ "status": next_status })))
+        let mut payload = json!({ "status": next_status });
+        if event_type == "run.indeterminate" {
+            payload["effect"] = json!(unknown_tool_effect.expect("indeterminate has Tool effect"));
+            payload["replay_safe"] = json!(false);
+        }
+        Ok(self.emit(next_status, event_type, payload))
     }
 
     pub fn apply_model_event(
@@ -418,6 +472,33 @@ impl RunMachine {
                 RunStatus::Running,
                 "model.tool_call",
                 json!({ "id": id, "name": name, "arguments": arguments }),
+            ),
+            ModelStreamEvent::Reasoning {
+                summary,
+                private_state,
+            } => self.emit(
+                RunStatus::Running,
+                "model.reasoning",
+                json!({
+                    "summary": summary,
+                    "has_private_state": private_state.is_some()
+                }),
+            ),
+            ModelStreamEvent::Refusal { text } => {
+                self.emit(RunStatus::Running, "model.refusal", json!({ "text": text }))
+            }
+            ModelStreamEvent::PrivateStateOmitted {
+                origin_provider_id,
+                target_provider_id,
+                format,
+            } => self.emit(
+                RunStatus::Running,
+                "model.private_state.omitted",
+                json!({
+                    "origin_provider_id": origin_provider_id,
+                    "target_provider_id": target_provider_id,
+                    "format": format
+                }),
             ),
             ModelStreamEvent::Usage {
                 input_tokens,
@@ -493,6 +574,70 @@ impl RunMachine {
         Ok(envelope)
     }
 
+    pub fn record_model_provider_failure(
+        &mut self,
+        provider_id: &str,
+        kind: ModelErrorKind,
+        retryable: bool,
+        status: Option<u16>,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::ModelEventOutsideRunning(self.status));
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "model.provider.failed",
+            json!({
+                "provider_id": provider_id,
+                "kind": kind,
+                "retryable": retryable,
+                "status": status,
+            }),
+        ))
+    }
+
+    pub fn record_model_provider_retry_scheduled(
+        &mut self,
+        provider_id: &str,
+        provider_attempt: u8,
+        delay_ms: u64,
+        kind: ModelErrorKind,
+        status: Option<u16>,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::ModelEventOutsideRunning(self.status));
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "model.provider.retry_scheduled",
+            json!({
+                "provider_id": provider_id,
+                "provider_attempt": provider_attempt,
+                "delay_ms": delay_ms,
+                "kind": kind,
+                "status": status,
+            }),
+        ))
+    }
+
+    pub fn record_model_provider_selection(
+        &mut self,
+        provider_id: &str,
+        failed_provider_ids: &[String],
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::ModelEventOutsideRunning(self.status));
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "model.provider.selected",
+            json!({
+                "provider_id": provider_id,
+                "failed_provider_ids": failed_provider_ids,
+            }),
+        ))
+    }
+
     pub fn record_budget_exhausted(
         &mut self,
         dimension: BudgetDimension,
@@ -515,6 +660,21 @@ impl RunMachine {
         ))
     }
 
+    pub fn record_duration_timed_out(&mut self) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        Ok(self.emit(
+            RunStatus::TimedOut,
+            "run.timed_out",
+            json!({
+                "status": RunStatus::TimedOut,
+                "kind": "duration_budget_exhausted",
+                "retryable": false
+            }),
+        ))
+    }
+
     pub fn record_subagent_spawn_requested(
         &mut self,
         request: &SubagentSpawnRequest,
@@ -522,22 +682,229 @@ impl RunMachine {
         if self.status.is_terminal() {
             return Err(TransitionError::TerminalState(self.status));
         }
-        if self.status != RunStatus::Running {
+        if !matches!(self.status, RunStatus::Running | RunStatus::Suspended) {
             return Err(TransitionError::InvalidTransition {
                 status: self.status,
                 command: RunCommand::RequireApproval,
             });
         }
+        let status = match request.mode {
+            SubagentSpawnMode::Inline => RunStatus::Suspended,
+            SubagentSpawnMode::Async => RunStatus::Running,
+        };
         Ok(self.emit(
-            RunStatus::Suspended,
+            status,
             "subagent.spawn.requested",
-            json!({"status": RunStatus::Suspended, "request": request}),
+            json!({"status": status, "request": request}),
+        ))
+    }
+
+    pub fn record_subagent_spawned(
+        &mut self,
+        request: &SubagentSpawnRequest,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running || request.mode != SubagentSpawnMode::Async {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.spawned",
+            json!({
+                "agent_id": request.delegation_id,
+                "role": request.role,
+                "status": "running"
+            }),
+        ))
+    }
+
+    pub fn record_subagent_forked(
+        &mut self,
+        receipt: &SubagentForkReceipt,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running || !receipt.is_well_formed() {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.forked",
+            json!({
+                "source_agent_id": receipt.source_agent_id,
+                "source_generation": receipt.source_generation,
+                "through_activation_ordinal": receipt.through_activation_ordinal,
+                "source_history_digest": receipt.source_history_digest,
+                "agent_id": receipt.agent_id,
+                "generation": receipt.generation,
+                "role": receipt.role,
+                "budget": receipt.budget
+            }),
+        ))
+    }
+
+    pub fn record_subagent_rolled_back(
+        &mut self,
+        receipt: &SubagentRollbackReceipt,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running || !receipt.is_well_formed() {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.rolled_back",
+            json!({
+                "agent_id": receipt.agent_id,
+                "from_generation": receipt.from_generation,
+                "generation": receipt.generation,
+                "through_activation_ordinal": receipt.through_activation_ordinal,
+                "previous_history_digest": receipt.previous_history_digest,
+                "restored_history_digest": receipt.restored_history_digest
+            }),
+        ))
+    }
+
+    pub fn record_subagent_terminal_observed(
+        &mut self,
+        result: &SubagentResultDelivery,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.terminal.observed",
+            json!({
+                "agent_id": result.delegation_id,
+                "child_run_id": result.child_run_id,
+                "child_terminal_event_id": result.child_terminal_event_id,
+                "terminal_status": result.terminal_status,
+                "is_error": result.is_error,
+                "usage": result.usage,
+                "result_digest": result.digest
+            }),
+        ))
+    }
+
+    pub fn record_subagent_input_accepted(
+        &mut self,
+        acceptance: SubagentInputAcceptance<'_>,
+    ) -> Result<EventEnvelope, TransitionError> {
+        let SubagentInputAcceptance {
+            agent_id,
+            message_sequence,
+            idempotency_key,
+            submission_id,
+            status,
+            interrupt,
+            request,
+        } = acceptance;
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running || request.mode != SubagentSpawnMode::Async {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.input.accepted",
+            json!({
+                "agent_id": agent_id,
+                "message_sequence": message_sequence,
+                "idempotency_key": idempotency_key,
+                "submission_id": submission_id,
+                "child_run_id": request.delegation_id,
+                "status": status,
+                "interrupt": interrupt
+            }),
+        ))
+    }
+
+    pub fn record_subagent_input_activated(
+        &mut self,
+        agent_id: Uuid,
+        message_sequence: u64,
+        request: &SubagentSpawnRequest,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running || request.mode != SubagentSpawnMode::Async {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.input.activated",
+            json!({
+                "agent_id": agent_id,
+                "message_sequence": message_sequence,
+                "child_run_id": request.delegation_id,
+                "status": "running"
+            }),
+        ))
+    }
+
+    pub fn record_subagent_closed(
+        &mut self,
+        agent_id: Uuid,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "subagent.closed",
+            json!({
+                "agent_id": agent_id,
+                "status": "closed"
+            }),
         ))
     }
 
     pub fn record_subagent_result_received(
         &mut self,
         result: &SubagentResultDelivery,
+    ) -> Result<EventEnvelope, TransitionError> {
+        self.record_subagent_result_received_with_remaining(result, 0)
+    }
+
+    pub fn record_subagent_result_received_with_remaining(
+        &mut self,
+        result: &SubagentResultDelivery,
+        remaining_subagents: usize,
     ) -> Result<EventEnvelope, TransitionError> {
         if self.status.is_terminal() {
             return Err(TransitionError::TerminalState(self.status));
@@ -548,11 +915,17 @@ impl RunMachine {
                 command: RunCommand::Approve,
             });
         }
+        let next_status = if remaining_subagents == 0 {
+            RunStatus::Running
+        } else {
+            RunStatus::Suspended
+        };
         Ok(self.emit(
-            RunStatus::Running,
+            next_status,
             "subagent.result.received",
             json!({
-                "status": RunStatus::Running,
+                "status": next_status,
+                "remaining_subagents": remaining_subagents,
                 "tool_call_id": result.tool_call_id,
                 "delegation_id": result.delegation_id,
                 "binding_digest": result.binding_digest,
@@ -560,6 +933,7 @@ impl RunMachine {
                 "child_terminal_event_id": result.child_terminal_event_id,
                 "terminal_status": result.terminal_status,
                 "is_error": result.is_error,
+                "usage": result.usage,
                 "result_digest": result.digest
             }),
         ))
@@ -663,6 +1037,112 @@ impl RunMachine {
             RunStatus::Running,
             "tool.execution.started",
             json!({"execution": execution}),
+        ))
+    }
+
+    pub fn record_tool_execution_progress(
+        &mut self,
+        tool_call_id: &str,
+        binding_digest: &str,
+        progress: f64,
+        total: Option<f64>,
+        message: Option<&str>,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Complete,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "tool.execution.progress",
+            json!({
+                "tool_call_id": tool_call_id,
+                "binding_digest": binding_digest,
+                "progress": progress,
+                "total": total,
+                "message": message,
+            }),
+        ))
+    }
+
+    pub fn record_mcp_input_required(
+        &mut self,
+        pending: &McpInputRequired,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::RequestInput,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Suspended,
+            "mcp.input.required",
+            json!({"input": pending, "status": RunStatus::Suspended}),
+        ))
+    }
+
+    pub fn record_mcp_input_resolved(
+        &mut self,
+        pending: &McpInputRequired,
+        continuation: &McpInputContinuation,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Suspended {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::ResumeInput,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "mcp.input.resolved",
+            json!({
+                "input_id": pending.input_id,
+                "tool_call_id": pending.tool_call_id,
+                "binding_digest": pending.binding_digest,
+                "round": continuation.round,
+                "actions": continuation.responses.iter().map(|(key, response)| {
+                    (key, response.action)
+                }).collect::<BTreeMap<_, _>>(),
+                "status": RunStatus::Running
+            }),
+        ))
+    }
+
+    pub fn record_mcp_continuation_started(
+        &mut self,
+        pending: &McpInputRequired,
+        continuation: &McpInputContinuation,
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if self.status != RunStatus::Running {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::ResumeInput,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Running,
+            "mcp.input.continuation.started",
+            json!({
+                "input_id": pending.input_id,
+                "tool_call_id": pending.tool_call_id,
+                "binding_digest": pending.binding_digest,
+                "round": continuation.round
+            }),
         ))
     }
 

@@ -4,13 +4,14 @@
 //! be killed at any time without touching a Run, and may reattach later to
 //! replay everything from the durable local event log.
 
-use agent_protocol::RunBudget;
+use agent_protocol::{RunBudget, SubagentRole};
 use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
-    LocalProviderConfig, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
-    WORKSPACE_READ_SCOPE,
+    LocalMcpInputResolution, LocalMcpServerConfig, LocalModelRoutingConfig,
+    LocalProcessSessionConfig, LocalProviderConfig, LocalProviderHealthPolicy, LocalRuntimeConfig,
+    LocalRuntimeHost, LocalToolConsent, WORKSPACE_READ_SCOPE,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -26,7 +27,153 @@ fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(PathBuf::from(required("AGENT_RUNTIME_LOCAL_STATE_ROOT")?))
 }
 
+fn load_mcp_servers_from_path(
+    path: &std::path::Path,
+) -> Result<Vec<LocalMcpServerConfig>, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err("local MCP config must be a regular JSON file no larger than 1 MiB".into());
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+fn load_mcp_servers() -> Result<Vec<LocalMcpServerConfig>, Box<dyn std::error::Error>> {
+    match std::env::var("AGENT_RUNTIME_LOCAL_MCP_CONFIG") {
+        Ok(path) => load_mcp_servers_from_path(std::path::Path::new(&path)),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_subagent_roles_from_path(
+    path: &std::path::Path,
+) -> Result<Vec<SubagentRole>, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(
+            "local subagent config must be a regular JSON file no larger than 1 MiB".into(),
+        );
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
+fn load_subagent_roles() -> Result<Vec<SubagentRole>, Box<dyn std::error::Error>> {
+    match std::env::var("AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG") {
+        Ok(path) => load_subagent_roles_from_path(std::path::Path::new(&path)),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalModelRoutingFile {
+    candidates: Vec<LocalProviderFile>,
+    allowed_regions: BTreeSet<String>,
+    data_class: agent_model_gateway::DataClass,
+    max_cost_per_million_tokens_micros: u64,
+    #[serde(default)]
+    health_policy: LocalProviderHealthPolicy,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalProviderFile {
+    id: String,
+    protocol: agent_model_gateway::ProviderProtocol,
+    endpoint: String,
+    model: String,
+    api_key_env: String,
+    region: String,
+    accepted_data_classes: BTreeSet<agent_model_gateway::DataClass>,
+    capabilities: BTreeSet<agent_model_gateway::Capability>,
+    healthy: bool,
+    latency_ms: u64,
+    cost_per_million_tokens_micros: u64,
+    response_timeout_ms: u64,
+    stream_idle_timeout_ms: u64,
+}
+
+fn load_model_routing_from_path(
+    path: &std::path::Path,
+    mut read_secret: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<LocalModelRoutingConfig, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(
+            "local model routing config must be a regular JSON file no larger than 1 MiB".into(),
+        );
+    }
+    let bytes = std::fs::read(path)?;
+    let file: LocalModelRoutingFile = serde_json::from_slice(&bytes)?;
+    let candidates = file
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            if candidate.api_key_env.is_empty()
+                || candidate.api_key_env.len() > 128
+                || !candidate
+                    .api_key_env
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(format!(
+                    "provider {} has an invalid api_key_env",
+                    candidate.id
+                ));
+            }
+            let api_key = read_secret(&candidate.api_key_env).map_err(|_| {
+                format!(
+                    "provider {} requires secret environment variable {}",
+                    candidate.id, candidate.api_key_env
+                )
+            })?;
+            Ok(LocalProviderConfig {
+                id: candidate.id,
+                protocol: candidate.protocol,
+                endpoint: candidate.endpoint,
+                model: candidate.model,
+                api_key,
+                region: candidate.region,
+                accepted_data_classes: candidate.accepted_data_classes,
+                capabilities: candidate.capabilities,
+                healthy: candidate.healthy,
+                latency_ms: candidate.latency_ms,
+                cost_per_million_tokens_micros: candidate.cost_per_million_tokens_micros,
+                response_timeout_ms: candidate.response_timeout_ms,
+                stream_idle_timeout_ms: candidate.stream_idle_timeout_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(LocalModelRoutingConfig {
+        candidates,
+        allowed_regions: file.allowed_regions,
+        data_class: file.data_class,
+        max_cost_per_million_tokens_micros: file.max_cost_per_million_tokens_micros,
+        health_policy: file.health_policy,
+    })
+}
+
+fn load_model_routing() -> Result<LocalModelRoutingConfig, Box<dyn std::error::Error>> {
+    match std::env::var("AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG") {
+        Ok(path) => {
+            load_model_routing_from_path(std::path::Path::new(&path), |name| std::env::var(name))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            Ok(LocalModelRoutingConfig::single_openai_compatible(
+                required("AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT")?,
+                required("AGENT_RUNTIME_LOCAL_PROVIDER_MODEL")?,
+                required("AGENT_RUNTIME_LOCAL_PROVIDER_API_KEY")?,
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn load_config() -> Result<LocalRuntimeConfig, Box<dyn std::error::Error>> {
+    let runtime_executable = std::env::current_exe()?;
     let consent = match std::env::var("AGENT_RUNTIME_LOCAL_TOOL_CONSENT").as_deref() {
         Ok("allow-once") => LocalToolConsent::AllowOnce,
         Ok("ask") | Err(_) => LocalToolConsent::Ask,
@@ -46,20 +193,33 @@ fn load_config() -> Result<LocalRuntimeConfig, Box<dyn std::error::Error>> {
             |_| "You are a local agent. Explain evidence before conclusions.".into(),
         ),
         delegated_scopes: scopes,
-        provider: LocalProviderConfig {
-            endpoint: required("AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT")?,
-            model: required("AGENT_RUNTIME_LOCAL_PROVIDER_MODEL")?,
-            api_key: required("AGENT_RUNTIME_LOCAL_PROVIDER_API_KEY")?,
-        },
+        subagent_roles: load_subagent_roles()?,
+        model_routing: load_model_routing()?,
+        mcp_servers: load_mcp_servers()?,
+        mcp_lifecycle: agent_runtime_host::LocalMcpLifecycleConfig::default(),
         trusted_workspace_tool: std::env::var("AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN")
             .ok()
             .map(PathBuf::from),
+        process_session: std::env::var_os("AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE").map(
+            |executable| LocalProcessSessionConfig {
+                executable: PathBuf::from(executable),
+                fixed_args: Vec::new(),
+                max_output_chunk_bytes: 64 * 1024,
+                governance: agent_tool_runtime::ProcessSessionGovernance::default(),
+                pty_supervisor: Some(agent_tool_runtime::ProcessSessionPtySupervisorConfig {
+                    executable: runtime_executable.clone(),
+                    fixed_args: vec!["__pty-session-supervisor".into()],
+                    startup_timeout: std::time::Duration::from_secs(5),
+                }),
+            },
+        ),
         consent,
         budget: RunBudget {
             max_tokens: 8_192,
             max_cost_cents: 100,
             max_duration_seconds: 600,
         },
+        runtime_policy: agent_protocol::RuntimeExecutionPolicySnapshot::default(),
     })
 }
 
@@ -95,6 +255,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.next().unwrap_or_else(|| "run".into());
 
     match command.as_str() {
+        "__pty-session-supervisor" => {
+            if args.next().as_deref() != Some("--state-root") {
+                return Err("missing --state-root for PTY session supervisor".into());
+            }
+            let state_root = PathBuf::from(
+                args.next()
+                    .ok_or("missing PTY session supervisor state root")?,
+            );
+            if args.next().is_some() {
+                return Err("unexpected PTY session supervisor argument".into());
+            }
+            agent_tool_runtime::run_process_session_pty_supervisor(state_root).await?;
+            Ok(())
+        }
         // The long-running Runtime. Runs outlive every client connection.
         "serve" => {
             let config = load_config()?;
@@ -139,6 +313,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         "list" => client_request(&LocalRequest::List).await,
+        "mcp-input" => {
+            let run_id: Uuid = args
+                .next()
+                .ok_or("usage: runtime-host mcp-input <run-id> <resolution-json>")?
+                .parse()?;
+            let resolution: LocalMcpInputResolution = serde_json::from_str(
+                &args
+                    .next()
+                    .ok_or("usage: runtime-host mcp-input <run-id> <resolution-json>")?,
+            )?;
+            client_request(&LocalRequest::ResolveMcpInput {
+                run_id,
+                input_id: resolution.input_id,
+                input_version: resolution.input_version,
+                binding_digest: resolution.binding_digest,
+                responses: resolution.responses,
+            })
+            .await
+        }
         "approve" | "deny" | "cancel" => {
             let run_id: Uuid = args
                 .next()
@@ -155,7 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "run" => {
             let input = args.next().ok_or("usage: runtime-host run <input>")?;
             let mut host = LocalRuntimeHost::start(load_config()?)?;
-            let outcome = host.execute(&input).await?;
+            let outcome = host.execute(&input).await;
+            host.shutdown().await;
+            let outcome = outcome?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -166,10 +361,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "output": outcome.output,
                     "checkpoint": outcome.checkpoint_path,
                     "pending_approval": outcome.pending_approval,
+                    "pending_mcp_input": outcome.pending_mcp_input,
+                    "mcp_servers": outcome.mcp_servers,
                 })
             );
             Ok(())
         }
         other => Err(format!("unsupported command {other}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_runtime_host::LocalMcpTransportConfig;
+
+    /// The production break this catches is exposing stdio only through the Rust
+    /// library while the shipped binary silently constructs an empty MCP list.
+    #[test]
+    fn local_mcp_config_file_is_consumed_by_the_binary() {
+        let root = tempfile::tempdir().expect("temp config root");
+        let path = root.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"[{
+                "server_id":"00000000-0000-4000-8000-000000000044",
+                "name":"local",
+                "transport":{
+                    "type":"stdio",
+                    "command":"/bin/sh",
+                    "args":["server.sh"],
+                    "env":{"EXPLICIT_VALUE":"present"},
+                    "cwd":null
+                },
+                "tool_names":["search"]
+            }]"#,
+        )
+        .unwrap();
+
+        let servers = load_mcp_servers_from_path(&path).expect("valid MCP config");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "local");
+        assert!(matches!(
+            &servers[0].transport,
+            LocalMcpTransportConfig::Stdio { command, args, env, cwd }
+                if command.as_path() == std::path::Path::new("/bin/sh")
+                    && args == &["server.sh"]
+                    && env.get("EXPLICIT_VALUE").map(String::as_str) == Some("present")
+                    && cwd.is_none()
+        ));
+    }
+
+    #[test]
+    fn local_subagent_role_file_is_consumed_by_the_binary() {
+        let root = tempfile::tempdir().expect("temp config root");
+        let path = root.path().join("subagents.json");
+        std::fs::write(
+            &path,
+            r#"[{
+                "name":"reviewer",
+                "instructions":"Review evidence only.",
+                "delegated_scopes":["tool:workspace.read"]
+            }]"#,
+        )
+        .unwrap();
+
+        let roles = load_subagent_roles_from_path(&path).expect("valid subagent config");
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].name, "reviewer");
+        assert_eq!(roles[0].instructions, "Review evidence only.");
+        assert_eq!(
+            roles[0].delegated_scopes,
+            BTreeSet::from(["tool:workspace.read".to_owned()])
+        );
+    }
+
+    #[test]
+    fn local_multi_provider_routing_file_is_consumed_without_embedding_secrets() {
+        let root = tempfile::tempdir().expect("temp config root");
+        let path = root.path().join("model-routing.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "allowed_regions":["us","eu"],
+                "data_class":"confidential",
+                "max_cost_per_million_tokens_micros":900000,
+                "health_policy":{
+                    "max_same_provider_attempts":3,
+                    "initial_retry_backoff_ms":125,
+                    "max_retry_backoff_ms":2000,
+                    "consecutive_failure_threshold":2,
+                    "cooldown_ms":30000,
+                    "max_retry_after_ms":60000,
+                    "half_open_probe_lease_ms":120000
+                },
+                "candidates":[
+                    {
+                        "id":"responses-primary",
+                        "protocol":"open_ai_responses",
+                        "endpoint":"https://responses.example.test/v1/responses",
+                        "model":"response-model",
+                        "api_key_env":"RESPONSES_API_KEY",
+                        "region":"us",
+                        "accepted_data_classes":["public","internal","confidential"],
+                        "capabilities":["text","tool_use","structured_output"],
+                        "healthy":true,
+                        "latency_ms":20,
+                        "cost_per_million_tokens_micros":700000,
+                        "response_timeout_ms":45000,
+                        "stream_idle_timeout_ms":15000
+                    },
+                    {
+                        "id":"anthropic-fallback",
+                        "protocol":"anthropic_messages",
+                        "endpoint":"https://anthropic.example.test/v1/messages",
+                        "model":"message-model",
+                        "api_key_env":"ANTHROPIC_API_KEY",
+                        "region":"eu",
+                        "accepted_data_classes":["public","internal","confidential"],
+                        "capabilities":["text","tool_use"],
+                        "healthy":true,
+                        "latency_ms":30,
+                        "cost_per_million_tokens_micros":800000,
+                        "response_timeout_ms":45000,
+                        "stream_idle_timeout_ms":15000
+                    }
+                ]
+            }"#,
+        )
+        .expect("write routing config");
+
+        let mut requested_secrets = Vec::new();
+        let routing = load_model_routing_from_path(&path, |name| {
+            requested_secrets.push(name.to_owned());
+            Ok::<_, std::env::VarError>(format!("secret-for-{name}"))
+        })
+        .expect("valid routing config");
+
+        assert_eq!(
+            requested_secrets,
+            ["RESPONSES_API_KEY", "ANTHROPIC_API_KEY"]
+        );
+        assert_eq!(routing.candidates.len(), 2);
+        assert_eq!(
+            routing.candidates[0].api_key,
+            "secret-for-RESPONSES_API_KEY"
+        );
+        assert_eq!(
+            routing.candidates[1].api_key,
+            "secret-for-ANTHROPIC_API_KEY"
+        );
+        assert_eq!(
+            routing.allowed_regions,
+            BTreeSet::from(["eu".into(), "us".into()])
+        );
+        assert_eq!(
+            routing.data_class,
+            agent_model_gateway::DataClass::Confidential
+        );
+        assert_eq!(routing.health_policy.max_same_provider_attempts, 3);
+        assert_eq!(routing.health_policy.initial_retry_backoff_ms, 125);
+        assert_eq!(routing.health_policy.cooldown_ms, 30_000);
     }
 }

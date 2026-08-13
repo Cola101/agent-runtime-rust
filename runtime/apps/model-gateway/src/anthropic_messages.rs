@@ -3,7 +3,8 @@ use crate::openai_compatible::{
     classify_http_error, classify_transport_error, emit, provider_error,
 };
 use agent_protocol::{
-    ContentPart, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent, Role,
+    ContentPart, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
+    ProviderPrivateState, Role,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -41,6 +42,7 @@ struct AnthropicStreamState {
     output_tokens: u64,
     stop_reason: Option<ModelFinishReason>,
     tools: BTreeMap<u64, PartialToolUse>,
+    reasoning: BTreeMap<u64, PartialReasoning>,
 }
 
 #[derive(Default)]
@@ -48,6 +50,11 @@ struct PartialToolUse {
     id: String,
     name: String,
     input_json: String,
+}
+
+enum PartialReasoning {
+    Thinking { thinking: String, signature: String },
+    Redacted { data: String },
 }
 
 impl AnthropicMessagesAdapter {
@@ -83,6 +90,28 @@ impl AnthropicMessagesAdapter {
 
     pub async fn execute(
         &self,
+        request: &ModelRequest,
+        credential: &ProviderCredential,
+        cancellation: CancellationToken,
+        events: mpsc::Sender<ModelStreamEvent>,
+    ) -> Result<(), ProviderExecutionError> {
+        let provider_id = "direct-anthropic-messages";
+        let (request, omissions) = crate::prepare_request_for_provider(
+            request,
+            provider_id,
+            "anthropic_messages",
+            &self.model,
+        )?;
+        for omission in omissions {
+            emit(&events, omission).await?;
+        }
+        self.execute_for_provider(provider_id, &request, credential, cancellation, events)
+            .await
+    }
+
+    pub(crate) async fn execute_for_provider(
+        &self,
+        provider_id: &str,
         request: &ModelRequest,
         credential: &ProviderCredential,
         cancellation: CancellationToken,
@@ -166,6 +195,9 @@ impl AnthropicMessagesAdapter {
                     let index = required_index(&value)?;
                     if let Some(tool) = state.tools.remove(&index) {
                         emit_tool(&events, tool).await?;
+                    }
+                    if let Some(reasoning) = state.reasoning.remove(&index) {
+                        emit_reasoning(&events, reasoning, provider_id, &self.model).await?;
                     }
                 }
                 "message_delta" => {
@@ -267,6 +299,10 @@ impl AnthropicMessagesAdapter {
         }
         Ok(payload)
     }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 fn anthropic_messages(
@@ -364,6 +400,49 @@ fn anthropic_content(
                     "tool results are only valid in tool messages",
                 ));
             }
+            ContentPart::Reasoning {
+                private_state: Some(state),
+                ..
+            } if role == Role::Assistant
+                && state.format == "anthropic.messages.thinking.v1" =>
+            {
+                let block: Value = serde_json::from_str(&state.data).map_err(|_| {
+                    provider_error(
+                        ModelErrorKind::Protocol,
+                        false,
+                        None,
+                        "Anthropic thinking continuation state is invalid",
+                    )
+                })?;
+                match block["type"].as_str() {
+                    Some("thinking")
+                        if block["thinking"].as_str().is_some()
+                            && block["signature"].as_str().is_some() =>
+                    {
+                        content.push(block);
+                    }
+                    Some("redacted_thinking") if block["data"].as_str().is_some() => {
+                        content.push(block);
+                    }
+                    _ => {
+                        return Err(provider_error(
+                            ModelErrorKind::Protocol,
+                            false,
+                            None,
+                            "Anthropic thinking continuation state has an unsupported shape",
+                        ));
+                    }
+                }
+            }
+            ContentPart::Reasoning { .. } => {}
+            ContentPart::Refusal { text } if role == Role::Assistant => {
+                content.push(json!({"type":"text","text":text}));
+            }
+            ContentPart::Refusal { .. } => {
+                return Err(capability_error(
+                    "refusals are only valid in assistant messages",
+                ));
+            }
         }
     }
     Ok(content)
@@ -403,7 +482,28 @@ async fn consume_block_start(
                 },
             );
         }
-        Some("thinking" | "redacted_thinking") => {}
+        Some("thinking") => {
+            state.reasoning.insert(
+                index,
+                PartialReasoning::Thinking {
+                    thinking: value["content_block"]["thinking"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    signature: String::new(),
+                },
+            );
+        }
+        Some("redacted_thinking") => {
+            let data = required_string(
+                &value["content_block"],
+                "data",
+                "redacted_thinking block is missing data",
+            )?;
+            state
+                .reasoning
+                .insert(index, PartialReasoning::Redacted { data });
+        }
         Some(kind) => {
             return Err(provider_error(
                 ModelErrorKind::Protocol,
@@ -452,7 +552,37 @@ async fn consume_block_delta(
                 tool.input_json.push_str(fragment);
             }
         }
-        Some("thinking_delta" | "signature_delta") => {}
+        Some("thinking_delta") => {
+            let index = required_index(value)?;
+            let Some(PartialReasoning::Thinking { thinking, .. }) = state.reasoning.get_mut(&index)
+            else {
+                return Err(provider_error(
+                    ModelErrorKind::Protocol,
+                    false,
+                    None,
+                    "thinking delta arrived before thinking block",
+                ));
+            };
+            if let Some(fragment) = value["delta"]["thinking"].as_str() {
+                thinking.push_str(fragment);
+            }
+        }
+        Some("signature_delta") => {
+            let index = required_index(value)?;
+            let Some(PartialReasoning::Thinking { signature, .. }) =
+                state.reasoning.get_mut(&index)
+            else {
+                return Err(provider_error(
+                    ModelErrorKind::Protocol,
+                    false,
+                    None,
+                    "thinking signature arrived before thinking block",
+                ));
+            };
+            if let Some(fragment) = value["delta"]["signature"].as_str() {
+                signature.push_str(fragment);
+            }
+        }
         Some(kind) => {
             return Err(provider_error(
                 ModelErrorKind::Protocol,
@@ -471,6 +601,54 @@ async fn consume_block_delta(
         }
     }
     Ok(())
+}
+
+async fn emit_reasoning(
+    events: &mpsc::Sender<ModelStreamEvent>,
+    reasoning: PartialReasoning,
+    provider_id: &str,
+    model: &str,
+) -> Result<(), ProviderExecutionError> {
+    let data = match reasoning {
+        PartialReasoning::Thinking {
+            thinking,
+            signature,
+        } => {
+            if signature.is_empty() {
+                return Err(provider_error(
+                    ModelErrorKind::Protocol,
+                    false,
+                    None,
+                    "thinking block ended without signature",
+                ));
+            }
+            json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            })
+            .to_string()
+        }
+        PartialReasoning::Redacted { data } => json!({
+            "type": "redacted_thinking",
+            "data": data,
+        })
+        .to_string(),
+    };
+    emit(
+        events,
+        ModelStreamEvent::Reasoning {
+            summary: Vec::new(),
+            private_state: Some(ProviderPrivateState {
+                provider_id: provider_id.to_owned(),
+                protocol: "anthropic_messages".into(),
+                model: model.to_owned(),
+                format: "anthropic.messages.thinking.v1".into(),
+                data,
+            }),
+        },
+    )
+    .await
 }
 
 async fn emit_tool(

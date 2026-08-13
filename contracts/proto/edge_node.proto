@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package agent.edge.v1;
+
+service EdgeNodeSession {
+  rpc OpenSession(stream NodeToControl) returns (stream ControlToNode);
+}
+
+message NodeToControl {
+  oneof frame {
+    ClientHello hello = 1;
+    SessionProof proof = 2;
+    OutboxBatch outbox_batch = 3;
+  }
+}
+
+message ControlToNode {
+  oneof frame {
+    SessionChallenge challenge = 1;
+    SessionAccepted accepted = 2;
+    TaskDelivery task = 3;
+    OutboxAck ack = 4;
+    EnrollmentRevoked revoked = 5;
+  }
+}
+
+message ClientHello {
+  uint32 schema_version = 1;
+  string device_id = 2;
+  string enrollment_id = 3;
+  string node_id = 4;
+  uint64 node_generation = 5;
+  string enrollment_grant_digest = 6;
+  string capability_manifest_digest = 7;
+  repeated string approved_capabilities = 8;
+}
+
+message SessionChallenge {
+  uint32 schema_version = 1;
+  string session_id = 2;
+  bytes nonce = 3;
+  int64 expires_at_unix_ms = 4;
+}
+
+message SessionProof {
+  uint32 schema_version = 1;
+  string proof_token = 2;
+}
+
+message SessionAccepted {
+  uint32 schema_version = 1;
+  string session_id = 2;
+}
+
+message TaskDelivery {
+  uint32 schema_version = 1;
+  string task_token = 2;
+}
+
+message OutboxBatch {
+  uint32 schema_version = 1;
+  string session_id = 2;
+  uint64 first_sequence = 3;
+  uint64 last_sequence = 4;
+  bytes records_json = 5;
+  string batch_digest = 6;
+}
+
+message OutboxAck {
+  uint32 schema_version = 1;
+  string ack_token = 2;
+}
+
+message EnrollmentRevoked {
+  uint32 schema_version = 1;
+  string revocation_token = 2;
+}

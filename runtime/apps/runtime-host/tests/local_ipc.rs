@@ -8,7 +8,7 @@ use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
-    LocalProviderConfig, LocalRuntimeConfig, LocalToolConsent, WORKSPACE_READ_SCOPE,
+    LocalModelRoutingConfig, LocalRuntimeConfig, LocalToolConsent, WORKSPACE_READ_SCOPE,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -52,18 +52,23 @@ fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> Loc
         workspace_root,
         agent_instructions: "Explain evidence before conclusions.".into(),
         delegated_scopes: BTreeSet::from([WORKSPACE_READ_SCOPE.to_owned()]),
-        provider: LocalProviderConfig {
+        subagent_roles: Vec::new(),
+        model_routing: LocalModelRoutingConfig::single_openai_compatible(
             endpoint,
-            model: "local-test-model".into(),
-            api_key: "local-test-key".into(),
-        },
+            "local-test-model",
+            "local-test-key",
+        ),
+        mcp_servers: Vec::new(),
+        mcp_lifecycle: agent_runtime_host::LocalMcpLifecycleConfig::default(),
         trusted_workspace_tool: None,
+        process_session: None,
         consent: LocalToolConsent::AllowOnce,
         budget: RunBudget {
             max_tokens: 4_096,
             max_cost_cents: 100,
             max_duration_seconds: 600,
         },
+        runtime_policy: agent_protocol::RuntimeExecutionPolicySnapshot::default(),
     }
 }
 
@@ -306,11 +311,11 @@ async fn a_deeply_nested_state_root_still_yields_a_bindable_control_socket() {
     let listener = LocalRuntimeDaemon::bind(&socket)
         .await
         .expect("a deeply nested state root must still bind a control socket");
-    drop(listener);
 
     assert_eq!(
         default_socket_path(&deep),
         socket,
         "clients must derive the same socket path as the daemon"
     );
+    LocalRuntimeDaemon::release(&socket, listener);
 }

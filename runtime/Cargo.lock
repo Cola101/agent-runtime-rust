@@ -80,10 +80,33 @@ dependencies = [
 name = "agent-edge-node"
 version = "0.1.0"
 dependencies = [
- "agent-kernel",
+ "agent-grpc-security",
+ "agent-model-gateway",
+ "agent-protocol",
+ "agent-runtime-host",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "libc",
+ "prost",
+ "rand_core 0.6.4",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -145,8 +168,10 @@ name = "agent-model-gateway-protocol"
 version = "0.1.0"
 dependencies = [
  "agent-protocol",
+ "hex",
  "prost",
  "serde_json",
+ "sha2",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -198,7 +223,10 @@ dependencies = [
  "agent-tool-runtime",
  "base64",
  "chrono",
+ "ed25519-dalek",
+ "futures-util",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

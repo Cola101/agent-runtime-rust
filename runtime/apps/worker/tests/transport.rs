@@ -308,12 +308,18 @@ fn signed_identity_renewal(
     let claims = WorkloadIdentityClaims {
         schema_version: 2,
         tenant_id: command.tenant_id,
+        application_id: Uuid::nil(),
+        workload_identity_id: Uuid::nil(),
         run_id: command.run_id,
+        session_id: Uuid::nil(),
+        workspace_id: Uuid::nil(),
+        agent_version_id: Uuid::nil(),
         attempt_id: command.attempt_id,
         worker_id: command.worker_id,
         worker_incarnation_id: command.worker_incarnation_id,
         model_policy_id: command.model_policy_id,
         model_policy_digest: String::new(),
+        authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["checkpoint-gateway".into(), "model-gateway".into()]),
         scopes: BTreeSet::from([
             "checkpoint.read".into(),

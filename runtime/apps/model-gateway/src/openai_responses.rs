@@ -5,7 +5,7 @@ use crate::openai_compatible::{
 };
 use agent_protocol::{
     ContentPart, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
-    ReasoningPolicy, Role,
+    ProviderPrivateState, ReasoningPolicy, Role,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -65,6 +65,28 @@ impl OpenAiResponsesAdapter {
 
     pub async fn execute(
         &self,
+        request: &ModelRequest,
+        credential: &ProviderCredential,
+        cancellation: CancellationToken,
+        events: mpsc::Sender<ModelStreamEvent>,
+    ) -> Result<(), ProviderExecutionError> {
+        let provider_id = "direct-openai-responses";
+        let (request, omissions) = crate::prepare_request_for_provider(
+            request,
+            provider_id,
+            "openai_responses",
+            &self.model,
+        )?;
+        for omission in omissions {
+            emit(&events, omission).await?;
+        }
+        self.execute_for_provider(provider_id, &request, credential, cancellation, events)
+            .await
+    }
+
+    pub(crate) async fn execute_for_provider(
+        &self,
+        provider_id: &str,
         request: &ModelRequest,
         credential: &ProviderCredential,
         cancellation: CancellationToken,
@@ -135,6 +157,49 @@ impl OpenAiResponsesAdapter {
                 "response.output_text.delta" => {
                     if let Some(text) = value["delta"].as_str().filter(|text| !text.is_empty()) {
                         emit(&events, ModelStreamEvent::TextDelta { text: text.into() }).await?;
+                    }
+                }
+                "response.refusal.done" => {
+                    if let Some(text) = value["refusal"].as_str().filter(|text| !text.is_empty()) {
+                        emit(&events, ModelStreamEvent::Refusal { text: text.into() }).await?;
+                    }
+                }
+                "response.output_item.done" if value["item"]["type"] == "reasoning" => {
+                    let item = &value["item"];
+                    let summary = item["summary"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|part| part["text"].as_str())
+                        .filter(|text| !text.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    let private_state = match item["encrypted_content"].as_str() {
+                        Some(encrypted_content) if !encrypted_content.is_empty() => {
+                            let id = required_string(item, "id", "reasoning item is missing id")?;
+                            Some(ProviderPrivateState {
+                                provider_id: provider_id.to_owned(),
+                                protocol: "openai_responses".into(),
+                                model: self.model.clone(),
+                                format: "openai.responses.reasoning.v1".into(),
+                                data: json!({
+                                    "id": id,
+                                    "encrypted_content": encrypted_content,
+                                })
+                                .to_string(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if !summary.is_empty() || private_state.is_some() {
+                        emit(
+                            &events,
+                            ModelStreamEvent::Reasoning {
+                                summary,
+                                private_state,
+                            },
+                        )
+                        .await?;
                     }
                 }
                 "response.output_item.done" if value["item"]["type"] == "function_call" => {
@@ -247,7 +312,8 @@ impl OpenAiResponsesAdapter {
             "stream": true,
             "store": false,
             "max_output_tokens": request.max_output_tokens,
-            "reasoning": {"effort": effort}
+            "reasoning": {"effort": effort},
+            "include": ["reasoning.encrypted_content"]
         });
         if !tools.is_empty() {
             payload["tools"] = Value::Array(tools);
@@ -264,6 +330,10 @@ impl OpenAiResponsesAdapter {
             });
         }
         Ok(payload)
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -323,6 +393,47 @@ fn response_input(request: &ModelRequest) -> Result<Vec<Value>, ProviderExecutio
                 ContentPart::ToolResult { .. } => {
                     return Err(capability_error(
                         "tool results are only valid in tool messages",
+                    ));
+                }
+                ContentPart::Reasoning {
+                    summary,
+                    private_state: Some(state),
+                } if state.format == "openai.responses.reasoning.v1" => {
+                    let private: Value = serde_json::from_str(&state.data).map_err(|_| {
+                        provider_error(
+                            ModelErrorKind::Protocol,
+                            false,
+                            None,
+                            "OpenAI reasoning continuation state is invalid",
+                        )
+                    })?;
+                    let id = required_string(
+                        &private,
+                        "id",
+                        "OpenAI reasoning continuation state is missing id",
+                    )?;
+                    let encrypted_content = required_string(
+                        &private,
+                        "encrypted_content",
+                        "OpenAI reasoning continuation state is missing encrypted content",
+                    )?;
+                    input.push(json!({
+                        "type": "reasoning",
+                        "id": id,
+                        "summary": summary.iter().map(|text| json!({
+                            "type": "summary_text",
+                            "text": text,
+                        })).collect::<Vec<_>>(),
+                        "encrypted_content": encrypted_content,
+                    }));
+                }
+                ContentPart::Reasoning { .. } => {}
+                ContentPart::Refusal { text } if message.role == Role::Assistant => {
+                    message_content.push(json!({"type":"refusal","refusal":text}));
+                }
+                ContentPart::Refusal { .. } => {
+                    return Err(capability_error(
+                        "refusals are only valid in assistant messages",
                     ));
                 }
             }

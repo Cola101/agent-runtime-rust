@@ -1,14 +1,18 @@
 use crate::{
     ModelInvocationDecodeError, ModelPolicyRouteResolver, ProviderAdapter, ProviderCredential,
-    ProviderExecutionError, ProviderRoute, decode_model_invocation, execute_with_safe_failover,
+    ProviderExecutionError, ProviderRoute, decode_model_invocation, execute_with_frozen_failover,
 };
 use agent_model_gateway_protocol::v1::model_event::Body as EventBody;
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecution;
 use agent_model_gateway_protocol::v1::{
     Completed, Failed, FinishReason, ModelErrorKind as WireErrorKind, ModelEvent, ModelInvocation,
-    TextDelta, ToolCall as WireToolCall, Usage,
+    PrivateStateOmitted as WirePrivateStateOmitted, ProviderPrivateState as WirePrivateState,
+    Reasoning as WireReasoning, Refusal as WireRefusal, TextDelta, ToolCall as WireToolCall, Usage,
 };
-use agent_protocol::{ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent};
+use agent_protocol::{
+    ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
+    RuntimeExecutionPolicySnapshot,
+};
 use agent_workload_identity::{
     RequiredCapability, WorkloadIdentityBinding, WorkloadIdentityClaims, WorkloadTokenVerifier,
 };
@@ -20,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct ModelExecutionGrpcService {
@@ -110,7 +115,7 @@ impl ModelExecution for ModelExecutionGrpcService {
         let invocation = request.into_inner();
         validate_invocation_identity(&invocation, &claims)?;
         let model_request = decode_invocation(&invocation)?;
-        let routes = if invocation.schema_version == 3 {
+        let routes = if matches!(invocation.schema_version, 3 | 4) {
             self.route_resolver
                 .as_ref()
                 .ok_or_else(|| {
@@ -121,6 +126,14 @@ impl ModelExecution for ModelExecutionGrpcService {
         } else {
             self.routes.clone()
         };
+        let runtime_policy = if invocation.schema_version == 4 {
+            serde_json::from_slice::<RuntimeExecutionPolicySnapshot>(
+                &invocation.runtime_policy_snapshot_json,
+            )
+            .map_err(|_| Status::failed_precondition("runtime execution policy is invalid"))?
+        } else {
+            RuntimeExecutionPolicySnapshot::default()
+        };
         let cancellation = CancellationToken::new();
         let stream_cancellation = cancellation.clone();
         let (provider_tx, mut provider_rx) = mpsc::channel(32);
@@ -129,9 +142,10 @@ impl ModelExecution for ModelExecutionGrpcService {
         tokio::spawn(async move {
             let provider_cancellation = cancellation.clone();
             let provider_task = tokio::spawn(async move {
-                execute_with_safe_failover(
+                execute_with_frozen_failover(
                     &routes,
                     &model_request,
+                    &runtime_policy.model_failover,
                     provider_cancellation,
                     provider_tx,
                 )
@@ -165,9 +179,35 @@ fn validate_invocation_identity(
     invocation: &ModelInvocation,
     claims: &WorkloadIdentityClaims,
 ) -> Result<(), Status> {
+    let complete_identity = invocation.schema_version == 5;
     let binding = WorkloadIdentityBinding {
         tenant_id: invocation.tenant_id.parse().unwrap_or_default(),
+        application_id: if complete_identity {
+            invocation.application_id.parse().unwrap_or_default()
+        } else {
+            Uuid::nil()
+        },
+        workload_identity_id: if complete_identity {
+            invocation.workload_identity_id.parse().unwrap_or_default()
+        } else {
+            Uuid::nil()
+        },
         run_id: invocation.run_id.parse().unwrap_or_default(),
+        session_id: if complete_identity {
+            invocation.session_id.parse().unwrap_or_default()
+        } else {
+            Uuid::nil()
+        },
+        workspace_id: if complete_identity {
+            invocation.workspace_id.parse().unwrap_or_default()
+        } else {
+            Uuid::nil()
+        },
+        agent_version_id: if complete_identity {
+            invocation.agent_version_id.parse().unwrap_or_default()
+        } else {
+            Uuid::nil()
+        },
         attempt_id: invocation.attempt_id.parse().unwrap_or_default(),
         worker_id: invocation.worker_id.parse().unwrap_or_default(),
         worker_incarnation_id: invocation.worker_incarnation_id.parse().unwrap_or_default(),
@@ -178,6 +218,8 @@ fn validate_invocation_identity(
                 && claims.model_policy_digest.is_empty()
                 && invocation.model_policy_digest.is_empty()
                 && invocation.model_policy_snapshot_json.is_empty()
+                && invocation.runtime_policy_snapshot_json.is_empty()
+                && invocation.runtime_policy_digest.is_empty()
         }
         3 => {
             claims.schema_version == 3
@@ -185,6 +227,36 @@ fn validate_invocation_identity(
                 && invocation.model_policy_digest == claims.model_policy_digest
                 && invocation.model_policy_digest
                     == hex::encode(Sha256::digest(&invocation.model_policy_snapshot_json))
+                && invocation.runtime_policy_snapshot_json.is_empty()
+                && invocation.runtime_policy_digest.is_empty()
+        }
+        4 => {
+            claims.schema_version == 3
+                && !invocation.model_policy_snapshot_json.is_empty()
+                && invocation.model_policy_digest == claims.model_policy_digest
+                && invocation.model_policy_digest
+                    == hex::encode(Sha256::digest(&invocation.model_policy_snapshot_json))
+                && !invocation.runtime_policy_snapshot_json.is_empty()
+                && invocation.runtime_policy_digest
+                    == hex::encode(Sha256::digest(&invocation.runtime_policy_snapshot_json))
+                && serde_json::from_slice::<RuntimeExecutionPolicySnapshot>(
+                    &invocation.runtime_policy_snapshot_json,
+                )
+                .is_ok_and(|policy| policy.is_bounded_and_safe())
+        }
+        5 => {
+            claims.schema_version == 4
+                && !invocation.model_policy_snapshot_json.is_empty()
+                && invocation.model_policy_digest == claims.model_policy_digest
+                && invocation.model_policy_digest
+                    == hex::encode(Sha256::digest(&invocation.model_policy_snapshot_json))
+                && !invocation.runtime_policy_snapshot_json.is_empty()
+                && invocation.runtime_policy_digest
+                    == hex::encode(Sha256::digest(&invocation.runtime_policy_snapshot_json))
+                && serde_json::from_slice::<RuntimeExecutionPolicySnapshot>(
+                    &invocation.runtime_policy_snapshot_json,
+                )
+                .is_ok_and(|policy| policy.is_bounded_and_safe())
         }
         _ => false,
     };
@@ -249,6 +321,29 @@ fn encode_event(sequence: u64, event: ModelStreamEvent) -> Result<ModelEvent, St
             name,
             arguments_json: serde_json::to_vec(&arguments)
                 .map_err(|_| Status::internal("tool-call arguments could not be encoded"))?,
+        }),
+        ModelStreamEvent::Reasoning {
+            summary,
+            private_state,
+        } => EventBody::Reasoning(WireReasoning {
+            summary,
+            private_state: private_state.map(|state| WirePrivateState {
+                provider_id: state.provider_id,
+                protocol: state.protocol,
+                model: state.model,
+                format: state.format,
+                data: state.data,
+            }),
+        }),
+        ModelStreamEvent::Refusal { text } => EventBody::Refusal(WireRefusal { text }),
+        ModelStreamEvent::PrivateStateOmitted {
+            origin_provider_id,
+            target_provider_id,
+            format,
+        } => EventBody::PrivateStateOmitted(WirePrivateStateOmitted {
+            origin_provider_id,
+            target_provider_id,
+            format,
         }),
     };
     Ok(ModelEvent {
@@ -341,12 +436,18 @@ mod tests {
         let claims = WorkloadIdentityClaims {
             schema_version: 3,
             tenant_id,
+            application_id: Uuid::nil(),
+            workload_identity_id: Uuid::nil(),
             run_id,
+            session_id: Uuid::nil(),
+            workspace_id: Uuid::nil(),
+            agent_version_id: Uuid::nil(),
             attempt_id,
             worker_id,
             worker_incarnation_id: worker_id,
             model_policy_id: policy_id,
             model_policy_digest: digest,
+            authorized_mcp_servers: Default::default(),
             audiences: BTreeSet::from(["model-gateway".into()]),
             scopes: BTreeSet::from(["model.execute".into()]),
             issued_at_unix_ms: now,
@@ -366,6 +467,86 @@ mod tests {
     fn schema_three_rejects_worker_snapshot_tampering() {
         let (mut invocation, claims) = bound_invocation_and_claims();
         invocation.model_policy_snapshot_json.push(b' ');
+
+        assert_eq!(
+            validate_invocation_identity(&invocation, &claims)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn schema_four_binds_and_validates_the_runtime_policy_snapshot() {
+        let (mut invocation, claims) = bound_invocation_and_claims();
+        let runtime_policy = agent_protocol::RuntimeExecutionPolicySnapshot::default();
+        invocation.schema_version = 4;
+        invocation.runtime_policy_snapshot_json = serde_json::to_vec(&runtime_policy).unwrap();
+        invocation.runtime_policy_digest =
+            hex::encode(Sha256::digest(&invocation.runtime_policy_snapshot_json));
+
+        validate_invocation_identity(&invocation, &claims).unwrap();
+
+        invocation.runtime_policy_snapshot_json.push(b' ');
+        assert_eq!(
+            validate_invocation_identity(&invocation, &claims)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    /// The production break this catches is accepting a v20 model call after
+    /// checking only tenant/Run/Worker identity. The full immutable resource
+    /// chain in the request must match the signed schema-v4 token.
+    #[test]
+    fn schema_five_binds_the_complete_runtime_invocation_identity() {
+        let (mut invocation, mut claims) = bound_invocation_and_claims();
+        let application_id = Uuid::now_v7();
+        let workload_identity_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let workspace_id = Uuid::now_v7();
+        let agent_version_id = Uuid::now_v7();
+        let runtime_policy = agent_protocol::RuntimeExecutionPolicySnapshot::default();
+        invocation.schema_version = 5;
+        invocation.application_id = application_id.to_string();
+        invocation.workload_identity_id = workload_identity_id.to_string();
+        invocation.session_id = session_id.to_string();
+        invocation.workspace_id = workspace_id.to_string();
+        invocation.agent_version_id = agent_version_id.to_string();
+        invocation.runtime_policy_snapshot_json = serde_json::to_vec(&runtime_policy).unwrap();
+        invocation.runtime_policy_digest =
+            hex::encode(Sha256::digest(&invocation.runtime_policy_snapshot_json));
+        claims.schema_version = 4;
+        claims.application_id = application_id;
+        claims.workload_identity_id = workload_identity_id;
+        claims.session_id = session_id;
+        claims.workspace_id = workspace_id;
+        claims.agent_version_id = agent_version_id;
+
+        validate_invocation_identity(&invocation, &claims).unwrap();
+
+        invocation.workspace_id = Uuid::now_v7().to_string();
+        assert_eq!(
+            validate_invocation_identity(&invocation, &claims)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn older_invocation_cannot_smuggle_a_runtime_policy() {
+        let (mut invocation, mut claims) = bound_invocation_and_claims();
+        invocation.schema_version = 2;
+        invocation.model_policy_snapshot_json.clear();
+        invocation.model_policy_digest.clear();
+        claims.schema_version = 2;
+        claims.model_policy_digest.clear();
+        invocation.runtime_policy_snapshot_json =
+            serde_json::to_vec(&agent_protocol::RuntimeExecutionPolicySnapshot::default()).unwrap();
+        invocation.runtime_policy_digest =
+            hex::encode(Sha256::digest(&invocation.runtime_policy_snapshot_json));
 
         assert_eq!(
             validate_invocation_identity(&invocation, &claims)

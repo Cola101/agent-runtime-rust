@@ -1,7 +1,33 @@
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "Linux cgroup protocol stays unreachable until persisted recovery wiring is complete"
+    )
+)]
+mod process_resources;
+mod process_session;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
-use agent_protocol::{SandboxClass, ToolExecutionRequest};
+pub use process_session::{
+    PROCESS_ATTACH_TOOL, PROCESS_CLOSE_TOOL, PROCESS_INTERRUPT_TOOL, PROCESS_POLL_TOOL,
+    PROCESS_RESIZE_TOOL, PROCESS_START_TOOL, PROCESS_WAIT_TOOL, PROCESS_WRITE_TOOL,
+    PersistentProcessSessionManager, ProcessSessionAccess, ProcessSessionAction,
+    ProcessSessionError, ProcessSessionGovernance, ProcessSessionInteraction, ProcessSessionOutput,
+    ProcessSessionPtySupervisorConfig, ProcessSessionQuotaScope, ProcessSessionRecovery,
+    ProcessSessionResourceBackendConfig, ProcessSessionResourceBackendKind,
+    ProcessSessionResourceCapabilities, ProcessSessionStartRequest, ProcessSessionState,
+    ProcessSessionSweepReport, ProcessSessionTerminationReason, ProcessSessionToolExecutor,
+    ProcessSessionToolOperation, ProcessWaitObservationSnapshot,
+};
+
+#[cfg(unix)]
+pub use process_session::run_process_session_pty_supervisor;
+
+use agent_protocol::{
+    McpElicitationRequest, McpInputContinuation, SandboxClass, ToolExecutionRequest,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -12,6 +38,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -48,7 +75,12 @@ pub struct TrustedNativeToolDefinition {
 #[derive(Clone, Debug)]
 pub struct ToolExecutionContext {
     pub tenant_id: Uuid,
+    pub application_id: Uuid,
+    pub workload_identity_id: Uuid,
     pub run_id: Uuid,
+    pub session_id: Uuid,
+    pub workspace_id: Uuid,
+    pub agent_version_id: Uuid,
     pub attempt_id: Uuid,
     pub workspace_root: PathBuf,
     pub timeout: Duration,
@@ -80,6 +112,48 @@ pub struct ToolExecutionResult {
     pub exit_code: i32,
 }
 
+/// One bounded, advisory update emitted while a Tool request is still active.
+/// Progress is never authority for replay or completion; the durable Tool
+/// result and Run terminal event remain the only completion boundaries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolExecutionProgress {
+    pub progress: f64,
+    pub total: Option<f64>,
+    pub message: Option<String>,
+}
+
+/// Non-blocking progress sink. A noisy Tool cannot stall execution or grow an
+/// unbounded queue: once the receiver falls behind, intermediate updates are
+/// deliberately dropped while the final result continues normally.
+#[derive(Clone, Debug)]
+pub struct ToolProgressReporter {
+    sender: Option<mpsc::Sender<ToolExecutionProgress>>,
+}
+
+impl ToolProgressReporter {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self { sender: None }
+    }
+
+    #[must_use]
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<ToolExecutionProgress>) {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        (
+            Self {
+                sender: Some(sender),
+            },
+            receiver,
+        )
+    }
+
+    pub fn try_report(&self, progress: ToolExecutionProgress) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(progress);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ToolExecutionError {
     #[error("invalid container tool definition: {0}")]
@@ -106,6 +180,40 @@ pub enum ToolExecutionError {
     OutputBindingMismatch,
     #[error("trusted native tool executable changed after registration")]
     ExecutableChanged,
+    #[error("persistent process session {session_id} start failed: {reason}")]
+    ProcessSessionStartFailed { session_id: Uuid, reason: String },
+    #[error("persistent process session failed: {0}")]
+    PersistentProcessSession(String),
+    #[error("MCP Tool requires recoverable user input at round {round}")]
+    McpInputRequired {
+        round: u8,
+        request_state: String,
+        requests: std::collections::BTreeMap<String, McpElicitationRequest>,
+    },
+}
+
+impl ToolExecutionError {
+    /// Converts only failures that prove execution never crossed the external
+    /// side-effect boundary into a model-visible Tool result. Callers must not
+    /// use this as a generic error adapter: an unclassified failure of a
+    /// non-idempotent Tool remains ambiguous and needs recovery/reconciliation.
+    #[must_use]
+    pub fn deterministic_failure_result(&self) -> Option<ToolExecutionResult> {
+        match self {
+            Self::ProcessSessionStartFailed { session_id, .. } => Some(ToolExecutionResult {
+                content: json!({
+                    "error": {
+                        "code": "process_session_start_failed",
+                        "message": "persistent process session could not be started",
+                        "session_id": session_id,
+                    }
+                }),
+                is_error: true,
+                exit_code: 1,
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub trait ToolExecutor: Send + Sync {
@@ -116,6 +224,49 @@ pub trait ToolExecutor: Send + Sync {
         request: ToolExecutionRequest,
         context: ToolExecutionContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolExecutionError>> + Send + '_>>;
+
+    fn execute_with_progress(
+        &self,
+        request: ToolExecutionRequest,
+        context: ToolExecutionContext,
+        _progress: ToolProgressReporter,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolExecutionError>> + Send + '_>>
+    {
+        self.execute(request, context)
+    }
+
+    /// Observes a previously accepted non-idempotent execution without
+    /// repeating its side effect. Implementations may return a bound result
+    /// only when durable executor-owned state proves the original operation;
+    /// the default keeps the Run indeterminate.
+    fn recover_started_result(
+        &self,
+        _request: ToolExecutionRequest,
+        _context: ToolExecutionContext,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ToolExecutionResult>, ToolExecutionError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn resume_with_mcp_input(
+        &self,
+        _request: ToolExecutionRequest,
+        _context: ToolExecutionContext,
+        _continuation: McpInputContinuation,
+        _progress: ToolProgressReporter,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolExecutionError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(ToolExecutionError::InvalidContext(
+                "tool executor does not support MCP continuation".into(),
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +366,12 @@ impl RestrictedContainerExecutor {
             stdin_json: json!({
                 "schema_version": 1,
                 "tenant_id": context.tenant_id,
+                "application_id": context.application_id,
+                "workload_identity_id": context.workload_identity_id,
                 "run_id": context.run_id,
+                "session_id": context.session_id,
+                "workspace_id": context.workspace_id,
+                "agent_version_id": context.agent_version_id,
                 "attempt_id": context.attempt_id,
                 "requested_at": context.requested_at,
                 "timeout_ms": context.timeout.as_millis(),
@@ -470,7 +626,12 @@ impl TrustedNativeExecutor {
             stdin_json: json!({
                 "schema_version": 1,
                 "tenant_id": context.tenant_id,
+                "application_id": context.application_id,
+                "workload_identity_id": context.workload_identity_id,
                 "run_id": context.run_id,
+                "session_id": context.session_id,
+                "workspace_id": context.workspace_id,
+                "agent_version_id": context.agent_version_id,
                 "attempt_id": context.attempt_id,
                 "requested_at": context.requested_at,
                 "timeout_ms": context.timeout.as_millis(),
@@ -640,7 +801,10 @@ async fn reap_process_tree(child: &mut tokio::process::Child) {
         // The group is signalled *before* waiting: killing only the direct
         // child would leave grandchildren holding the stdout pipe, and the wait
         // below would then block on a tree that is still alive.
-        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        // Spawn used `process_group(0)`, so the child PID is the group ID by
+        // construction. Re-resolving it with `getpgid(pid)` creates a race with
+        // leader exit and PID reuse that can skip the still-live descendants.
+        let pgid = pid as libc::pid_t;
         // Never signal our own group -- that would take the Worker with it.
         if pgid > 0 && pgid != unsafe { libc::getpgrp() } {
             unsafe { libc::killpg(pgid, libc::SIGKILL) };

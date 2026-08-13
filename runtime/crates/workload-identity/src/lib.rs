@@ -2,7 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const TOKEN_VERSION: &str = "v2";
@@ -12,13 +12,27 @@ const MAX_TOKEN_LIFETIME_MS: i64 = 5 * 60 * 1000;
 pub struct WorkloadIdentityClaims {
     pub schema_version: u32,
     pub tenant_id: Uuid,
+    #[serde(default)]
+    pub application_id: Uuid,
+    #[serde(default)]
+    pub workload_identity_id: Uuid,
     pub run_id: Uuid,
+    #[serde(default)]
+    pub session_id: Uuid,
+    #[serde(default)]
+    pub workspace_id: Uuid,
+    #[serde(default)]
+    pub agent_version_id: Uuid,
     pub attempt_id: Uuid,
     pub worker_id: Uuid,
     pub worker_incarnation_id: Uuid,
     pub model_policy_id: Uuid,
     #[serde(default)]
     pub model_policy_digest: String,
+    /// Exact MCP Server snapshots this token may present to the credential
+    /// gateway, keyed by `server_id`. Empty means federation is not delegated.
+    #[serde(default)]
+    pub authorized_mcp_servers: BTreeMap<Uuid, String>,
     pub audiences: BTreeSet<String>,
     pub scopes: BTreeSet<String>,
     pub issued_at_unix_ms: i64,
@@ -29,7 +43,12 @@ impl WorkloadIdentityClaims {
     #[must_use]
     pub fn authorizes(&self, binding: &WorkloadIdentityBinding) -> bool {
         self.tenant_id == binding.tenant_id
+            && self.application_id == binding.application_id
+            && self.workload_identity_id == binding.workload_identity_id
             && self.run_id == binding.run_id
+            && self.session_id == binding.session_id
+            && self.workspace_id == binding.workspace_id
+            && self.agent_version_id == binding.agent_version_id
             && self.attempt_id == binding.attempt_id
             && self.worker_id == binding.worker_id
             && self.worker_incarnation_id == binding.worker_incarnation_id
@@ -39,7 +58,12 @@ impl WorkloadIdentityClaims {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkloadIdentityBinding {
     pub tenant_id: Uuid,
+    pub application_id: Uuid,
+    pub workload_identity_id: Uuid,
     pub run_id: Uuid,
+    pub session_id: Uuid,
+    pub workspace_id: Uuid,
+    pub agent_version_id: Uuid,
     pub attempt_id: Uuid,
     pub worker_id: Uuid,
     pub worker_incarnation_id: Uuid,
@@ -49,7 +73,12 @@ impl From<&WorkloadIdentityClaims> for WorkloadIdentityBinding {
     fn from(claims: &WorkloadIdentityClaims) -> Self {
         Self {
             tenant_id: claims.tenant_id,
+            application_id: claims.application_id,
+            workload_identity_id: claims.workload_identity_id,
             run_id: claims.run_id,
+            session_id: claims.session_id,
+            workspace_id: claims.workspace_id,
+            agent_version_id: claims.agent_version_id,
             attempt_id: claims.attempt_id,
             worker_id: claims.worker_id,
             worker_incarnation_id: claims.worker_incarnation_id,
@@ -153,18 +182,36 @@ impl WorkloadTokenVerifier {
             .map_err(|_| WorkloadTokenError::InvalidClaims)?;
         let claims = serde_json::from_slice::<WorkloadIdentityClaims>(&claims)
             .map_err(|_| WorkloadTokenError::InvalidClaims)?;
+        let legacy_invocation_fields_are_empty = claims.application_id.is_nil()
+            && claims.workload_identity_id.is_nil()
+            && claims.session_id.is_nil()
+            && claims.workspace_id.is_nil()
+            && claims.agent_version_id.is_nil()
+            && claims.authorized_mcp_servers.is_empty();
         let valid_policy_binding = match claims.schema_version {
-            2 => claims.model_policy_digest.is_empty(),
-            3 => {
-                claims.model_policy_digest.len() == 64
+            2 => claims.model_policy_digest.is_empty() && legacy_invocation_fields_are_empty,
+            3 => is_sha256(&claims.model_policy_digest) && legacy_invocation_fields_are_empty,
+            4 => {
+                is_sha256(&claims.model_policy_digest)
+                    && !claims.application_id.is_nil()
+                    && !claims.workload_identity_id.is_nil()
+                    && !claims.session_id.is_nil()
+                    && !claims.workspace_id.is_nil()
+                    && !claims.agent_version_id.is_nil()
+                    && claims.authorized_mcp_servers.len() <= 32
                     && claims
-                        .model_policy_digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        .authorized_mcp_servers
+                        .iter()
+                        .all(|(server_id, digest)| !server_id.is_nil() && is_sha256(digest))
             }
             _ => false,
         };
-        if !valid_policy_binding
+        if claims.tenant_id.is_nil()
+            || claims.run_id.is_nil()
+            || claims.attempt_id.is_nil()
+            || claims.worker_id.is_nil()
+            || claims.model_policy_id.is_nil()
+            || !valid_policy_binding
             || (required.require_incarnation && claims.worker_incarnation_id.is_nil())
         {
             return Err(WorkloadTokenError::InvalidClaims);
@@ -181,4 +228,11 @@ impl WorkloadTokenVerifier {
         }
         Ok(claims)
     }
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

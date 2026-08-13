@@ -23,6 +23,15 @@ message ModelInvocation {
   string worker_incarnation_id = 14;
   bytes model_policy_snapshot_json = 15;
   string model_policy_digest = 16;
+  // v4: exact protocol-neutral runtime policy accepted for this Run.
+  bytes runtime_policy_snapshot_json = 17;
+  string runtime_policy_digest = 18;
+  // v5: complete immutable v20 Runtime invocation identity. These fields are
+  // signed in workload-token schema v4 and must match before model egress.
+  string application_id = 19;
+  string workload_identity_id = 20;
+  string workspace_id = 21;
+  string agent_version_id = 22;
 }
 
 message ModelMessage {
@@ -37,6 +46,8 @@ message ContentPart {
     MediaPart audio = 3;
     ToolResultPart tool_result = 4;
     ToolCallPart tool_call = 5;
+    ReasoningPart reasoning = 6;
+    RefusalPart refusal = 7;
   }
 }
 
@@ -58,6 +69,23 @@ message ToolCallPart {
   string tool_call_id = 1;
   string name = 2;
   bytes arguments_json = 3;
+}
+
+message ProviderPrivateState {
+  string provider_id = 1;
+  string protocol = 2;
+  string model = 3;
+  string format = 4;
+  string data = 5;
+}
+
+message ReasoningPart {
+  repeated string summary = 1;
+  ProviderPrivateState private_state = 2;
+}
+
+message RefusalPart {
+  string text = 1;
 }
 
 message ModelTool {
@@ -90,6 +118,9 @@ message ModelEvent {
     Usage usage = 5;
     Completed completed = 6;
     Failed failed = 7;
+    Reasoning reasoning = 8;
+    Refusal refusal = 9;
+    PrivateStateOmitted private_state_omitted = 10;
   }
 }
 
@@ -117,6 +148,21 @@ message Failed {
   ModelErrorKind kind = 1;
   bool retryable = 2;
   string message = 3;
+}
+
+message Reasoning {
+  repeated string summary = 1;
+  ProviderPrivateState private_state = 2;
+}
+
+message Refusal {
+  string text = 1;
+}
+
+message PrivateStateOmitted {
+  string origin_provider_id = 1;
+  string target_provider_id = 2;
+  string format = 3;
 }
 
 enum FinishReason {
@@ -158,6 +204,11 @@ message McpServerRef {
   string endpoint = 3;
   // Sealed. Opened by the gateway and by nothing else.
   bytes credential_envelope_json = 4;
+  // Run-frozen wire revision. Empty decodes only as the legacy revision for
+  // read compatibility; new callers always send an explicit value.
+  string protocol_revision = 5;
+  // Client authority the Run delegated to this server (currently elicitation).
+  repeated string client_capabilities = 6;
 }
 
 message McpListToolsRequest {
@@ -171,6 +222,12 @@ message McpListToolsRequest {
   string attempt_id = 5;
   string worker_id = 6;
   string worker_incarnation_id = 7;
+  // v2: complete immutable invocation identity signed by workload-token v4.
+  string application_id = 8;
+  string workload_identity_id = 9;
+  string session_id = 10;
+  string workspace_id = 11;
+  string agent_version_id = 12;
 }
 
 message McpTool {
@@ -199,6 +256,16 @@ message McpCallToolRequest {
   string attempt_id = 8;
   string worker_id = 9;
   string worker_incarnation_id = 10;
+  // Empty for the first round. Later rounds carry the protocol-neutral,
+  // checkpointed McpInputContinuation JSON; the gateway translates it to the
+  // selected MCP wire revision without owning user-interaction state.
+  bytes input_continuation_json = 11;
+  // v2: complete immutable invocation identity signed by workload-token v4.
+  string application_id = 12;
+  string workload_identity_id = 13;
+  string session_id = 14;
+  string workspace_id = 15;
+  string agent_version_id = 16;
 }
 
 message McpCallToolResponse {
@@ -207,4 +274,8 @@ message McpCallToolResponse {
   // The server reported the call failed. Distinct from a transport failure: the
   // model should see this, and nothing should be retried.
   bool is_error = 3;
+  // Non-empty only when the modern MCP server returned input_required. The
+  // Worker persists this typed round before asking a user and sends the answer
+  // back in input_continuation_json on a fresh RPC.
+  bytes input_required_json = 4;
 }

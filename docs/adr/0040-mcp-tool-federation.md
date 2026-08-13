@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed. No implementation yet; this decides the shape before any is written.
+Accepted. HTTP federation is implemented in the Rust Runtime and credential-free
+HTTP is also available in the standalone Host through ADR-0045. Local operator-
+trusted stdio MCP is implemented separately by ADR-0046; OAuth onboarding and
+pin-aware outbound proxying remain outside this decision.
 
 ## Context
 
@@ -33,9 +36,11 @@ user picked the server and the server runs as that user, that is coherent. It
 does not survive multi-tenancy: a server process is shared mutable state, and
 "the user chose it" is not a statement anyone can make on behalf of a tenant.
 
-**OpenClaw**'s `src/mcp` is the *serving* side — exposing its own tools as an
-MCP server. Its consuming side lives in a skill (`skills/mcporter`), outside the
-runtime's own trust decisions.
+**OpenClaw** now has a first-class consuming Runtime under `src/agents`: stdio,
+SSE and Streamable HTTP transports, OAuth, requester-scoped connection
+resolution, session Runtime caching and lifecycle disposal. Its mature local
+Gateway boundary is useful evidence for transport breadth, but it does not bind
+an immutable MCP authority to a cross-Worker Checkpoint.
 
 So neither reference answers the question this platform has to answer, and the
 one thing worth taking from Codex is smaller and specific: it re-validates the
@@ -73,12 +78,34 @@ independently.
    safety this platform vouches for.
 
 4. **The catalog is discovered once per Run, frozen, and bound.**
-   Discovery happens at Run start. The resulting tool set enters the effective
-   Tool catalog digest exactly as native Tools do, so a Checkpoint restore
-   recomputes it and refuses on mismatch (ADR-0029). A server whose catalog
+   Discovery happens at Run start. The resulting qualified Tool names and their
+   frozen catalog digests enter a dedicated Checkpoint binding set, alongside
+   the native Tool catalog digest. Recovery rediscovers and requires an exact
+   binding-set match before model work or an old approval can continue. A server whose catalog
    changes mid-Run does not get to change what the Run may do; the call is
    refused rather than dispatched against a catalog nobody approved. Codex
    enforces the same rule.
+
+   Discovery uses at most four in-flight servers per Run. Completion is folded
+   back into command order so network timing cannot change model-visible Tool
+   order or which duplicate-name conflict wins. The default Worker policy gives
+   each server 3 seconds and the whole discovery 10 seconds; a standalone host
+   may provide another `McpDiscoveryPolicy`. Completed catalogs survive a total
+   deadline while queued and in-flight servers are cancelled and reported.
+   RunExecution v10 now decides the effective discovery policy before network
+   work (ADR-0041). Checkpoint schema 8 freezes it together with the catalog
+   bindings; schema 9 additionally freezes the configured server authority
+   (ADR-0045). Recovery under different concurrency or deadline
+   semantics is rejected even when the discovered Tool catalog is unchanged;
+   a v10 Run cannot resume from a pre-schema-8 Checkpoint that cannot prove the
+   complete Runtime policy.
+
+   Every clone of one gateway client also shares a process-local admission
+   scheduler (ADR-0042). Its default ceiling is 32 active discovery RPCs across
+   Runs. Queued requests rotate by `tenant_id`, so one tenant cannot drain its
+   whole queue before another queued tenant receives a slot. Queue wait is
+   covered by the Run's total discovery deadline, and cancellation releases the
+   slot without waiting for the remote server.
 
 5. **The three-way intersection is unchanged.**
    Effective Tools stay `Skill declared ∩ Worker trusted ∩ delegated scopes`.
@@ -113,10 +140,10 @@ independently.
 
 ### Negative
 
-- **Local stdio MCP servers — the most common kind today — are not supported.**
-  Most published MCP servers are npm or Python processes meant to run locally.
-  Excluding them excludes most of the ecosystem, which is a real cost against
-  the reason for doing this at all.
+- **The multi-tenant cloud Worker does not launch tenant stdio processes.**
+  ADR-0046 supports operator-trusted local stdio in the standalone Host, but
+  that native trust decision does not transfer to shared Workers without a
+  strong sandbox and a signed executable supply chain.
 - A federated tool call is a network round trip inside a Run, so a slow or
   unavailable server becomes a slow or failing Run. Timeouts and failure
   classification need to be explicit, not inherited.
@@ -138,6 +165,11 @@ independently.
   whole discovery path for this), server health and circuit breaking, per-tool
   rather than per-server scopes, or how a tenant reviews what a server's tools
   actually do before delegating them.
+- The shared scheduler is implemented in the protocol-neutral discovery path,
+  but the current NATS adapter still awaits each Run's discovery inside its
+  serial assignment poll. It therefore avoids unbounded concurrency but lets a
+  slow discovery delay later assignment polling. An async admission supervisor
+  is still required before claiming Worker-level multi-Run throughput.
 - Cost and rate limiting for federated calls are unaddressed.
 
 ## Alternatives Considered
@@ -151,10 +183,10 @@ independently.
   tenant's behalf.
 - **Register each federated tool individually as a trusted Tool:** rejected. It
   reintroduces the per-tool linear work MCP exists to remove.
-- **Proxy MCP through the Model Gateway:** considered and deferred. It would put
-  the credential in the process that already holds provider seals, which is
-  attractive, but the Gateway's job is protocol conversion for models and
-  widening it needs its own decision.
+- **Give the Worker plaintext MCP credentials:** rejected. Federation is served
+  by the existing Rust Gateway process so sealed credentials stay in the same
+  restricted access domain as model-provider credentials; the Worker receives
+  only Tool metadata and bounded results.
 
 ## References
 
@@ -163,5 +195,10 @@ independently.
 - ADR-0029 signed SkillVersion and trusted Tool activation
 - ADR-0036 Seatbelt-contained trusted Tools
 - ADR-0039 read-only shell command auto-approval
+- ADR-0041 runtime execution policy snapshot
+- ADR-0042 shared MCP discovery admission
+- ADR-0045 protocol-neutral MCP backend and standalone Host
+- ADR-0046 standalone stdio MCP session and process lifecycle
 - Codex `codex-rs/codex-mcp/src/binding.rs`, `codex-rs/codex-mcp/src/rmcp_client.rs`
-- OpenClaw `src/mcp/` (serving side), `skills/mcporter` (consuming side)
+- OpenClaw `src/agents/mcp-transport.ts`, `src/agents/mcp-oauth.ts`,
+  `src/agents/agent-bundle-mcp-manager-lifecycle.ts`

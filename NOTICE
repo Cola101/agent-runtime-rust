@@ -1,5 +1,5 @@
-Agent Runtime Platform
-Copyright 2026 Agent Runtime Platform contributors
+Agent Runtime Rust
+Copyright 2026 Agent Runtime Rust contributors
 
 This repository does not currently contain copied Codex source code. Any future
 selective port must preserve the original Apache-2.0 header, be recorded in

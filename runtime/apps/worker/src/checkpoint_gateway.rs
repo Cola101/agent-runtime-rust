@@ -56,7 +56,7 @@ impl CheckpointPayloadStore for GrpcCheckpointPayloadStore {
     ) -> BoxFuture<'a, Result<(), CheckpointStoreError>> {
         Box::pin(async move {
             let mut request = Request::new(PutCheckpointRequest {
-                schema_version: 1,
+                schema_version: schema_version(context),
                 binding: Some(binding(context)),
                 payload_ref: payload_ref.to_owned(),
                 payload: payload.to_vec(),
@@ -88,7 +88,7 @@ impl CheckpointPayloadStore for GrpcCheckpointPayloadStore {
     ) -> BoxFuture<'a, Result<Vec<u8>, CheckpointStoreError>> {
         Box::pin(async move {
             let mut request = Request::new(GetCheckpointRequest {
-                schema_version: 1,
+                schema_version: schema_version(context),
                 binding: Some(binding(context)),
                 payload_ref: payload_ref.to_owned(),
             });
@@ -111,10 +111,40 @@ impl CheckpointPayloadStore for GrpcCheckpointPayloadStore {
 fn binding(context: &CheckpointStoreContext) -> WorkloadBinding {
     WorkloadBinding {
         tenant_id: context.tenant_id.to_string(),
+        application_id: optional_uuid(context.application_id),
+        workload_identity_id: optional_uuid(context.workload_identity_id),
         run_id: context.run_id.to_string(),
+        session_id: optional_uuid(context.session_id),
+        workspace_id: optional_uuid(context.workspace_id),
+        agent_version_id: optional_uuid(context.agent_version_id),
         attempt_id: context.attempt_id.to_string(),
         worker_id: context.worker_id.to_string(),
         worker_incarnation_id: context.worker_incarnation_id.to_string(),
+    }
+}
+
+fn schema_version(context: &CheckpointStoreContext) -> u32 {
+    if [
+        context.application_id,
+        context.workload_identity_id,
+        context.session_id,
+        context.workspace_id,
+        context.agent_version_id,
+    ]
+    .iter()
+    .all(|id| !id.is_nil())
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn optional_uuid(value: uuid::Uuid) -> String {
+    if value.is_nil() {
+        String::new()
+    } else {
+        value.to_string()
     }
 }
 
