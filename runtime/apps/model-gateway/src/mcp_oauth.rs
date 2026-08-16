@@ -895,10 +895,57 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     token_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_expires_in")]
     expires_in: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_scope")]
     scope: Option<String>,
+}
+
+/// RFC 6749 types `expires_in` as a number, but providers commonly send a
+/// numeric string. Accepting both is parsing leniency only: the value goes
+/// through the identical bound check afterwards, so nothing downstream can tell
+/// which spelling arrived.
+///
+/// A value that is neither becomes `None`, which is exactly what omitting the
+/// optional field means -- an unknown lifetime. That is safe rather than
+/// convenient: an unknown lifetime is never treated as a long one, and a token
+/// the provider later rejects still converges through the 401 path.
+fn deserialize_expires_in<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::Number(number)) => number.as_u64(),
+            Some(serde_json::Value::String(text)) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        },
+    )
+}
+
+/// `scope` is specified as a space-delimited string, but arrays appear in the
+/// wild. Both normalize to the same string before the existing scope validation
+/// runs, so the count, length and control-character rules are unchanged.
+fn deserialize_scope<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => Some(text),
+            Some(serde_json::Value::Array(items)) => Some(
+                items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        serde_json::Value::String(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        },
+    )
 }
 
 impl Drop for TokenResponse {
