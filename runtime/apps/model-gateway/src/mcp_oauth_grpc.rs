@@ -83,6 +83,16 @@ impl McpOAuthAdminGrpcService {
                 Utc::now().timestamp_millis(),
             )
             .map_err(|_| Status::unauthenticated("invalid workload token"))?;
+        // Scope alone is not enough. A Run-shaped token carrying the admin scope
+        // would still be a Run acting as an operator, and no later policy could
+        // separate the two. Requiring the operator shape makes the distinction
+        // structural: a Run token names an execution, and an operator token
+        // cannot.
+        if !claims.is_operator() {
+            return Err(Status::permission_denied(
+                "the mcp oauth admin surface requires an operator identity",
+            ));
+        }
         let binding = WorkloadIdentityBinding {
             tenant_id: parse_uuid(&context.tenant_id, "tenant_id")?,
             application_id: parse_uuid(&context.application_id, "application_id")?,

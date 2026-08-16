@@ -194,6 +194,48 @@ async fn a_token_for_another_tenant_cannot_name_this_one() {
     assert_eq!(status.code(), Code::PermissionDenied);
 }
 
+/// The other half of the structural separation: an operator identity cannot
+/// federate.
+///
+/// An operator token names no execution, so it can never satisfy a federation
+/// binding, which always does. Together with the admin surface refusing
+/// Run-shaped tokens, this makes administering and executing two shapes rather
+/// than two scopes on one shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_token_cannot_federate() {
+    let signing_key = SigningKey::from_bytes(&[52; 32]);
+    let mcp = spawn_mcp_server().await;
+    let gateway = spawn_gateway(&signing_key).await;
+    let mut client = WireClient::connect(gateway).await.unwrap();
+
+    let mut operator = claims_for(Uuid::now_v7(), Uuid::now_v7(), &["mcp.federate"]);
+    operator.schema_version = agent_workload_identity::OPERATOR_SCHEMA_VERSION;
+    operator.application_id = Uuid::now_v7();
+    operator.workload_identity_id = Uuid::now_v7();
+    operator.run_id = Uuid::nil();
+    operator.attempt_id = Uuid::nil();
+    operator.worker_id = Uuid::nil();
+    operator.worker_incarnation_id = Uuid::nil();
+    operator.model_policy_id = Uuid::nil();
+    let token = sign(&signing_key, &operator);
+
+    let status = client
+        .list_tools(with_token(
+            list_request(operator.tenant_id, Uuid::now_v7(), &operator, mcp),
+            &token,
+        ))
+        .await
+        .expect_err("an operator identity must not be able to federate");
+    assert!(
+        matches!(
+            status.code(),
+            Code::PermissionDenied | Code::Unauthenticated
+        ),
+        "unexpected code {:?}",
+        status.code()
+    );
+}
+
 /// A Run may hold a token and still not be entitled to federation. A token that
 /// can execute a model is not automatically a token that can reach a tenant's
 /// third-party servers.

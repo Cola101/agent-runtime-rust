@@ -43,26 +43,24 @@ impl Drop for TestRoot {
     }
 }
 
-/// Note the run, attempt and worker identifiers: the workload token format has
-/// no operator shape, and `verify` refuses claims whose run/attempt/worker are
-/// nil. So an administrative token today is a Run-bound token carrying an extra
-/// scope, and the separation between federating and administering rests on that
-/// scope rather than on a distinct identity shape.
+/// An operator identity: it names who is acting and for which tenant, and every
+/// Run-scoped field is absent. That absence is the point -- it is what stops a
+/// Run token from ever satisfying an operator binding.
 fn claims_for(tenant_id: Uuid, scopes: &[&str]) -> WorkloadIdentityClaims {
     let now = chrono::Utc::now().timestamp_millis();
     WorkloadIdentityClaims {
-        schema_version: 2,
+        schema_version: agent_workload_identity::OPERATOR_SCHEMA_VERSION,
         tenant_id,
-        application_id: Uuid::nil(),
-        workload_identity_id: Uuid::nil(),
-        run_id: Uuid::now_v7(),
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
+        run_id: Uuid::nil(),
         session_id: Uuid::nil(),
         workspace_id: Uuid::nil(),
         agent_version_id: Uuid::nil(),
-        attempt_id: Uuid::now_v7(),
-        worker_id: Uuid::now_v7(),
-        worker_incarnation_id: Uuid::now_v7(),
-        model_policy_id: Uuid::now_v7(),
+        attempt_id: Uuid::nil(),
+        worker_id: Uuid::nil(),
+        worker_incarnation_id: Uuid::nil(),
+        model_policy_id: Uuid::nil(),
         model_policy_digest: String::new(),
         authorized_mcp_servers: Default::default(),
         audiences: BTreeSet::from(["model-gateway".to_owned()]),
@@ -176,6 +174,43 @@ async fn a_federation_token_cannot_administer_credentials() {
         "unexpected code {:?}",
         status.code()
     );
+}
+
+/// The separation is structural, not a matter of scope.
+///
+/// This is a Run-shaped token that carries the admin scope. Under the previous
+/// contract that was exactly what an administrative token looked like, so it
+/// would have been accepted. It must now be refused for its shape: a token that
+/// names an execution is not an operator, whatever scope it was granted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_shaped_token_with_the_admin_scope_is_still_refused() {
+    let signing_key = SigningKey::from_bytes(&[75; 32]);
+    let root = TestRoot::new();
+    let admin = spawn_admin(&signing_key, &root).await;
+    let mut client = WireClient::connect(admin).await.unwrap();
+
+    let mut run_shaped = claims_for(Uuid::now_v7(), &["mcp.oauth.admin"]);
+    run_shaped.schema_version = 2;
+    run_shaped.application_id = Uuid::nil();
+    run_shaped.workload_identity_id = Uuid::nil();
+    run_shaped.run_id = Uuid::now_v7();
+    run_shaped.attempt_id = Uuid::now_v7();
+    run_shaped.worker_id = Uuid::now_v7();
+    run_shaped.worker_incarnation_id = Uuid::now_v7();
+    run_shaped.model_policy_id = Uuid::now_v7();
+    let token = sign(&signing_key, &run_shaped);
+
+    let status = client
+        .get_credential_status(with_token(
+            McpOauthStatusRequest {
+                context: Some(context(&run_shaped)),
+                credential: Some(credential()),
+            },
+            &token,
+        ))
+        .await
+        .expect_err("a Run-shaped token must not administer, whatever scope it holds");
+    assert_eq!(status.code(), Code::PermissionDenied);
 }
 
 /// A token issued for one tenant must not administer another's credential, even

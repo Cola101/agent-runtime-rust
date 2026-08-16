@@ -54,14 +54,21 @@ flowchart LR
 8. **discovery 与 provider 拒绝合并为同一个状态码**。具体是 resource 不匹配、issuer 不一致还是字段超限，正是
    探测者想知道的信息，coordinator 内部错误也出于同样理由保持粗粒度。
 
-## 已知限制：workload token 没有运维态身份
+## 曾经的限制：workload token 没有运维态身份（已解除，见 ADR-0121）
 
-`WorkloadTokenVerifier::verify` 拒绝 `run_id`、`attempt_id`、`worker_id` 为 nil 的 claims，`require_incarnation`
-另外要求 `worker_incarnation_id`。**因此当前不存在租户级运维 token**：管理 token 实质上是一个绑定 Run 的 token
-额外携带一个 scope。
+本 ADR 最初记录：`verify` 拒绝 `run_id`/`attempt_id`/`worker_id` 为 nil 的 claims，因此不存在租户级运维 token，
+管理 token 实质是绑定 Run 的 token 额外携带一个 scope，federation 与 administration 的隔离**只建立在 scope 上**。
 
-这意味着 federation 与 administration 的隔离**建立在 scope 上，而不是建立在独立的身份形状上**。本 ADR 不声称
-更强的性质。真正的运维身份需要扩展 workload token 契约，属于后续工作。
+该限制**已解除**。workload token 新增 schema 5 运维身份形状：tenant、application、workload identity 必须存在，
+而 run、attempt、worker、incarnation、model policy、session、workspace、agent version **必须全部为 nil**。
+这个"必须缺席"才是关键——它让隔离变成**结构性**的：
+
+- Run token 的 `run_id` 非 nil，永远无法满足运维绑定；
+- 运维 token 的 `run_id` 为 nil，永远无法满足 federation 绑定。
+
+`authorizes` 逐字段全等比较，因此这层不需要任何改动，nil 与非 nil 的不对称本身就完成了隔离。管理面另外显式
+要求 `claims.is_operator()`：**携带 `mcp.oauth.admin` 的 Run 形态 token 现在会因其形状被拒绝**，而在旧契约下
+那恰恰就是管理 token 的样子。
 
 ## 非功能与失败语义
 

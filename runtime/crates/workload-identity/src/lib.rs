@@ -8,6 +8,14 @@ use uuid::Uuid;
 const TOKEN_VERSION: &str = "v2";
 const MAX_TOKEN_LIFETIME_MS: i64 = 5 * 60 * 1000;
 
+/// Schema version carried by an administrative identity that is not a Run.
+///
+/// Public because a service that exposes an operator surface has to be able to
+/// insist on it. Accepting a Run-shaped token there would put the separation
+/// between administering and executing back on scope alone, which is what this
+/// version exists to replace.
+pub const OPERATOR_SCHEMA_VERSION: u32 = 5;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkloadIdentityClaims {
     pub schema_version: u32,
@@ -40,6 +48,12 @@ pub struct WorkloadIdentityClaims {
 }
 
 impl WorkloadIdentityClaims {
+    /// Whether these claims describe an operator rather than an execution.
+    #[must_use]
+    pub fn is_operator(&self) -> bool {
+        self.schema_version == OPERATOR_SCHEMA_VERSION
+    }
+
     #[must_use]
     pub fn authorizes(&self, binding: &WorkloadIdentityBinding) -> bool {
         self.tenant_id == binding.tenant_id
@@ -204,15 +218,40 @@ impl WorkloadTokenVerifier {
                         .iter()
                         .all(|(server_id, digest)| !server_id.is_nil() && is_sha256(digest))
             }
+            // Schema 5 is an operator identity, which is deliberately not a Run.
+            // It names who is acting and for which tenant, and nothing about an
+            // execution. Requiring every Run-scoped field to be absent is what
+            // makes the separation structural: a Run token can never satisfy an
+            // operator binding, because its run_id is populated and the
+            // operator binding's is not. Before this, administering and
+            // federating were told apart only by scope, and one token shape
+            // could carry either.
+            OPERATOR_SCHEMA_VERSION => {
+                claims.model_policy_digest.is_empty()
+                    && claims.run_id.is_nil()
+                    && claims.attempt_id.is_nil()
+                    && claims.worker_id.is_nil()
+                    && claims.worker_incarnation_id.is_nil()
+                    && claims.model_policy_id.is_nil()
+                    && claims.session_id.is_nil()
+                    && claims.workspace_id.is_nil()
+                    && claims.agent_version_id.is_nil()
+                    && claims.authorized_mcp_servers.is_empty()
+                    && !claims.application_id.is_nil()
+                    && !claims.workload_identity_id.is_nil()
+            }
             _ => false,
         };
-        if claims.tenant_id.is_nil()
-            || claims.run_id.is_nil()
+        let operator = claims.schema_version == OPERATOR_SCHEMA_VERSION;
+        let run_identity_missing = claims.run_id.is_nil()
             || claims.attempt_id.is_nil()
             || claims.worker_id.is_nil()
-            || claims.model_policy_id.is_nil()
+            || claims.model_policy_id.is_nil();
+        if claims.tenant_id.is_nil()
             || !valid_policy_binding
-            || (required.require_incarnation && claims.worker_incarnation_id.is_nil())
+            // A Run token must name its execution; an operator token must not.
+            || (!operator && run_identity_missing)
+            || (!operator && required.require_incarnation && claims.worker_incarnation_id.is_nil())
         {
             return Err(WorkloadTokenError::InvalidClaims);
         }
