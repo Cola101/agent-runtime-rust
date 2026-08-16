@@ -730,6 +730,71 @@ async fn live_401_marks_current_token_rejected_without_replay() {
     task.abort();
 }
 
+/// A 401 wearing an event-stream content type must classify the same as a 401
+/// wearing a JSON one.
+///
+/// The status is checked before the transport branch is chosen, so this should
+/// hold -- but "should" is exactly the kind of claim that stops being true when
+/// someone reorders those two steps, and nothing else would notice.
+#[tokio::test]
+async fn a_401_on_the_event_stream_path_is_still_a_token_rejection() {
+    let root = TestRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&hits);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let observed = Arc::clone(&observed);
+            tokio::spawn(async move {
+                let mut chunk = [0_u8; 4_096];
+                if socket.read(&mut chunk).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = "event: message\ndata: {}\n\n";
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer error=\"invalid_token\"\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            });
+        }
+    });
+
+    let coordinator = coordinator(&root);
+    let bound = binding(&endpoint);
+    activate_via_real_exchange(&coordinator, &bound, "live-token", Some("refresh-value")).await;
+
+    let coordinator = Arc::new(coordinator);
+    let client = McpFederationClient::for_open_servers(Duration::from_secs(5), true)
+        .unwrap()
+        .with_oauth_coordinator(Arc::clone(&coordinator));
+    let error = match client
+        .list_tools(bound.tenant_id, &oauth_server_ref(&bound))
+        .await
+    {
+        Ok(_) => panic!("a 401 must not produce a catalog"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, McpFederationError::AuthorizationRequired),
+        "an event-stream 401 must classify as a rejection, not an outage: {error}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "no replay");
+    assert!(matches!(
+        coordinator.status(bound).await.unwrap(),
+        McpOAuthCredentialStatus::AuthorizationRequired {
+            reason: McpOAuthAuthorizationReason::AccessTokenRejected,
+            ..
+        }
+    ));
+    task.abort();
+}
+
 /// A 403 is an authorization decision about a caller that authenticated fine.
 /// Recording it as a dead token would let one permission change force every
 /// tenant through re-authorization.
