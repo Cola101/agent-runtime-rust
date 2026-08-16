@@ -52,6 +52,22 @@ workspace/all-targets/all-features `-D warnings` 与 fmt check 通过。途中�
 `agent-tool-runtime` flake（定点采样竞态，改为有界轮询）。证据见 ADR-0119 与
 `docs/evidence/2026-08-16-mcp-oauth-discovery-and-rejection-feedback.md`。
 
+2026-08-17 MCP OAuth 管理面与远端撤销完成：新增 `McpOauthAdmin` gRPC（begin/complete/status/revoke），要求
+独立 capability `mcp.oauth.admin` 而非复用 `mcp.federate`——能调用租户工具的 token 不应自动能销毁该租户的授权。
+管理面与 federation 共享同一 coordinator 实例，运维撤销对在途调用立即可见。响应不含 access token、refresh
+token、authorization code、PKCE verifier 或 OAuth state；完成授权只回 revision。tenant 取自已验证 claims 而非
+请求体，请求体只能断言 tenant/application/workload identity，run 相关字段一律来自 claims，因此请求无法拓宽
+自己的 token。RFC 7009 远端撤销：revocation endpoint 在授权时冻结（revoke 时重新 discovery 会把待作废的
+refresh token 交给一个此刻才解析出的地址），先原子提交本地 `Revoked` 并释放 lease，再做有界 best-effort 远端
+调用，远端失败只如实回报不复活本地；存在 refresh token 时优先撤销它以作废整个 grant。**已知限制**：workload
+token 没有运维态身份形状（`verify` 拒绝 run/attempt/worker 为 nil 的 claims），管理 token 实质是绑定 Run 的
+token 多带一个 scope，隔离建立在 scope 而非独立身份上。本轮 Rust 全工作区精确列出 748 项：**742 通过、0 失败、
+6 个外部 live 用例显式忽略**（120 个测试二进制）；Clippy workspace/all-targets/all-features `-D warnings` 与
+fmt check 通过。途中另修复两个与本阶段无关的 `agent-tool-runtime` 缺陷：定点采样竞态，以及终止原因分类不一致
+（恢复路径无条件写 `RecoveredMissing`，不查看输出长度，导致因输出超限被终止的会话可能被报告为"消失"）。
+全部证据仍来自受控回环 server，真实外部 OAuth Server 兼容矩阵未开展，因此总体进度维持 70–75%。证据见
+ADR-0120 与 `docs/evidence/2026-08-17-mcp-oauth-admin-surface-and-remote-revocation.md`。
+
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与
 `get_mcp_prompt`。Server 必须同时拥有 Run 冻结的 Resources/Prompts capability 和独立

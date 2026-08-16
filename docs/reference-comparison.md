@@ -14,7 +14,30 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：MCP OAuth 第二阶段（discovery 与拒绝反馈）
+## 当前阶段：MCP OAuth 管理面与远端撤销
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 管理入口 | CLI `mcp login`，浏览器与本地 callback listener 完整 | Gateway 命令面与用户侧登录体验成熟 | `McpOauthAdmin` gRPC：begin/complete/status/revoke，可嵌入但不承载浏览器 | 契约已具备，用户旅程明显落后两者 |
+| 授权分离 | 登录属 CLI 用户操作，不区分 scope | Gateway 命令面统一鉴权 | 管理面要求 `mcp.oauth.admin`，与 `mcp.federate` 互不蕴含 | 更严：能用工具不等于能销毁授权 |
+| 身份绑定 | 单用户本地，无多租户断言问题 | 以 Gateway 会话为界 | tenant 取自已验证 claims；请求体只能断言 tenant/application/workload identity，run 字段来自 claims | 更严：请求体无法拓宽自己的 token |
+| 远端撤销 | 已实现 revocation | logout 走 provider | RFC 7009：endpoint 授权时冻结；本地先提交再有界 best-effort；优先撤 refresh token | 更严：注销时无法被重定向到攻击者地址 |
+| 机密外泄面 | token 在本地 store，CLI 可见 | store 内可见 | 管理面响应结构上不含任何凭证材料；完成授权只回 revision | 更严：管理面不是取 token 的通道 |
+| 运维身份 | 单用户，不适用 | 不适用 | **workload token 无运维态形状**，管理 token 是绑定 Run 的 token 多带一个 scope | **落后**：隔离靠 scope，非独立身份 |
+
+### 本阶段结论
+
+- 已验证：管理面四个 RPC 的身份与授权边界；远端撤销在 provider 返回 500 时仍本地 fail-closed、返回 200 时如实
+  回报。证据见 `docs/evidence/2026-08-17-mcp-oauth-admin-surface-and-remote-revocation.md`。
+- 相比 Codex，本项目补上了它已有的管理入口语义与远端撤销；Codex 的浏览器承载、callback listener 与真实生态
+  兼容仍明显领先。
+- 相比 OpenClaw，本项目把撤销顺序与租户绑定写成了硬约束；OpenClaw 的运维体验仍领先。
+- **偏离点**：管理与执行分属不同 capability、revocation endpoint 授权时冻结、本地先提交再远端。这些是边界更严，
+  不是功能更全。运维身份形状缺失是本阶段最实质的落后项，已在 ADR-0120 明确记录，不做粉饰。
+- **总体进度不因本阶段提高**，仍为 70–75%：全部证据来自受控回环 server。
+- 下一目标：真实外部 OAuth MCP Server 兼容矩阵。
+
+## 上一阶段：MCP OAuth 第二阶段（discovery 与拒绝反馈）
 
 本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
 `58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只参考执行语义与失败边界，未移植代码，
