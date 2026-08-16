@@ -24,6 +24,7 @@
 | 远端撤销 | 已实现 revocation | logout 走 provider | RFC 7009：endpoint 授权时冻结；本地先提交再有界 best-effort；优先撤 refresh token | 更严：注销时无法被重定向到攻击者地址 |
 | 机密外泄面 | token 在本地 store，CLI 可见 | store 内可见 | 管理面响应结构上不含任何凭证材料；完成授权只回 revision | 更严：管理面不是取 token 的通道 |
 | 运维身份 | 单用户，不适用 | 不适用 | **workload token 无运维态形状**，管理 token 是绑定 Run 的 token 多带一个 scope | **落后**：隔离靠 scope，非独立身份 |
+| provider 偏差容忍 | 真实用户流量长期打磨 | SDK 承担大部分容错 | 10 条已知偏差脚本化验证：8 条本就正确，2 条（`expires_in` 字符串、`scope` 数组）过严已放宽 | 容忍度开始靠拢；**但无真实厂商流量背书**，脚本化不等于兼容证据 |
 
 ### 本阶段结论
 

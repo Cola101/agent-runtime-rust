@@ -27,7 +27,9 @@ operator token（mcp.oauth.admin）
 | discovery / 拒绝 / 撤销 | `-p agent-model-gateway --test mcp_oauth_discovery` | **15 passed，0 failed，0 ignored** |
 | Gateway 全包 | `-p agent-model-gateway` | **97 passed，0 failed，4 ignored** |
 | tool-runtime 全包 | `-p agent-tool-runtime` | **109 passed，0 failed，0 ignored** |
-| 全工作区 | `cargo test --workspace -- --test-threads=4` | **120 个测试二进制，742 passed，0 failed，6 ignored（共 748 项），`CARGO_EXIT=0`** |
+| provider 偏差矩阵 | `-p agent-model-gateway --test mcp_oauth_provider_deviations` | **11 passed，0 failed，0 ignored** |
+| 全工作区 | `cargo test --workspace -- --test-threads=4` | **121 个测试二进制，753 passed，0 failed，6 ignored（共 759 项），`CARGO_EXIT=0`** |
+| Clippy | `--workspace --all-targets --all-features -- -D warnings` | `CLIPPY_EXIT=0`，0 条诊断 |
 
 > 计数方法：把全部 `test result:` 行相加。管道到 `tail` 会掩盖 cargo 退出码，必须单独记录 `$?`；本轮曾因此
 > 把一次含失败的运行误读为成功，也曾手工数漏一个二进制（91 数成 89）。
@@ -89,6 +91,38 @@ left: Some(RecoveredMissing)   right: Some(OutputLimit)
 
 安全性核查：整个测试目录**没有任何测试断言 `RecoveredMissing`**，说明该原因本身缺乏覆盖，这也解释了缺陷为何
 长期存活；修复不与任何既有预期冲突。
+
+## Provider 偏差矩阵（脚本化，非真实外部证据）
+
+`-p agent-model-gateway --test mcp_oauth_provider_deviations` → **11 passed，0 failed，0 ignored**。
+
+用脚本化回环服务器模拟真实 provider 的已知偏差，逐条判定我们是**正确**、**过严**还是**过松**。
+**必须说明：脚本化模拟不构成真实外部兼容证据**，它只固定了"provider 这样做时我们怎么办"。
+
+| # | 偏差 | 判定 | 处置 |
+| --- | --- | --- | --- |
+| 1 | issuer 尾斜杠与 metadata 不一致 | 已正确 | 比较的是解析后的 URL 而非原始字符串，两种写法相等，但不同 origin 仍不相等 |
+| 2 | PRM 缺 `scopes_supported` | 已正确 | 回退到授权服务器的列表 |
+| 3 | AS metadata 无 `revocation_endpoint` | 已正确 | 撤销降级为仅本地，`remote_confirmed=false`，不报错 |
+| 4 | `expires_in` 返回字符串 | **过严，已放宽** | 见下 |
+| 5 | `scope` 返回数组 | **过严，已放宽** | 见下 |
+| 6 | `authorization_servers` 多项 | 已正确（有意） | 只取第一项：逐个尝试会让"信任哪台服务器"取决于哪台先应答 |
+| 7 | metadata 含未知字段 | 已正确 | 忽略而非拒绝 |
+| 8 | `WWW-Authenticate` 含多参数 | 已正确 | `realm`/`error`/`error_description` 共存仍能取出 `resource_metadata` |
+| 9 | token endpoint 200 但非 JSON | 已正确 | 拒绝，且不产生凭证 |
+| 10 | metadata `Content-Type` 非 JSON | 已正确（有意宽松） | 能否解析才是真正的门；头部是建议性的，解析失败仍然拒绝 |
+
+### 为什么放宽 4 和 5 不削弱安全边界
+
+两者都只是**解析**层面的宽松，解析之后的校验完全不变：
+
+- `expires_in`：数字与数字字符串表达同一事实，之后仍走同一个上界检查（≤366 天）。无法解析的值变为 `None`，
+  这与"省略该可选字段"含义相同，即生命周期未知——未知不会被当作很长，且被 provider 拒绝的 token 仍会经 401
+  路径收敛。
+- `scope`：数组与空格分隔字符串归一化为同一个字符串后，仍走同一套校验（≤32 项、非空、≤256 字符、无控制字符）。
+
+配套断言 `missing_s256_is_still_refused_after_leniency`：放宽之后，只声明 `plain` 的 provider **仍然被拒绝**，
+证明宽松没有蔓延到 PKCE 强度这类真正的安全边界。
 
 ## 尚未证明与风险
 

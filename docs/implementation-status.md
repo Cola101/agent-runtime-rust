@@ -68,6 +68,14 @@ fmt check 通过。途中另修复两个与本阶段无关的 `agent-tool-runtim
 全部证据仍来自受控回环 server，真实外部 OAuth Server 兼容矩阵未开展，因此总体进度维持 70–75%。证据见
 ADR-0120 与 `docs/evidence/2026-08-17-mcp-oauth-admin-surface-and-remote-revocation.md`。
 
+同日补充 provider 偏差硬化：用脚本化回环服务器验证 10 条真实世界偏差，其中 8 条现有实现已正确（issuer 尾斜杠、
+PRM 缺 `scopes_supported`、无 `revocation_endpoint` 时降级为仅本地撤销、未知字段忽略、多参数 challenge、
+非 JSON token body 拒绝、`authorization_servers` 多项只取第一项、`Content-Type` 建议性）；2 条过严已放宽：
+`expires_in` 现接受数字字符串、`scope` 现接受数组。**放宽严格限定在解析层**，解析后仍走同一套上界与字符校验，
+并以 `missing_s256_is_still_refused_after_leniency` 断言只声明 `plain` 的 provider 仍被拒绝，证明宽松未蔓延到
+PKCE 强度。全工作区精确列出 759 项：**753 通过、0 失败、6 个外部 live 用例显式忽略**（121 个测试二进制）；
+Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，总体进度仍维持 70–75%。**
+
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与
 `get_mcp_prompt`。Server 必须同时拥有 Run 冻结的 Resources/Prompts capability 和独立
