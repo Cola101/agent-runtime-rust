@@ -781,6 +781,150 @@ async fn a_provider_that_omits_refresh_token_keeps_the_original() {
     );
 }
 
+/// Deviation 17: the provider grants a narrower scope than was requested. That
+/// is its prerogative under RFC 6749 and must not be treated as a failure.
+#[tokio::test]
+async fn a_narrower_granted_scope_is_accepted() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    // Requested tools.read; granted only a lesser scope.
+    exchange_token_body(
+        &coordinator,
+        &bound,
+        r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"scope":"tools.list"}"#
+            .to_owned(),
+    )
+    .await
+    .expect("a narrower granted scope is the provider's prerogative, not a failure");
+    assert!(matches!(
+        coordinator.status(bound).await.unwrap(),
+        McpOAuthCredentialStatus::Active { .. }
+    ));
+}
+
+/// Deviation 18: a non-Bearer token type. We only know how to present Bearer, so
+/// storing a `mac` token would produce a credential that silently fails every
+/// request.
+#[tokio::test]
+async fn a_non_bearer_token_type_is_refused() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let error = exchange_token_body(
+        &coordinator,
+        &bound,
+        r#"{"access_token":"a","token_type":"mac","expires_in":3600}"#.to_owned(),
+    )
+    .await
+    .expect_err("a token type we cannot present must be refused");
+    assert!(matches!(error, McpOAuthError::ProviderUnavailable));
+    assert!(!matches!(
+        coordinator.status(bound).await.unwrap(),
+        McpOAuthCredentialStatus::Active { .. }
+    ));
+}
+
+/// Deviation 19: two authorizations opened against the same credential. The
+/// second must supersede the first, and the first flow's state must no longer be
+/// redeemable -- otherwise an abandoned flow stays a live way in.
+#[tokio::test]
+async fn a_second_begin_invalidates_the_first_flow() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = scripted_server(|_| {
+        vec![(
+            "/token",
+            200,
+            JSON,
+            r#"{"access_token":"a","token_type":"Bearer","expires_in":3600}"#.to_owned(),
+        )]
+    })
+    .await;
+    let request = || McpOAuthAuthorizationRequest {
+        authorization_endpoint: format!("{}/authorize", provider.origin),
+        token_endpoint: format!("{}/token", provider.origin),
+        client_id: "trusted-public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
+        scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: None,
+    };
+    let extract_state = |url: &str| {
+        url.split("&state=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("state")
+            .to_owned()
+    };
+
+    let first = coordinator
+        .begin_authorization(bound.clone(), request(), Utc::now())
+        .await
+        .unwrap();
+    let first_state = extract_state(&first.authorization_url);
+    let second = coordinator
+        .begin_authorization(bound.clone(), request(), Utc::now())
+        .await
+        .unwrap();
+    assert_ne!(first.flow_id, second.flow_id);
+
+    // The abandoned flow must be dead, both by its id and by its state.
+    let stale = match coordinator
+        .complete_authorization(
+            bound.clone(),
+            first.flow_id,
+            &first_state,
+            "callback-code",
+            Utc::now(),
+        )
+        .await
+    {
+        Ok(_) => panic!("a superseded flow must not be redeemable"),
+        Err(error) => error,
+    };
+    assert!(matches!(stale, McpOAuthError::InvalidAuthorizationCallback));
+
+    // The surviving flow still works.
+    let second_state = extract_state(&second.authorization_url);
+    coordinator
+        .complete_authorization(
+            bound.clone(),
+            second.flow_id,
+            &second_state,
+            "callback-code",
+            Utc::now(),
+        )
+        .await
+        .expect("the most recent flow must still be redeemable");
+}
+
+/// Deviation 20: a token whose lifetime lands inside the refresh skew window.
+/// Presenting it would be a request we already expect to fail, so it must be
+/// refreshed on resolve rather than used.
+#[tokio::test]
+async fn a_token_expiring_inside_the_skew_window_is_refreshed_not_used() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = refresh_recorder(true).await;
+
+    // The exchange issues a token with expires_in 0, which is inside the skew
+    // window, so the very first resolve must refresh rather than present it.
+    activate_against(&coordinator, &bound, &provider.origin).await;
+    let _ = coordinator
+        .resolve_access_token(bound.clone(), Utc::now())
+        .await;
+
+    let seen = provider.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "resolve must have refreshed exactly once, saw {seen:?}"
+    );
+    assert_eq!(seen[0], "refresh-1");
+}
+
 /// The strictness that must NOT be relaxed for compatibility: a provider whose
 /// metadata omits S256 does not get to fall back to `plain`.
 #[tokio::test]
