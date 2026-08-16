@@ -1,9 +1,14 @@
 use agent_model_gateway::mcp::{
     McpCatalog, McpFederationError, McpToolCallOutcome, McpToolResult,
-    attach_modern_request_metadata, catalog_from_list_result, mrtr_responses_value,
-    parse_modern_input_required, tool_result_from_call_result,
+    attach_modern_request_metadata, catalog_from_list_result, empty_catalog_for_capabilities,
+    mrtr_responses_value, parse_modern_input_required, prompt_page_from_list_result,
+    prompt_result_from_get_result, resource_page_from_list_result, resource_read_from_result,
+    resource_template_page_from_list_result, tool_result_from_call_result,
 };
-use agent_protocol::{McpInputContinuation, McpProtocolRevision};
+use agent_protocol::{
+    McpInputContinuation, McpPromptPage, McpPromptResult, McpProtocolRevision, McpResourcePage,
+    McpResourceReadResult, McpResourceTemplatePage, McpServerCapability,
+};
 use agent_runtime_worker::{McpCallContext, McpProgressNotification};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -32,6 +37,32 @@ enum SessionOperation {
     ListTools {
         server_name: String,
     },
+    ListResources {
+        server_name: String,
+        frozen_catalog_digest: String,
+        cursor: Option<String>,
+    },
+    ReadResource {
+        server_name: String,
+        frozen_catalog_digest: String,
+        uri: String,
+    },
+    ListResourceTemplates {
+        server_name: String,
+        frozen_catalog_digest: String,
+        cursor: Option<String>,
+    },
+    ListPrompts {
+        server_name: String,
+        frozen_catalog_digest: String,
+        cursor: Option<String>,
+    },
+    GetPrompt {
+        server_name: String,
+        frozen_catalog_digest: String,
+        name: String,
+        arguments: Option<Value>,
+    },
     CallTool {
         server_name: String,
         qualified_name: String,
@@ -45,6 +76,11 @@ enum SessionOperation {
 enum SessionResponse {
     Healthy,
     Catalog(McpCatalog),
+    ResourcePage(McpResourcePage),
+    ResourceRead(McpResourceReadResult),
+    ResourceTemplatePage(McpResourceTemplatePage),
+    PromptPage(McpPromptPage),
+    Prompt(McpPromptResult),
     Tool(McpToolCallOutcome),
 }
 
@@ -236,11 +272,15 @@ impl StdioMcpClient {
                         .fetch_add(1, Ordering::Relaxed);
                     Ok(catalog)
                 }
-                SessionResponse::Catalog(_) | SessionResponse::Tool(_) => {
-                    Err(McpFederationError::Protocol(
-                        "stdio MCP returned data to a health check".into(),
-                    ))
-                }
+                SessionResponse::Catalog(_)
+                | SessionResponse::ResourcePage(_)
+                | SessionResponse::ResourceRead(_)
+                | SessionResponse::ResourceTemplatePage(_)
+                | SessionResponse::PromptPage(_)
+                | SessionResponse::Prompt(_)
+                | SessionResponse::Tool(_) => Err(McpFederationError::Protocol(
+                    "stdio MCP returned data to a health check".into(),
+                )),
             };
         }
         self.metrics
@@ -265,9 +305,142 @@ impl StdioMcpClient {
                 );
                 Ok(catalog)
             }
-            SessionResponse::Healthy | SessionResponse::Tool(_) => Err(
-                McpFederationError::Protocol("stdio MCP returned the wrong list result".into()),
-            ),
+            SessionResponse::Healthy
+            | SessionResponse::ResourcePage(_)
+            | SessionResponse::ResourceRead(_)
+            | SessionResponse::ResourceTemplatePage(_)
+            | SessionResponse::PromptPage(_)
+            | SessionResponse::Prompt(_)
+            | SessionResponse::Tool(_) => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong list result".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn list_resources(
+        &self,
+        server_id: Uuid,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+    ) -> Result<McpResourcePage, McpFederationError> {
+        match self
+            .request(
+                server_id,
+                SessionOperation::ListResources {
+                    server_name: server_name.to_owned(),
+                    frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+                    cursor: cursor.map(str::to_owned),
+                },
+            )
+            .await?
+        {
+            SessionResponse::ResourcePage(page) => Ok(page),
+            _ => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong resources/list result".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn read_resource(
+        &self,
+        server_id: Uuid,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        uri: &str,
+    ) -> Result<McpResourceReadResult, McpFederationError> {
+        match self
+            .request(
+                server_id,
+                SessionOperation::ReadResource {
+                    server_name: server_name.to_owned(),
+                    frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+                    uri: uri.to_owned(),
+                },
+            )
+            .await?
+        {
+            SessionResponse::ResourceRead(result) => Ok(result),
+            _ => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong resources/read result".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn list_resource_templates(
+        &self,
+        server_id: Uuid,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+    ) -> Result<McpResourceTemplatePage, McpFederationError> {
+        match self
+            .request(
+                server_id,
+                SessionOperation::ListResourceTemplates {
+                    server_name: server_name.to_owned(),
+                    frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+                    cursor: cursor.map(str::to_owned),
+                },
+            )
+            .await?
+        {
+            SessionResponse::ResourceTemplatePage(page) => Ok(page),
+            _ => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong resources/templates/list result".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn list_prompts(
+        &self,
+        server_id: Uuid,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+    ) -> Result<McpPromptPage, McpFederationError> {
+        match self
+            .request(
+                server_id,
+                SessionOperation::ListPrompts {
+                    server_name: server_name.to_owned(),
+                    frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+                    cursor: cursor.map(str::to_owned),
+                },
+            )
+            .await?
+        {
+            SessionResponse::PromptPage(page) => Ok(page),
+            _ => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong prompts/list result".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn get_prompt(
+        &self,
+        server_id: Uuid,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Result<McpPromptResult, McpFederationError> {
+        match self
+            .request(
+                server_id,
+                SessionOperation::GetPrompt {
+                    server_name: server_name.to_owned(),
+                    frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+                    name: name.to_owned(),
+                    arguments: arguments.cloned(),
+                },
+            )
+            .await?
+        {
+            SessionResponse::Prompt(result) => Ok(result),
+            _ => Err(McpFederationError::Protocol(
+                "stdio MCP returned the wrong prompts/get result".into(),
+            )),
         }
     }
 
@@ -354,9 +527,15 @@ impl StdioMcpClient {
             .await?
         {
             SessionResponse::Tool(result) => Ok(result),
-            SessionResponse::Healthy | SessionResponse::Catalog(_) => Err(
-                McpFederationError::Protocol("stdio MCP returned a catalog to tools/call".into()),
-            ),
+            SessionResponse::Healthy
+            | SessionResponse::Catalog(_)
+            | SessionResponse::ResourcePage(_)
+            | SessionResponse::ResourceRead(_)
+            | SessionResponse::ResourceTemplatePage(_)
+            | SessionResponse::PromptPage(_)
+            | SessionResponse::Prompt(_) => Err(McpFederationError::Protocol(
+                "stdio MCP returned a catalog to tools/call".into(),
+            )),
         }
     }
 
@@ -610,6 +789,53 @@ fn clone_operation(operation: &SessionOperation) -> SessionOperation {
         SessionOperation::ListTools { server_name } => SessionOperation::ListTools {
             server_name: server_name.clone(),
         },
+        SessionOperation::ListResources {
+            server_name,
+            frozen_catalog_digest,
+            cursor,
+        } => SessionOperation::ListResources {
+            server_name: server_name.clone(),
+            frozen_catalog_digest: frozen_catalog_digest.clone(),
+            cursor: cursor.clone(),
+        },
+        SessionOperation::ReadResource {
+            server_name,
+            frozen_catalog_digest,
+            uri,
+        } => SessionOperation::ReadResource {
+            server_name: server_name.clone(),
+            frozen_catalog_digest: frozen_catalog_digest.clone(),
+            uri: uri.clone(),
+        },
+        SessionOperation::ListResourceTemplates {
+            server_name,
+            frozen_catalog_digest,
+            cursor,
+        } => SessionOperation::ListResourceTemplates {
+            server_name: server_name.clone(),
+            frozen_catalog_digest: frozen_catalog_digest.clone(),
+            cursor: cursor.clone(),
+        },
+        SessionOperation::ListPrompts {
+            server_name,
+            frozen_catalog_digest,
+            cursor,
+        } => SessionOperation::ListPrompts {
+            server_name: server_name.clone(),
+            frozen_catalog_digest: frozen_catalog_digest.clone(),
+            cursor: cursor.clone(),
+        },
+        SessionOperation::GetPrompt {
+            server_name,
+            frozen_catalog_digest,
+            name,
+            arguments,
+        } => SessionOperation::GetPrompt {
+            server_name: server_name.clone(),
+            frozen_catalog_digest: frozen_catalog_digest.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        },
         SessionOperation::CallTool {
             server_name,
             qualified_name,
@@ -739,6 +965,7 @@ struct StdioProcess {
     next_id: u64,
     protocol_revision: McpProtocolRevision,
     client_capabilities: std::collections::BTreeSet<agent_protocol::McpClientCapability>,
+    server_capabilities: std::collections::BTreeSet<McpServerCapability>,
 }
 
 impl StdioProcess {
@@ -787,6 +1014,7 @@ impl StdioProcess {
             next_id: 1,
             protocol_revision: config.protocol_revision,
             client_capabilities: config.client_capabilities.clone(),
+            server_capabilities: Default::default(),
         })
     }
 
@@ -809,7 +1037,7 @@ impl StdioProcess {
                             "stdio MCP server/discover timed out".into(),
                         )
                     })??;
-            validate_modern_discovery_result(&discovery)?;
+            self.server_capabilities = validate_modern_discovery_result(&discovery)?;
             return Ok(());
         }
         let initialize_result = tokio::time::timeout(
@@ -825,12 +1053,40 @@ impl StdioProcess {
         )
         .await
         .map_err(|_| McpFederationError::Unreachable("stdio MCP initialize timed out".into()))??;
-        validate_initialize_result(&initialize_result)?;
+        self.server_capabilities = validate_initialize_result(&initialize_result)?;
         self.write_message(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         }))
         .await
+    }
+
+    async fn verify_read_surface(
+        &mut self,
+        server_name: &str,
+        frozen_catalog_digest: &str,
+        capability: McpServerCapability,
+    ) -> Result<(), McpFederationError> {
+        if !self.server_capabilities.contains(&capability) {
+            return Err(McpFederationError::CatalogChanged);
+        }
+        let catalog = if self
+            .server_capabilities
+            .contains(&McpServerCapability::Tools)
+        {
+            let params = self.request_params(serde_json::json!({}))?;
+            let listed = self.rpc("tools/list", params).await?;
+            if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                validate_modern_complete_result(&listed, "tools/list")?;
+            }
+            catalog_from_list_result(server_name, &listed, self.server_capabilities.clone())?
+        } else {
+            empty_catalog_for_capabilities(self.server_capabilities.clone())
+        };
+        if catalog.digest != frozen_catalog_digest {
+            return Err(McpFederationError::CatalogChanged);
+        }
+        Ok(())
     }
 
     async fn apply(
@@ -855,6 +1111,14 @@ impl StdioProcess {
                 Ok(SessionResponse::Healthy)
             }
             SessionOperation::ListTools { server_name } => {
+                if !self
+                    .server_capabilities
+                    .contains(&McpServerCapability::Tools)
+                {
+                    return Ok(SessionResponse::Catalog(empty_catalog_for_capabilities(
+                        self.server_capabilities.clone(),
+                    )));
+                }
                 let params = self.request_params(serde_json::json!({}))?;
                 let result = self.rpc("tools/list", params).await?;
                 if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
@@ -862,6 +1126,168 @@ impl StdioProcess {
                 }
                 Ok(SessionResponse::Catalog(catalog_from_list_result(
                     &server_name,
+                    &result,
+                    self.server_capabilities.clone(),
+                )?))
+            }
+            SessionOperation::ListResources {
+                server_name,
+                frozen_catalog_digest,
+                cursor,
+            } => {
+                if cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 2 * 1024)
+                {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP pagination cursor is empty or unbounded".into(),
+                    ));
+                }
+                self.verify_read_surface(
+                    &server_name,
+                    &frozen_catalog_digest,
+                    McpServerCapability::Resources,
+                )
+                .await?;
+                let mut params = serde_json::Map::new();
+                if let Some(cursor) = cursor {
+                    params.insert("cursor".into(), Value::String(cursor));
+                }
+                let params = self.request_params(Value::Object(params))?;
+                let result = self.rpc("resources/list", params).await?;
+                if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                    validate_modern_complete_result(&result, "resources/list")?;
+                }
+                Ok(SessionResponse::ResourcePage(
+                    resource_page_from_list_result(&result)?,
+                ))
+            }
+            SessionOperation::ReadResource {
+                server_name,
+                frozen_catalog_digest,
+                uri,
+            } => {
+                if uri.is_empty() || uri.len() > 4 * 1024 || uri.chars().any(char::is_control) {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP resource URI is empty or unbounded".into(),
+                    ));
+                }
+                self.verify_read_surface(
+                    &server_name,
+                    &frozen_catalog_digest,
+                    McpServerCapability::Resources,
+                )
+                .await?;
+                let params = self.request_params(serde_json::json!({"uri": uri}))?;
+                let result = self.rpc("resources/read", params).await?;
+                if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                    validate_modern_complete_result(&result, "resources/read")?;
+                }
+                Ok(SessionResponse::ResourceRead(resource_read_from_result(
+                    &result,
+                )?))
+            }
+            SessionOperation::ListResourceTemplates {
+                server_name,
+                frozen_catalog_digest,
+                cursor,
+            } => {
+                if cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 2 * 1024)
+                {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP pagination cursor is empty or unbounded".into(),
+                    ));
+                }
+                self.verify_read_surface(
+                    &server_name,
+                    &frozen_catalog_digest,
+                    McpServerCapability::Resources,
+                )
+                .await?;
+                let mut params = serde_json::Map::new();
+                if let Some(cursor) = cursor {
+                    params.insert("cursor".into(), Value::String(cursor));
+                }
+                let params = self.request_params(Value::Object(params))?;
+                let result = self.rpc("resources/templates/list", params).await?;
+                if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                    validate_modern_complete_result(&result, "resources/templates/list")?;
+                }
+                Ok(SessionResponse::ResourceTemplatePage(
+                    resource_template_page_from_list_result(&result)?,
+                ))
+            }
+            SessionOperation::ListPrompts {
+                server_name,
+                frozen_catalog_digest,
+                cursor,
+            } => {
+                if cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 2 * 1024)
+                {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP pagination cursor is empty or unbounded".into(),
+                    ));
+                }
+                self.verify_read_surface(
+                    &server_name,
+                    &frozen_catalog_digest,
+                    McpServerCapability::Prompts,
+                )
+                .await?;
+                let mut params = serde_json::Map::new();
+                if let Some(cursor) = cursor {
+                    params.insert("cursor".into(), Value::String(cursor));
+                }
+                let params = self.request_params(Value::Object(params))?;
+                let result = self.rpc("prompts/list", params).await?;
+                if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                    validate_modern_complete_result(&result, "prompts/list")?;
+                }
+                Ok(SessionResponse::PromptPage(prompt_page_from_list_result(
+                    &result,
+                )?))
+            }
+            SessionOperation::GetPrompt {
+                server_name,
+                frozen_catalog_digest,
+                name,
+                arguments,
+            } => {
+                if name.is_empty() || name.len() > 128 {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP prompt name is empty or unbounded".into(),
+                    ));
+                }
+                if arguments.as_ref().is_some_and(|arguments| {
+                    arguments.as_object().is_none_or(|object| {
+                        object.len() > 32 || object.values().any(|value| !value.is_string())
+                    }) || serde_json::to_vec(arguments)
+                        .map_or(true, |encoded| encoded.len() > 64 * 1024)
+                }) {
+                    return Err(McpFederationError::Protocol(
+                        "stdio MCP prompt arguments are malformed or unbounded".into(),
+                    ));
+                }
+                self.verify_read_surface(
+                    &server_name,
+                    &frozen_catalog_digest,
+                    McpServerCapability::Prompts,
+                )
+                .await?;
+                let mut params = serde_json::Map::from_iter([("name".into(), Value::String(name))]);
+                if let Some(arguments) = arguments {
+                    params.insert("arguments".into(), arguments);
+                }
+                let params = self.request_params(Value::Object(params))?;
+                let result = self.rpc("prompts/get", params).await?;
+                if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
+                    validate_modern_complete_result(&result, "prompts/get")?;
+                }
+                Ok(SessionResponse::Prompt(prompt_result_from_get_result(
                     &result,
                 )?))
             }
@@ -872,6 +1298,12 @@ impl StdioProcess {
                 frozen_catalog_digest,
                 continuation,
             } => {
+                if !self
+                    .server_capabilities
+                    .contains(&McpServerCapability::Tools)
+                {
+                    return Err(McpFederationError::ToolNotInFrozenCatalog(qualified_name));
+                }
                 if self.protocol_revision == McpProtocolRevision::V2025_06_18
                     && continuation.is_some()
                 {
@@ -884,7 +1316,11 @@ impl StdioProcess {
                 if self.protocol_revision == McpProtocolRevision::V2026_07_28 {
                     validate_modern_complete_result(&listed, "tools/list")?;
                 }
-                let catalog = catalog_from_list_result(&server_name, &listed)?;
+                let catalog = catalog_from_list_result(
+                    &server_name,
+                    &listed,
+                    self.server_capabilities.clone(),
+                )?;
                 if catalog.digest != frozen_catalog_digest {
                     return Err(McpFederationError::CatalogChanged);
                 }
@@ -1218,7 +1654,9 @@ impl StdioProcess {
     }
 }
 
-fn validate_initialize_result(result: &Value) -> Result<(), McpFederationError> {
+fn validate_initialize_result(
+    result: &Value,
+) -> Result<std::collections::BTreeSet<McpServerCapability>, McpFederationError> {
     let selected = result["protocolVersion"].as_str().ok_or_else(|| {
         McpFederationError::Protocol("stdio MCP initialize result has no protocolVersion".into())
     })?;
@@ -1227,15 +1665,18 @@ fn validate_initialize_result(result: &Value) -> Result<(), McpFederationError> 
             "stdio MCP server selected unsupported protocol version {selected}"
         )));
     }
-    if !result["capabilities"]["tools"].is_object() {
+    let capabilities = parse_server_capabilities(&result["capabilities"])?;
+    if capabilities.is_empty() {
         return Err(McpFederationError::Protocol(
-            "stdio MCP server did not negotiate the tools capability".into(),
+            "stdio MCP server did not negotiate a supported capability".into(),
         ));
     }
-    Ok(())
+    Ok(capabilities)
 }
 
-fn validate_modern_discovery_result(result: &Value) -> Result<(), McpFederationError> {
+fn validate_modern_discovery_result(
+    result: &Value,
+) -> Result<std::collections::BTreeSet<McpServerCapability>, McpFederationError> {
     validate_modern_complete_result(result, "server/discover")?;
     if !result["supportedVersions"]
         .as_array()
@@ -1249,12 +1690,37 @@ fn validate_modern_discovery_result(result: &Value) -> Result<(), McpFederationE
             "stdio MCP server/discover did not advertise 2026-07-28".into(),
         ));
     }
-    if !result["capabilities"]["tools"].is_object() {
+    let capabilities = parse_server_capabilities(&result["capabilities"])?;
+    if capabilities.is_empty() {
         return Err(McpFederationError::Protocol(
-            "stdio MCP server did not advertise the tools capability".into(),
+            "stdio MCP server did not advertise a supported capability".into(),
         ));
     }
-    Ok(())
+    Ok(capabilities)
+}
+
+fn parse_server_capabilities(
+    value: &Value,
+) -> Result<std::collections::BTreeSet<McpServerCapability>, McpFederationError> {
+    let object = value.as_object().ok_or_else(|| {
+        McpFederationError::Protocol("stdio MCP server capabilities must be an object".into())
+    })?;
+    let mut capabilities = std::collections::BTreeSet::new();
+    for (field, capability) in [
+        ("tools", McpServerCapability::Tools),
+        ("resources", McpServerCapability::Resources),
+        ("prompts", McpServerCapability::Prompts),
+    ] {
+        if let Some(value) = object.get(field) {
+            if !value.is_object() {
+                return Err(McpFederationError::Protocol(format!(
+                    "stdio MCP server capability {field} must be an object"
+                )));
+            }
+            capabilities.insert(capability);
+        }
+    }
+    Ok(capabilities)
 }
 
 fn validate_modern_complete_result(result: &Value, method: &str) -> Result<(), McpFederationError> {
@@ -1324,6 +1790,231 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    /// Resources and Prompts are server surfaces, not implicit Tool authority.
+    /// A directory-only stdio server must initialize successfully without ever
+    /// receiving `tools/list` or becoming able to execute a Tool.
+    #[tokio::test]
+    async fn resource_and_prompt_only_stdio_server_skips_tool_discovery() {
+        let state = tempfile::tempdir().expect("fixture state");
+        let lists = state.path().join("lists");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio_mcp_server.sh")
+            .canonicalize()
+            .expect("fixture script");
+        let server_id = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00c5);
+        let client = StdioMcpClient::new(
+            HashMap::from([(
+                server_id,
+                LocalStdioMcpConfig {
+                    command: Path::new("/bin/sh").to_path_buf(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    env: BTreeMap::from([
+                        (
+                            "MCP_SERVER_CAPABILITIES_JSON".into(),
+                            r#"{"resources":{"listChanged":true},"prompts":{}}"#.into(),
+                        ),
+                        (
+                            "MCP_LIST_MARKER".into(),
+                            lists.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    cwd: None,
+                    protocol_revision: McpProtocolRevision::V2025_06_18,
+                    client_capabilities: Default::default(),
+                },
+            )]),
+            Duration::from_secs(2),
+            LocalMcpLifecycleConfig::default(),
+        );
+
+        let catalog = client
+            .list_tools(server_id, "knowledge")
+            .await
+            .expect("directory-only server must initialize");
+        client.shutdown().await;
+
+        assert!(catalog.tools.is_empty());
+        assert_eq!(
+            catalog.capabilities,
+            std::collections::BTreeSet::from([
+                McpServerCapability::Resources,
+                McpServerCapability::Prompts,
+            ])
+        );
+        assert_eq!(catalog.digest.len(), 64);
+        assert!(
+            !lists.exists(),
+            "a server without Tool capability received tools/list"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_resources_and_prompts_use_the_same_bounded_types_as_http() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio_mcp_server.sh")
+            .canonicalize()
+            .expect("fixture script");
+        let server_id = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00c6);
+        let client = StdioMcpClient::new(
+            HashMap::from([(
+                server_id,
+                LocalStdioMcpConfig {
+                    command: Path::new("/bin/sh").to_path_buf(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    env: BTreeMap::from([(
+                        "MCP_SERVER_CAPABILITIES_JSON".into(),
+                        r#"{"resources":{},"prompts":{}}"#.into(),
+                    )]),
+                    cwd: None,
+                    protocol_revision: McpProtocolRevision::V2025_06_18,
+                    client_capabilities: Default::default(),
+                },
+            )]),
+            Duration::from_secs(2),
+            LocalMcpLifecycleConfig::default(),
+        );
+        let catalog = client.list_tools(server_id, "knowledge").await.unwrap();
+
+        let resources = client
+            .list_resources(
+                server_id,
+                "knowledge",
+                &catalog.digest,
+                Some("resource-page-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.resources[0].uri, "kb://local/runbook");
+        assert_eq!(resources.next_cursor.as_deref(), Some("resource-page-2"));
+
+        let read = client
+            .read_resource(
+                server_id,
+                "knowledge",
+                &catalog.digest,
+                "kb://local/runbook",
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.contents.len(), 2);
+
+        let templates = client
+            .list_resource_templates(
+                server_id,
+                "knowledge",
+                &catalog.digest,
+                Some("template-page-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(templates.resource_templates[0].name, "knowledge");
+        assert_eq!(templates.next_cursor.as_deref(), Some("template-page-2"));
+
+        let prompts = client
+            .list_prompts(
+                server_id,
+                "knowledge",
+                &catalog.digest,
+                Some("prompt-page-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prompts.prompts[0].name, "summarize");
+
+        let prompt = client
+            .get_prompt(
+                server_id,
+                "knowledge",
+                &catalog.digest,
+                "summarize",
+                Some(&serde_json::json!({"tone": "short"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prompt.description.as_deref(), Some("resolved"));
+        assert_eq!(prompt.messages[0].role, "user");
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn modern_stdio_resources_and_prompts_share_the_same_contract() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio_mcp_2026_server.sh")
+            .canonicalize()
+            .expect("modern fixture script");
+        let server_id = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00c7);
+        let client = StdioMcpClient::new(
+            HashMap::from([(
+                server_id,
+                LocalStdioMcpConfig {
+                    command: Path::new("/bin/sh").to_path_buf(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    env: BTreeMap::from([("MCP_READ_SURFACES".into(), "1".into())]),
+                    cwd: None,
+                    protocol_revision: McpProtocolRevision::V2026_07_28,
+                    client_capabilities: std::collections::BTreeSet::from([
+                        agent_protocol::McpClientCapability::Elicitation,
+                    ]),
+                },
+            )]),
+            Duration::from_secs(2),
+            LocalMcpLifecycleConfig::default(),
+        );
+        let catalog = client.list_tools(server_id, "knowledge").await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert_eq!(
+            client
+                .list_resources(server_id, "knowledge", &catalog.digest, None)
+                .await
+                .unwrap()
+                .resources[0]
+                .uri,
+            "kb://modern-stdio/runbook"
+        );
+        assert_eq!(
+            client
+                .read_resource(
+                    server_id,
+                    "knowledge",
+                    &catalog.digest,
+                    "kb://modern-stdio/runbook"
+                )
+                .await
+                .unwrap()
+                .contents
+                .len(),
+            1
+        );
+        assert_eq!(
+            client
+                .list_resource_templates(server_id, "knowledge", &catalog.digest, None)
+                .await
+                .unwrap()
+                .resource_templates[0]
+                .uri_template,
+            "kb://modern-stdio/{name}"
+        );
+        assert_eq!(
+            client
+                .list_prompts(server_id, "knowledge", &catalog.digest, None)
+                .await
+                .unwrap()
+                .prompts[0]
+                .name,
+            "summarize"
+        );
+        assert_eq!(
+            client
+                .get_prompt(server_id, "knowledge", &catalog.digest, "summarize", None)
+                .await
+                .unwrap()
+                .messages[0]
+                .role,
+            "user"
+        );
+        client.shutdown().await;
     }
 
     /// A cached directory is an optimization, not proof that its authority is
@@ -1610,7 +2301,12 @@ mod tests {
                 }
             }]
         });
-        let catalog = catalog_from_list_result("local", &listed).expect("fixture catalog");
+        let catalog = catalog_from_list_result(
+            "local",
+            &listed,
+            std::collections::BTreeSet::from([McpServerCapability::Tools]),
+        )
+        .expect("fixture catalog");
 
         let (sender, mut receiver) = mpsc::channel::<SessionRequest>(1);
         let shutdown = CancellationToken::new();

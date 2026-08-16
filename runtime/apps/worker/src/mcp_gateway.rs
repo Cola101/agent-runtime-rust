@@ -7,11 +7,20 @@
 use agent_model_gateway_protocol::mcp_server_authorization_digest;
 use agent_model_gateway_protocol::v1::mcp_federation_client::McpFederationClient as GrpcMcpFederationStub;
 use agent_model_gateway_protocol::v1::{
-    McpCallToolRequest, McpListToolsRequest, McpServerRef as WireServerRef,
+    McpCallToolRequest, McpGetPromptRequest, McpListPromptsRequest,
+    McpListResourceTemplatesRequest, McpListResourcesRequest, McpListToolsRequest, McpReadContext,
+    McpReadResourceRequest, McpServerRef as WireServerRef, mcp_resource_content,
 };
-use agent_protocol::{McpElicitationRequest, McpInputContinuation, McpServerSnapshot};
+use agent_protocol::{
+    McpElicitationRequest, McpInputContinuation, McpPromptArgument, McpPromptDescriptor,
+    McpPromptMessage, McpPromptPage, McpPromptResult, McpResourceContent, McpResourceDescriptor,
+    McpResourcePage, McpResourceReadResult, McpResourceTemplateDescriptor, McpResourceTemplatePage,
+    McpServerCapability, McpServerSnapshot,
+};
+use base64::Engine;
 use futures_util::{StreamExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -26,6 +35,26 @@ use uuid::Uuid;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const COMPLETE_IDENTITY_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SHARED_DISCOVERY_CONCURRENCY: usize = 32;
+const RUNTIME_MCP_READ_TOOL_VERSION: u32 = 1;
+const MAX_MODEL_MCP_RESULT_BYTES: usize = 128 * 1024;
+
+pub const LIST_MCP_RESOURCES_TOOL: &str = "list_mcp_resources";
+pub const READ_MCP_RESOURCE_TOOL: &str = "read_mcp_resource";
+pub const LIST_MCP_RESOURCE_TEMPLATES_TOOL: &str = "list_mcp_resource_templates";
+pub const LIST_MCP_PROMPTS_TOOL: &str = "list_mcp_prompts";
+pub const GET_MCP_PROMPT_TOOL: &str = "get_mcp_prompt";
+
+#[must_use]
+pub fn is_runtime_mcp_read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        LIST_MCP_RESOURCES_TOOL
+            | READ_MCP_RESOURCE_TOOL
+            | LIST_MCP_RESOURCE_TEMPLATES_TOOL
+            | LIST_MCP_PROMPTS_TOOL
+            | GET_MCP_PROMPT_TOOL
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct McpDiscoveryPolicy {
@@ -76,6 +105,10 @@ pub struct McpServerDiscoveryStatus {
     pub required: bool,
     pub health: McpServerHealth,
     pub attempts: u8,
+    /// Advertised surfaces frozen into the directory digest. Empty when the
+    /// server was unavailable before a trustworthy discovery completed.
+    #[serde(default)]
+    pub capabilities: std::collections::BTreeSet<McpServerCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -368,7 +401,44 @@ pub struct DiscoveredTool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredCatalog {
     pub tools: Vec<DiscoveredTool>,
+    pub capabilities: std::collections::BTreeSet<McpServerCapability>,
     pub digest: String,
+}
+
+fn parse_directory_capabilities(
+    schema_version: u32,
+    advertised: &[String],
+    has_tools: bool,
+) -> Result<std::collections::BTreeSet<McpServerCapability>, McpGatewayClientError> {
+    let capabilities = match schema_version {
+        // Schema 1 predates an explicit capability directory and could only
+        // represent Tool catalogs. Retaining that exact inference is the sole
+        // rolling-upgrade compatibility path.
+        1 => std::collections::BTreeSet::from([McpServerCapability::Tools]),
+        2 => advertised
+            .iter()
+            .map(|capability| match capability.as_str() {
+                "tools" => Ok(McpServerCapability::Tools),
+                "resources" => Ok(McpServerCapability::Resources),
+                "prompts" => Ok(McpServerCapability::Prompts),
+                _ => Err(McpGatewayClientError::InvalidResponse(
+                    "MCP gateway returned an unknown server capability".into(),
+                )),
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?,
+        version => {
+            return Err(McpGatewayClientError::InvalidResponse(format!(
+                "MCP gateway returned unsupported directory schema {version}"
+            )));
+        }
+    };
+    if capabilities.is_empty() || (!capabilities.contains(&McpServerCapability::Tools) && has_tools)
+    {
+        return Err(McpGatewayClientError::InvalidResponse(
+            "MCP gateway returned an inconsistent server capability directory".into(),
+        ));
+    }
+    Ok(capabilities)
 }
 
 /// Protocol-neutral MCP operations consumed by discovery and Tool execution.
@@ -382,6 +452,82 @@ pub trait McpFederationBackend: Send + Sync {
         server: &'a McpServerSnapshot,
         workload_token: &'a str,
     ) -> BoxFuture<'a, Result<DiscoveredCatalog, McpGatewayClientError>>;
+
+    fn list_resources<'a>(
+        &'a self,
+        _identity: &'a FederationIdentity,
+        _server: &'a McpServerSnapshot,
+        _frozen_catalog_digest: &'a str,
+        _cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourcePage, McpGatewayClientError>> {
+        Box::pin(async {
+            Err(McpGatewayClientError::InvalidResponse(
+                "MCP backend does not implement resources/list".into(),
+            ))
+        })
+    }
+
+    fn read_resource<'a>(
+        &'a self,
+        _identity: &'a FederationIdentity,
+        _server: &'a McpServerSnapshot,
+        _frozen_catalog_digest: &'a str,
+        _uri: &'a str,
+        _workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourceReadResult, McpGatewayClientError>> {
+        Box::pin(async {
+            Err(McpGatewayClientError::InvalidResponse(
+                "MCP backend does not implement resources/read".into(),
+            ))
+        })
+    }
+
+    fn list_resource_templates<'a>(
+        &'a self,
+        _identity: &'a FederationIdentity,
+        _server: &'a McpServerSnapshot,
+        _frozen_catalog_digest: &'a str,
+        _cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourceTemplatePage, McpGatewayClientError>> {
+        Box::pin(async {
+            Err(McpGatewayClientError::InvalidResponse(
+                "MCP backend does not implement resources/templates/list".into(),
+            ))
+        })
+    }
+
+    fn list_prompts<'a>(
+        &'a self,
+        _identity: &'a FederationIdentity,
+        _server: &'a McpServerSnapshot,
+        _frozen_catalog_digest: &'a str,
+        _cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpPromptPage, McpGatewayClientError>> {
+        Box::pin(async {
+            Err(McpGatewayClientError::InvalidResponse(
+                "MCP backend does not implement prompts/list".into(),
+            ))
+        })
+    }
+
+    fn get_prompt<'a>(
+        &'a self,
+        _identity: &'a FederationIdentity,
+        _server: &'a McpServerSnapshot,
+        _frozen_catalog_digest: &'a str,
+        _name: &'a str,
+        _arguments: Option<&'a serde_json::Value>,
+        _workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpPromptResult, McpGatewayClientError>> {
+        Box::pin(async {
+            Err(McpGatewayClientError::InvalidResponse(
+                "MCP backend does not implement prompts/get".into(),
+            ))
+        })
+    }
 
     #[allow(
         clippy::too_many_arguments,
@@ -503,6 +649,97 @@ impl McpFederationClient {
             .await
     }
 
+    pub async fn list_resources(
+        &self,
+        identity: &FederationIdentity,
+        server: &McpServerSnapshot,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+        workload_token: &str,
+    ) -> Result<McpResourcePage, McpGatewayClientError> {
+        self.backend
+            .list_resources(
+                identity,
+                server,
+                frozen_catalog_digest,
+                cursor,
+                workload_token,
+            )
+            .await
+    }
+
+    pub async fn read_resource(
+        &self,
+        identity: &FederationIdentity,
+        server: &McpServerSnapshot,
+        frozen_catalog_digest: &str,
+        uri: &str,
+        workload_token: &str,
+    ) -> Result<McpResourceReadResult, McpGatewayClientError> {
+        self.backend
+            .read_resource(identity, server, frozen_catalog_digest, uri, workload_token)
+            .await
+    }
+
+    pub async fn list_resource_templates(
+        &self,
+        identity: &FederationIdentity,
+        server: &McpServerSnapshot,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+        workload_token: &str,
+    ) -> Result<McpResourceTemplatePage, McpGatewayClientError> {
+        self.backend
+            .list_resource_templates(
+                identity,
+                server,
+                frozen_catalog_digest,
+                cursor,
+                workload_token,
+            )
+            .await
+    }
+
+    pub async fn list_prompts(
+        &self,
+        identity: &FederationIdentity,
+        server: &McpServerSnapshot,
+        frozen_catalog_digest: &str,
+        cursor: Option<&str>,
+        workload_token: &str,
+    ) -> Result<McpPromptPage, McpGatewayClientError> {
+        self.backend
+            .list_prompts(
+                identity,
+                server,
+                frozen_catalog_digest,
+                cursor,
+                workload_token,
+            )
+            .await
+    }
+
+    pub async fn get_prompt(
+        &self,
+        identity: &FederationIdentity,
+        server: &McpServerSnapshot,
+        frozen_catalog_digest: &str,
+        name: &str,
+        arguments: Option<&serde_json::Value>,
+        workload_token: &str,
+    ) -> Result<McpPromptResult, McpGatewayClientError> {
+        self.backend
+            .get_prompt(
+                identity,
+                server,
+                frozen_catalog_digest,
+                name,
+                arguments,
+                workload_token,
+            )
+            .await
+    }
+
     pub async fn call_tool(
         &self,
         identity: &FederationIdentity,
@@ -614,6 +851,11 @@ impl McpFederationBackend for GrpcMcpFederationBackend {
             authorize(&mut request, workload_token)?;
             let response = inner.list_tools(request).await.map_err(rpc_error)?;
             let response = response.into_inner();
+            let capabilities = parse_directory_capabilities(
+                response.schema_version,
+                &response.server_capabilities,
+                !response.tools.is_empty(),
+            )?;
             let mut tools = Vec::with_capacity(response.tools.len());
             for tool in response.tools {
                 let schema = std::str::from_utf8(&tool.input_schema_json)
@@ -641,7 +883,330 @@ impl McpFederationBackend for GrpcMcpFederationBackend {
             }
             Ok(DiscoveredCatalog {
                 tools,
+                capabilities,
                 digest: response.catalog_digest,
+            })
+        })
+    }
+
+    fn list_resources<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourcePage, McpGatewayClientError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.clone();
+            let mut request = tonic::Request::new(McpListResourcesRequest {
+                context: Some(wire_read_context(identity, server, frozen_catalog_digest)?),
+                cursor: cursor.unwrap_or_default().to_owned(),
+            });
+            authorize(&mut request, workload_token)?;
+            let response = inner
+                .list_resources(request)
+                .await
+                .map_err(rpc_error)?
+                .into_inner();
+            require_read_schema(response.schema_version)?;
+            if response.resources.len() > 64 {
+                return Err(invalid_read_response("resource page exceeds 64 entries"));
+            }
+            let resources = response
+                .resources
+                .into_iter()
+                .map(|resource| {
+                    validate_bounded(&resource.uri, 4096, "resource URI")?;
+                    validate_bounded(&resource.name, 128, "resource name")?;
+                    let title = optional_wire_string(resource.title, 512, "resource title")?;
+                    let description = optional_wire_string(
+                        resource.description,
+                        16 * 1024,
+                        "resource description",
+                    )?;
+                    let mime_type =
+                        optional_wire_string(resource.mime_type, 256, "resource mime type")?;
+                    Ok(McpResourceDescriptor {
+                        uri: resource.uri,
+                        name: resource.name,
+                        title,
+                        description,
+                        mime_type,
+                        size: resource.size,
+                    })
+                })
+                .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+            let next_cursor =
+                optional_wire_string(response.next_cursor, 2 * 1024, "resource next cursor")?;
+            Ok(McpResourcePage {
+                resources,
+                next_cursor,
+            })
+        })
+    }
+
+    fn read_resource<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        uri: &'a str,
+        workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourceReadResult, McpGatewayClientError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.clone();
+            let mut request = tonic::Request::new(McpReadResourceRequest {
+                context: Some(wire_read_context(identity, server, frozen_catalog_digest)?),
+                uri: uri.to_owned(),
+            });
+            authorize(&mut request, workload_token)?;
+            let response = inner
+                .read_resource(request)
+                .await
+                .map_err(rpc_error)?
+                .into_inner();
+            require_read_schema(response.schema_version)?;
+            if response.contents.is_empty() || response.contents.len() > 16 {
+                return Err(invalid_read_response(
+                    "resource read must contain between 1 and 16 entries",
+                ));
+            }
+            let contents = response
+                .contents
+                .into_iter()
+                .map(|content| {
+                    validate_bounded(&content.uri, 4096, "resource content URI")?;
+                    let mime_type =
+                        optional_wire_string(content.mime_type, 256, "resource content mime type")?;
+                    match content.body {
+                        Some(mcp_resource_content::Body::Text(text))
+                            if text.len() <= 256 * 1024 =>
+                        {
+                            Ok(McpResourceContent::Text {
+                                uri: content.uri,
+                                mime_type,
+                                text,
+                            })
+                        }
+                        Some(mcp_resource_content::Body::Blob(bytes))
+                            if bytes.len() <= 192 * 1024 =>
+                        {
+                            Ok(McpResourceContent::Blob {
+                                uri: content.uri,
+                                mime_type,
+                                bytes,
+                            })
+                        }
+                        _ => Err(invalid_read_response(
+                            "resource content body is missing or unbounded",
+                        )),
+                    }
+                })
+                .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+            Ok(McpResourceReadResult { contents })
+        })
+    }
+
+    fn list_resource_templates<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpResourceTemplatePage, McpGatewayClientError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.clone();
+            let mut request = tonic::Request::new(McpListResourceTemplatesRequest {
+                context: Some(wire_read_context(identity, server, frozen_catalog_digest)?),
+                cursor: cursor.unwrap_or_default().to_owned(),
+            });
+            authorize(&mut request, workload_token)?;
+            let response = inner
+                .list_resource_templates(request)
+                .await
+                .map_err(rpc_error)?
+                .into_inner();
+            require_read_schema(response.schema_version)?;
+            if response.resource_templates.len() > 64 {
+                return Err(invalid_read_response(
+                    "resource template page exceeds 64 entries",
+                ));
+            }
+            let resource_templates = response
+                .resource_templates
+                .into_iter()
+                .map(|template| {
+                    validate_bounded(&template.uri_template, 4096, "resource URI template")?;
+                    validate_bounded(&template.name, 128, "resource template name")?;
+                    Ok(McpResourceTemplateDescriptor {
+                        uri_template: template.uri_template,
+                        name: template.name,
+                        title: optional_wire_string(
+                            template.title,
+                            512,
+                            "resource template title",
+                        )?,
+                        description: optional_wire_string(
+                            template.description,
+                            16 * 1024,
+                            "resource template description",
+                        )?,
+                        mime_type: optional_wire_string(
+                            template.mime_type,
+                            256,
+                            "resource template mime type",
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+            Ok(McpResourceTemplatePage {
+                resource_templates,
+                next_cursor: optional_wire_string(
+                    response.next_cursor,
+                    2 * 1024,
+                    "resource template next cursor",
+                )?,
+            })
+        })
+    }
+
+    fn list_prompts<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpPromptPage, McpGatewayClientError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.clone();
+            let mut request = tonic::Request::new(McpListPromptsRequest {
+                context: Some(wire_read_context(identity, server, frozen_catalog_digest)?),
+                cursor: cursor.unwrap_or_default().to_owned(),
+            });
+            authorize(&mut request, workload_token)?;
+            let response = inner
+                .list_prompts(request)
+                .await
+                .map_err(rpc_error)?
+                .into_inner();
+            require_read_schema(response.schema_version)?;
+            if response.prompts.len() > 64 {
+                return Err(invalid_read_response("prompt page exceeds 64 entries"));
+            }
+            let prompts = response
+                .prompts
+                .into_iter()
+                .map(|prompt| {
+                    validate_bounded(&prompt.name, 128, "prompt name")?;
+                    if prompt.arguments.len() > 32 {
+                        return Err(invalid_read_response("prompt has more than 32 arguments"));
+                    }
+                    let arguments = prompt
+                        .arguments
+                        .into_iter()
+                        .map(|argument| {
+                            validate_bounded(&argument.name, 128, "prompt argument name")?;
+                            Ok(McpPromptArgument {
+                                name: argument.name,
+                                description: optional_wire_string(
+                                    argument.description,
+                                    16 * 1024,
+                                    "prompt argument description",
+                                )?,
+                                required: argument.required,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+                    Ok(McpPromptDescriptor {
+                        name: prompt.name,
+                        title: optional_wire_string(prompt.title, 512, "prompt title")?,
+                        description: optional_wire_string(
+                            prompt.description,
+                            16 * 1024,
+                            "prompt description",
+                        )?,
+                        arguments,
+                    })
+                })
+                .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+            Ok(McpPromptPage {
+                prompts,
+                next_cursor: optional_wire_string(
+                    response.next_cursor,
+                    2 * 1024,
+                    "prompt next cursor",
+                )?,
+            })
+        })
+    }
+
+    fn get_prompt<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        name: &'a str,
+        arguments: Option<&'a serde_json::Value>,
+        workload_token: &'a str,
+    ) -> BoxFuture<'a, Result<McpPromptResult, McpGatewayClientError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.clone();
+            let arguments_json = arguments
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| invalid_read_response(&error.to_string()))?
+                .unwrap_or_default();
+            let mut request = tonic::Request::new(McpGetPromptRequest {
+                context: Some(wire_read_context(identity, server, frozen_catalog_digest)?),
+                name: name.to_owned(),
+                arguments_json,
+            });
+            authorize(&mut request, workload_token)?;
+            let response = inner
+                .get_prompt(request)
+                .await
+                .map_err(rpc_error)?
+                .into_inner();
+            require_read_schema(response.schema_version)?;
+            if response.messages.is_empty() || response.messages.len() > 32 {
+                return Err(invalid_read_response(
+                    "prompt result must contain between 1 and 32 messages",
+                ));
+            }
+            let messages = response
+                .messages
+                .into_iter()
+                .map(|message| {
+                    if message.role != "user" && message.role != "assistant" {
+                        return Err(invalid_read_response("prompt message role is unsupported"));
+                    }
+                    if message.content_json.len() > 256 * 1024 {
+                        return Err(invalid_read_response("prompt message content is unbounded"));
+                    }
+                    let content =
+                        serde_json::from_slice::<serde_json::Value>(&message.content_json)
+                            .map_err(|error| invalid_read_response(&error.to_string()))?;
+                    if !content.is_object() {
+                        return Err(invalid_read_response(
+                            "prompt message content is not an object",
+                        ));
+                    }
+                    Ok(McpPromptMessage {
+                        role: message.role,
+                        content,
+                    })
+                })
+                .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
+            Ok(McpPromptResult {
+                description: optional_wire_string(
+                    response.description,
+                    16 * 1024,
+                    "prompt result description",
+                )?,
+                messages,
             })
         })
     }
@@ -785,6 +1350,71 @@ impl McpFederationBackend for GrpcMcpFederationBackend {
     }
 }
 
+fn wire_read_context(
+    identity: &FederationIdentity,
+    server: &McpServerSnapshot,
+    frozen_catalog_digest: &str,
+) -> Result<McpReadContext, McpGatewayClientError> {
+    if frozen_catalog_digest.len() != 64 {
+        return Err(invalid_read_response(
+            "frozen catalog digest is not a sha256",
+        ));
+    }
+    Ok(McpReadContext {
+        schema_version: 1,
+        tenant_id: identity.tenant_id.to_string(),
+        application_id: identity.application_id.to_string(),
+        workload_identity_id: identity.workload_identity_id.to_string(),
+        run_id: identity.run_id.to_string(),
+        session_id: identity.session_id.to_string(),
+        workspace_id: identity.workspace_id.to_string(),
+        agent_version_id: identity.agent_version_id.to_string(),
+        attempt_id: identity.attempt_id.to_string(),
+        worker_id: identity.worker_id.to_string(),
+        worker_incarnation_id: identity.worker_incarnation_id.to_string(),
+        server: Some(wire_server(server)?),
+        frozen_catalog_digest: frozen_catalog_digest.to_owned(),
+    })
+}
+
+fn require_read_schema(schema_version: u32) -> Result<(), McpGatewayClientError> {
+    if schema_version == 1 {
+        Ok(())
+    } else {
+        Err(invalid_read_response(&format!(
+            "unsupported MCP read schema {schema_version}"
+        )))
+    }
+}
+
+fn validate_bounded(value: &str, max: usize, field: &str) -> Result<(), McpGatewayClientError> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        Err(invalid_read_response(&format!(
+            "{field} is empty, unbounded, or contains controls"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn optional_wire_string(
+    value: String,
+    max: usize,
+    field: &str,
+) -> Result<Option<String>, McpGatewayClientError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > max {
+        return Err(invalid_read_response(&format!("{field} is unbounded")));
+    }
+    Ok(Some(value))
+}
+
+fn invalid_read_response(message: &str) -> McpGatewayClientError {
+    McpGatewayClientError::InvalidResponse(message.to_owned())
+}
+
 fn wire_server(server: &McpServerSnapshot) -> Result<WireServerRef, McpGatewayClientError> {
     use base64::Engine;
     // The Worker holds the envelope base64-encoded and never decodes it as a
@@ -811,6 +1441,9 @@ fn wire_server(server: &McpServerSnapshot) -> Result<WireServerRef, McpGatewayCl
                 agent_protocol::McpClientCapability::Elicitation => "elicitation".to_owned(),
             })
             .collect(),
+        oauth_credential_id: server
+            .oauth_credential_id
+            .map_or_else(String::new, |credential_id| credential_id.to_string()),
     })
 }
 
@@ -853,6 +1486,140 @@ fn rpc_error(status: tonic::Status) -> McpGatewayClientError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeMcpReadServerBinding {
+    pub server: McpServerSnapshot,
+    pub frozen_catalog_digest: String,
+    pub capabilities: std::collections::BTreeSet<McpServerCapability>,
+}
+
+fn runtime_mcp_read_implementation_digest(
+    servers: &BTreeMap<String, RuntimeMcpReadServerBinding>,
+) -> String {
+    let material = servers
+        .iter()
+        .map(|(name, binding)| {
+            (
+                name,
+                &binding.frozen_catalog_digest,
+                &binding.capabilities,
+                binding.server.server_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&(RUNTIME_MCP_READ_TOOL_VERSION, material))
+            .expect("runtime MCP read binding is serializable"),
+    ))
+}
+
+fn runtime_mcp_read_tool_definitions(
+    servers: &BTreeMap<String, RuntimeMcpReadServerBinding>,
+) -> Vec<crate::WorkerToolDefinition> {
+    use agent_protocol::{ApprovalMode, SandboxClass, ToolDescriptor, ToolEffect};
+
+    let resource_servers = servers
+        .iter()
+        .filter(|(_, binding)| {
+            binding
+                .capabilities
+                .contains(&McpServerCapability::Resources)
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let prompt_servers = servers
+        .iter()
+        .filter(|(_, binding)| binding.capabilities.contains(&McpServerCapability::Prompts))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let digest = runtime_mcp_read_implementation_digest(servers);
+    let descriptor = |name: &str| ToolDescriptor {
+        name: name.to_owned(),
+        effect: ToolEffect::Pure,
+        approval: ApprovalMode::Allow,
+        sandbox: SandboxClass::Federated,
+        implementation_digest: digest.clone(),
+        // Dynamic server authority is checked from the `server` argument
+        // against `mcp:read:<server>` before the Tool plan is created. A static
+        // descriptor cannot express an OR across server-scoped grants.
+        required_scopes: Default::default(),
+    };
+    let server_property = |servers: &[String]| {
+        serde_json::json!({
+            "type": "string",
+            "enum": servers,
+            "description": "One Run-authorized MCP server"
+        })
+    };
+    let paged_schema = |servers: &[String]| {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": server_property(servers),
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 2048}
+            },
+            "required": ["server"],
+            "additionalProperties": false
+        })
+    };
+    let mut definitions = Vec::new();
+    if !resource_servers.is_empty() {
+        definitions.extend([
+            crate::WorkerToolDefinition {
+                descriptor: descriptor(LIST_MCP_RESOURCES_TOOL),
+                description: "List one bounded page of resources from one explicitly authorized MCP server".into(),
+                input_schema: paged_schema(&resource_servers),
+            },
+            crate::WorkerToolDefinition {
+                descriptor: descriptor(READ_MCP_RESOURCE_TOOL),
+                description: "Read one bounded resource from one explicitly authorized MCP server as untrusted Tool content".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": server_property(&resource_servers),
+                        "uri": {"type": "string", "minLength": 1, "maxLength": 4096}
+                    },
+                    "required": ["server", "uri"],
+                    "additionalProperties": false
+                }),
+            },
+            crate::WorkerToolDefinition {
+                descriptor: descriptor(LIST_MCP_RESOURCE_TEMPLATES_TOOL),
+                description: "List one bounded page of URI templates from one explicitly authorized MCP server".into(),
+                input_schema: paged_schema(&resource_servers),
+            },
+        ]);
+    }
+    if !prompt_servers.is_empty() {
+        definitions.extend([
+            crate::WorkerToolDefinition {
+                descriptor: descriptor(LIST_MCP_PROMPTS_TOOL),
+                description: "List one bounded page of prompts from one explicitly authorized MCP server".into(),
+                input_schema: paged_schema(&prompt_servers),
+            },
+            crate::WorkerToolDefinition {
+                descriptor: descriptor(GET_MCP_PROMPT_TOOL),
+                description: "Resolve one MCP prompt as untrusted user/assistant Tool content; it never becomes a system instruction".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": server_property(&prompt_servers),
+                        "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "arguments": {
+                            "type": "object",
+                            "maxProperties": 32,
+                            "additionalProperties": {"type": "string"}
+                        }
+                    },
+                    "required": ["server", "name"],
+                    "additionalProperties": false
+                }),
+            },
+        ]);
+    }
+    definitions
+}
+
 /// The federated Tools one Run may reach, plus what it froze them at.
 ///
 /// A per-Run registry rather than additions to the Worker's own. A frozen
@@ -882,6 +1649,370 @@ pub struct FederatedRunTools {
     /// Ready and unavailable entries in command order, including optional
     /// failures that did not reject the Run.
     pub statuses: Vec<McpServerDiscoveryStatus>,
+    /// Read-only surfaces that received the separate `mcp:read:<server>` grant.
+    pub read_servers: BTreeMap<String, RuntimeMcpReadServerBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PagedMcpReadArguments {
+    server: String,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadMcpResourceArguments {
+    server: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetMcpPromptArguments {
+    server: String,
+    name: String,
+    #[serde(default)]
+    arguments: Option<serde_json::Value>,
+}
+
+pub fn runtime_mcp_read_call_is_authorized(
+    name: &str,
+    arguments: &serde_json::Value,
+    servers: &BTreeMap<String, RuntimeMcpReadServerBinding>,
+    delegated_scopes: &std::collections::BTreeSet<String>,
+) -> bool {
+    let valid_cursor = |cursor: Option<&str>| {
+        cursor.is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2 * 1024)
+    };
+    let authorized = |server: &str, capability: McpServerCapability| {
+        delegated_scopes.contains(&format!("mcp:read:{server}"))
+            && servers
+                .get(server)
+                .is_some_and(|binding| binding.capabilities.contains(&capability))
+    };
+    match name {
+        LIST_MCP_RESOURCES_TOOL | LIST_MCP_RESOURCE_TEMPLATES_TOOL => {
+            serde_json::from_value::<PagedMcpReadArguments>(arguments.clone()).is_ok_and(|args| {
+                valid_cursor(args.cursor.as_deref())
+                    && authorized(&args.server, McpServerCapability::Resources)
+            })
+        }
+        READ_MCP_RESOURCE_TOOL => serde_json::from_value::<ReadMcpResourceArguments>(
+            arguments.clone(),
+        )
+        .is_ok_and(|args| {
+            !args.uri.is_empty()
+                && args.uri.len() <= 4 * 1024
+                && !args.uri.chars().any(char::is_control)
+                && authorized(&args.server, McpServerCapability::Resources)
+        }),
+        LIST_MCP_PROMPTS_TOOL => serde_json::from_value::<PagedMcpReadArguments>(arguments.clone())
+            .is_ok_and(|args| {
+                valid_cursor(args.cursor.as_deref())
+                    && authorized(&args.server, McpServerCapability::Prompts)
+            }),
+        GET_MCP_PROMPT_TOOL => serde_json::from_value::<GetMcpPromptArguments>(arguments.clone())
+            .is_ok_and(|args| {
+                !args.name.is_empty()
+                    && args.name.len() <= 128
+                    && !args.name.chars().any(char::is_control)
+                    && args.arguments.as_ref().is_none_or(|arguments| {
+                        arguments.as_object().is_some_and(|object| {
+                            object.len() <= 32 && object.values().all(serde_json::Value::is_string)
+                        }) && serde_json::to_vec(arguments)
+                            .is_ok_and(|encoded| encoded.len() <= 64 * 1024)
+                    })
+                    && authorized(&args.server, McpServerCapability::Prompts)
+            }),
+        _ => false,
+    }
+}
+
+pub struct RuntimeMcpReadExecutor {
+    client: McpFederationClient,
+    identity: FederationIdentity,
+    servers: BTreeMap<String, RuntimeMcpReadServerBinding>,
+    workload_token: String,
+    implementation_digest: String,
+}
+
+impl RuntimeMcpReadExecutor {
+    fn new(
+        client: McpFederationClient,
+        identity: FederationIdentity,
+        servers: BTreeMap<String, RuntimeMcpReadServerBinding>,
+        workload_token: String,
+    ) -> Self {
+        let implementation_digest = runtime_mcp_read_implementation_digest(&servers);
+        Self {
+            client,
+            identity,
+            servers,
+            workload_token,
+            implementation_digest,
+        }
+    }
+
+    fn server(
+        &self,
+        name: &str,
+        capability: McpServerCapability,
+    ) -> Result<&RuntimeMcpReadServerBinding, agent_tool_runtime::ToolExecutionError> {
+        self.servers
+            .get(name)
+            .filter(|binding| binding.capabilities.contains(&capability))
+            .ok_or_else(|| {
+                agent_tool_runtime::ToolExecutionError::InvalidContext(
+                    "MCP read server is not authorized for this Run".into(),
+                )
+            })
+    }
+
+    fn validate_context(
+        &self,
+        context: &agent_tool_runtime::ToolExecutionContext,
+    ) -> Result<(), agent_tool_runtime::ToolExecutionError> {
+        if context.tenant_id != self.identity.tenant_id
+            || context.application_id != self.identity.application_id
+            || context.workload_identity_id != self.identity.workload_identity_id
+            || context.run_id != self.identity.run_id
+            || context.session_id != self.identity.session_id
+            || context.workspace_id != self.identity.workspace_id
+            || context.agent_version_id != self.identity.agent_version_id
+            || context.attempt_id != self.identity.attempt_id
+        {
+            return Err(agent_tool_runtime::ToolExecutionError::InvalidContext(
+                "Runtime MCP read executor belongs to another invocation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn bounded_result(value: serde_json::Value) -> agent_tool_runtime::ToolExecutionResult {
+        if serde_json::to_vec(&value)
+            .map_or(true, |encoded| encoded.len() > MAX_MODEL_MCP_RESULT_BYTES)
+        {
+            return agent_tool_runtime::ToolExecutionResult {
+                content: serde_json::json!({
+                    "error": {
+                        "code": "mcp_model_result_too_large",
+                        "message": "MCP content exceeds the model-visible Tool result limit"
+                    }
+                }),
+                is_error: true,
+                exit_code: 1,
+            };
+        }
+        agent_tool_runtime::ToolExecutionResult {
+            content: value,
+            is_error: false,
+            exit_code: 0,
+        }
+    }
+
+    fn failed_result() -> agent_tool_runtime::ToolExecutionResult {
+        agent_tool_runtime::ToolExecutionResult {
+            content: serde_json::json!({
+                "error": {
+                    "code": "mcp_read_failed",
+                    "message": "MCP read operation failed inside its authorized gateway"
+                }
+            }),
+            is_error: true,
+            exit_code: 1,
+        }
+    }
+
+    async fn execute_inner(
+        &self,
+        request: &agent_protocol::ToolExecutionRequest,
+    ) -> Result<agent_tool_runtime::ToolExecutionResult, McpGatewayClientError> {
+        let value = match request.call.name.as_str() {
+            LIST_MCP_RESOURCES_TOOL => {
+                let arguments: PagedMcpReadArguments =
+                    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                        McpGatewayClientError::InvalidResponse(
+                            "list_mcp_resources arguments are invalid".into(),
+                        )
+                    })?;
+                let binding = self
+                    .server(&arguments.server, McpServerCapability::Resources)
+                    .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+                serde_json::to_value(
+                    self.client
+                        .list_resources(
+                            &self.identity,
+                            &binding.server,
+                            &binding.frozen_catalog_digest,
+                            arguments.cursor.as_deref(),
+                            &self.workload_token,
+                        )
+                        .await?,
+                )
+            }
+            READ_MCP_RESOURCE_TOOL => {
+                let arguments: ReadMcpResourceArguments =
+                    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                        McpGatewayClientError::InvalidResponse(
+                            "read_mcp_resource arguments are invalid".into(),
+                        )
+                    })?;
+                let binding = self
+                    .server(&arguments.server, McpServerCapability::Resources)
+                    .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+                let result = self
+                    .client
+                    .read_resource(
+                        &self.identity,
+                        &binding.server,
+                        &binding.frozen_catalog_digest,
+                        &arguments.uri,
+                        &self.workload_token,
+                    )
+                    .await?;
+                let contents = result
+                    .contents
+                    .into_iter()
+                    .map(|content| match content {
+                        McpResourceContent::Text {
+                            uri,
+                            mime_type,
+                            text,
+                        } => serde_json::json!({
+                            "kind": "text",
+                            "uri": uri,
+                            "mime_type": mime_type,
+                            "text": text,
+                        }),
+                        McpResourceContent::Blob {
+                            uri,
+                            mime_type,
+                            bytes,
+                        } => serde_json::json!({
+                            "kind": "blob",
+                            "uri": uri,
+                            "mime_type": mime_type,
+                            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({"contents": contents}))
+            }
+            LIST_MCP_RESOURCE_TEMPLATES_TOOL => {
+                let arguments: PagedMcpReadArguments =
+                    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                        McpGatewayClientError::InvalidResponse(
+                            "list_mcp_resource_templates arguments are invalid".into(),
+                        )
+                    })?;
+                let binding = self
+                    .server(&arguments.server, McpServerCapability::Resources)
+                    .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+                serde_json::to_value(
+                    self.client
+                        .list_resource_templates(
+                            &self.identity,
+                            &binding.server,
+                            &binding.frozen_catalog_digest,
+                            arguments.cursor.as_deref(),
+                            &self.workload_token,
+                        )
+                        .await?,
+                )
+            }
+            LIST_MCP_PROMPTS_TOOL => {
+                let arguments: PagedMcpReadArguments =
+                    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                        McpGatewayClientError::InvalidResponse(
+                            "list_mcp_prompts arguments are invalid".into(),
+                        )
+                    })?;
+                let binding = self
+                    .server(&arguments.server, McpServerCapability::Prompts)
+                    .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+                serde_json::to_value(
+                    self.client
+                        .list_prompts(
+                            &self.identity,
+                            &binding.server,
+                            &binding.frozen_catalog_digest,
+                            arguments.cursor.as_deref(),
+                            &self.workload_token,
+                        )
+                        .await?,
+                )
+            }
+            GET_MCP_PROMPT_TOOL => {
+                let arguments: GetMcpPromptArguments =
+                    serde_json::from_value(request.call.arguments.clone()).map_err(|_| {
+                        McpGatewayClientError::InvalidResponse(
+                            "get_mcp_prompt arguments are invalid".into(),
+                        )
+                    })?;
+                let binding = self
+                    .server(&arguments.server, McpServerCapability::Prompts)
+                    .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+                serde_json::to_value(
+                    self.client
+                        .get_prompt(
+                            &self.identity,
+                            &binding.server,
+                            &binding.frozen_catalog_digest,
+                            &arguments.name,
+                            arguments.arguments.as_ref(),
+                            &self.workload_token,
+                        )
+                        .await?,
+                )
+            }
+            _ => {
+                return Err(McpGatewayClientError::InvalidResponse(
+                    "unknown Runtime MCP read Tool".into(),
+                ));
+            }
+        }
+        .map_err(|error| McpGatewayClientError::InvalidResponse(error.to_string()))?;
+        Ok(Self::bounded_result(value))
+    }
+}
+
+impl agent_tool_runtime::ToolExecutor for RuntimeMcpReadExecutor {
+    fn implementation_digest(&self) -> &str {
+        &self.implementation_digest
+    }
+
+    fn execute(
+        &self,
+        request: agent_protocol::ToolExecutionRequest,
+        context: agent_tool_runtime::ToolExecutionContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        agent_tool_runtime::ToolExecutionResult,
+                        agent_tool_runtime::ToolExecutionError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            if request.sandbox != agent_protocol::SandboxClass::Federated {
+                return Err(agent_tool_runtime::ToolExecutionError::WrongSandbox);
+            }
+            self.validate_context(&context)?;
+            tokio::select! {
+                _ = context.cancellation.cancelled() => {
+                    Err(agent_tool_runtime::ToolExecutionError::Cancelled)
+                }
+                result = self.execute_inner(&request) => {
+                    Ok(result.unwrap_or_else(|_| Self::failed_result()))
+                }
+            }
+        })
+    }
 }
 
 /// Attaches an already-discovered MCP catalog to one accepted or restored Run.
@@ -942,13 +2073,29 @@ pub fn attach_discovered_federated_tools(
             )) as std::sync::Arc<dyn agent_tool_runtime::ToolExecutor>,
         ));
     }
+    if !discovered.read_servers.is_empty() {
+        let executor = std::sync::Arc::new(RuntimeMcpReadExecutor::new(
+            client,
+            identity,
+            discovered.read_servers.clone(),
+            command.workload_token.as_str().to_owned(),
+        )) as std::sync::Arc<dyn agent_tool_runtime::ToolExecutor>;
+        executors.extend(
+            discovered
+                .definitions
+                .iter()
+                .filter(|definition| is_runtime_mcp_read_tool(&definition.descriptor.name))
+                .map(|definition| (definition.descriptor.name.clone(), executor.clone())),
+        );
+    }
     processor.attach_federated_tools(
         attempt_id,
         discovered.registry,
         discovered.definitions,
         executors,
         discovered.policy,
-    )
+    )?;
+    processor.bind_runtime_mcp_read_servers(attempt_id, discovered.read_servers)
 }
 
 /// Discovers every MCP server the command carries and builds this Run's Tools.
@@ -1075,6 +2222,7 @@ pub async fn discover_federated_tools_with_policy(
     discovered_servers.sort_by_key(|(ordinal, _, _, _)| *ordinal);
 
     let mut statuses = Vec::with_capacity(command.mcp_servers.len());
+    let mut read_servers = BTreeMap::new();
     for (_, server, attempts, catalog) in discovered_servers {
         let catalog = match catalog {
             Ok(catalog) => catalog,
@@ -1085,6 +2233,7 @@ pub async fn discover_federated_tools_with_policy(
                     required: server.required,
                     health: McpServerHealth::Unavailable,
                     attempts,
+                    capabilities: Default::default(),
                     error: Some(error.clone()),
                 });
                 unavailable.push((server.name.clone(), error));
@@ -1121,11 +2270,28 @@ pub async fn discover_federated_tools_with_policy(
                             required: server.required,
                             health: McpServerHealth::Unavailable,
                             attempts,
+                            capabilities: catalog.capabilities.clone(),
                             error: Some(error.clone()),
                         });
                         unavailable.push((server.name.clone(), error));
                     }
                     None => {
+                        let read_scope = format!("mcp:read:{}", server.name);
+                        if command.delegated_scopes.contains(&read_scope)
+                            && (catalog
+                                .capabilities
+                                .contains(&McpServerCapability::Resources)
+                                || catalog.capabilities.contains(&McpServerCapability::Prompts))
+                        {
+                            read_servers.insert(
+                                server.name.clone(),
+                                RuntimeMcpReadServerBinding {
+                                    server: server.clone(),
+                                    frozen_catalog_digest: catalog.digest.clone(),
+                                    capabilities: catalog.capabilities.clone(),
+                                },
+                            );
+                        }
                         definitions.extend(registered);
                         frozen_digests.insert(server.name.clone(), catalog.digest);
                         statuses.push(McpServerDiscoveryStatus {
@@ -1133,6 +2299,7 @@ pub async fn discover_federated_tools_with_policy(
                             required: server.required,
                             health: McpServerHealth::Ready,
                             attempts,
+                            capabilities: catalog.capabilities,
                             error: None,
                         });
                     }
@@ -1145,9 +2312,33 @@ pub async fn discover_federated_tools_with_policy(
                     required: server.required,
                     health: McpServerHealth::Unavailable,
                     attempts,
+                    capabilities: catalog.capabilities,
                     error: Some(error.clone()),
                 });
                 unavailable.push((server.name.clone(), error));
+            }
+        }
+    }
+
+    let runtime_read_definitions = runtime_mcp_read_tool_definitions(&read_servers);
+    if !runtime_read_definitions.is_empty() {
+        // Register all-or-nothing. A native registration collision must not
+        // expose only part of the Runtime-owned read surface.
+        let mut candidate_registry = registry.clone();
+        let registration = runtime_read_definitions
+            .iter()
+            .try_for_each(|definition| candidate_registry.register(definition.descriptor.clone()));
+        match registration {
+            Ok(()) => {
+                registry = candidate_registry;
+                definitions.extend(runtime_read_definitions);
+            }
+            Err(error) => {
+                unavailable.push((
+                    "runtime-mcp-read-tools".into(),
+                    format!("Runtime MCP read Tool registration failed: {error}"),
+                ));
+                read_servers.clear();
             }
         }
     }
@@ -1159,6 +2350,7 @@ pub async fn discover_federated_tools_with_policy(
         policy,
         unavailable,
         statuses,
+        read_servers,
     }
 }
 
@@ -1332,5 +2524,74 @@ impl agent_tool_runtime::ToolExecutor for FederatedToolExecutor {
         >,
     > {
         Box::pin(self.execute_round(request, context, Some(continuation), progress))
+    }
+}
+
+#[cfg(test)]
+mod directory_contract_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn schema_one_remains_a_tool_only_compatibility_directory() {
+        assert_eq!(
+            parse_directory_capabilities(1, &[], true).expect("schema one compatibility"),
+            std::collections::BTreeSet::from([McpServerCapability::Tools])
+        );
+    }
+
+    #[test]
+    fn schema_two_preserves_non_tool_surfaces_without_granting_tool_authority() {
+        assert_eq!(
+            parse_directory_capabilities(2, &["resources".into(), "prompts".into()], false)
+                .expect("resource/prompt directory"),
+            std::collections::BTreeSet::from([
+                McpServerCapability::Resources,
+                McpServerCapability::Prompts,
+            ])
+        );
+    }
+
+    #[test]
+    fn unknown_or_inconsistent_directory_versions_fail_closed() {
+        for result in [
+            parse_directory_capabilities(3, &[], false),
+            parse_directory_capabilities(2, &["sampling".into()], false),
+            parse_directory_capabilities(2, &["resources".into()], true),
+            parse_directory_capabilities(2, &[], false),
+        ] {
+            assert!(result.is_err(), "unsafe directory was accepted: {result:?}");
+        }
+    }
+
+    #[test]
+    fn read_contract_versions_and_bounds_fail_closed() {
+        assert!(require_read_schema(1).is_ok());
+        assert!(require_read_schema(0).is_err());
+        assert!(require_read_schema(2).is_err());
+        assert!(validate_bounded("kb://runbook", 4096, "uri").is_ok());
+        assert!(validate_bounded("", 4096, "uri").is_err());
+        assert!(optional_wire_string("x".repeat(2049), 2048, "cursor").is_err());
+    }
+
+    #[test]
+    fn worker_wire_carries_only_the_stable_oauth_handle() {
+        let credential_id = Uuid::now_v7();
+        let server = McpServerSnapshot {
+            server_id: Uuid::now_v7(),
+            name: "oauth".into(),
+            endpoint: "https://mcp.example.test/rpc".into(),
+            credential_envelope_base64: String::new(),
+            oauth_credential_id: Some(credential_id),
+            required: true,
+            tool_effect_overrides: BTreeMap::new(),
+            protocol_revision: agent_protocol::McpProtocolRevision::V2025_06_18,
+            client_capabilities: BTreeSet::new(),
+        };
+
+        let wire = wire_server(&server).unwrap();
+        assert_eq!(wire.oauth_credential_id, credential_id.to_string());
+        assert!(wire.credential_envelope_json.is_empty());
+        assert!(!format!("{wire:?}").contains("access-token-must-never-cross-worker-wire"));
     }
 }

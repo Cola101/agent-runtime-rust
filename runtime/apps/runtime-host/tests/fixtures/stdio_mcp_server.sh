@@ -38,7 +38,8 @@ while IFS= read -r request; do
         continue
       fi
       id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}"
+      capabilities_json=${MCP_SERVER_CAPABILITIES_JSON:-'{"tools":{}}'}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":${capabilities_json},\"serverInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}"
       ;;
     *'"method":"notifications/initialized"'*)
       ;;
@@ -52,6 +53,26 @@ while IFS= read -r request; do
       fi
       id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{}}"
+      ;;
+    *'"method":"resources/list"'*)
+      id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resources\":[{\"uri\":\"kb://local/runbook\",\"name\":\"runbook\",\"mimeType\":\"text/markdown\",\"size\":5}],\"nextCursor\":\"resource-page-2\"}}"
+      ;;
+    *'"method":"resources/read"'*)
+      id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"contents\":[{\"uri\":\"kb://local/runbook\",\"text\":\"local\"},{\"uri\":\"blob://local/a\",\"blob\":\"AAEC\"}]}}"
+      ;;
+    *'"method":"resources/templates/list"'*)
+      id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resourceTemplates\":[{\"uriTemplate\":\"kb://local/{name}\",\"name\":\"knowledge\",\"mimeType\":\"text/markdown\"}],\"nextCursor\":\"template-page-2\"}}"
+      ;;
+    *'"method":"prompts/list"'*)
+      id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"prompts\":[{\"name\":\"summarize\",\"description\":\"Summarize\",\"arguments\":[{\"name\":\"tone\",\"required\":false}]}],\"nextCursor\":\"prompt-page-2\"}}"
+      ;;
+    *'"method":"prompts/get"'*)
+      id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"description\":\"resolved\",\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"Summarize this\"}}]}}"
       ;;
     *'"method":"tools/list"'*)
       if [ "${MCP_STALL_LIST:-}" = "1" ]; then

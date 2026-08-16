@@ -3432,7 +3432,7 @@ fn v20_worker_admission_rejects_a_workspace_not_bound_by_the_workload_token() {
 }
 
 #[test]
-fn v20_worker_admission_requires_federation_authority_when_mcp_is_configured() {
+fn v21_worker_admission_requires_federation_authority_when_mcp_is_configured() {
     let signing_key = SigningKey::from_bytes(&[65; 32]);
     let mut command: RunExecutionCommand = serde_json::from_str(EXECUTION_V12_EXAMPLE).unwrap();
     command.schema_version = agent_protocol::RUN_EXECUTION_SCHEMA_VERSION;
@@ -3446,6 +3446,7 @@ fn v20_worker_admission_requires_federation_authority_when_mcp_is_configured() {
         name: "search".into(),
         endpoint: "https://mcp.example.test/rpc".into(),
         credential_envelope_base64: String::new(),
+        oauth_credential_id: None,
         required: false,
         tool_effect_overrides: BTreeMap::new(),
         protocol_revision: agent_protocol::McpProtocolRevision::V2025_06_18,
@@ -3457,6 +3458,7 @@ fn v20_worker_admission_requires_federation_authority_when_mcp_is_configured() {
         name: server.name.clone(),
         endpoint: server.endpoint.clone(),
         credential_envelope_json: Vec::new(),
+        oauth_credential_id: String::new(),
         protocol_revision: server.protocol_revision.as_str().to_string(),
         client_capabilities: Vec::new(),
     };

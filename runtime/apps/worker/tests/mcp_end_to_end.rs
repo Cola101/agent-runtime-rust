@@ -11,12 +11,17 @@ use agent_kernel::ToolPlan;
 use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
-use agent_protocol::{AutoApproval, McpServerSnapshot, SandboxClass, ToolCall};
+use agent_protocol::{
+    AutoApproval, McpServerCapability, McpServerSnapshot, ModelFinishReason, ModelStreamEvent,
+    SandboxClass, ToolCall,
+};
 use agent_protocol::{RunExecutionCommand, RuntimeExecutionPolicySnapshot};
 use agent_runtime_worker::FederationIdentity;
 use agent_runtime_worker::{
-    GrpcMcpFederationClient, McpDiscoveryCompletion, McpDiscoveryCoordinator, McpDiscoveryPolicy,
-    McpDiscoveryScheduler, WorkerAssignmentError, WorkerProcessor, WorkerRecoveryAction,
+    GET_MCP_PROMPT_TOOL, GrpcMcpFederationClient, LIST_MCP_PROMPTS_TOOL,
+    LIST_MCP_RESOURCE_TEMPLATES_TOOL, LIST_MCP_RESOURCES_TOOL, McpDiscoveryCompletion,
+    McpDiscoveryCoordinator, McpDiscoveryPolicy, McpDiscoveryScheduler, READ_MCP_RESOURCE_TOOL,
+    WorkerAssignmentError, WorkerProcessor, WorkerRecoveryAction,
     attach_discovered_federated_tools, discover_federated_tools,
     discover_federated_tools_with_policy, federated_tool_definitions,
 };
@@ -39,6 +44,67 @@ use uuid::Uuid;
 /// A minimal MCP server: initialize, tools/list, tools/call.
 async fn spawn_mcp_server(tools: Arc<Mutex<Vec<String>>>) -> String {
     spawn_controlled_mcp_server(tools, None).await
+}
+
+async fn spawn_directory_only_mcp_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 16 * 1024];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let (status, body) = if request.contains("notifications/initialized") {
+                    ("202 Accepted", String::new())
+                } else if request.contains("tools/list") {
+                    panic!("a resource/prompt-only server must not receive tools/list");
+                } else if request.contains("resources/list") {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"resources":[{"uri":"kb://gateway/runbook","name":"runbook","mimeType":"text/markdown","size":7}],"nextCursor":"r2"}}"#.to_owned(),
+                    )
+                } else if request.contains("resources/read") {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"contents":[{"uri":"kb://gateway/runbook","text":"gateway"}]}}"#.to_owned(),
+                    )
+                } else if request.contains("resources/templates/list") {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"resourceTemplates":[{"uriTemplate":"kb://gateway/{name}","name":"knowledge"}],"nextCursor":"t2"}}"#.to_owned(),
+                    )
+                } else if request.contains("prompts/list") {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"prompts":[{"name":"summarize","arguments":[{"name":"tone","required":false}]}],"nextCursor":"p2"}}"#.to_owned(),
+                    )
+                } else if request.contains("prompts/get") {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"description":"resolved","messages":[{"role":"user","content":{"type":"text","text":"Summarize this"}}]}}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"resources":{"listChanged":true},"prompts":{}}}}"#.to_owned(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            });
+        }
+    });
+    format!("http://{address}/rpc")
 }
 
 async fn spawn_modern_mrtr_mcp_server() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
@@ -277,6 +343,7 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
         name: "search".into(),
         endpoint: mcp_endpoint,
         credential_envelope_base64: String::new(),
+        oauth_credential_id: None,
         required: false,
         tool_effect_overrides: BTreeMap::new(),
         protocol_revision: agent_protocol::McpProtocolRevision::V2025_06_18,
@@ -293,6 +360,10 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
         .await
         .expect("discovery should succeed");
     assert_eq!(catalog.tools.len(), 1);
+    assert_eq!(
+        catalog.capabilities,
+        BTreeSet::from([McpServerCapability::Tools])
+    );
     assert_eq!(catalog.tools[0].qualified_name, "mcp:search/web_search");
     assert_eq!(catalog.digest.len(), 64);
 
@@ -380,6 +451,241 @@ async fn a_federated_tool_is_discovered_registered_gated_and_called() {
     assert!(
         refused.to_string().contains("catalog changed"),
         "expected the catalog refusal, got {refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resource_and_prompt_capabilities_survive_the_authenticated_gateway_boundary() {
+    let private_key_pem = test_private_key_pem();
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
+    let identity = FederationIdentity {
+        tenant_id: Uuid::now_v7(),
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
+        run_id: Uuid::now_v7(),
+        session_id: Uuid::now_v7(),
+        workspace_id: Uuid::now_v7(),
+        agent_version_id: Uuid::now_v7(),
+        attempt_id: Uuid::now_v7(),
+        worker_id: Uuid::now_v7(),
+        worker_incarnation_id: Uuid::now_v7(),
+    };
+    let server = McpServerSnapshot {
+        server_id: Uuid::now_v7(),
+        name: "knowledge".into(),
+        endpoint: spawn_directory_only_mcp_server().await,
+        credential_envelope_base64: String::new(),
+        oauth_credential_id: None,
+        required: true,
+        tool_effect_overrides: BTreeMap::new(),
+        protocol_revision: agent_protocol::McpProtocolRevision::V2025_06_18,
+        client_capabilities: BTreeSet::new(),
+    };
+    let token = signed_read_identity(&signing_key, &identity, &server);
+    let gateway_endpoint = spawn_gateway(private_key_pem, &signing_key).await;
+    let client = GrpcMcpFederationClient::connect(gateway_endpoint)
+        .await
+        .expect("worker should reach the gateway");
+
+    let directory = client
+        .list_tools(&identity, &server, &token)
+        .await
+        .expect("non-Tool MCP surfaces must cross the authenticated boundary");
+
+    assert!(directory.tools.is_empty());
+    assert_eq!(
+        directory.capabilities,
+        BTreeSet::from([McpServerCapability::Resources, McpServerCapability::Prompts,])
+    );
+    assert_eq!(directory.digest.len(), 64);
+
+    let resources = client
+        .list_resources(&identity, &server, &directory.digest, Some("r1"), &token)
+        .await
+        .expect("resource page must cross the authenticated gateway");
+    assert_eq!(resources.resources[0].uri, "kb://gateway/runbook");
+    assert_eq!(resources.next_cursor.as_deref(), Some("r2"));
+
+    let read = client
+        .read_resource(
+            &identity,
+            &server,
+            &directory.digest,
+            "kb://gateway/runbook",
+            &token,
+        )
+        .await
+        .expect("resource contents must cross the authenticated gateway");
+    assert_eq!(read.contents.len(), 1);
+
+    let templates = client
+        .list_resource_templates(&identity, &server, &directory.digest, Some("t1"), &token)
+        .await
+        .expect("resource templates must cross the authenticated gateway");
+    assert_eq!(templates.resource_templates[0].name, "knowledge");
+    assert_eq!(templates.next_cursor.as_deref(), Some("t2"));
+
+    let prompts = client
+        .list_prompts(&identity, &server, &directory.digest, Some("p1"), &token)
+        .await
+        .expect("prompt page must cross the authenticated gateway");
+    assert_eq!(prompts.prompts[0].name, "summarize");
+
+    let prompt = client
+        .get_prompt(
+            &identity,
+            &server,
+            &directory.digest,
+            "summarize",
+            Some(&serde_json::json!({"tone": "short"})),
+            &token,
+        )
+        .await
+        .expect("resolved prompt must cross the authenticated gateway");
+    assert_eq!(prompt.description.as_deref(), Some("resolved"));
+    assert_eq!(prompt.messages[0].role, "user");
+
+    let mut unauthorized = server.clone();
+    unauthorized.server_id = Uuid::now_v7();
+    let refused = client
+        .list_resources(&identity, &unauthorized, &directory.digest, None, &token)
+        .await
+        .expect_err("a token cannot read an MCP server snapshot it did not authorize");
+    assert!(
+        matches!(
+            refused,
+            agent_runtime_worker::McpGatewayClientError::Rpc {
+                code: tonic::Code::PermissionDenied,
+                ..
+            }
+        ),
+        "expected a server-snapshot authorization refusal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_owned_mcp_read_tools_require_the_separate_server_scope_before_planning() {
+    let private_key_pem = test_private_key_pem();
+    let signing_key = SigningKey::from_bytes(&[82; 32]);
+    let endpoint = spawn_directory_only_mcp_server().await;
+    let gateway_endpoint = spawn_gateway(private_key_pem, &signing_key).await;
+    let mut client = GrpcMcpFederationClient::connect(gateway_endpoint)
+        .await
+        .unwrap();
+    let mut command = v9_command_with(
+        serde_json::json!([{
+            "server_id": "6f1a9a1a-0000-4000-8000-0000000000aa",
+            "name": "knowledge",
+            "endpoint": endpoint,
+            "credential_envelope_base64": ""
+        }]),
+        serde_json::json!(["mcp:read:knowledge"]),
+    );
+    command.skill_snapshots.clear();
+    command.issued_at = chrono::Utc::now();
+    command.lease_expires_at = command.issued_at + chrono::Duration::minutes(5);
+    let mut worker = WorkerProcessor::new(
+        command.worker_id,
+        vec![agent_protocol::Placement::Cloud],
+        4,
+        "0.1.0".into(),
+    )
+    .unwrap();
+    command.worker_incarnation_id = worker.worker_incarnation_id();
+    worker.accept(command.clone(), chrono::Utc::now()).unwrap();
+    let token = signed_identity(&signing_key, &FederationIdentity::from_command(&command));
+    let discovered =
+        discover_federated_tools(worker.tool_registry(), &mut client, &command, &token).await;
+    assert_eq!(
+        discovered
+            .definitions
+            .iter()
+            .filter(|definition| agent_runtime_worker::is_runtime_mcp_read_tool(
+                &definition.descriptor.name
+            ))
+            .count(),
+        5
+    );
+    attach_discovered_federated_tools(
+        &mut worker,
+        client,
+        &command,
+        command.attempt_id,
+        discovered,
+    )
+    .unwrap();
+
+    let offered = worker
+        .prepare_model_invocation(command.attempt_id)
+        .unwrap()
+        .invocation
+        .tools
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<BTreeSet<_>>();
+    for name in [
+        LIST_MCP_RESOURCES_TOOL,
+        READ_MCP_RESOURCE_TOOL,
+        LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+        LIST_MCP_PROMPTS_TOOL,
+        GET_MCP_PROMPT_TOOL,
+    ] {
+        assert!(offered.contains(name), "missing Runtime-owned Tool {name}");
+    }
+
+    worker
+        .start(command.attempt_id)
+        .expect("the accepted Run starts");
+    worker
+        .apply_model_event(
+            command.attempt_id,
+            ModelStreamEvent::ToolCall {
+                id: "call-list-resources".into(),
+                name: LIST_MCP_RESOURCES_TOOL.into(),
+                arguments: serde_json::json!({"server": "knowledge"}),
+            },
+        )
+        .unwrap();
+    worker
+        .apply_model_event(
+            command.attempt_id,
+            ModelStreamEvent::Completed {
+                reason: ModelFinishReason::ToolCalls,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        worker.plan_next_tool_call(command.attempt_id).unwrap().plan,
+        ToolPlan::Execute(ref execution)
+            if execution.effect == agent_protocol::ToolEffect::Pure
+                && execution.sandbox == SandboxClass::Federated
+    ));
+
+    let mut without_read_scope = command;
+    without_read_scope.attempt_id = Uuid::now_v7();
+    without_read_scope.run_id = Uuid::now_v7();
+    without_read_scope.session_id = without_read_scope.run_id;
+    without_read_scope.delegated_scopes.clear();
+    let mut second_client =
+        GrpcMcpFederationClient::connect(spawn_gateway(test_private_key_pem(), &signing_key).await)
+            .await
+            .unwrap();
+    let second_token = signed_identity(
+        &signing_key,
+        &FederationIdentity::from_command(&without_read_scope),
+    );
+    let no_read_tools = discover_federated_tools(
+        worker.tool_registry(),
+        &mut second_client,
+        &without_read_scope,
+        &second_token,
+    )
+    .await;
+    assert!(
+        no_read_tools.definitions.iter().all(|definition| {
+            !agent_runtime_worker::is_runtime_mcp_read_tool(&definition.descriptor.name)
+        }),
+        "tool:mcp or server capability alone must not create model-readable content authority"
     );
 }
 
@@ -1581,6 +1887,60 @@ fn signed_identity(signing_key: &SigningKey, identity: &FederationIdentity) -> S
     format!("{signing_input}.{signature}")
 }
 
+fn signed_read_identity(
+    signing_key: &SigningKey,
+    identity: &FederationIdentity,
+    server: &McpServerSnapshot,
+) -> String {
+    let wire_server = agent_model_gateway_protocol::v1::McpServerRef {
+        server_id: server.server_id.to_string(),
+        name: server.name.clone(),
+        endpoint: server.endpoint.clone(),
+        credential_envelope_json: Vec::new(),
+        oauth_credential_id: server
+            .oauth_credential_id
+            .map_or_else(String::new, |credential_id| credential_id.to_string()),
+        protocol_revision: server.protocol_revision.as_str().to_owned(),
+        client_capabilities: server
+            .client_capabilities
+            .iter()
+            .map(|capability| match capability {
+                agent_protocol::McpClientCapability::Elicitation => "elicitation".to_owned(),
+            })
+            .collect(),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let claims = WorkloadIdentityClaims {
+        schema_version: 4,
+        tenant_id: identity.tenant_id,
+        application_id: identity.application_id,
+        workload_identity_id: identity.workload_identity_id,
+        run_id: identity.run_id,
+        session_id: identity.session_id,
+        workspace_id: identity.workspace_id,
+        agent_version_id: identity.agent_version_id,
+        attempt_id: identity.attempt_id,
+        worker_id: identity.worker_id,
+        worker_incarnation_id: identity.worker_incarnation_id,
+        model_policy_id: Uuid::now_v7(),
+        model_policy_digest: "0".repeat(64),
+        authorized_mcp_servers: BTreeMap::from([(
+            server.server_id,
+            agent_model_gateway_protocol::mcp_server_authorization_digest(&wire_server),
+        )]),
+        audiences: BTreeSet::from(["model-gateway".to_owned()]),
+        scopes: BTreeSet::from(["mcp.federate".to_owned()]),
+        issued_at_unix_ms: now,
+        expires_at_unix_ms: now + 60_000,
+    };
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).unwrap());
+    let signing_input = format!("v2.{payload}");
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(signing_key.sign(signing_input.as_bytes()).to_bytes());
+    format!("{signing_input}.{signature}")
+}
+
 fn sign_skill_for_federated_tool(
     command: &mut RunExecutionCommand,
     tool_name: &str,
@@ -1752,6 +2112,7 @@ async fn the_worker_gateway_path_preserves_a_modern_mcp_input_round() {
         name: "modern".into(),
         endpoint,
         credential_envelope_base64: String::new(),
+        oauth_credential_id: None,
         required: true,
         tool_effect_overrides: BTreeMap::new(),
         protocol_revision: McpProtocolRevision::V2026_07_28,

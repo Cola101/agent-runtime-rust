@@ -194,6 +194,11 @@ enum ModelErrorKind {
 service McpFederation {
   rpc ListTools(McpListToolsRequest) returns (McpListToolsResponse);
   rpc CallTool(McpCallToolRequest) returns (McpCallToolResponse);
+  rpc ListResources(McpListResourcesRequest) returns (McpListResourcesResponse);
+  rpc ReadResource(McpReadResourceRequest) returns (McpReadResourceResponse);
+  rpc ListResourceTemplates(McpListResourceTemplatesRequest) returns (McpListResourceTemplatesResponse);
+  rpc ListPrompts(McpListPromptsRequest) returns (McpListPromptsResponse);
+  rpc GetPrompt(McpGetPromptRequest) returns (McpGetPromptResponse);
 }
 
 message McpServerRef {
@@ -209,6 +214,8 @@ message McpServerRef {
   string protocol_revision = 5;
   // Client authority the Run delegated to this server (currently elicitation).
   repeated string client_capabilities = 6;
+  // Stable credential-domain handle. OAuth token material never crosses this wire.
+  string oauth_credential_id = 7;
 }
 
 message McpListToolsRequest {
@@ -239,8 +246,13 @@ message McpTool {
 message McpListToolsResponse {
   uint32 schema_version = 1;
   repeated McpTool tools = 2;
-  // What the Run freezes and presents on every later call.
+  // What the Run freezes and presents on every later call. Schema v2 binds the
+  // whole advertised directory (Tools/Resources/Prompts), not only Tool rows.
   string catalog_digest = 3;
+  // Schema v2. Server-advertised surfaces are discovery facts, never grants.
+  // A resource- or prompt-only server therefore remains observable without
+  // being misreported as an unavailable Tool server.
+  repeated string server_capabilities = 4;
 }
 
 message McpCallToolRequest {
@@ -278,4 +290,125 @@ message McpCallToolResponse {
   // Worker persists this typed round before asking a user and sends the answer
   // back in input_continuation_json on a fresh RPC.
   bytes input_required_json = 4;
+}
+
+// Complete Run-bound authority shared by read-only MCP surface operations.
+// Schema v1 requires workload-token v4 and does not admit the legacy partial
+// identity accepted by the original Tool RPCs during their rolling upgrade.
+message McpReadContext {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string application_id = 3;
+  string workload_identity_id = 4;
+  string run_id = 5;
+  string session_id = 6;
+  string workspace_id = 7;
+  string agent_version_id = 8;
+  string attempt_id = 9;
+  string worker_id = 10;
+  string worker_incarnation_id = 11;
+  McpServerRef server = 12;
+  // Whole capability/Tool directory frozen by this Run.
+  string frozen_catalog_digest = 13;
+}
+
+message McpListResourcesRequest {
+  McpReadContext context = 1;
+  // Opaque Server cursor. Empty means the first page.
+  string cursor = 2;
+}
+
+message McpResourceDescriptor {
+  string uri = 1;
+  string name = 2;
+  string title = 3;
+  string description = 4;
+  string mime_type = 5;
+  optional uint64 size = 6;
+}
+
+message McpListResourcesResponse {
+  uint32 schema_version = 1;
+  repeated McpResourceDescriptor resources = 2;
+  string next_cursor = 3;
+}
+
+message McpReadResourceRequest {
+  McpReadContext context = 1;
+  string uri = 2;
+}
+
+message McpResourceContent {
+  string uri = 1;
+  string mime_type = 2;
+  oneof body {
+    string text = 3;
+    bytes blob = 4;
+  }
+}
+
+message McpReadResourceResponse {
+  uint32 schema_version = 1;
+  repeated McpResourceContent contents = 2;
+}
+
+message McpListResourceTemplatesRequest {
+  McpReadContext context = 1;
+  string cursor = 2;
+}
+
+message McpResourceTemplateDescriptor {
+  string uri_template = 1;
+  string name = 2;
+  string title = 3;
+  string description = 4;
+  string mime_type = 5;
+}
+
+message McpListResourceTemplatesResponse {
+  uint32 schema_version = 1;
+  repeated McpResourceTemplateDescriptor resource_templates = 2;
+  string next_cursor = 3;
+}
+
+message McpListPromptsRequest {
+  McpReadContext context = 1;
+  string cursor = 2;
+}
+
+message McpPromptArgument {
+  string name = 1;
+  string description = 2;
+  bool required = 3;
+}
+
+message McpPromptDescriptor {
+  string name = 1;
+  string title = 2;
+  string description = 3;
+  repeated McpPromptArgument arguments = 4;
+}
+
+message McpListPromptsResponse {
+  uint32 schema_version = 1;
+  repeated McpPromptDescriptor prompts = 2;
+  string next_cursor = 3;
+}
+
+message McpGetPromptRequest {
+  McpReadContext context = 1;
+  string name = 2;
+  // Object of string values. Empty bytes mean no arguments.
+  bytes arguments_json = 3;
+}
+
+message McpPromptMessage {
+  string role = 1;
+  bytes content_json = 2;
+}
+
+message McpGetPromptResponse {
+  uint32 schema_version = 1;
+  string description = 2;
+  repeated McpPromptMessage messages = 3;
 }

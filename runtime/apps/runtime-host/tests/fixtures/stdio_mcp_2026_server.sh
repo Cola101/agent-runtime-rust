@@ -17,7 +17,27 @@ while IFS= read -r request; do
         *'"elicitation"'*) ;;
         *) exit 86 ;;
       esac
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{}}}}"
+      if [ "${MCP_READ_SURFACES:-}" = "1" ]; then
+        capabilities_json='{"resources":{},"prompts":{}}'
+      else
+        capabilities_json='{"tools":{}}'
+      fi
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":${capabilities_json}}}"
+      ;;
+    *'"method":"resources/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"resources\":[{\"uri\":\"kb://modern-stdio/runbook\",\"name\":\"runbook\"}],\"nextCursor\":\"modern-resource-2\"}}"
+      ;;
+    *'"method":"resources/read"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"contents\":[{\"uri\":\"kb://modern-stdio/runbook\",\"text\":\"modern stdio\"}]}}"
+      ;;
+    *'"method":"resources/templates/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"resourceTemplates\":[{\"uriTemplate\":\"kb://modern-stdio/{name}\",\"name\":\"knowledge\"}]}}"
+      ;;
+    *'"method":"prompts/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"prompts\":[{\"name\":\"summarize\"}]}}"
+      ;;
+    *'"method":"prompts/get"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"resultType\":\"complete\",\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"modern stdio prompt\"}}]}}"
       ;;
     *'"method":"tools/list"'*)
       case "$request" in

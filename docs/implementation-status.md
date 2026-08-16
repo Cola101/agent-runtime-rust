@@ -1,28 +1,151 @@
 # 实施状态
 
-更新时间：2026-08-14
+更新时间：2026-08-15
 
 本文件区分“已实现并有证据”“仅有契约或骨架”“尚未实现”，避免把六个月目标误报为当前能力。
 
-## 进度（2026-08-07 重算）
+## 进度（2026-08-15 重算）
 
 此前这里写着「私有 Beta 约 **96%**」，更新时间停在 08-02。那个数字**不可信**，已作废：
 它是按「已列出的验收项覆盖率」算的，而那份验收项清单本身没有覆盖工具面、MCP、桌面客户端和
 规模验证。分母定小了，分子自然好看。
 
-重算，三个不同坐标系，**不要混用**：
+旧的 08-07 数字也已被后续 70 多项 ADR 和真实门禁淘汰。当前重算只统计本阶段明确要求的 Rust Runtime，
+不把暂停的 Edge、Java、GUI 计入分母：
 
 | 坐标系 | 估计 | 依据 |
 | --- | --- | --- |
-| 十一项路线（`docs/project-goal.md` 后续顺序） | **约 40%** | runtime-host 与本地 IPC/恢复完成（1、2）；第 9 项落了「写文件 + 容器边界 + Shell」 |
-| Codex 已发布能力面 | **约 25–30%** | 工具面 3 : 约 18；MCP 有 HTTP 与本地 stdio Tool 子集及进程内目录缓存；上下文压缩、typed transcript、显式历史修复和 handle Fork/Rollback 核心已实现，仍缺 OAuth/完整协议、rich provider item、通用 Thread Fork/Rollback |
-| 私有 Beta 可交付 | **约 70%** | 缺桌面客户端、命令白名单、Linux 容器化、真实厂商验收、调用方认证与配额 |
+| 当前 Rust Runtime 内核目标 | **约 70–75%** | Agent Loop、三协议模型、安全故障转移、Tool/MCP/审批、持久恢复、Session/子代理、预算、公平准入、进程治理、图感知 retention、1000 在途/32 admitted、Event Cursor、模型可用的有界 MCP Resources/Prompts/Templates，以及 OAuth 凭证域第一阶段已有真实闭环；OAuth discovery/完整登录面、外部兼容矩阵和跨平台资源治理仍未证明 |
+| Codex 执行内核可比能力 | **约 65–70%** | 核心 Turn/Tool/Checkpoint/Session/子代理、MCP Resources/Templates 模型入口及 OAuth refresh 事务第一阶段已对齐；工具广度、完整 OAuth discovery/login、跨平台 sandbox/exec、客户端与 SQLite Thread 产品链落后 |
+| OpenClaw 可比协同语义（不含 Edge） | **约 55–60%** | durable 多租户身份、恢复和副作用围栏较强；SQLite Session、归档/history gap、Gateway 运维、跨平台产品能力落后 |
 
 三个数字差距大是正常的，因为分母不同。**引用时必须带上坐标系**，单说一个百分比没有意义。
 
-2026-08-09 新增的独立 Host HTTP/stdio MCP 闭环和 stdio 会话生命周期尚未触发一次完整能力面重算，
-因此不修改上述百分比；它证明两类 Transport 可脱离外部 Gateway 运行，并补齐 stdio 目录缓存、
-active lease、idle TTL 和 LRU，但 OAuth、完整 MCP 方法面和远端连接治理等分母仍然缺失。
+该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
+跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
+
+2026-08-15 MCP OAuth 凭证域第一阶段完成：RunExecution schema 21 与 Worker→Gateway Protobuf 只携带
+`oauth_credential_id`，该稳定句柄与 tenant、Server UUID、endpoint 一起进入授权摘要，静态 envelope 与 OAuth
+模式互斥且旧 schema fail-closed。Model Gateway 新增 PKCE S256 begin/complete、AES-256-GCM owner-only 文件账本、
+revision CAS、credential-scoped `flock`、先持久化 exchange/refresh intent、跨进程刷新单飞、先落盘再暴露 Token、
+过期无 refresh 的显式收敛、stale 401 摘要保护、本地 revoke，以及刷新/交换崩溃后不重放的
+authorization-required 恢复。真实回环授权端点 + MCP Server 证明并发两次解析只发生一次 refresh，Gateway 用
+句柄完成认证 MCP discovery，磁盘不含 access/refresh token、授权码或 state；独立 Host 会拒绝 Gateway-owned
+handle。Gateway 二进制可选读取状态目录与 base64 32-byte 主密钥文件，密钥不放环境变量。该阶段仍是**部分
+OAuth**：Protected Resource / Authorization Server metadata discovery、动态客户端注册、管理 gRPC/CLI callback、
+将 MCP HTTP 401 自动接到 rejected-token CAS、远端 revocation、外部 Server 兼容矩阵及非 Unix store adapter
+尚未完成，因此总体进度暂不提高。最终 Rust 全工作区精确列出 729 项：723 通过、0 失败、6 个外部 live
+用例显式忽略；Clippy workspace/all-targets/all-features `-D warnings`、格式与 all-targets check 通过。证据见 ADR-0118 与
+`docs/evidence/2026-08-15-credential-domain-mcp-oauth-stage-one.md`。
+
+2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
+`list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与
+`get_mcp_prompt`。Server 必须同时拥有 Run 冻结的 Resources/Prompts capability 和独立
+`mcp:read:<server>` scope；既有 `tool:mcp:<server>` 不会静默扩大为内容读取权。五个入口固定为 Runtime-owned
+`Pure + Allow + Federated`，但仍走普通 Tool event、Checkpoint、取消与恢复链；远端 Prompt 只作为低权限
+Tool Result，不进入 system/developer 层。Resource Templates 已贯通 HTTP 2025/2026、stdio、Gateway gRPC、
+Worker 与独立 Host；模型可见结果硬限 128 KiB，超限确定性失败而不伪装截断。真实回环闭环验证了一个无
+remote Tool authority 的 MCP Server 能完成五次读取并终结 Run。最终全量门禁为 721 项：715 通过、0 失败、
+6 个外部 live 用例显式忽略；Clippy all-targets/all-features、格式和差异门禁通过。总体进度仍保持
+70–75%，因为 OAuth、真实外部 Server 长稳分页、内容分级/DLP 与跨平台资源治理仍未完成。证据见
+ADR-0117 与 `docs/evidence/2026-08-15-runtime-owned-mcp-read-tools-and-resource-templates.md`。
+
+2026-08-15 MCP Resources/Prompts 可调用面阶段完成：协议中立 Resource/Prompt 类型与 Resources
+`list/read`、Prompts `list/get` 已贯通 HTTP 2025/2026、真实 stdio 子进程、Model Gateway gRPC 与 Worker。
+每次云调用绑定完整 workload identity、Run 授权的 Server snapshot 与冻结目录摘要，凭证只在 Gateway 解封；
+单页最多 64 项、cursor 2 KiB、read 16 个 content、prompt 32 条 message，未知 schema/role、畸形 JSON、
+超界响应、越权 Server 和 capability 漂移全部 fail-closed。Runtime 不自动拉完 cursor 链，也不扩大
+Roots/Sampling 权限。专项覆盖真实 HTTP、stdio 2025/2026、认证 Gateway→Worker 全链与消费端 wire/bounds；
+最终 Rust 全工作区精确列出 718 项：712 通过、0 失败、6 个外部 live 用例显式忽略；Clippy
+workspace/all-targets/all-features `-D warnings`、格式和差异门禁通过。17 GiB `target` 作为可复用增量缓存保留。
+其中模型可自主调用的 Runtime-owned 只读入口与 Resource Templates 已由后续 ADR-0117 完成；OAuth 与真实
+外部 Server 长稳分页仍缺，所以总体进度不因单一能力面完成而上调。证据见 ADR-0116 与
+`docs/evidence/2026-08-15-bounded-mcp-resources-and-prompts.md`。
+
+2026-08-15 MCP 能力目录与反向权限防火墙阶段完成：协议中立
+`McpServerCapability::{Tools,Resources,Prompts}` 进入 HTTP 2025/2026、stdio、Model Gateway gRPC 与 Worker；
+Resources/Prompts-only Server 初始化为合法空 Tool 目录且不会收到 `tools/list`。directory schema 2 摘要绑定
+受支持表面与 Tool schema；Worker 对 schema 1 只推断历史 Tools-only，对未知 schema/capability、空目录和
+能力/Tool rows 矛盾全部 fail-closed。Gateway 在每个新调用会话上重新验证 Tools capability，发现后降权不会
+误发副作用。Roots/Sampling 继续默认拒绝，凭证仍只在 Gateway 打开。专项 HTTP、真实 stdio 子进程、认证
+Gateway→Worker、3 项 wire contract 与 2 项调用时降权门禁均通过。ADR-0115 与
+`docs/evidence/2026-08-15-mcp-capability-directory-and-reverse-authority.md` 记录证据。Resources/Prompts
+调用已由后续 ADR-0116 完成；OAuth onboarding/refresh/revoke 尚未实现，因此总体进度仍保持 70–75%。该阶段 Rust 全工作区精确列出
+708 项：702 通过、0 失败、6 个外部 live 用例显式忽略；Clippy workspace/all-targets/all-features
+`-D warnings`、格式与差异门禁通过。14 GiB `target` 作为可复用增量缓存保留，未执行 `cargo clean`。
+
+同轮全量门禁修复 PTY pre-spawn 失败分类：supervisor 在 manifest 仍为精确 `Starting/unprepared` 时启动
+失败，现持久收敛为 `Terminated/start_failed`，不再伪造模糊副作用；若已越过 `prepared` 或状态不可读，
+仍 fail-closed 为 `indeterminate`。本地 Host 冷启动 supervisor 的有界等待调整为 10 秒，实际快速路径不增加
+固定延迟。默认高并发曾观察到一次 macOS 进程组 close `EPERM`；专项与 8 线程全量门禁通过，仍列稳定性风险。
+
+2026-08-15 版本化 Runtime Event Cursor 阶段完成：schema 1 请求绑定完整 invocation、Run、exclusive
+sequence 与 1..256 limit；页面显式返回 next/earliest/highest、has-more、history-gap、事件和 running/
+cancelling/waiting-approval/suspended/interrupted/terminal/retired 状态。unsupported schema、invalid request、
+not found、cursor ahead、identity mismatch、corrupt log 与 storage unavailable 均为 typed error。retired gap
+只由 tombstone terminal watermark 证明，不能从序号距离猜测。订阅输出改为 Event/Boundary；Legacy Attach
+已迁移到同一 bounded persistent tail reader，不再每 20ms 全量重读，但保留旧 wire 响应兼容。sequence gap、
+摘要清空、foreign invocation、cursor ahead、慢消费者与 retired 两种 cursor 均有 executable evidence。
+ADR-0114 与 `docs/evidence/2026-08-15-versioned-runtime-event-cursor.md` 记录当前证据；随机分页仍为
+O(日志长度)验证，长单 Run sparse index 尚无 profiling 依据，不提前实现。最终 Rust 全工作区 696 项中
+690 通过、0 失败、6 个外部 live 用例显式忽略；Clippy、格式与差异门禁通过。
+
+2026-08-15 本地容量口径已校正并完成扩展门禁：20 tenant、200 Workspace/Profile、1000 个 claimed
+in-flight Run 中只有 32 个 Host/Provider admitted，peak queued=968；首轮覆盖 20/20 tenant，取消释放后的
+晋升波覆盖 16 tenant。500 个排队 future 撤销、16 个 active durable cancel、484 个成功，最终 owner、
+admission、事件订阅和缓冲均归零。慢事件消费者已从 unbounded live sink 改为 fsync JSONL + bounded cursor
+subscription：单订阅≤256、进程≤256 个订阅/1024 缓冲槽、事件行≤256 KiB。exact RSS 14.6→48.5 MB、
+FD 211→278→211、38.300 秒。该证据见 ADR-0113 与
+`docs/evidence/2026-08-15-bounded-1000-inflight-runtime-capacity.md`；它不是 1000 个同时 Provider/Tool 执行，
+因此进度仍保持 70–75%，不因更换口径虚增。最终 Rust 全工作区 695 项中 689 通过、0 失败、6 个外部
+live 用例显式忽略；Clippy workspace/all-targets/all-features `-D warnings`、格式与差异门禁通过。
+
+2026-08-15 Unix daemon/CLI 已收敛为统一 Runtime 控制适配器：Submit、resume、精确审批、cancel 与 MCP
+输入全部委托 `EmbeddedRuntime`，完整 control command 可直接穿透 IPC；旧命令使用确定性 command ID，
+重放命中同一 durable receipt。daemon 不再持有独立 Run handle、取消 token 或恢复状态机，Attach 改从
+已提交事件日志与 durable Run record 续传，替代 daemon 无需旧内存状态。Runtime core 统一负责 accepted
+receipt 恢复、owner epoch、取消优先级、审批/MCP 恢复和后台失败终态化；只有完全空身份的 legacy 本地记录
+可迁移，外部或部分身份记录不会被兼容路径认领。专项证据见 ADR-0109 与
+`docs/evidence/2026-08-15-unified-local-runtime-control-adapter.md`。这仍是本机 Unix transport，不是远端
+认证、分布式 ledger 或 GUI/Java/Edge 集成。最终全工作区为 671 通过、0 失败、6 个外部 live 用例显式
+忽略；Clippy workspace/all-target/all-feature `-D warnings`、格式与差异门禁通过。
+
+同日多租户混合容量阶段完成：10 tenant、100 Profile/Workspace 在一个 `EmbeddedRuntime` 内形成 8 active /
+92 queued，单 tenant active≤2、单 Workspace active=1；60 成功、20 审批、10 cancel、10 crash-resume 最终
+产生 40 个 Completed control receipt 与精确 130 次 Provider 请求，无 Running/Accepted 残留。一次 M1 Pro
+exact 运行 RSS 从 25,853,952 增至 43,220,992 bytes，FD 11→27→11，14.538 秒完成。压力测试先暴露
+“先写 accepted 再发现队列满”的真实缺陷；现在新 Run 与需要新执行槽的 control 都在 durable acceptance
+和 epoch 推进前取得 permit，拒绝后同一命令可安全重试。证据见 ADR-0110 与
+`docs/evidence/2026-08-15-multi-tenant-runtime-storm.md`。最终 Rust 全工作区为 674 通过、0 失败、6 个外部
+live 用例显式忽略；Clippy workspace/all-targets/all-features `-D warnings`、格式与差异门禁通过。该结果
+不是 1000 active Run 或生产 SLA。
+
+同日终态账本 retention/GC 第一阶段完成：`EmbeddedRuntime` 只为事件序列、payload digest、完整 invocation
+与唯一终态全部一致的 Run 建立精确 tombstone；Run/input、owner epoch、terminal event 和 Completed control
+command digest 在删除热目录前 durable commit，删除后再提交 cleaned 状态，崩溃窄窗可幂等 repair。活动、
+等待审批、`indeterminate` 和存在未完成 `Accepted` receipt 的 Run 不会成为候选。Unix state-root 生命周期
+租约拒绝第二个 live owner；Workspace 与同进程 tenant 的目录/墓碑上限均落到执行路径，另一个 Workspace
+的合格终态可释放 tenant 容量，否则新 Run 在 Provider 前失败关闭。1000 个真实 HTTP/SSE 顺序 Run 的一次
+exact 证据为：16 个热目录、984 个墓碑、约 1.16 MiB state、RSS 11.9→29.6 MiB、FD 12→12，总耗时
+123.262 秒，替代 Runtime 扫描 1,114ms。证据见 ADR-0111 与
+`docs/evidence/2026-08-15-terminal-ledger-retention-and-1000-run-churn.md`。这仍不是 1000 active Run、
+跨进程 tenant 配额或生产归档；单 JSON ledger、Session/子代理 unmanaged 目录和非 Unix 单写仍是下一缺口。
+最终 Runtime Host 为 163 通过、0 失败、1 个外部用例忽略；Rust 全工作区为 683 通过、0 失败、6 个外部
+live 用例忽略，Clippy workspace/all-targets/all-features `-D warnings` 通过。
+
+同日图感知回收与分段终态账本阶段完成：root Session Turn 与新子代理 Run 现在写统一多租户 Run record；
+活动 Session、非终态父 Checkpoint 的 pending/active/reservation 和未完成 control receipt 构成强恢复边，
+完成 Session/子代理的 typed transcript/result 只保留来源 ID，不再永久钉住热目录。schema 2 以 manifest、
+最多 256 Run 的 immutable segment 和 bounded active segment 替代单 JSON 全量重写；schema 1 可在 manifest
+提交前保留旧权威、提交后再删除。1000 个真实顺序 Run 为 110.617 秒、最终扫描 0.934 秒、16 热目录/
+984 墓碑、约 1.17 MiB、RSS 12.5→27.2 MiB、FD 12→12；4 tenant×3 Workspace×32 Run 共 384 次真实
+HTTP Agent Loop 在 36.64 秒内完成，每 Workspace 最终 6 热目录/26 墓碑，替代 Runtime replay fence 保持。
+首轮实现曾因重复读取封存段造成 170.49 秒和扫描门禁失败；首次全工作区门禁又发现父/child 双恢复的
+stale owner epoch 竞争，现已按恢复图根调度修复，而非放宽围栏。最终 Runtime Host 为 168 通过、0 失败、
+1 个外部用例忽略；Rust 全工作区为 688 通过、0 失败、6 个外部 live 用例忽略，Clippy、格式与差异门禁
+通过。证据见 ADR-0112 与
+`docs/evidence/2026-08-15-graph-aware-retention-and-segmented-ledger.md`。仍未证明 1000 同时 active Run、
+公开 history gap、冷归档读取、外部 tombstone 转储和非 Unix 跨进程单写。
 
 2026-08-14 Runtime 内核回归补齐两个活性边界：stdio MCP 的新鲜目录不再凭进程/actor 存活复用，必须由
 精确初始化会话在 deadline 内返回协议级 `ping`；活进程但协议卡死同样退役。Process Wait 仍保持每
@@ -31,6 +154,17 @@ Session 一个共享观察器，但本地 write 在 durable intent 与真实副�
 1 秒；PTY wire v3 的 pre-spawn generation fence 6 项与真实 TTY exact 连续 10 次保持通过。该数字不是
 1000 Agent Run 容量，也没有触发旧百分比重算。证据见 ADR-0107 与
 `docs/evidence/2026-08-14-runtime-liveness-and-process-wait.md`。
+
+同日协议中立 Runtime 控制阶段补齐 `EmbeddedRuntime` 的持久 Run record 与统一 control contract：schema 1
+命令绑定 command ID、完整 tenant/application/workload/Workspace/AgentVersion/model policy、Run、预期
+owner epoch 和 resume/精确审批/cancel action；摘要收据以 `accepted → completed` 收敛。状态写入前先取得
+单 Run 执行 owner，并发审批只接受一个且 Tool 只执行一次；并发取消共享 cancellation token，所有已接受
+收据都会完成。原执行者和 Accepted command 的替代执行者连续崩溃后，同一 command ID 可在冻结的 Provider
+尝试预算内以更高 epoch 恢复。Run record 与收据使用文件和目录同步，非 NotFound 读取错误 fail-closed。
+8 项专项测试与 Runtime Host 完整测试通过；最终全工作区 4 线程门禁为 667 通过、0 失败、6 个外部 live
+用例忽略，Clippy/格式/差异门禁通过。此前 8 线程门禁有一个既有 PTY identity ambiguous 偶发失败，同一
+exact 用例随后 10/10 通过，因此仍列为高并发进程治理风险。证据见
+ADR-0108 与 `docs/evidence/2026-08-14-durable-embedded-runtime-control.md`。
 
 2026-08-12 显式多租户调用与公平准入阶段完成第一段闭环：`RuntimeInvocationContext` 与 RunExecution v20
 冻结 tenant/application/non-secret workload identity/Workspace/AgentVersion/model policy；本地事件与 Worker
@@ -306,10 +440,11 @@ progress token，严格校验匹配、有限、单调进度，并经有界非阻
 最终状态仍是 `indeterminate`。云 gRPC 目前只能取消 unary RPC，尚未传输 MCP progress/cancel 通知。
 
 同日 MCP capability negotiation/default-deny 阶段完成：HTTP/stdio 初始化严格验证协议 `2025-06-18`
-和服务端 `tools` 能力；客户端仍不声明 sampling、elicitation 或 roots。真实 MCP peer 在 discovery 和
+和当时唯一支持的服务端 `tools` 能力；客户端仍不声明 sampling、elicitation 或 roots。真实 MCP peer 在 discovery 和
 `tools/call` 中发送越权反向请求，均收到精确 request ID 的 `-32601`，随后会话退役。发现违规零模型
 调用；已开始 Unknown Tool 的违规只调用模型一次并形成持久 `run.indeterminate`，后续伪造 success 不被
-接受。Resources/Prompts 属于客户端查询的服务端能力，旧分类已纠正。下一内核缺口是 Run-frozen、可审批
+接受。Resources/Prompts 属于客户端查询的服务端能力，旧分类已纠正；ADR-0115 后续已让这两类能力可协商并
+进入冻结目录，但尚未暴露 list/read/get。下一内核缺口是 Run-frozen、可审批
 且可恢复的 elicitation 回路；sampling/roots 继续关闭。
 
 同日 MCP 2026 MRTR 阶段完成：RunExecution v19 冻结 wire revision、`elicitation` capability 与 delegated
@@ -356,6 +491,8 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 | Tool 中断副作用确定性 | cancellation/时限先关闭真实执行资源，再按已持久 start 与冻结 effect 选终态；unsafe Tool 为带原始中断原因的 `run.indeterminate`，replay-safe/未开始工作保持 cancelled/timed-out；独立 Host 在事件前持久终态 Checkpoint | `ADR-0087`、`runtime/apps/worker/tests/assignment.rs`、`runtime/apps/runtime-host/tests/execution_cancellation.rs`、`docs/evidence/2026-08-11-interrupted-tool-uncertainty.md` |
 | MCP 请求取消与进度 | HTTP/stdio Tool call 携带唯一 progress token；匹配进度经 32 槽非阻塞队列写入单调 Run 事件并逐次 Checkpoint；取消发送绑定原 request ID 的 `notifications/cancelled`，再执行连接/进程组硬清理；unsafe Tool 仍 indeterminate | `ADR-0088`、`runtime/apps/{model-gateway,worker,runtime-host}/src`、`runtime/apps/runtime-host/tests/execution_cancellation.rs`、`docs/evidence/2026-08-11-mcp-request-cancellation-and-progress.md` |
 | MCP 能力协商与反向请求默认拒绝 | HTTP/stdio 只接受精确协议和服务端 `tools` capability；客户端空 capability 下的 sampling/elicitation/roots 请求按原 ID 回 `-32601` 并退役会话。发现违规阻止模型出口；已开始 unsafe Tool 保持 durable indeterminate，后续 success 不可信 | `ADR-0089`、`runtime/apps/{model-gateway,runtime-host}/src/{mcp.rs,stdio_mcp.rs}`、`runtime/apps/{model-gateway,runtime-host}/tests/{mcp_federation.rs,execution_cancellation.rs}`、`docs/evidence/2026-08-11-mcp-negotiated-capabilities-and-default-deny.md` |
+| MCP 服务端能力目录 | HTTP 2025/2026、stdio、Gateway gRPC 与 Worker 统一冻结 Tools/Resources/Prompts；Resources/Prompts-only 是合法空 Tool 目录且不触发 `tools/list`。directory schema 1 只兼容 Tools-only，schema 2 传递支持表面；未知或矛盾响应 fail-closed。Roots/Sampling 继续默认拒绝 | `ADR-0115`、`contracts/proto/model_gateway.proto`、`runtime/apps/{model-gateway,runtime-host,worker}`、`docs/evidence/2026-08-15-mcp-capability-directory-and-reverse-authority.md` |
+| MCP OAuth 凭证域第一阶段 | RunExecution v21/Protobuf 只传稳定句柄；Gateway 内 PKCE、AEAD 文件账本、CAS + OS lease、owned exchange/refresh、跨进程 singleflight、先提交再暴露、崩溃不重放、stale 401 摘要保护与本地 revoke。真实回环 OAuth→refresh→认证 MCP 闭环；独立 Host 拒绝该 handle。metadata discovery、管理 API、401 transport 联动、远端 revoke、真实外部兼容与跨平台 store 尚缺 | `ADR-0118`、`runtime/apps/model-gateway/src/mcp_oauth.rs`、`runtime/apps/model-gateway/tests/mcp_oauth_lifecycle.rs`、`execution_contract.rs`、`mcp_server_authorization.rs`、`docs/evidence/2026-08-15-credential-domain-mcp-oauth-stage-one.md` |
 | MCP 2026 可恢复用户输入 | RunExecution v19 冻结 revision/capability/scope；Checkpoint v25 在询问、回答、续传三个边界持久化。HTTP form/url 与 stdio form 均跨 Host replacement 原样续传 opaque state；URL 不承载 secret content；Codex 严格外部 stdio fixture 已完成真实 Agent Loop。续传后的 Unknown 副作用模糊失败仍 indeterminate。无状态 gRPC 轮次桥已实跑真实 MCP→Gateway→Worker ToolExecutor；NATS recovery poll 自动续传仍未验证 | `ADR-0090`—`ADR-0092`、`contracts/events/run-execution-requested.v19.example.json`、`runtime/{crates/protocol,apps/model-gateway,apps/worker,apps/runtime-host}`、`standalone_run.rs`、`mcp_end_to_end.rs`、`docs/evidence/2026-08-11-{durable-mcp-mrtr,mcp-mrtr-grpc-bridge,mcp-2026-stdio-url-compatibility}.md` |
 | Runtime IR | 供应商无关模型请求/流事件、错误分类、Tool 描述、assistant Tool Call / tool result、Reasoning、Refusal 与来源绑定 private state；跨 Provider omission 是无 opaque 数据且不提交输出的审计事件 | `ADR-0067`、`runtime/crates/protocol/tests/model_ir.rs`、`runtime/apps/model-gateway/tests/{openai_responses,anthropic_messages,failover}.rs` |
 | Runtime 执行策略 | RunExecution v18 在权威 root Session branch 之上冻结 runtime-policy schema 4、有界 Tool 并发和操作员 MCP effect；ModelInvocation v4 带策略摘要传至 Gateway。Worker Checkpoint schema 24 进一步绑定 source-order Tool commit queue、未完成请求和 staged results；恢复拒绝策略、目录、审批、历史、branch、预算、并行或 MCP effect 语义漂移。独立 Rust Host 使用同一策略且不依赖控制面 | `ADR-0041`、`ADR-0047`、`ADR-0052`—`ADR-0068`、`ADR-0086`、`contracts/events/run-execution-requested.v18.example.json`、`execution_contract.rs`、`history_repair_contract.rs`、`assignment.rs`、`standalone_run.rs`、`subagent_concurrency.rs`、`multi_provider.rs`、`docs/evidence/2026-08-11-run-frozen-mcp-tool-effects.md` |
@@ -509,7 +646,9 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
   zero-lease LRU 以及显式/Drop 关闭。HTTP/stdio 请求级 cancel/progress 已进入持久事件链；独立 HTTP
   Host 已支持 2026 MRTR form/url contract、持久输入和跨进程续传；显式 `stdio2026` 使用相同能力冻结、
   metadata 与 MRTR parser，并已通过 Codex 外部严格服务。云 gRPC 仍保持 unary，但已能用新请求
-  传输下一 MRTR 轮次；NATS recovery poll 尚未自动调度该续传。仍未实现 remote stdio、OAuth onboarding、客户端查询的 Resources/Prompts、2025 held-open
+  传输下一 MRTR 轮次；NATS recovery poll 尚未自动调度该续传。Resources list/read 与 Prompts list/get
+  已通过协议中立 Rust/gRPC 契约贯通 HTTP/stdio/Gateway/Worker，但尚无模型内核入口与 Resource Templates。
+  仍未实现 remote stdio、OAuth onboarding、2025 held-open
   elicitation、sampling/roots、Codex server cache opt-out、后台主动重连、requester 配置重验证/
   撤销、pin-aware 显式代理、持续健康/熔断与真实外部 MCP 长稳验收，
   因此生态广度仍明显落后 Codex/OpenClaw。v11 Run 不能从低于 schema 10 的 Checkpoint 恢复；任何
@@ -519,7 +658,9 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
   验证执行语义。**仍未验证**：Java 控制面 + PostgreSQL + NATS 的完整云端链路对真实厂商、真实厂商的
   `openai_responses`/`anthropic_messages`，以及三协议对真实厂商限流、`Retry-After`、冷却/探针和错误响应的兼容矩阵。
 - 外部调用方认证尚未实现；进程内调用必须选择预注册的完整 invocation Profile，且已有全局/tenant/
-  Workspace active limit、全局/tenant queue limit 与 round-robin。signed workload token、远端
+  Workspace active limit、全局/tenant queue limit 与 round-robin。协议中立 control schema 已统一本地
+  resume、精确审批决定和 cancel，并有 tenant-bound durable receipt；调用 adapter 的认证/签名、远端
+  delivery、分布式 command ledger 和多进程 state-root ownership 尚未实现。signed workload token、远端
   Model/MCP/Checkpoint gRPC、Tool context 与 daemon 已绑定完整 application/workload/Workspace 身份；
   控制面 v20 producer、主动撤销/密钥轮换、持久配额与跨节点公平调度仍未实现。
 - Checkpoint 对象缺失、内容损坏及一次短暂 `Unavailable` 后 JetStream 重投递已做故障分流；尚缺对象保留/垃圾回收、真实 Gateway 进程或存储实例丢失和跨可用区故障注入。

@@ -6,6 +6,10 @@
 //! is not finished no matter what its last outcome looked like.
 
 use agent_protocol::RunBudget;
+use agent_runtime_host::embedded::{
+    RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION, RuntimeControlAction, RuntimeControlCommand,
+    RuntimeControlReceipt, RuntimeControlReceiptState,
+};
 use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
@@ -540,4 +544,166 @@ async fn cancelling_a_parked_run_closes_it_without_executing_the_tool() {
     );
     // A cancelled Run must stay cancelled across a restart.
     let _ = Uuid::nil();
+}
+
+fn control_receipts(state_root: &Path) -> Vec<RuntimeControlReceipt> {
+    let directory = state_root.join("control-receipts");
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("control receipt directory: {error}"),
+    };
+    let mut receipts = entries
+        .map(|entry| {
+            let path = entry.expect("receipt entry").path();
+            serde_json::from_slice(&std::fs::read(path).expect("read receipt"))
+                .expect("decode receipt")
+        })
+        .collect::<Vec<_>>();
+    receipts.sort_by_key(|receipt: &RuntimeControlReceipt| receipt.command_id);
+    receipts
+}
+
+#[tokio::test]
+async fn legacy_approval_is_one_replayable_runtime_control_command() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let (socket, _serving) = start(config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider().await,
+    ))
+    .await;
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+    let probe = state_root.clone();
+    wait_for("the approval to be recorded", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+        )
+    })
+    .await;
+
+    assert!(matches!(
+        request(&socket, &LocalRequest::Approve { run_id }).await,
+        LocalResponse::Accepted { .. }
+    ));
+    let probe = state_root.clone();
+    wait_for("the control receipt to complete", move || {
+        control_receipts(&probe).iter().any(|receipt| {
+            receipt.run_id == run_id && receipt.state == RuntimeControlReceiptState::Completed
+        })
+    })
+    .await;
+    let receipts = control_receipts(&state_root);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "legacy approval forked its command ledger"
+    );
+    let receipt = &receipts[0];
+    assert!(matches!(
+        &receipt.action,
+        RuntimeControlAction::DecideApproval {
+            decision: agent_runtime_host::LocalApprovalDecision::AllowOnce,
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        request(&socket, &LocalRequest::Approve { run_id }).await,
+        LocalResponse::Accepted { .. }
+    ));
+    assert_eq!(
+        control_receipts(&state_root).len(),
+        1,
+        "retry created a second durable command"
+    );
+    let tool_starts = LocalRuntimeHost::replay_events(&state_root, run_id, 0)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "tool.execution.started")
+        .count();
+    assert_eq!(tool_starts, 1, "approval retry executed the Tool twice");
+}
+
+#[tokio::test]
+async fn full_control_request_rejects_stale_epoch_then_returns_its_exact_receipt() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let (socket, _serving) = start(config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider().await,
+    ))
+    .await;
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+    let probe = state_root.clone();
+    wait_for("the approval to be recorded", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+        )
+    })
+    .await;
+    let record = LocalRuntimeHost::read_run_record(&state_root, run_id)
+        .expect("read record")
+        .expect("record");
+    let LocalRunState::AwaitingApproval {
+        approval_id,
+        binding_digest,
+        target_run_id,
+    } = &record.state
+    else {
+        panic!("not awaiting approval");
+    };
+    let command_id = Uuid::now_v7();
+    let command = RuntimeControlCommand {
+        schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+        command_id,
+        invocation: agent_runtime_host::local_invocation_context(),
+        run_id,
+        expected_owner_epoch: record.owner_epoch,
+        action: RuntimeControlAction::DecideApproval {
+            target_run_id: target_run_id.unwrap_or(run_id),
+            approval_id: *approval_id,
+            binding_digest: binding_digest.clone(),
+            decision: agent_runtime_host::LocalApprovalDecision::AllowOnce,
+        },
+    };
+    let mut stale = command.clone();
+    stale.expected_owner_epoch += 1;
+    assert!(matches!(
+        request(&socket, &LocalRequest::Control { command: stale }).await,
+        LocalResponse::Error { .. }
+    ));
+    assert!(control_receipts(&state_root).is_empty());
+
+    let response = request(&socket, &LocalRequest::Control { command }).await;
+    let LocalResponse::ControlReceipt { receipt } = response else {
+        panic!("expected an exact control receipt, got {response:?}");
+    };
+    assert_eq!(receipt.command_id, command_id);
+    assert_eq!(receipt.run_id, run_id);
+    assert_eq!(receipt.expected_owner_epoch, record.owner_epoch);
 }

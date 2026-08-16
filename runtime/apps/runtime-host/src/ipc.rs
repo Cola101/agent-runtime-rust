@@ -5,25 +5,29 @@
 //! must reconstruct what happened from the durable event log rather than from
 //! anything the client remembered.
 
+use crate::admission::RuntimeAdmissionLimits;
+use crate::embedded::{
+    EmbeddedRuntime, EmbeddedRuntimeError, RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+    RuntimeControlAction, RuntimeControlCommand, RuntimeControlReceipt, RuntimeEventCursorError,
+    RuntimeEventCursorErrorCode, RuntimeEventCursorPage, RuntimeEventCursorRequest,
+    RuntimeEventCursorState, RuntimeEventStreamItem, RuntimeProfile,
+};
 use crate::{
-    LocalApprovalDecision, LocalApprovalResolution, LocalEvent, LocalMcpInputResolution,
-    LocalResumeResolution, LocalRunRecord, LocalRunState, LocalRuntimeConfig, LocalRuntimeError,
-    LocalRuntimeHost, local_invocation_context,
+    LocalApprovalDecision, LocalEvent, LocalMcpInputResolution, LocalRunRecord, LocalRunState,
+    LocalRuntimeConfig, LocalRuntimeError, LocalRuntimeHost, local_invocation_context,
 };
 use agent_protocol::{McpInputResponse, RuntimeInvocationContext};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// Bounded live-tail buffer. A slow client that falls behind is told to replay
-/// from the log rather than being silently given a hole in the stream.
-const LIVE_TAIL_CAPACITY: usize = 1024;
+const LOCAL_DAEMON_MAX_ACTIVE_RUNS: usize = 16;
+const LOCAL_DAEMON_MAX_QUEUED_RUNS: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -38,6 +42,11 @@ pub enum LocalRequest {
         run_id: Uuid,
         #[serde(default)]
         after_sequence: u64,
+    },
+    /// One bounded, versioned page for SDKs and future GUI adapters. Unlike
+    /// legacy Attach, all lifecycle and history-gap outcomes remain typed.
+    EventCursor {
+        request: RuntimeEventCursorRequest,
     },
     /// Runs this daemon has started, newest first.
     List,
@@ -59,6 +68,14 @@ pub enum LocalRequest {
     Cancel {
         run_id: Uuid,
     },
+    Resume {
+        run_id: Uuid,
+    },
+    /// Full protocol-neutral command for SDKs and future GUI adapters. Legacy
+    /// convenience variants above are translated to this exact contract.
+    Control {
+        command: RuntimeControlCommand,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -68,26 +85,16 @@ pub enum LocalResponse {
     Event { event: Box<LocalEvent> },
     Finished { run_id: Uuid, status: String },
     Runs { run_ids: Vec<Uuid> },
+    ControlReceipt { receipt: Box<RuntimeControlReceipt> },
+    EventCursor { page: Box<RuntimeEventCursorPage> },
+    EventCursorError { error: RuntimeEventCursorError },
     Error { message: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RunLifecycle {
-    Running,
-    Cancelling,
-    Finished(String),
-}
-
-struct RunHandle {
-    live: broadcast::Sender<LocalEvent>,
-    lifecycle: Arc<Mutex<RunLifecycle>>,
-    cancellation: tokio_util::sync::CancellationToken,
 }
 
 pub struct LocalRuntimeDaemon {
     config: LocalRuntimeConfig,
     invocation: RuntimeInvocationContext,
-    runs: Arc<Mutex<HashMap<Uuid, Arc<RunHandle>>>>,
+    runtime: Arc<EmbeddedRuntime>,
     order: Arc<Mutex<Vec<Uuid>>>,
 }
 
@@ -105,10 +112,25 @@ impl LocalRuntimeDaemon {
         invocation
             .validate()
             .map_err(|error| LocalRuntimeError::Configuration(error.to_string()))?;
+        Self::migrate_legacy_local_records(&config, invocation)?;
+        let runtime = EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: LOCAL_DAEMON_MAX_ACTIVE_RUNS,
+                max_active_runs_per_tenant: LOCAL_DAEMON_MAX_ACTIVE_RUNS,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: LOCAL_DAEMON_MAX_QUEUED_RUNS,
+                max_queued_runs_per_tenant: LOCAL_DAEMON_MAX_QUEUED_RUNS,
+            },
+            vec![RuntimeProfile {
+                invocation,
+                config: config.clone(),
+            }],
+        )
+        .map_err(|error| LocalRuntimeError::Configuration(error.to_string()))?;
         Ok(Arc::new(Self {
             config,
             invocation,
-            runs: Arc::new(Mutex::new(HashMap::new())),
+            runtime: Arc::new(runtime),
             order: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -135,11 +157,46 @@ impl LocalRuntimeDaemon {
             && record.model_policy_id == self.invocation.model_policy_id
     }
 
+    fn migrate_legacy_local_records(
+        config: &LocalRuntimeConfig,
+        invocation: RuntimeInvocationContext,
+    ) -> Result<(), LocalRuntimeError> {
+        if invocation != local_invocation_context() {
+            return Ok(());
+        }
+        for record in LocalRuntimeHost::list_run_records(&config.state_root)? {
+            let legacy = [
+                record.tenant_id,
+                record.application_id,
+                record.workload_identity_id,
+                record.workspace_id,
+                record.agent_version_id,
+                record.model_policy_id,
+            ]
+            .iter()
+            .all(Uuid::is_nil);
+            if legacy {
+                LocalRuntimeHost::write_run_record(
+                    &config.state_root,
+                    &LocalRunRecord {
+                        tenant_id: invocation.tenant_id,
+                        application_id: invocation.application_id,
+                        workload_identity_id: invocation.workload_identity_id,
+                        workspace_id: invocation.workspace_id,
+                        agent_version_id: invocation.agent_version_id,
+                        model_policy_id: invocation.model_policy_id,
+                        ..record
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_owned_record(&self, run_id: Uuid) -> Result<Option<LocalRunRecord>, LocalRuntimeError> {
-        Ok(
-            LocalRuntimeHost::read_run_record(&self.config.state_root, run_id)?
-                .filter(|record| self.record_is_owned(record)),
-        )
+        self.runtime
+            .read_run_record(self.invocation, run_id)
+            .map_err(Self::map_runtime_error)
     }
 
     /// Releases the control socket on a clean shutdown. Removing it after the
@@ -226,8 +283,13 @@ impl LocalRuntimeDaemon {
             };
             match request {
                 LocalRequest::Submit { input } => {
-                    let run_id = self.spawn_run(input).await;
-                    write_response(&mut writer, &LocalResponse::Accepted { run_id }).await?;
+                    let response = match self.spawn_run(input).await {
+                        Ok(run_id) => LocalResponse::Accepted { run_id },
+                        Err(error) => LocalResponse::Error {
+                            message: error.to_string(),
+                        },
+                    };
+                    write_response(&mut writer, &response).await?;
                 }
                 LocalRequest::List => {
                     let run_ids = self.order.lock().await.iter().rev().copied().collect();
@@ -238,6 +300,31 @@ impl LocalRuntimeDaemon {
                     after_sequence,
                 } => {
                     self.stream_run(&mut writer, run_id, after_sequence).await?;
+                }
+                LocalRequest::EventCursor { request } => {
+                    let response = match self.runtime.event_cursor(request) {
+                        Ok(page) => LocalResponse::EventCursor {
+                            page: Box::new(page),
+                        },
+                        Err(EmbeddedRuntimeError::EventCursor(error)) => {
+                            LocalResponse::EventCursorError { error }
+                        }
+                        Err(EmbeddedRuntimeError::UnregisteredInvocation) => {
+                            LocalResponse::EventCursorError {
+                                error: RuntimeEventCursorError {
+                                    code: RuntimeEventCursorErrorCode::IdentityMismatch,
+                                    message: "Runtime event invocation is not registered".into(),
+                                },
+                            }
+                        }
+                        Err(_) => LocalResponse::EventCursorError {
+                            error: RuntimeEventCursorError {
+                                code: RuntimeEventCursorErrorCode::StorageUnavailable,
+                                message: "Runtime event cursor is unavailable".into(),
+                            },
+                        },
+                    };
+                    write_response(&mut writer, &response).await?;
                 }
                 LocalRequest::Approve { run_id } => {
                     let response = self.decide(run_id, LocalApprovalDecision::AllowOnce).await;
@@ -271,102 +358,178 @@ impl LocalRuntimeDaemon {
                     let response = self.cancel(run_id).await;
                     write_response(&mut writer, &response).await?;
                 }
+                LocalRequest::Resume { run_id } => {
+                    let response = self.resume(run_id).await;
+                    write_response(&mut writer, &response).await?;
+                }
+                LocalRequest::Control { command } => {
+                    let response = match self.runtime.control_detached(command).await {
+                        Ok(receipt) => LocalResponse::ControlReceipt {
+                            receipt: Box::new(receipt),
+                        },
+                        Err(error) => LocalResponse::Error {
+                            message: error.to_string(),
+                        },
+                    };
+                    write_response(&mut writer, &response).await?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Starts a Run on its own task. The returned id is durable immediately;
-    /// execution outlives the connection that asked for it.
-    async fn spawn_run(self: &Arc<Self>, input: String) -> Uuid {
+    /// Starts a Run through the same embedded coordinator used by every other
+    /// adapter. The durable Run record exists before acceptance is returned.
+    async fn spawn_run(self: &Arc<Self>, input: String) -> Result<Uuid, EmbeddedRuntimeError> {
         let run_id = Uuid::now_v7();
-        // Record before executing: a daemon that dies between these two points
-        // must still leave evidence that this Run exists.
-        let record = LocalRunRecord {
-            store_version: crate::LOCAL_STORE_VERSION,
-            tenant_id: self.invocation.tenant_id,
-            application_id: self.invocation.application_id,
-            workload_identity_id: self.invocation.workload_identity_id,
-            workspace_id: self.invocation.workspace_id,
-            agent_version_id: self.invocation.agent_version_id,
-            model_policy_id: self.invocation.model_policy_id,
-            run_id,
-            input: input.clone(),
-            state: LocalRunState::Running,
-            owner_epoch: 1,
-        };
-        if LocalRuntimeHost::write_run_record(&self.config.state_root, &record).is_err() {
-            return run_id;
+        self.runtime
+            .execute_detached(self.invocation, run_id, input)
+            .await?;
+        let mut order = self.order.lock().await;
+        if !order.contains(&run_id) {
+            order.push(run_id);
         }
-        self.launch(record, None, None, false).await;
-        run_id
+        Ok(run_id)
     }
 
-    /// Answers the approval a parked Run is waiting on and lets it continue.
-    /// Only a parked Run can be decided: answering anything else would either
-    /// be a no-op or would restart work that is already in flight.
+    fn map_runtime_error(error: EmbeddedRuntimeError) -> LocalRuntimeError {
+        match error {
+            EmbeddedRuntimeError::Runtime(error) => error,
+            other => LocalRuntimeError::Configuration(other.to_string()),
+        }
+    }
+
+    fn legacy_command_id(run_id: Uuid, kind: &str, related_id: Option<Uuid>) -> Uuid {
+        let mut digest = Sha256::new();
+        digest.update(b"agent-runtime-local-control-v1\0");
+        digest.update(run_id.as_bytes());
+        digest.update(kind.as_bytes());
+        if let Some(related_id) = related_id {
+            digest.update(related_id.as_bytes());
+        }
+        let digest = digest.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        // RFC 9562 custom UUID (version 8), with the standard variant.
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes)
+    }
+
+    fn existing_legacy_command(
+        &self,
+        command_id: Uuid,
+    ) -> Result<Option<RuntimeControlCommand>, EmbeddedRuntimeError> {
+        Ok(self
+            .runtime
+            .read_control_receipt(self.invocation, command_id)?
+            .map(|receipt| receipt.command()))
+    }
+
+    async fn dispatch_legacy_control(
+        self: &Arc<Self>,
+        command: RuntimeControlCommand,
+    ) -> LocalResponse {
+        match self.runtime.control_detached(command).await {
+            Ok(receipt) => LocalResponse::Accepted {
+                run_id: receipt.run_id,
+            },
+            Err(error) => LocalResponse::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// Legacy approve/deny remains a convenience adapter, but the exact pending
+    /// approval and stable command id are converted into RuntimeControlCommand.
     async fn decide(
         self: &Arc<Self>,
         run_id: Uuid,
         decision: LocalApprovalDecision,
     ) -> LocalResponse {
-        let Ok(Some(record)) = self.read_owned_record(run_id) else {
-            return LocalResponse::Error {
-                message: "unknown run".into(),
-            };
+        let kind = match decision {
+            LocalApprovalDecision::AllowOnce => "approve",
+            LocalApprovalDecision::Deny => "deny",
         };
-        let resolution = match &record.state {
+        let command_id = Self::legacy_command_id(run_id, kind, None);
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command))
+                if matches!(
+                    command.action,
+                    RuntimeControlAction::DecideApproval {
+                        decision: recorded,
+                        ..
+                    } if recorded == decision
+                ) =>
+            {
+                return self.dispatch_legacy_control(command).await;
+            }
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "legacy approval command id is bound to another action".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
+        }
+        let record = match self.read_owned_record(run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalResponse::Error {
+                    message: "unknown run".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let (target_run_id, approval_id, binding_digest) = match &record.state {
             LocalRunState::AwaitingApproval {
                 approval_id,
                 binding_digest,
                 target_run_id,
-            } => LocalApprovalResolution {
-                target_run_id: target_run_id.unwrap_or(run_id),
-                approval_id: Some(*approval_id),
-                binding_digest: Some(binding_digest.clone()),
-                decision,
-            },
+            } => (
+                target_run_id.unwrap_or(run_id),
+                *approval_id,
+                binding_digest.clone(),
+            ),
             LocalRunState::ApprovalDecided {
-                decision: recorded, ..
-            } if *recorded == decision => return LocalResponse::Accepted { run_id },
+                target_run_id,
+                approval_id,
+                binding_digest,
+                decision: recorded,
+            } if *recorded == decision => (*target_run_id, *approval_id, binding_digest.clone()),
             LocalRunState::ApprovalDecided { .. } => {
                 return LocalResponse::Error {
                     message: "approval was already decided differently".into(),
                 };
             }
-            _ => {
+            state => {
                 return LocalResponse::Error {
-                    message: format!("run is not awaiting approval: {:?}", record.state),
+                    message: format!("run is not awaiting approval: {state:?}"),
                 };
             }
         };
-        let epoch = record.owner_epoch + 1;
-        let resuming = LocalRunRecord {
-            owner_epoch: epoch,
-            state: LocalRunState::ApprovalDecided {
-                target_run_id: resolution.target_run_id,
-                approval_id: resolution.approval_id.expect("bound daemon approval id"),
-                binding_digest: resolution
-                    .binding_digest
-                    .clone()
-                    .expect("bound daemon approval digest"),
+        self.dispatch_legacy_control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id,
+            invocation: self.invocation,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::DecideApproval {
+                target_run_id,
+                approval_id,
+                binding_digest,
                 decision,
             },
-            ..record
-        };
-        if LocalRuntimeHost::write_run_record(&self.config.state_root, &resuming).is_err() {
-            return LocalResponse::Error {
-                message: "could not record the decision".into(),
-            };
-        }
-        self.launch(
-            resuming,
-            Some(epoch),
-            Some(LocalResumeResolution::Approval(resolution)),
-            false,
-        )
-        .await;
-        LocalResponse::Accepted { run_id }
+        })
+        .await
     }
 
     async fn resolve_mcp_input(
@@ -374,10 +537,42 @@ impl LocalRuntimeDaemon {
         resolution: LocalMcpInputResolution,
         run_id: Uuid,
     ) -> LocalResponse {
-        let Ok(Some(record)) = self.read_owned_record(run_id) else {
-            return LocalResponse::Error {
-                message: "unknown run".into(),
-            };
+        let command_id =
+            Self::legacy_command_id(run_id, "resolve_mcp_input", Some(resolution.input_id));
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command))
+                if matches!(
+                    &command.action,
+                    RuntimeControlAction::ResolveMcpInput { input_id, .. }
+                        if *input_id == resolution.input_id
+                ) =>
+            {
+                return self.dispatch_legacy_control(command).await;
+            }
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "legacy MCP input command id is bound to another action".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
+        }
+        let record = match self.read_owned_record(run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalResponse::Error {
+                    message: "unknown run".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
         };
         match &record.state {
             LocalRunState::AwaitingMcpInput { input }
@@ -385,7 +580,7 @@ impl LocalRuntimeDaemon {
                     && input.binding_digest == resolution.binding_digest => {}
             LocalRunState::McpInputDecided {
                 resolution: recorded,
-            } if recorded == &resolution => return LocalResponse::Accepted { run_id },
+            } if recorded == &resolution => {}
             LocalRunState::McpInputDecided { .. } => {
                 return LocalResponse::Error {
                     message: "MCP input was already answered differently".into(),
@@ -397,446 +592,196 @@ impl LocalRuntimeDaemon {
                 };
             }
         }
-        let epoch = record.owner_epoch + 1;
-        let resuming = LocalRunRecord {
-            owner_epoch: epoch,
-            state: LocalRunState::McpInputDecided {
-                resolution: resolution.clone(),
+        self.dispatch_legacy_control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id,
+            invocation: self.invocation,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::ResolveMcpInput {
+                input_id: resolution.input_id,
+                input_version: resolution.input_version,
+                binding_digest: resolution.binding_digest,
+                responses: resolution.responses,
             },
-            ..record
-        };
-        if LocalRuntimeHost::write_run_record(&self.config.state_root, &resuming).is_err() {
-            return LocalResponse::Error {
-                message: "could not record the MCP input response".into(),
-            };
-        }
-        self.launch(
-            resuming,
-            Some(epoch),
-            Some(LocalResumeResolution::McpInput(resolution)),
-            false,
-        )
-        .await;
-        LocalResponse::Accepted { run_id }
+        })
+        .await
     }
 
-    /// Cancels a parked or active Run. Active execution owns the durable
-    /// terminal event; this method only signals its downward cancellation tree.
     async fn cancel(self: &Arc<Self>, run_id: Uuid) -> LocalResponse {
-        let Ok(Some(record)) = self.read_owned_record(run_id) else {
-            return LocalResponse::Error {
-                message: "unknown run".into(),
-            };
+        let command_id = Self::legacy_command_id(run_id, "cancel", None);
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command)) if matches!(command.action, RuntimeControlAction::Cancel { .. }) => {
+                return self.dispatch_legacy_control(command).await;
+            }
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "legacy cancellation command id is bound to another action".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
+        }
+        let record = match self.read_owned_record(run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalResponse::Error {
+                    message: "unknown run".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
         };
-        if matches!(record.state, LocalRunState::Cancelling { .. }) {
-            return LocalResponse::Accepted { run_id };
-        }
-        if record.state == LocalRunState::Running {
-            let handle = self.runs.lock().await.get(&run_id).map(Arc::clone);
-            let Some(handle) = handle else {
-                return LocalResponse::Error {
-                    message: "active run is not owned by this daemon".into(),
-                };
-            };
-            let mut lifecycle = handle.lifecycle.lock().await;
-            match &*lifecycle {
-                RunLifecycle::Cancelling => return LocalResponse::Accepted { run_id },
-                RunLifecycle::Finished(_) => {
-                    return LocalResponse::Error {
-                        message: "run is not cancellable".into(),
-                    };
-                }
-                RunLifecycle::Running => {}
-            }
-            let Ok(Some(current)) = self.read_owned_record(run_id) else {
-                return LocalResponse::Error {
-                    message: "could not revalidate the active run".into(),
-                };
-            };
-            if matches!(current.state, LocalRunState::Cancelling { .. }) {
-                *lifecycle = RunLifecycle::Cancelling;
-                return LocalResponse::Accepted { run_id };
-            }
-            if current.state != LocalRunState::Running {
-                return LocalResponse::Error {
-                    message: "run is not cancellable".into(),
-                };
-            }
-            let cancelling = LocalRunRecord {
-                state: LocalRunState::Cancelling {
-                    reason: "cancelled by the local operator".into(),
-                },
-                ..current
-            };
-            if LocalRuntimeHost::write_run_record(&self.config.state_root, &cancelling).is_err() {
-                return LocalResponse::Error {
-                    message: "could not record the cancellation intent".into(),
-                };
-            }
-            *lifecycle = RunLifecycle::Cancelling;
-            handle.cancellation.cancel();
-            return LocalResponse::Accepted { run_id };
-        }
-        if !matches!(
-            record.state,
-            LocalRunState::AwaitingApproval { .. } | LocalRunState::AwaitingMcpInput { .. }
-        ) {
-            return LocalResponse::Error {
-                message: "run is not cancellable".into(),
-            };
-        }
-        let cancelled = LocalRunRecord {
-            state: LocalRunState::Cancelled {
-                reason: "cancelled by the local operator while awaiting approval".into(),
+        self.dispatch_legacy_control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id,
+            invocation: self.invocation,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Cancel {
+                reason: "cancelled by the local operator".into(),
             },
-            ..record
-        };
-        if LocalRuntimeHost::write_run_record(&self.config.state_root, &cancelled).is_err() {
-            return LocalResponse::Error {
-                message: "could not record the cancellation".into(),
-            };
-        }
-        if let Some(handle) = self.runs.lock().await.get(&run_id) {
-            *handle.lifecycle.lock().await = RunLifecycle::Finished("cancelled".into());
-        }
-        LocalResponse::Accepted { run_id }
+        })
+        .await
     }
 
-    /// Picks up Runs an earlier daemon left unfinished. A Run without a
-    /// Checkpoint is not restarted: nothing proves what it already did, and
-    /// re-running is only safe when the Checkpoint says where to continue.
-    pub async fn recover_unfinished(self: &Arc<Self>) -> Result<usize, LocalRuntimeError> {
-        let records = LocalRuntimeHost::list_run_records(&self.config.state_root)?;
-        let mut resumed = 0;
-        for record in records {
-            if !self.record_is_owned(&record) {
-                continue;
+    async fn resume(self: &Arc<Self>, run_id: Uuid) -> LocalResponse {
+        let command_id = Self::legacy_command_id(run_id, "resume", None);
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command)) if matches!(command.action, RuntimeControlAction::Resume) => {
+                return self.dispatch_legacy_control(command).await;
             }
-            let (cancellation_reason, resolution) = match &record.state {
-                LocalRunState::Running => (None, None),
-                LocalRunState::Cancelling { reason } => (Some(reason.clone()), None),
-                LocalRunState::ApprovalDecided {
-                    target_run_id,
-                    approval_id,
-                    binding_digest,
-                    decision,
-                } => (
-                    None,
-                    Some(LocalResumeResolution::Approval(LocalApprovalResolution {
-                        target_run_id: *target_run_id,
-                        approval_id: Some(*approval_id),
-                        binding_digest: Some(binding_digest.clone()),
-                        decision: *decision,
-                    })),
-                ),
-                LocalRunState::McpInputDecided { resolution } => (
-                    None,
-                    Some(LocalResumeResolution::McpInput(resolution.clone())),
-                ),
-                _ => continue,
-            };
-            if self.runs.lock().await.contains_key(&record.run_id) {
-                continue;
-            }
-            if let Some(terminal) =
-                Self::terminal_state_from_events(&self.config.state_root, record.run_id)?
-            {
-                LocalRuntimeHost::write_run_record(
-                    &self.config.state_root,
-                    &LocalRunRecord {
-                        state: terminal,
-                        ..record
-                    },
-                )?;
-                continue;
-            }
-            if !LocalRuntimeHost::checkpoint_path(&self.config.state_root, record.run_id).is_file()
-            {
-                let terminal = LocalRunRecord {
-                    state: match cancellation_reason {
-                        Some(reason) => LocalRunState::Cancelled { reason },
-                        None => LocalRunState::Interrupted {
-                            reason: "daemon stopped before the run produced a checkpoint".into(),
-                        },
-                    },
-                    ..record
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "legacy resume command id is bound to another action".into(),
                 };
-                LocalRuntimeHost::write_run_record(&self.config.state_root, &terminal)?;
-                continue;
             }
-            // Recovery must outrank the epoch the Checkpoint bound, or restore
-            // refuses it as a stale lease.
-            let epoch = record.owner_epoch + 1;
-            let resuming = LocalRunRecord {
-                owner_epoch: epoch,
-                ..record
-            };
-            LocalRuntimeHost::write_run_record(&self.config.state_root, &resuming)?;
-            self.launch(
-                resuming,
-                Some(epoch),
-                resolution,
-                cancellation_reason.is_some(),
-            )
-            .await;
-            resumed += 1;
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
         }
-        Ok(resumed)
+        let record = match self.read_owned_record(run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalResponse::Error {
+                    message: "unknown run".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        self.dispatch_legacy_control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id,
+            invocation: self.invocation,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Resume,
+        })
+        .await
     }
 
-    /// Reconciles the crash window after a terminal event append but before the
-    /// daemon updates `run.json`. The event is the Kernel authority and must win
-    /// over an older local lifecycle hint.
-    fn terminal_state_from_events(
-        state_root: &Path,
-        run_id: Uuid,
-    ) -> Result<Option<LocalRunState>, LocalRuntimeError> {
-        let events = LocalRuntimeHost::replay_events(state_root, run_id, 0)?;
-        Ok(events
-            .iter()
-            .rev()
-            .find_map(|event| match event.event_type.as_str() {
-                "run.succeeded" => Some(LocalRunState::Finished {
-                    status: "succeeded".into(),
-                }),
-                "run.failed" => Some(LocalRunState::Finished {
-                    status: "failed".into(),
-                }),
-                "run.cancelled" => Some(LocalRunState::Cancelled {
-                    reason: "the Kernel attempt was cancelled".into(),
-                }),
-                "run.timed_out" => Some(LocalRunState::Finished {
-                    status: "timed_out".into(),
-                }),
-                "run.indeterminate" => Some(LocalRunState::Finished {
-                    status: "indeterminate".into(),
-                }),
-                _ => None,
-            }))
+    pub async fn recover_unfinished(self: &Arc<Self>) -> Result<usize, LocalRuntimeError> {
+        let recovered = self
+            .runtime
+            .recover_unfinished_detached(self.invocation)
+            .await
+            .map_err(Self::map_runtime_error)?;
+        let mut run_ids = LocalRuntimeHost::list_run_records(&self.config.state_root)?
+            .into_iter()
+            .filter(|record| self.record_is_owned(record))
+            .map(|record| record.run_id)
+            .collect::<Vec<_>>();
+        run_ids.sort_unstable();
+        run_ids.dedup();
+        *self.order.lock().await = run_ids;
+        Ok(recovered)
     }
-
-    /// Runs `record` on its own task, fresh when `resume_epoch` is `None` and
-    /// from its Checkpoint otherwise, then durably records the outcome.
-    async fn launch(
-        self: &Arc<Self>,
-        record: LocalRunRecord,
-        resume_epoch: Option<u64>,
-        resolution: Option<LocalResumeResolution>,
-        cancel_on_start: bool,
-    ) {
-        let (sender, _) = broadcast::channel(LIVE_TAIL_CAPACITY);
-        let lifecycle = Arc::new(Mutex::new(RunLifecycle::Running));
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        if cancel_on_start {
-            cancellation.cancel();
-        }
-        let handle = Arc::new(RunHandle {
-            live: sender.clone(),
-            lifecycle: Arc::clone(&lifecycle),
-            cancellation: cancellation.clone(),
-        });
-        let run_id = record.run_id;
-        self.runs.lock().await.insert(run_id, Arc::clone(&handle));
-        if !self.order.lock().await.contains(&run_id) {
-            self.order.lock().await.push(run_id);
-        }
-
-        let config = self.config.clone();
-        let invocation = self.invocation;
-        let state_root = self.config.state_root.clone();
-        tokio::spawn(async move {
-            let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-            let fanout = tokio::spawn(async move {
-                while let Some(event) = events_rx.recv().await {
-                    // No receivers is normal: every client may be detached.
-                    let _ = sender.send(event);
-                }
-            });
-            let status = match LocalRuntimeHost::start_for_invocation_with_cancellation(
-                config,
-                invocation,
-                cancellation,
-            ) {
-                Ok(mut host) => {
-                    host.set_event_sink(events_tx);
-                    let outcome = match (resume_epoch, resolution) {
-                        (Some(epoch), Some(LocalResumeResolution::Approval(resolution))) => {
-                            host.resume_with_resolution(run_id, &record.input, epoch, resolution)
-                                .await
-                        }
-                        (Some(epoch), Some(LocalResumeResolution::McpInput(resolution))) => {
-                            host.resume_with_mcp_input(run_id, &record.input, epoch, resolution)
-                                .await
-                        }
-                        (Some(epoch), None) => host.resume(run_id, &record.input, epoch).await,
-                        _ => host.execute_as(run_id, &record.input).await,
-                    };
-                    host.shutdown().await;
-                    match outcome {
-                        // A Run parked on an approval is not finished. Recording
-                        // it as finished would make recovery skip it and leave
-                        // it permanently unapprovable.
-                        Ok(outcome) => {
-                            if let Some(approval) = outcome.pending_approval {
-                                Err(LocalRunState::AwaitingApproval {
-                                    approval_id: approval.approval_id,
-                                    binding_digest: approval.binding_digest,
-                                    target_run_id: Some(approval.target_run_id),
-                                })
-                            } else if let Some(input) = outcome.pending_mcp_input {
-                                Err(LocalRunState::AwaitingMcpInput { input })
-                            } else {
-                                Ok(outcome.status.as_str().to_owned())
-                            }
-                        }
-                        Err(error) => Ok(format!("failed: {error}")),
-                    }
-                }
-                Err(error) => Ok(format!("failed: {error}")),
-            };
-            fanout.abort();
-            let (next_state, lifecycle_status) = match status {
-                Ok(status) if status == "cancelled" => (
-                    LocalRunState::Cancelled {
-                        reason: "cancelled by the local operator".into(),
-                    },
-                    Some(status),
-                ),
-                Ok(status) => (
-                    LocalRunState::Finished {
-                        status: status.clone(),
-                    },
-                    Some(status),
-                ),
-                Err(parked) => (parked, None),
-            };
-            let updated = LocalRunRecord {
-                state: next_state,
-                ..record
-            };
-            // Durable before the in-memory lifecycle flips, so a crash between
-            // the two cannot lose the outcome. The same lock serializes this
-            // write against cancellation acknowledgement, so an older
-            // `Cancelling` write cannot overwrite a terminal record.
-            let mut lifecycle = lifecycle.lock().await;
-            let _ = LocalRuntimeHost::write_run_record(&state_root, &updated);
-            *lifecycle = match lifecycle_status {
-                Some(status) => RunLifecycle::Finished(status),
-                None => RunLifecycle::Finished("awaiting_approval".into()),
-            };
-        });
-    }
-
-    /// Replays the durable log first, then follows the live tail. Replay before
-    /// subscribe would drop events produced in between, so the live subscription
-    /// is opened first and replayed events are de-duplicated by sequence.
+    /// Compatibility stream backed by the bounded versioned cursor. No call
+    /// reads the complete log into memory; new SDKs should use EventCursor so
+    /// terminal, retired and history-gap states remain typed on the wire.
     async fn stream_run(
         self: &Arc<Self>,
         writer: &mut tokio::net::unix::OwnedWriteHalf,
         run_id: Uuid,
         after_sequence: u64,
     ) -> std::io::Result<()> {
-        if self.read_owned_record(run_id).ok().flatten().is_none() {
-            write_response(
-                writer,
-                &LocalResponse::Error {
-                    message: "unknown run".into(),
-                },
-            )
-            .await?;
-            return Ok(());
-        }
-        let handle = self.runs.lock().await.get(&run_id).map(Arc::clone);
-        let mut live = handle.as_ref().map(|handle| handle.live.subscribe());
-
-        let replayed =
-            LocalRuntimeHost::replay_events(&self.config.state_root, run_id, after_sequence)
-                .unwrap_or_default();
-        let mut highest = after_sequence;
-        for event in replayed {
-            highest = highest.max(event.sequence);
-            write_response(
-                writer,
-                &LocalResponse::Event {
-                    event: Box::new(event),
-                },
-            )
-            .await?;
-        }
-
-        let Some(handle) = handle else {
-            write_response(
-                writer,
-                &LocalResponse::Error {
-                    message: "unknown run".into(),
-                },
-            )
-            .await?;
-            return Ok(());
-        };
-
-        loop {
-            if let Some(receiver) = live.as_mut() {
-                match receiver.try_recv() {
-                    Ok(event) => {
-                        if event.sequence > highest {
-                            highest = event.sequence;
-                            write_response(
-                                writer,
-                                &LocalResponse::Event {
-                                    event: Box::new(event),
-                                },
-                            )
-                            .await?;
-                        }
-                        continue;
-                    }
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                        // The client fell behind the bounded tail. Replay the
-                        // gap from the durable log instead of skipping it.
-                        let missed = LocalRuntimeHost::replay_events(
-                            &self.config.state_root,
-                            run_id,
-                            highest,
-                        )
-                        .unwrap_or_default();
-                        for event in missed {
-                            highest = highest.max(event.sequence);
-                            write_response(
-                                writer,
-                                &LocalResponse::Event {
-                                    event: Box::new(event),
-                                },
-                            )
-                            .await?;
-                        }
-                        continue;
-                    }
-                    Err(broadcast::error::TryRecvError::Closed) => live = None,
-                    Err(broadcast::error::TryRecvError::Empty) => {}
-                }
-            }
-            let lifecycle = handle.lifecycle.lock().await.clone();
-            if let RunLifecycle::Finished(status) = lifecycle {
-                // Drain anything durable that landed after the last live poll.
-                let tail =
-                    LocalRuntimeHost::replay_events(&self.config.state_root, run_id, highest)
-                        .unwrap_or_default();
-                for event in tail {
-                    highest = highest.max(event.sequence);
+        let mut subscription =
+            match self
+                .runtime
+                .subscribe_events(self.invocation, run_id, after_sequence, 64)
+            {
+                Ok(subscription) => subscription,
+                Err(error) => {
                     write_response(
                         writer,
-                        &LocalResponse::Event {
-                            event: Box::new(event),
+                        &LocalResponse::Error {
+                            message: error.to_string(),
                         },
                     )
                     .await?;
+                    return Ok(());
                 }
-                write_response(writer, &LocalResponse::Finished { run_id, status }).await?;
-                return Ok(());
+            };
+        while let Some(item) = subscription.recv().await {
+            match item {
+                Ok(RuntimeEventStreamItem::Event { event, .. }) => {
+                    write_response(writer, &LocalResponse::Event { event }).await?;
+                }
+                Ok(RuntimeEventStreamItem::Boundary {
+                    state, history_gap, ..
+                }) => {
+                    if history_gap {
+                        write_response(
+                            writer,
+                            &LocalResponse::Error {
+                                message: "Run event history was retired before this cursor".into(),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    let status = match state {
+                        RuntimeEventCursorState::Terminal { status }
+                        | RuntimeEventCursorState::Retired { status, .. } => {
+                            status.as_str().to_owned()
+                        }
+                        RuntimeEventCursorState::WaitingApproval => "waiting_approval".into(),
+                        RuntimeEventCursorState::Suspended => "suspended".into(),
+                        RuntimeEventCursorState::Interrupted => "interrupted".into(),
+                        RuntimeEventCursorState::Running | RuntimeEventCursorState::Cancelling => {
+                            return Ok(());
+                        }
+                    };
+                    write_response(writer, &LocalResponse::Finished { run_id, status }).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    write_response(
+                        writer,
+                        &LocalResponse::Error {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        Ok(())
     }
 }
 

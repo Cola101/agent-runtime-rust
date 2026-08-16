@@ -63,6 +63,7 @@ fn server() -> McpServerRef {
         name: "everything".into(),
         endpoint: endpoint(),
         credential_envelope_json: String::new(),
+        oauth_credential_id: None,
         protocol_revision: McpProtocolRevision::V2025_06_18,
         client_capabilities: BTreeSet::new(),
     }
@@ -183,6 +184,7 @@ async fn discovery_works_against_every_configured_server() {
             name: "compat".into(),
             endpoint: endpoint.clone(),
             credential_envelope_json: String::new(),
+            oauth_credential_id: None,
             protocol_revision: McpProtocolRevision::V2025_06_18,
             client_capabilities: BTreeSet::new(),
         };
@@ -307,6 +309,7 @@ async fn a_sealed_credential_opens_against_an_authenticating_server() {
         name: "github".into(),
         endpoint: endpoint.clone(),
         credential_envelope_json: String::new(),
+        oauth_credential_id: None,
         protocol_revision: McpProtocolRevision::V2025_06_18,
         client_capabilities: BTreeSet::new(),
     };

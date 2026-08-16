@@ -8,7 +8,9 @@ use std::fmt;
 use uuid::Uuid;
 
 pub const RUN_QUEUED_SCHEMA_VERSION: u32 = 1;
-pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 20;
+pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 21;
+pub const RUN_EXECUTION_COMPLETE_IDENTITY_SCHEMA_VERSION: u32 = 20;
+pub const RUN_EXECUTION_MCP_OAUTH_SCHEMA_VERSION: u32 = 21;
 pub const RUN_CANCELLATION_SCHEMA_VERSION: u32 = 2;
 pub const RUN_STEERING_SCHEMA_VERSION: u32 = 1;
 pub const RUN_STEERING_OUTCOME_SCHEMA_VERSION: u32 = 1;
@@ -559,6 +561,150 @@ impl McpProtocolRevision {
     }
 }
 
+/// Capability surface an MCP server advertised during discovery.
+///
+/// This is descriptive, not authority: a remote peer may advertise a surface,
+/// but the Runtime still decides whether a Run may invoke it. Keeping the two
+/// concepts separate prevents an untrusted server from granting itself access
+/// merely by returning a larger `capabilities` object.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerCapability {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl McpServerCapability {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Resources => "resources",
+            Self::Prompts => "prompts",
+        }
+    }
+}
+
+/// One bounded page of read-only MCP resources. The cursor remains opaque: a
+/// Runtime must never inspect, concatenate, or synthesize it because only the
+/// originating Server owns its pagination state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpResourcePage {
+    pub resources: Vec<McpResourceDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Protocol-neutral projection of an MCP resource descriptor. Presentation
+/// metadata is intentionally omitted from the authority contract; the URI is
+/// the only value later sent to `resources/read`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpResourceDescriptor {
+    pub uri: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// One bounded page of URI templates advertised by an MCP Resource surface.
+/// A template is descriptive input to a later concrete `resources/read`; it is
+/// never expanded by the Runtime because doing so would invent Server-owned URI
+/// semantics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpResourceTemplatePage {
+    pub resource_templates: Vec<McpResourceTemplateDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpResourceTemplateDescriptor {
+    pub uri_template: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpResourceReadResult {
+    pub contents: Vec<McpResourceContent>,
+}
+
+/// Resource bytes are decoded at the credential-holding egress boundary. This
+/// prevents base64 expansion and validation from becoming every consumer's
+/// responsibility while retaining the text/blob distinction from MCP.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpResourceContent {
+    Text {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        text: String,
+    },
+    Blob {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptPage {
+    pub prompts: Vec<McpPromptDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptDescriptor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub messages: Vec<McpPromptMessage>,
+}
+
+/// Prompt content is retained as bounded JSON because MCP content blocks are
+/// extensible across protocol revisions. The Runtime validates the role and
+/// size, but does not discard a future safe content kind merely because an
+/// older Rust enum did not know its spelling.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: Value,
+}
+
 /// Authority the Runtime is prepared to exercise on behalf of an MCP server.
 /// This is frozen per Run and intentionally separate from the server's own
 /// advertised capabilities: an untrusted peer cannot grant itself client work.
@@ -886,6 +1032,10 @@ pub struct McpServerSnapshot {
     /// Sealed. Base64 of the envelope, opaque here and opened at the egress hop.
     #[serde(default)]
     pub credential_envelope_base64: String,
+    /// Stable credential-domain handle. The Worker may carry this UUID but
+    /// never the OAuth access/refresh token it resolves to.
+    #[serde(default)]
+    pub oauth_credential_id: Option<Uuid>,
     /// A required server is part of the Run's accepted capability contract.
     /// Discovery failure therefore stops before model egress rather than
     /// silently presenting a smaller Tool catalog.
@@ -929,6 +1079,21 @@ impl McpServerSnapshot {
 
     fn scope(&self) -> String {
         format!("tool:mcp:{}", self.name)
+    }
+
+    fn read_scope(&self) -> String {
+        format!("mcp:read:{}", self.name)
+    }
+
+    fn has_valid_credential_mode(&self, schema_version: u32) -> bool {
+        match self.oauth_credential_id {
+            Some(credential_id) => {
+                schema_version >= RUN_EXECUTION_MCP_OAUTH_SCHEMA_VERSION
+                    && !credential_id.is_nil()
+                    && self.credential_envelope_base64.is_empty()
+            }
+            None => true,
+        }
     }
 
     fn capability_scope(&self, capability: McpClientCapability) -> String {
@@ -1537,9 +1702,12 @@ impl RunExecutionCommand {
                 && server.endpoint.len() <= 2_048
                 && !server.endpoint.trim().is_empty()
                 && server.credential_envelope_base64.len() <= 16 * 1024
-                // A server nobody delegated is either a mistake or a
-                // pre-authorisation waiting for a scope change to activate it.
-                && self.delegated_scopes.contains(&server.scope())
+                && server.has_valid_credential_mode(self.schema_version)
+                // Tool execution and model-visible read access are separate
+                // authorities. A Resource/Prompt-only server must be valid
+                // without also granting its remote Tools side-effect power.
+                && (self.delegated_scopes.contains(&server.scope())
+                    || self.delegated_scopes.contains(&server.read_scope()))
                 && seen.insert(server.name.clone())
         })
     }

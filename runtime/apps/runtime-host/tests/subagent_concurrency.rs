@@ -5,9 +5,12 @@
 //! hold the first child response until it observes the second child request.
 
 use agent_protocol::{RunBudget, RunStatus, RuntimeExecutionPolicySnapshot, SubagentRole};
+use agent_runtime_host::admission::RuntimeAdmissionLimits;
+use agent_runtime_host::embedded::{EmbeddedRuntime, RuntimeProfile};
+use agent_runtime_host::retention::RuntimeRetentionPolicy;
 use agent_runtime_host::{
-    LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalRuntimeConfig, LocalRuntimeHost,
-    LocalToolConsent, WORKSPACE_READ_SCOPE,
+    LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalRunState, LocalRuntimeConfig,
+    LocalRuntimeHost, LocalToolConsent, WORKSPACE_READ_SCOPE, local_invocation_context,
 };
 use agent_runtime_worker::WorkerProcessor;
 use std::collections::BTreeSet;
@@ -2391,19 +2394,27 @@ async fn crash_after_interrupt_receipt(config: LocalRuntimeConfig, run_id: Uuid)
             .expect("isolated runtime");
         runtime.block_on(async move {
             let mut host = LocalRuntimeHost::start(config).expect("first host");
-            let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-            host.set_event_sink(events);
             let execution = tokio::spawn(async move {
                 host.execute_as(run_id, "Delegate the bounded child.").await
             });
             let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut after_sequence = 0;
                 loop {
-                    let event = event_rx.recv().await.expect("event stream ended");
-                    if event.event_type == "subagent.input.accepted"
-                        && event.payload["interrupt"] == true
-                    {
-                        break event;
+                    let events = LocalRuntimeHost::replay_events(
+                        &state_root,
+                        run_id,
+                        after_sequence,
+                    )
+                    .expect("durable event stream");
+                    for event in events {
+                        after_sequence = event.sequence;
+                        if event.event_type == "subagent.input.accepted"
+                            && event.payload["interrupt"] == true
+                        {
+                            return event;
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
@@ -2984,7 +2995,7 @@ async fn two_subagents_are_inflight_before_either_child_completes() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
     let (endpoint, provider) = spawn_parallel_provider().await;
-    let mut host = LocalRuntimeHost::start(LocalRuntimeConfig {
+    let local_config = LocalRuntimeConfig {
         state_root: state.path().to_path_buf(),
         workspace_root: workspace
             .path()
@@ -3013,8 +3024,8 @@ async fn two_subagents_are_inflight_before_either_child_completes() {
             max_duration_seconds: 600,
         },
         runtime_policy: RuntimeExecutionPolicySnapshot::default(),
-    })
-    .expect("start host");
+    };
+    let mut host = LocalRuntimeHost::start(local_config.clone()).expect("start host");
 
     let outcome = host
         .execute("Delegate alpha and beta.")
@@ -3051,6 +3062,70 @@ async fn two_subagents_are_inflight_before_either_child_completes() {
     assert_eq!(
         checkpoint["budget_usage"]["tokens"], 300,
         "both child usage receipts must be settled into the parent budget"
+    );
+    let child_run_ids = LocalRuntimeHost::replay_events(state.path(), outcome.run_id, 0)
+        .expect("parent event log")
+        .into_iter()
+        .filter(|event| event.event_type == "subagent.spawn.requested")
+        .filter_map(|event| {
+            event
+                .payload
+                .get("request")
+                .and_then(|request| request.get("delegation_id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(child_run_ids.len(), 2);
+    for child_run_id in &child_run_ids {
+        let record = LocalRuntimeHost::read_run_record(state.path(), *child_run_id)
+            .expect("child Run record read")
+            .expect("child Run is retention-managed");
+        assert!(matches!(record.state, LocalRunState::Finished { .. }));
+    }
+    drop(host);
+    let runtime = EmbeddedRuntime::new_with_retention(
+        RuntimeAdmissionLimits {
+            max_active_runs: 2,
+            max_active_runs_per_tenant: 2,
+            max_active_runs_per_workspace: 1,
+            max_queued_runs: 8,
+            max_queued_runs_per_tenant: 8,
+        },
+        vec![RuntimeProfile {
+            invocation: local_invocation_context(),
+            config: local_config,
+        }],
+        RuntimeRetentionPolicy {
+            max_run_directories_per_workspace: 8,
+            max_run_directories_per_tenant: 16,
+            retain_terminal_runs_per_workspace: 0,
+            min_terminal_age: Duration::ZERO,
+            max_run_tombstones_per_workspace: 16,
+            max_run_tombstones_per_tenant: 32,
+            max_control_tombstones_per_workspace: 16,
+            max_control_tombstones_per_tenant: 32,
+        },
+    )
+    .expect("retention Runtime");
+    let report = runtime
+        .maintain_retention(local_invocation_context())
+        .expect("completed child retention");
+    assert_eq!(report.tombstoned_runs, 2);
+    assert_eq!(report.strongly_referenced_runs, 0);
+    assert_eq!(report.unmanaged_run_directories, 1);
+    for child_run_id in child_run_ids {
+        assert!(
+            !state
+                .path()
+                .join("runs")
+                .join(child_run_id.to_string())
+                .exists()
+        );
+    }
+    assert!(
+        outcome.checkpoint_path.exists(),
+        "the parent result graph remains durable after child hot artifacts are retired"
     );
 }
 

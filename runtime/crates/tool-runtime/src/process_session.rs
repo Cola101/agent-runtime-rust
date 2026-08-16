@@ -2048,11 +2048,24 @@ impl PersistentProcessSessionManager {
                         return self.output_from_manifest(&running, 0, 0);
                     }
                     Err(error) => {
-                        if load_manifest(&session_dir)
-                            .is_ok_and(|current| current.state == ProcessSessionState::Starting)
-                            && finalize_start_failure(&session_dir, &manifest).is_err()
-                        {
-                            return Err(ProcessSessionError::Indeterminate);
+                        match load_manifest(&session_dir) {
+                            Ok(current)
+                                if current.state == ProcessSessionState::Starting
+                                    && current.resource_phase
+                                        == ProcessSessionResourcePhase::Unprepared =>
+                            {
+                                if finalize_unprepared_start_failure(&session_dir, &manifest)
+                                    .is_err()
+                                {
+                                    return Err(ProcessSessionError::Indeterminate);
+                                }
+                            }
+                            Ok(current)
+                                if current.state == ProcessSessionState::Terminated
+                                    && current.last_operation == "start_failed"
+                                    && current.termination_reason
+                                        == Some(ProcessSessionTerminationReason::StartFailed) => {}
+                            Ok(_) | Err(_) => return Err(ProcessSessionError::Indeterminate),
                         }
                         return Err(error);
                     }
@@ -2144,7 +2157,7 @@ impl PersistentProcessSessionManager {
                     drop(spawn_guard);
                     drop(prepared_linux_group.take());
                     let reason = error.to_string();
-                    finalize_start_failure(&session_dir, &manifest)?;
+                    finalize_prepared_start_failure(&session_dir, &manifest)?;
                     let terminal = load_manifest(&session_dir)?;
                     // A Linux cleanup failure intentionally leaves the durable
                     // terminal record at `cleanup_pending`; a replacement
@@ -3775,7 +3788,36 @@ fn finalize_governance_termination(
     })
 }
 
-fn finalize_start_failure(
+fn finalize_start_failure_transition(manifest: &mut ProcessSessionManifest) {
+    manifest.state = ProcessSessionState::Terminated;
+    manifest.resource_phase = terminal_resource_phase(&manifest.resource_identity);
+    manifest.pid = None;
+    manifest.process_group_id = None;
+    manifest.exit_code = None;
+    manifest.operation_sequence = manifest.operation_sequence.saturating_add(1);
+    manifest.last_operation = "start_failed".into();
+    manifest.last_input_digest = None;
+    manifest.termination_reason = Some(ProcessSessionTerminationReason::StartFailed);
+    manifest.updated_at = Utc::now().max(manifest.updated_at);
+}
+
+fn finalize_unprepared_start_failure(
+    session_dir: &Path,
+    expected: &ProcessSessionManifest,
+) -> Result<(), ProcessSessionError> {
+    mutate_manifest(session_dir, |manifest| {
+        validate_same_manifest(manifest, expected)?;
+        if manifest.state != ProcessSessionState::Starting
+            || manifest.resource_phase != ProcessSessionResourcePhase::Unprepared
+        {
+            return Err(ProcessSessionError::Conflict);
+        }
+        finalize_start_failure_transition(manifest);
+        Ok(())
+    })
+}
+
+fn finalize_prepared_start_failure(
     session_dir: &Path,
     expected: &ProcessSessionManifest,
 ) -> Result<(), ProcessSessionError> {
@@ -3786,16 +3828,7 @@ fn finalize_start_failure(
         {
             return Err(ProcessSessionError::Conflict);
         }
-        manifest.state = ProcessSessionState::Terminated;
-        manifest.resource_phase = terminal_resource_phase(&manifest.resource_identity);
-        manifest.pid = None;
-        manifest.process_group_id = None;
-        manifest.exit_code = None;
-        manifest.operation_sequence = manifest.operation_sequence.saturating_add(1);
-        manifest.last_operation = "start_failed".into();
-        manifest.last_input_digest = None;
-        manifest.termination_reason = Some(ProcessSessionTerminationReason::StartFailed);
-        manifest.updated_at = Utc::now().max(manifest.updated_at);
+        finalize_start_failure_transition(manifest);
         Ok(())
     })
 }

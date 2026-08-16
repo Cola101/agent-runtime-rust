@@ -22,11 +22,16 @@ pub struct RuntimeAdmissionLimits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeAdmissionSnapshot {
+    pub limits: RuntimeAdmissionLimits,
     pub active_runs: usize,
     pub queued_runs: usize,
     pub active_tenants: usize,
     pub active_workspaces: usize,
     pub queued_tenants: usize,
+    pub peak_active_runs: usize,
+    pub peak_queued_runs: usize,
+    pub peak_active_runs_per_tenant: usize,
+    pub peak_active_runs_per_workspace: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -76,6 +81,10 @@ struct AdmissionState {
     queues: HashMap<Uuid, VecDeque<WaitingRun>>,
     rotation: VecDeque<Uuid>,
     last_admitted_tenant: Option<Uuid>,
+    peak_active_runs: usize,
+    peak_queued_runs: usize,
+    peak_active_runs_per_tenant: usize,
+    peak_active_runs_per_workspace: usize,
 }
 
 /// A process-local coordinator suitable for an embedded Runtime or a local
@@ -109,11 +118,16 @@ impl RuntimeAdmissionController {
     pub fn snapshot(&self) -> RuntimeAdmissionSnapshot {
         let state = self.lock_state();
         RuntimeAdmissionSnapshot {
+            limits: self.limits,
             active_runs: state.active_runs,
             queued_runs: state.queued_runs,
             active_tenants: state.active_by_tenant.len(),
             active_workspaces: state.active_by_workspace.len(),
             queued_tenants: state.queues.len(),
+            peak_active_runs: state.peak_active_runs,
+            peak_queued_runs: state.peak_queued_runs,
+            peak_active_runs_per_tenant: state.peak_active_runs_per_tenant,
+            peak_active_runs_per_workspace: state.peak_active_runs_per_workspace,
         }
     }
 
@@ -166,6 +180,7 @@ impl RuntimeAdmissionController {
                     grant,
                 });
             state.queued_runs += 1;
+            state.peak_queued_runs = state.peak_queued_runs.max(state.queued_runs);
             self.promote_locked(&mut state);
             (
                 receiver,
@@ -198,14 +213,22 @@ impl RuntimeAdmissionController {
 
     fn mark_active(state: &mut AdmissionState, invocation: RuntimeInvocationContext) {
         state.active_runs += 1;
-        *state
+        let tenant_active = state
             .active_by_tenant
             .entry(invocation.tenant_id)
-            .or_default() += 1;
-        *state
+            .or_default();
+        *tenant_active += 1;
+        let tenant_active = *tenant_active;
+        let workspace_active = state
             .active_by_workspace
             .entry(Self::workspace_key(invocation))
-            .or_default() += 1;
+            .or_default();
+        *workspace_active += 1;
+        let workspace_active = *workspace_active;
+        state.peak_active_runs = state.peak_active_runs.max(state.active_runs);
+        state.peak_active_runs_per_tenant = state.peak_active_runs_per_tenant.max(tenant_active);
+        state.peak_active_runs_per_workspace =
+            state.peak_active_runs_per_workspace.max(workspace_active);
     }
 
     fn unmark_active(state: &mut AdmissionState, invocation: RuntimeInvocationContext) {

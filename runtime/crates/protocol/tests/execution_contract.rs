@@ -361,6 +361,51 @@ fn v20_execution_binds_one_complete_application_scoped_invocation_identity() {
     }
 }
 
+/// OAuth credential material stays inside the Model Gateway credential domain.
+/// The Run contract carries only one non-nil stable handle, and an older schema
+/// cannot silently accept that new authority-bearing field.
+#[test]
+fn v21_mcp_oauth_handle_is_stable_authority_and_downgrade_safe() {
+    let credential_id = Uuid::now_v7();
+    let mut value: serde_json::Value = serde_json::from_str(EXECUTION_V20_EXAMPLE).unwrap();
+    value["schema_version"] = serde_json::json!(21);
+    value["mcp_servers"][0]["oauth_credential_id"] = serde_json::json!(credential_id.to_string());
+
+    let command: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(command.validate(), Ok(()));
+    assert_eq!(
+        command.mcp_servers[0].oauth_credential_id,
+        Some(credential_id)
+    );
+    assert!(command.mcp_servers[0].credential_envelope_base64.is_empty());
+
+    value["schema_version"] = serde_json::json!(20);
+    let downgraded: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        downgraded.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpServers),
+        "a v20 Worker must reject an OAuth authority it cannot resolve"
+    );
+
+    value["schema_version"] = serde_json::json!(21);
+    value["mcp_servers"][0]["oauth_credential_id"] = serde_json::json!(Uuid::nil());
+    let nil_handle: RunExecutionCommand = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        nil_handle.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpServers)
+    );
+
+    value["mcp_servers"][0]["oauth_credential_id"] = serde_json::json!(credential_id.to_string());
+    value["mcp_servers"][0]["credential_envelope_base64"] =
+        serde_json::json!("eyJzZWFsZWQiOnRydWV9");
+    let ambiguous: RunExecutionCommand = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        ambiguous.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpServers),
+        "static and OAuth credentials must never be active together"
+    );
+}
+
 #[test]
 fn runtime_invocation_context_rejects_an_ambiguous_resource_boundary() {
     let context = RuntimeInvocationContext {

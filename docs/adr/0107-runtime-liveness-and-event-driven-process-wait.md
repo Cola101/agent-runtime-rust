@@ -34,6 +34,7 @@ Session / 1024 个 wait 虽然只有每 Session 一个观察器，但本地写�
 - 已退出会话不能授权缓存；新初始化会话成功 `ping` 后才可复用缓存，不能额外 `tools/list`。
 - 64 Session / 1024 wait 保持最多 64 observer；本轮连续 3 次 p50 分别为 869.39ms、727.03ms、
   883.04ms，p95 均低于 1 秒，p100 均低于 1 秒。
-- PTY generation-fence 单元测试与真实 TTY exact 测试保持通过；一次重叠包级压力曾出现模糊启动，随后
-  聚焦 5 轮 85/85 与完整 workspace 门禁通过，继续作为负载稳定性观察项。本 ADR 不把单机回归等同于
-  跨平台证明。
+- PTY generation-fence 单元测试与真实 TTY exact 测试保持通过。后续全量门禁已定位原“模糊启动”：
+  supervisor 在 manifest 尚为 `Starting/unprepared` 时未能在冷启动期限内就绪，Manager 的失败收敛却只
+  接受 `prepared`，因此把确定的 pre-spawn 失败错误升级为 `indeterminate`。现在两条边界分别收敛，
+  `prepared` 之后仍禁止乐观归类；本 ADR 不把单机回归等同于跨平台证明。

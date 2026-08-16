@@ -3,12 +3,17 @@
 //! The property under test is ownership: a Run belongs to the daemon and to the
 //! local store, never to a client connection.
 
-use agent_protocol::RunBudget;
+use agent_protocol::{RunBudget, RunStatus};
+use agent_runtime_host::embedded::{
+    RUNTIME_EVENT_CURSOR_SCHEMA_VERSION, RuntimeEventCursorErrorCode, RuntimeEventCursorRequest,
+    RuntimeEventCursorState,
+};
 use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
     LocalModelRoutingConfig, LocalRuntimeConfig, LocalToolConsent, WORKSPACE_READ_SCOPE,
+    local_invocation_context,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -268,6 +273,75 @@ async fn a_reconnecting_client_replays_the_durable_event_log_from_its_last_seque
         "cursor replay dropped or duplicated events: full={full:?} resumed={resumed:?}"
     );
     assert_eq!(resumed, full[1..], "replay order changed");
+
+    let (stream, response) = send(
+        &socket,
+        &LocalRequest::EventCursor {
+            request: RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: local_invocation_context(),
+                run_id,
+                after_sequence: 0,
+                limit: 1,
+            },
+        },
+    )
+    .await;
+    drop(stream);
+    let LocalResponse::EventCursor { page } = response else {
+        panic!("expected typed event cursor page, got {response:?}");
+    };
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.next_after_sequence, 1);
+    assert_eq!(page.highest_committed_sequence, full.len() as u64);
+    assert!(page.has_more);
+    assert!(!page.history_gap);
+    assert_eq!(
+        page.state,
+        RuntimeEventCursorState::Terminal {
+            status: RunStatus::Succeeded
+        }
+    );
+
+    let (stream, response) = send(
+        &socket,
+        &LocalRequest::EventCursor {
+            request: RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: local_invocation_context(),
+                run_id,
+                after_sequence: full.len() as u64 + 1,
+                limit: 1,
+            },
+        },
+    )
+    .await;
+    drop(stream);
+    let LocalResponse::EventCursorError { error } = response else {
+        panic!("expected typed cursor-ahead error, got {response:?}");
+    };
+    assert_eq!(error.code, RuntimeEventCursorErrorCode::CursorAhead);
+
+    let mut foreign = local_invocation_context();
+    foreign.tenant_id = uuid::Uuid::now_v7();
+    let (stream, response) = send(
+        &socket,
+        &LocalRequest::EventCursor {
+            request: RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: foreign,
+                run_id,
+                after_sequence: 0,
+                limit: 1,
+            },
+        },
+    )
+    .await;
+    drop(stream);
+    let LocalResponse::EventCursorError { error } = response else {
+        panic!("expected typed identity error, got {response:?}");
+    };
+    assert_eq!(error.code, RuntimeEventCursorErrorCode::IdentityMismatch);
 }
 
 #[tokio::test]
@@ -318,4 +392,103 @@ async fn a_deeply_nested_state_root_still_yields_a_bindable_control_socket() {
         "clients must derive the same socket path as the daemon"
     );
     LocalRuntimeDaemon::release(&socket, listener);
+}
+
+#[tokio::test]
+async fn a_replacement_daemon_attaches_from_durable_state_without_an_in_memory_handle() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let endpoint = spawn_provider(vec![text_turn("durable replacement answer")]).await;
+    let config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("canonical"),
+        endpoint,
+    );
+    let socket = default_socket_path(&config.state_root);
+    let listener = LocalRuntimeDaemon::bind(&socket).await.expect("bind first");
+    let first = LocalRuntimeDaemon::new(config.clone());
+    let serving = tokio::spawn(first.serve(listener));
+
+    let (client, response) = send(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Return one durable answer.".into(),
+        },
+    )
+    .await;
+    drop(client);
+    let LocalResponse::Accepted { run_id } = response else {
+        panic!("expected acceptance, got {response:?}");
+    };
+    loop {
+        let (stream, first) = send(
+            &socket,
+            &LocalRequest::Attach {
+                run_id,
+                after_sequence: 0,
+            },
+        )
+        .await;
+        match first {
+            LocalResponse::Finished { status, .. } if status == "succeeded" => {
+                drop(stream);
+                break;
+            }
+            LocalResponse::Event { .. } => {
+                let (_, status) = drain_stream(stream).await;
+                if status == "succeeded" {
+                    break;
+                }
+            }
+            other => panic!("unexpected attach response: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    serving.abort();
+    let _ = serving.await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let replacement = loop {
+        match LocalRuntimeDaemon::new_for_invocation(config.clone(), local_invocation_context()) {
+            Ok(daemon) => break daemon,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("Workspace state root already has another Runtime owner") =>
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the predecessor daemon did not release its state-root lease"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => panic!("replacement daemon failed to start: {error}"),
+        }
+    };
+    let listener = LocalRuntimeDaemon::bind(&socket)
+        .await
+        .expect("bind replacement");
+    assert_eq!(
+        replacement.recover_unfinished().await.expect("reconcile"),
+        0
+    );
+    let replacement_serving = tokio::spawn(replacement.serve(listener));
+
+    let (stream, first) = send(
+        &socket,
+        &LocalRequest::Attach {
+            run_id,
+            after_sequence: 0,
+        },
+    )
+    .await;
+    let mut events = match first {
+        LocalResponse::Event { event } => vec![event.event_type],
+        other => panic!("replacement did not replay the durable log: {other:?}"),
+    };
+    let (rest, status) = drain_stream(stream).await;
+    events.extend(rest);
+    assert_eq!(status, "succeeded");
+    assert!(events.iter().any(|event| event == "run.succeeded"));
+    replacement_serving.abort();
 }

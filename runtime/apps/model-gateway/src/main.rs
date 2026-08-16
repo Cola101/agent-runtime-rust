@@ -1,6 +1,7 @@
 use agent_grpc_security::ServerMtlsMaterials;
 use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
+use agent_model_gateway::mcp_oauth::McpOAuthCoordinator;
 use agent_model_gateway::{
     AnthropicMessagesAdapter, AnthropicMessagesConfig, ModelExecutionGrpcService,
     ModelPolicyRouteResolver, OpenAiCompatibleAdapter, OpenAiCompatibleConfig,
@@ -10,11 +11,15 @@ use agent_model_gateway::{
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecutionServer;
 use agent_runtime_health::{HealthState, serve as serve_health};
+use base64::Engine as _;
+use std::io::Read as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::info;
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         required_environment("AGENT_RUNTIME_GRPC_CLIENT_CA_CERT")?,
     )?;
     let mut service = ModelExecutionGrpcService::new(adapter, credential, verifier);
-    let mut mcp_federation: Option<McpFederationGrpcService> = None;
+    let loopback_permitted = environment("AGENT_RUNTIME_MCP_ALLOW_LOOPBACK", "false") == "true";
+    let mut mcp_client = None;
     if let Ok(private_key_path) =
         std::env::var("AGENT_RUNTIME_MODEL_GATEWAY_CREDENTIAL_PRIVATE_KEY_PATH")
     {
@@ -104,23 +110,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             response_timeout,
             stream_idle_timeout,
         )?);
-        // The same key opens MCP credentials, so federation is available only
-        // where model credentials already are. A gateway that could open one but
-        // not the other would be a surprising half-configured state.
-        mcp_federation = Some(McpFederationGrpcService::new(
-            McpFederationClient::from_pkcs8_pem(
-                &private_key_pem,
-                response_timeout,
-                // Default deny. A deployment that needs a loopback MCP server --
-                // local development, mostly -- says so; production says nothing
-                // and gets the safe answer.
-                environment("AGENT_RUNTIME_MCP_ALLOW_LOOPBACK", "false") == "true",
-            )?,
-            WorkloadTokenVerifier::from_base64(&required_environment(
-                "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
-            )?)?,
-        ));
+        mcp_client = Some(McpFederationClient::from_pkcs8_pem(
+            &private_key_pem,
+            response_timeout,
+            loopback_permitted,
+        )?);
     }
+    if let Some(coordinator) =
+        oauth_coordinator_from_environment(response_timeout, loopback_permitted)?
+    {
+        let client = match mcp_client.take() {
+            Some(client) => client,
+            None => McpFederationClient::for_open_servers(response_timeout, loopback_permitted)?,
+        };
+        mcp_client = Some(client.with_oauth_coordinator(Arc::new(coordinator)));
+    }
+    let mcp_federation = mcp_client
+        .map(|client| {
+            Ok::<_, Box<dyn std::error::Error>>(McpFederationGrpcService::new(
+                client,
+                WorkloadTokenVerifier::from_base64(&required_environment(
+                    "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
+                )?)?,
+            ))
+        })
+        .transpose()?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     health.set_ready(true);
     info!(
@@ -138,6 +152,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
+}
+
+fn oauth_coordinator_from_environment(
+    request_timeout: Duration,
+    loopback_permitted: bool,
+) -> Result<Option<McpOAuthCoordinator>, Box<dyn std::error::Error>> {
+    let (state_root, master_key_path) = match (
+        std::env::var("AGENT_RUNTIME_MCP_OAUTH_STATE_ROOT").ok(),
+        std::env::var("AGENT_RUNTIME_MCP_OAUTH_MASTER_KEY_FILE").ok(),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(state_root), Some(master_key_path)) => (state_root, master_key_path),
+        _ => {
+            return Err(
+                "MCP OAuth state root and master key file must be configured together".into(),
+            );
+        }
+    };
+    if state_root.trim().is_empty() || master_key_path.trim().is_empty() {
+        return Err("MCP OAuth paths must not be blank".into());
+    }
+    #[cfg(unix)]
+    let key_file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&master_key_path)?
+    };
+    #[cfg(not(unix))]
+    let key_file = std::fs::File::open(&master_key_path)?;
+    let metadata = key_file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 1_024 {
+        return Err("MCP OAuth master key must be a small regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.permissions().mode() & 0o077 != 0
+            // SAFETY: geteuid has no preconditions and does not mutate process state.
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(
+                "MCP OAuth master key file must be owned by this user and mode 0600 or stricter"
+                    .into(),
+            );
+        }
+    }
+    let mut encoded_key = Zeroizing::new(String::new());
+    key_file.take(1_025).read_to_string(&mut encoded_key)?;
+    if encoded_key.len() > 1_024 {
+        return Err("MCP OAuth master key file is too large".into());
+    }
+    let decoded_key =
+        Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(encoded_key.trim())?);
+    let master_key: [u8; 32] = decoded_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "MCP OAuth master key must decode to exactly 32 bytes")?;
+    Ok(Some(McpOAuthCoordinator::new(
+        state_root,
+        master_key,
+        request_timeout,
+        loopback_permitted,
+    )?))
 }
 
 fn environment(name: &str, default: &str) -> String {

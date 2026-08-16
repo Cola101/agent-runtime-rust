@@ -6,10 +6,12 @@
 //! refused, and whether an oversized body is stopped rather than read.
 
 use agent_model_gateway::mcp::{
-    McpFederationClient, McpFederationError, McpRoundTripContinuation, McpServerRef,
-    McpToolCallOutcome,
+    McpCallLifecycle, McpFederationClient, McpFederationError, McpRoundTripContinuation,
+    McpServerRef, McpToolCallOutcome,
 };
-use agent_protocol::{McpClientCapability, McpInputAction, McpInputResponse, McpProtocolRevision};
+use agent_protocol::{
+    McpClientCapability, McpInputAction, McpInputResponse, McpProtocolRevision, McpServerCapability,
+};
 use rsa::RsaPrivateKey;
 use rsa::rand_core::OsRng;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +51,11 @@ struct ServerBehaviour {
     protocol_version: String,
     /// Whether the server negotiated the tools capability before tool traffic.
     advertise_tools: bool,
+    advertise_resources: bool,
+    advertise_prompts: bool,
+    /// Optional number of actual initialize handshakes that may still advertise
+    /// Tools. Notifications do not consume this counter.
+    advertise_tools_for_initializes: Option<usize>,
     /// JSON-RPC response id echoed by the fixture.
     response_id: u64,
 }
@@ -103,11 +110,29 @@ async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<At
                             state.response_id
                         )
                     } else {
-                        let capabilities = if state.advertise_tools {
-                            r#"{"tools":{}}"#
+                        let mut advertised = Vec::new();
+                        let advertise_tools = if request.contains("\"method\":\"initialize\"") {
+                            match state.advertise_tools_for_initializes.as_mut() {
+                                Some(remaining) => {
+                                    let advertised = *remaining > 0;
+                                    *remaining = remaining.saturating_sub(1);
+                                    advertised
+                                }
+                                None => state.advertise_tools,
+                            }
                         } else {
-                            r#"{}"#
+                            state.advertise_tools
                         };
+                        if advertise_tools {
+                            advertised.push(r#""tools":{}"#);
+                        }
+                        if state.advertise_resources {
+                            advertised.push(r#""resources":{"listChanged":true}"#);
+                        }
+                        if state.advertise_prompts {
+                            advertised.push(r#""prompts":{"listChanged":false}"#);
+                        }
+                        let capabilities = format!("{{{}}}", advertised.join(","));
                         format!(
                             r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"{}","capabilities":{capabilities}}}}}"#,
                             state.response_id, state.protocol_version
@@ -125,6 +150,300 @@ async fn spawn_server(behaviour: Arc<Mutex<ServerBehaviour>>) -> (String, Arc<At
     (format!("http://{address}/rpc"), requests)
 }
 
+async fn spawn_read_surface_server() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() - header_end < content_length {
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let id = request.get("id").cloned().unwrap_or(serde_json::json!(0));
+                let result = match request["method"].as_str().unwrap_or_default() {
+                    "initialize" => serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"resources": {}, "prompts": {}},
+                        "serverInfo": {"name": "read-surface", "version": "1"}
+                    }),
+                    "resources/list" => {
+                        assert_eq!(
+                            request.pointer("/params/cursor"),
+                            Some(&serde_json::json!("r/1"))
+                        );
+                        serde_json::json!({
+                            "resources": [{
+                                "uri": "kb://tenant/runbook",
+                                "name": "runbook",
+                                "mimeType": "text/markdown",
+                                "size": 12
+                            }],
+                            "nextCursor": "r/2"
+                        })
+                    }
+                    "resources/read" => {
+                        assert_eq!(
+                            request.pointer("/params/uri"),
+                            Some(&serde_json::json!("kb://tenant/runbook"))
+                        );
+                        serde_json::json!({
+                            "contents": [
+                                {"uri": "kb://tenant/runbook", "text": "hello"},
+                                {"uri": "blob://tenant/a", "blob": "AAEC"}
+                            ]
+                        })
+                    }
+                    "resources/templates/list" => {
+                        assert_eq!(
+                            request.pointer("/params/cursor"),
+                            Some(&serde_json::json!("t/1"))
+                        );
+                        serde_json::json!({
+                            "resourceTemplates": [{
+                                "uriTemplate": "kb://tenant/{name}",
+                                "name": "knowledge",
+                                "mimeType": "text/markdown"
+                            }],
+                            "nextCursor": "t/2"
+                        })
+                    }
+                    "prompts/list" => {
+                        assert_eq!(
+                            request.pointer("/params/cursor"),
+                            Some(&serde_json::json!("p/1"))
+                        );
+                        serde_json::json!({
+                            "prompts": [{
+                                "name": "summarize",
+                                "description": "Summarize",
+                                "arguments": [{"name": "tone", "required": false}]
+                            }],
+                            "nextCursor": "p/2"
+                        })
+                    }
+                    "prompts/get" => {
+                        assert_eq!(
+                            request.pointer("/params/arguments/tone"),
+                            Some(&serde_json::json!("short"))
+                        );
+                        serde_json::json!({
+                            "description": "resolved",
+                            "messages": [{
+                                "role": "user",
+                                "content": {"type": "text", "text": "Summarize this"}
+                            }]
+                        })
+                    }
+                    "notifications/initialized" => serde_json::json!({}),
+                    method => panic!("unexpected MCP method {method}"),
+                };
+                let body =
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (format!("http://{address}/rpc"), seen)
+}
+
+async fn spawn_modern_read_surface_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                assert!(headers.contains("mcp-protocol-version: 2026-07-28"));
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while bytes.len() - header_end < content_length {
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "server/discover" => serde_json::json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"resources": {}, "prompts": {}},
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "resources/list" => serde_json::json!({
+                        "resultType": "complete",
+                        "resources": [{"uri": "kb://modern/runbook", "name": "runbook"}],
+                        "nextCursor": "modern-r2",
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "resources/read" => serde_json::json!({
+                        "resultType": "complete",
+                        "contents": [{"uri": "kb://modern/runbook", "text": "modern"}],
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "resources/templates/list" => serde_json::json!({
+                        "resultType": "complete",
+                        "resourceTemplates": [{
+                            "uriTemplate": "kb://modern/{name}",
+                            "name": "knowledge"
+                        }],
+                        "nextCursor": "modern-t2",
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "prompts/list" => serde_json::json!({
+                        "resultType": "complete",
+                        "prompts": [{"name": "summarize"}],
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    "prompts/get" => serde_json::json!({
+                        "resultType": "complete",
+                        "messages": [{
+                            "role": "assistant",
+                            "content": {"type": "text", "text": "modern prompt"}
+                        }],
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    }),
+                    method => panic!("unexpected modern read method {method}"),
+                };
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    format!("http://{address}/mcp")
+}
+
+async fn spawn_revoking_resource_server() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let initializes = Arc::new(AtomicUsize::new(0));
+    let resource_calls = Arc::new(AtomicUsize::new(0));
+    let observed_resource_calls = Arc::clone(&resource_calls);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let initializes = Arc::clone(&initializes);
+            let resource_calls = Arc::clone(&resource_calls);
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 16 * 1024];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let (status, body) = if request.contains("notifications/initialized") {
+                    ("202 Accepted", String::new())
+                } else if request.contains("resources/list") {
+                    resource_calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"resources":[]}}"#.to_owned(),
+                    )
+                } else {
+                    let ordinal = initializes.fetch_add(1, Ordering::SeqCst) + 1;
+                    let capabilities = if ordinal <= 2 {
+                        r#"{"resources":{}}"#
+                    } else {
+                        r#"{"prompts":{}}"#
+                    };
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{capabilities}}}}}"#
+                        ),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    (format!("http://{address}/rpc"), observed_resource_calls)
+}
+
 fn client() -> McpFederationClient {
     McpFederationClient::from_pkcs8_pem(test_key_pem(), Duration::from_secs(5), true).unwrap()
 }
@@ -135,9 +454,155 @@ fn open_server(endpoint: String) -> McpServerRef {
         name: "search".into(),
         endpoint,
         credential_envelope_json: String::new(),
+        oauth_credential_id: None,
         protocol_revision: McpProtocolRevision::V2025_06_18,
         client_capabilities: BTreeSet::new(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_resources_and_prompts_cross_a_real_http_mcp_session() {
+    let (endpoint, seen) = spawn_read_surface_server().await;
+    let server = open_server(endpoint);
+    let tenant_id = Uuid::now_v7();
+    let client = client();
+    let catalog = client.list_tools(tenant_id, &server).await.unwrap();
+    assert!(catalog.tools.is_empty());
+    assert_eq!(
+        catalog.capabilities,
+        BTreeSet::from([McpServerCapability::Resources, McpServerCapability::Prompts])
+    );
+
+    let resources = client
+        .list_resources(tenant_id, &server, &catalog.digest, Some("r/1"))
+        .await
+        .unwrap();
+    assert_eq!(resources.resources[0].uri, "kb://tenant/runbook");
+    assert_eq!(resources.next_cursor.as_deref(), Some("r/2"));
+
+    let read = client
+        .read_resource(tenant_id, &server, &catalog.digest, "kb://tenant/runbook")
+        .await
+        .unwrap();
+    assert_eq!(read.contents.len(), 2);
+
+    let templates = client
+        .list_resource_templates(tenant_id, &server, &catalog.digest, Some("t/1"))
+        .await
+        .unwrap();
+    assert_eq!(templates.resource_templates[0].name, "knowledge");
+    assert_eq!(templates.next_cursor.as_deref(), Some("t/2"));
+
+    let prompts = client
+        .list_prompts(tenant_id, &server, &catalog.digest, Some("p/1"))
+        .await
+        .unwrap();
+    assert_eq!(prompts.prompts[0].name, "summarize");
+    assert_eq!(prompts.next_cursor.as_deref(), Some("p/2"));
+
+    let prompt = client
+        .get_prompt(
+            tenant_id,
+            &server,
+            &catalog.digest,
+            "summarize",
+            Some(&serde_json::json!({"tone": "short"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prompt.description.as_deref(), Some("resolved"));
+    assert_eq!(prompt.messages[0].role, "user");
+
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "tools/list"),
+        "a resource/prompt-only server must never receive tools/list"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn modern_resources_and_prompts_use_the_same_protocol_neutral_contract() {
+    let mut server = open_server(spawn_modern_read_surface_server().await);
+    server.protocol_revision = McpProtocolRevision::V2026_07_28;
+    let tenant_id = Uuid::now_v7();
+    let client = client();
+    let catalog = client.list_tools(tenant_id, &server).await.unwrap();
+    assert_eq!(
+        catalog.capabilities,
+        BTreeSet::from([McpServerCapability::Resources, McpServerCapability::Prompts])
+    );
+
+    let resources = client
+        .list_resources(tenant_id, &server, &catalog.digest, None)
+        .await
+        .unwrap();
+    assert_eq!(resources.resources[0].uri, "kb://modern/runbook");
+    assert_eq!(resources.next_cursor.as_deref(), Some("modern-r2"));
+    assert_eq!(
+        client
+            .read_resource(tenant_id, &server, &catalog.digest, "kb://modern/runbook")
+            .await
+            .unwrap()
+            .contents
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .list_resource_templates(tenant_id, &server, &catalog.digest, None)
+            .await
+            .unwrap()
+            .resource_templates[0]
+            .uri_template,
+        "kb://modern/{name}"
+    );
+    assert_eq!(
+        client
+            .list_prompts(tenant_id, &server, &catalog.digest, None)
+            .await
+            .unwrap()
+            .prompts[0]
+            .name,
+        "summarize"
+    );
+    assert_eq!(
+        client
+            .get_prompt(tenant_id, &server, &catalog.digest, "summarize", None)
+            .await
+            .unwrap()
+            .messages[0]
+            .role,
+        "assistant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resource_capability_revoked_on_the_operation_session_fails_before_read() {
+    let (endpoint, resource_calls) = spawn_revoking_resource_server().await;
+    let server = open_server(endpoint);
+    let tenant_id = Uuid::now_v7();
+    let client = client();
+    let catalog = client.list_tools(tenant_id, &server).await.unwrap();
+    assert!(
+        catalog
+            .capabilities
+            .contains(&McpServerCapability::Resources)
+    );
+
+    let error = client
+        .list_resources(tenant_id, &server, &catalog.digest, None)
+        .await
+        .expect_err("the operation session revoked Resources");
+
+    assert!(matches!(error, McpFederationError::CatalogChanged));
+    assert_eq!(
+        resource_calls.load(Ordering::SeqCst),
+        0,
+        "resources/list was sent after the fresh session revoked capability"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -258,6 +723,7 @@ async fn modern_http_mrtr_preserves_opaque_state_and_uses_a_fresh_request_id() {
         name: "modern".into(),
         endpoint,
         credential_envelope_json: String::new(),
+        oauth_credential_id: None,
         protocol_revision: McpProtocolRevision::V2026_07_28,
         client_capabilities: BTreeSet::from([McpClientCapability::Elicitation]),
     };
@@ -327,6 +793,9 @@ fn behaviour(tools: &[&str]) -> Arc<Mutex<ServerBehaviour>> {
         padding: 0,
         protocol_version: "2025-06-18".into(),
         advertise_tools: true,
+        advertise_resources: false,
+        advertise_prompts: false,
+        advertise_tools_for_initializes: None,
         response_id: 1,
     }))
 }
@@ -366,6 +835,35 @@ async fn discovery_refuses_tool_traffic_without_a_negotiated_tools_capability() 
         requests.load(Ordering::SeqCst),
         1,
         "no initialized notification or tools/list may follow a rejected handshake"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resource_and_prompt_only_server_is_a_valid_empty_tool_directory() {
+    let state = behaviour(&[]);
+    {
+        let mut state = state.lock().unwrap();
+        state.advertise_tools = false;
+        state.advertise_resources = true;
+        state.advertise_prompts = true;
+    }
+    let (endpoint, requests) = spawn_server(state).await;
+
+    let catalog = client()
+        .list_tools(Uuid::now_v7(), &open_server(endpoint))
+        .await
+        .expect("resource/prompt-only servers are part of the MCP directory");
+
+    assert!(catalog.tools.is_empty());
+    assert_eq!(
+        catalog.capabilities,
+        BTreeSet::from([McpServerCapability::Resources, McpServerCapability::Prompts,])
+    );
+    assert_eq!(catalog.digest.len(), 64);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "the client must initialize and notify, but must not issue tools/list"
     );
 }
 
@@ -433,6 +931,71 @@ async fn a_call_is_refused_once_the_server_changes_its_catalog() {
         matches!(refused, McpFederationError::CatalogChanged),
         "expected CatalogChanged, got {refused:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_call_session_must_still_advertise_tools_before_the_side_effect() {
+    let state = behaviour(&["web_search"]);
+    {
+        let mut state = state.lock().unwrap();
+        // Initial freeze and call-time re-discovery may observe Tools. The fresh
+        // session opened for the actual side effect then drops that capability.
+        state.advertise_tools_for_initializes = Some(2);
+        state.advertise_resources = true;
+    }
+    let (endpoint, requests) = spawn_server(state).await;
+    let server = open_server(endpoint);
+    let tenant = Uuid::now_v7();
+    let frozen = client().list_tools(tenant, &server).await.unwrap().digest;
+
+    let refused = client()
+        .call_tool(tenant, &server, "mcp:search/web_search", "{}", &frozen)
+        .await
+        .expect_err("the execution session dropped Tool authority");
+
+    assert!(matches!(refused, McpFederationError::CatalogChanged));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        8,
+        "the third initialize may be notified, but tools/call must not be sent"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lifecycle_call_also_rechecks_tool_capability_before_the_side_effect() {
+    let state = behaviour(&["web_search"]);
+    {
+        let mut state = state.lock().unwrap();
+        state.advertise_tools_for_initializes = Some(2);
+        state.advertise_prompts = true;
+    }
+    let (endpoint, requests) = spawn_server(state).await;
+    let server = open_server(endpoint);
+    let tenant = Uuid::now_v7();
+    let client = client();
+    let frozen = client.list_tools(tenant, &server).await.unwrap().digest;
+    let (progress, _progress_receiver) = tokio::sync::mpsc::channel(1);
+    let lifecycle = McpCallLifecycle {
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        progress,
+        progress_token: "capability-fence".into(),
+        cancellation_reason: "test".into(),
+    };
+
+    let refused = client
+        .call_tool_with_lifecycle(
+            tenant,
+            &server,
+            "mcp:search/web_search",
+            "{}",
+            &frozen,
+            &lifecycle,
+        )
+        .await
+        .expect_err("the lifecycle execution session dropped Tool authority");
+
+    assert!(matches!(refused, McpFederationError::CatalogChanged));
+    assert_eq!(requests.load(Ordering::SeqCst), 8);
 }
 
 /// A tool the Run never froze is refused even when the server offers it and the
@@ -584,6 +1147,7 @@ async fn a_sealed_credential_is_opened_and_sent_as_a_bearer_token() {
                 name: "search".into(),
                 endpoint,
                 credential_envelope_json: envelope,
+                oauth_credential_id: None,
                 protocol_revision: McpProtocolRevision::V2025_06_18,
                 client_capabilities: BTreeSet::new(),
             },
@@ -661,6 +1225,7 @@ async fn an_envelope_sealed_for_another_server_does_not_open() {
                 name: "search".into(),
                 endpoint,
                 credential_envelope_json: envelope,
+                oauth_credential_id: None,
                 protocol_revision: McpProtocolRevision::V2025_06_18,
                 client_capabilities: BTreeSet::new(),
             },

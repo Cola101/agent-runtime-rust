@@ -10,8 +10,8 @@ use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
-    LocalModelRoutingConfig, LocalRunState, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
-    WORKSPACE_READ_SCOPE, local_invocation_context,
+    LocalModelRoutingConfig, LocalRunRecord, LocalRunState, LocalRuntimeConfig, LocalRuntimeHost,
+    LocalToolConsent, WORKSPACE_READ_SCOPE, local_invocation_context,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -193,6 +193,27 @@ async fn wait_for<F: Fn() -> bool>(label: &str, predicate: F) {
     panic!("timed out waiting for {label}");
 }
 
+async fn wait_for_replacement_daemon(config: LocalRuntimeConfig) -> Arc<LocalRuntimeDaemon> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match LocalRuntimeDaemon::new_for_invocation(config.clone(), local_invocation_context()) {
+            Ok(daemon) => return daemon,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("Workspace state root already has another Runtime owner") =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the predecessor Runtime owner did not release its state-root lease"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => panic!("replacement Runtime failed to start: {error}"),
+        }
+    }
+}
+
 /// The production break this catches is a daemon recovering any record found
 /// under a shared state root. A daemon bound to one Application/Workspace must
 /// leave another identity's unfinished Run untouched.
@@ -238,6 +259,51 @@ async fn a_daemon_does_not_recover_a_foreign_invocation_record() {
             .state,
         LocalRunState::Running
     );
+}
+
+#[tokio::test]
+async fn the_local_adapter_migrates_only_fully_legacy_run_identity() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state_root = state.path().to_path_buf();
+    let endpoint = spawn_one_answer_provider().await.0;
+    let local_config = config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        endpoint,
+    );
+    let run_id = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        &state_root,
+        &LocalRunRecord {
+            store_version: 1,
+            tenant_id: Uuid::nil(),
+            application_id: Uuid::nil(),
+            workload_identity_id: Uuid::nil(),
+            workspace_id: Uuid::nil(),
+            agent_version_id: Uuid::nil(),
+            model_policy_id: Uuid::nil(),
+            run_id,
+            input: "legacy local input".into(),
+            state: LocalRunState::Interrupted {
+                reason: "legacy fixture".into(),
+            },
+            owner_epoch: 1,
+        },
+    )
+    .expect("legacy record");
+
+    let _daemon = LocalRuntimeDaemon::new(local_config);
+    let migrated = LocalRuntimeHost::read_run_record(&state_root, run_id)
+        .expect("read migrated")
+        .expect("migrated record");
+    let expected = local_invocation_context();
+    assert_eq!(migrated.tenant_id, expected.tenant_id);
+    assert_eq!(migrated.application_id, expected.application_id);
+    assert_eq!(migrated.workload_identity_id, expected.workload_identity_id);
+    assert_eq!(migrated.workspace_id, expected.workspace_id);
+    assert_eq!(migrated.agent_version_id, expected.agent_version_id);
+    assert_eq!(migrated.model_policy_id, expected.model_policy_id);
 }
 
 /// Runs a daemon on its own runtime, submits one Run, waits for it to become
@@ -382,7 +448,8 @@ async fn an_interrupted_provider_attempt_is_never_replayed_past_its_durable_budg
         .max_same_provider_attempts = 1;
 
     let run_id = crash_after_first_checkpoint(bounded.clone(), Arc::clone(&accepted));
-    LocalRuntimeDaemon::new(bounded.clone())
+    let first_replacement = LocalRuntimeDaemon::new(bounded.clone());
+    first_replacement
         .recover_unfinished()
         .await
         .expect("first replacement reconciles the interrupted attempt");
@@ -409,7 +476,9 @@ async fn an_interrupted_provider_attempt_is_never_replayed_past_its_durable_budg
         recovered.state
     );
 
-    LocalRuntimeDaemon::new(bounded)
+    drop(first_replacement);
+    wait_for_replacement_daemon(bounded)
+        .await
         .recover_unfinished()
         .await
         .expect("later replacement leaves the terminal Run alone");
@@ -707,7 +776,7 @@ async fn a_restarted_daemon_never_re_executes_a_run_that_already_finished() {
         workspace_root.clone(),
         endpoint.clone(),
     ));
-    tokio::spawn(daemon.serve(listener));
+    let serving = tokio::spawn(Arc::clone(&daemon).serve(listener));
     let run_id = submit(&socket, "Summarize the workspace.").await;
 
     let probe = state_root.clone();
@@ -725,7 +794,11 @@ async fn a_restarted_daemon_never_re_executes_a_run_that_already_finished() {
         LocalRuntimeHost::replay_events(&state_root, run_id, 0).expect("events readable");
 
     // A replacement daemon must leave the finished Run alone.
-    let replacement = LocalRuntimeDaemon::new(config(state_root.clone(), workspace_root, endpoint));
+    serving.abort();
+    let _ = serving.await;
+    drop(daemon);
+    let replacement =
+        wait_for_replacement_daemon(config(state_root.clone(), workspace_root, endpoint)).await;
     replacement
         .recover_unfinished()
         .await

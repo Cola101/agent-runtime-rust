@@ -1065,7 +1065,7 @@ async fn start_session(
             drop(spawn_guard);
             drop(prepared_linux_group.take());
             let reason = error.to_string();
-            finalize_start_failure(&session_dir, &manifest)?;
+            finalize_prepared_start_failure(&session_dir, &manifest)?;
             let terminal = load_manifest(&session_dir)?;
             let _ = cleanup_terminal_resource_identity(&session_dir, &terminal, &resource_backend);
             return Err(ProcessSessionError::StartFailed { session_id, reason });

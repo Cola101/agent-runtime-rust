@@ -12,9 +12,17 @@ use crate::mcp::{
 use agent_model_gateway_protocol::mcp_server_authorization_digest;
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederation;
 use agent_model_gateway_protocol::v1::{
-    McpCallToolRequest, McpCallToolResponse, McpListToolsRequest, McpListToolsResponse, McpTool,
+    McpCallToolRequest, McpCallToolResponse, McpGetPromptRequest, McpGetPromptResponse,
+    McpListPromptsRequest, McpListPromptsResponse, McpListResourceTemplatesRequest,
+    McpListResourceTemplatesResponse, McpListResourcesRequest, McpListResourcesResponse,
+    McpListToolsRequest, McpListToolsResponse, McpPromptArgument, McpPromptDescriptor,
+    McpPromptMessage, McpReadContext, McpReadResourceRequest, McpReadResourceResponse,
+    McpResourceContent, McpResourceDescriptor, McpResourceTemplateDescriptor, McpTool,
+    mcp_resource_content,
 };
-use agent_protocol::{McpClientCapability, McpProtocolRevision};
+use agent_protocol::{
+    McpClientCapability, McpProtocolRevision, McpResourceContent as ResourceBody,
+};
 use agent_workload_identity::{
     RequiredCapability, WorkloadIdentityBinding, WorkloadIdentityClaims, WorkloadTokenVerifier,
 };
@@ -23,7 +31,8 @@ use std::collections::BTreeSet;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const READ_SCHEMA_VERSION: u32 = 1;
 
 /// Federation is its own capability.
 ///
@@ -92,6 +101,32 @@ impl McpFederationGrpcService {
         }
         Ok(claims)
     }
+
+    fn authenticate_read<T>(
+        &self,
+        request: &Request<T>,
+        context: &McpReadContext,
+    ) -> Result<WorkloadIdentityClaims, Status> {
+        let asserted = AssertedIdentity {
+            tenant_id: parse_uuid(&context.tenant_id, "tenant_id")?,
+            application_id: parse_uuid(&context.application_id, "application_id")?,
+            workload_identity_id: parse_uuid(
+                &context.workload_identity_id,
+                "workload_identity_id",
+            )?,
+            run_id: parse_uuid(&context.run_id, "run_id")?,
+            session_id: parse_uuid(&context.session_id, "session_id")?,
+            workspace_id: parse_uuid(&context.workspace_id, "workspace_id")?,
+            agent_version_id: parse_uuid(&context.agent_version_id, "agent_version_id")?,
+            attempt_id: parse_uuid(&context.attempt_id, "attempt_id")?,
+            worker_id: parse_uuid(&context.worker_id, "worker_id")?,
+            worker_incarnation_id: parse_uuid(
+                &context.worker_incarnation_id,
+                "worker_incarnation_id",
+            )?,
+        };
+        self.authenticate(request, &asserted)
+    }
 }
 
 /// What the request says about itself, before anything has verified it.
@@ -155,6 +190,11 @@ impl McpFederation for McpFederationGrpcService {
         Ok(Response::new(McpListToolsResponse {
             schema_version: SCHEMA_VERSION,
             catalog_digest: catalog.digest,
+            server_capabilities: catalog
+                .capabilities
+                .into_iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
             tools: catalog
                 .tools
                 .into_iter()
@@ -246,6 +286,273 @@ impl McpFederation for McpFederationGrpcService {
             }
         }
     }
+
+    async fn list_resources(
+        &self,
+        request: Request<McpListResourcesRequest>,
+    ) -> Result<Response<McpListResourcesResponse>, Status> {
+        let context = request
+            .get_ref()
+            .context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let claims = self.authenticate_read(&request, context)?;
+        let request = request.into_inner();
+        let context = request
+            .context
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let server = authorize_read_context(&claims, &context)?;
+        let page = self
+            .client
+            .list_resources(
+                claims.tenant_id,
+                &server,
+                &context.frozen_catalog_digest,
+                (!request.cursor.is_empty()).then_some(request.cursor.as_str()),
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(McpListResourcesResponse {
+            schema_version: READ_SCHEMA_VERSION,
+            resources: page
+                .resources
+                .into_iter()
+                .map(|resource| McpResourceDescriptor {
+                    uri: resource.uri,
+                    name: resource.name,
+                    title: resource.title.unwrap_or_default(),
+                    description: resource.description.unwrap_or_default(),
+                    mime_type: resource.mime_type.unwrap_or_default(),
+                    size: resource.size,
+                })
+                .collect(),
+            next_cursor: page.next_cursor.unwrap_or_default(),
+        }))
+    }
+
+    async fn read_resource(
+        &self,
+        request: Request<McpReadResourceRequest>,
+    ) -> Result<Response<McpReadResourceResponse>, Status> {
+        let context = request
+            .get_ref()
+            .context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let claims = self.authenticate_read(&request, context)?;
+        let request = request.into_inner();
+        let context = request
+            .context
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let server = authorize_read_context(&claims, &context)?;
+        let result = self
+            .client
+            .read_resource(
+                claims.tenant_id,
+                &server,
+                &context.frozen_catalog_digest,
+                &request.uri,
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(McpReadResourceResponse {
+            schema_version: READ_SCHEMA_VERSION,
+            contents: result
+                .contents
+                .into_iter()
+                .map(|content| match content {
+                    ResourceBody::Text {
+                        uri,
+                        mime_type,
+                        text,
+                    } => McpResourceContent {
+                        uri,
+                        mime_type: mime_type.unwrap_or_default(),
+                        body: Some(mcp_resource_content::Body::Text(text)),
+                    },
+                    ResourceBody::Blob {
+                        uri,
+                        mime_type,
+                        bytes,
+                    } => McpResourceContent {
+                        uri,
+                        mime_type: mime_type.unwrap_or_default(),
+                        body: Some(mcp_resource_content::Body::Blob(bytes)),
+                    },
+                })
+                .collect(),
+        }))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Request<McpListResourceTemplatesRequest>,
+    ) -> Result<Response<McpListResourceTemplatesResponse>, Status> {
+        let context = request
+            .get_ref()
+            .context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let claims = self.authenticate_read(&request, context)?;
+        let request = request.into_inner();
+        let context = request
+            .context
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let server = authorize_read_context(&claims, &context)?;
+        let page = self
+            .client
+            .list_resource_templates(
+                claims.tenant_id,
+                &server,
+                &context.frozen_catalog_digest,
+                (!request.cursor.is_empty()).then_some(request.cursor.as_str()),
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(McpListResourceTemplatesResponse {
+            schema_version: READ_SCHEMA_VERSION,
+            resource_templates: page
+                .resource_templates
+                .into_iter()
+                .map(|template| McpResourceTemplateDescriptor {
+                    uri_template: template.uri_template,
+                    name: template.name,
+                    title: template.title.unwrap_or_default(),
+                    description: template.description.unwrap_or_default(),
+                    mime_type: template.mime_type.unwrap_or_default(),
+                })
+                .collect(),
+            next_cursor: page.next_cursor.unwrap_or_default(),
+        }))
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Request<McpListPromptsRequest>,
+    ) -> Result<Response<McpListPromptsResponse>, Status> {
+        let context = request
+            .get_ref()
+            .context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let claims = self.authenticate_read(&request, context)?;
+        let request = request.into_inner();
+        let context = request
+            .context
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let server = authorize_read_context(&claims, &context)?;
+        let page = self
+            .client
+            .list_prompts(
+                claims.tenant_id,
+                &server,
+                &context.frozen_catalog_digest,
+                (!request.cursor.is_empty()).then_some(request.cursor.as_str()),
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(McpListPromptsResponse {
+            schema_version: READ_SCHEMA_VERSION,
+            prompts: page
+                .prompts
+                .into_iter()
+                .map(|prompt| McpPromptDescriptor {
+                    name: prompt.name,
+                    title: prompt.title.unwrap_or_default(),
+                    description: prompt.description.unwrap_or_default(),
+                    arguments: prompt
+                        .arguments
+                        .into_iter()
+                        .map(|argument| McpPromptArgument {
+                            name: argument.name,
+                            description: argument.description.unwrap_or_default(),
+                            required: argument.required,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            next_cursor: page.next_cursor.unwrap_or_default(),
+        }))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: Request<McpGetPromptRequest>,
+    ) -> Result<Response<McpGetPromptResponse>, Status> {
+        let context = request
+            .get_ref()
+            .context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let claims = self.authenticate_read(&request, context)?;
+        let request = request.into_inner();
+        let context = request
+            .context
+            .ok_or_else(|| Status::invalid_argument("context is required"))?;
+        let server = authorize_read_context(&claims, &context)?;
+        let arguments = if request.arguments_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice::<serde_json::Value>(&request.arguments_json)
+                    .map_err(|_| Status::invalid_argument("arguments_json is malformed"))?,
+            )
+        };
+        let result = self
+            .client
+            .get_prompt(
+                claims.tenant_id,
+                &server,
+                &context.frozen_catalog_digest,
+                &request.name,
+                arguments.as_ref(),
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(McpGetPromptResponse {
+            schema_version: READ_SCHEMA_VERSION,
+            description: result.description.unwrap_or_default(),
+            messages: result
+                .messages
+                .into_iter()
+                .map(|message| {
+                    Ok(McpPromptMessage {
+                        role: message.role,
+                        content_json: serde_json::to_vec(&message.content)
+                            .map_err(|_| Status::internal("prompt content could not be encoded"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?,
+        }))
+    }
+}
+
+fn authorize_read_context(
+    claims: &WorkloadIdentityClaims,
+    context: &McpReadContext,
+) -> Result<McpServerRef, Status> {
+    if context.schema_version != READ_SCHEMA_VERSION || claims.schema_version != 4 {
+        return Err(Status::permission_denied(
+            "workload token schema does not authorize this MCP read schema",
+        ));
+    }
+    if context.frozen_catalog_digest.len() != 64 {
+        return Err(Status::invalid_argument(
+            "frozen_catalog_digest is not a sha256",
+        ));
+    }
+    let wire_server = context
+        .server
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("server is required"))?;
+    let server_id = parse_uuid(&wire_server.server_id, "server_id")?;
+    let digest = mcp_server_authorization_digest(wire_server);
+    if claims.authorized_mcp_servers.get(&server_id) != Some(&digest) {
+        return Err(Status::permission_denied(
+            "workload token does not authorize this MCP server snapshot",
+        ));
+    }
+    server_ref(wire_server.clone())
 }
 
 fn authorize_server(
@@ -305,6 +612,14 @@ fn server_ref(
         endpoint: server.endpoint,
         credential_envelope_json: String::from_utf8(server.credential_envelope_json.to_vec())
             .map_err(|_| Status::invalid_argument("credential_envelope_json is not utf-8"))?,
+        oauth_credential_id: if server.oauth_credential_id.is_empty() {
+            None
+        } else {
+            Some(parse_uuid(
+                &server.oauth_credential_id,
+                "oauth_credential_id",
+            )?)
+        },
         protocol_revision,
         client_capabilities,
     })
@@ -335,6 +650,8 @@ fn to_status(error: McpFederationError) -> Status {
             Status::failed_precondition(error.to_string())
         }
         McpFederationError::CredentialUnopenable => Status::permission_denied(error.to_string()),
+        McpFederationError::AuthorizationRequired => Status::failed_precondition(error.to_string()),
+        McpFederationError::CredentialDomainUnavailable => Status::unavailable(error.to_string()),
         McpFederationError::ResponseTooLarge => Status::out_of_range(error.to_string()),
         McpFederationError::Protocol(_) => Status::invalid_argument(error.to_string()),
         McpFederationError::Unreachable(_) => Status::unavailable(error.to_string()),

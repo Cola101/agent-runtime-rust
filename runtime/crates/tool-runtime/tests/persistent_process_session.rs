@@ -95,6 +95,16 @@ fn terminal_probe_script(root: &Path) -> PathBuf {
     executable
 }
 
+#[cfg(unix)]
+fn unavailable_supervisor_script(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = root.join("unavailable-pty-supervisor");
+    fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    executable
+}
+
 fn process_tree_script(root: &Path) -> PathBuf {
     let executable = root.join("process-tree-session");
     fs::write(
@@ -199,7 +209,7 @@ fn supervised_manager(
         Some(ProcessSessionPtySupervisorConfig {
             executable: PathBuf::from(env!("CARGO_BIN_EXE_agent-pty-session-supervisor")),
             fixed_args: Vec::new(),
-            startup_timeout: Duration::from_secs(3),
+            startup_timeout: Duration::from_secs(10),
         }),
     )
     .unwrap()
@@ -387,6 +397,64 @@ async fn process_start_tty_requires_an_external_supervisor_before_spawning() {
             .is_none(),
         "a rejected PTY start must not create a session directory"
     );
+}
+
+/// The production break this catches is converting a proven pre-spawn PTY
+/// supervisor startup failure into an ambiguous side effect and leaving an
+/// unrecoverable `starting/unprepared` manifest behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_pty_supervisor_fails_before_spawn_and_closes_the_start_intent() {
+    let state = tempfile::tempdir().unwrap();
+    let trusted = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let executable = terminal_probe_script(trusted.path());
+    let unavailable_supervisor = unavailable_supervisor_script(trusted.path());
+    let tenant_id = Uuid::now_v7();
+    let session_id = Uuid::now_v7();
+    let workspace_root = workspace.path().canonicalize().unwrap();
+    let manager = PersistentProcessSessionManager::new_with_governance_and_pty_supervisor(
+        state.path().to_path_buf(),
+        executor(trusted.path(), &executable),
+        16 * 1024,
+        ProcessSessionGovernance::default(),
+        Some(ProcessSessionPtySupervisorConfig {
+            executable: unavailable_supervisor,
+            fixed_args: Vec::new(),
+            startup_timeout: Duration::from_millis(100),
+        }),
+    )
+    .unwrap();
+
+    let result = manager
+        .start_pty(
+            ProcessSessionStartRequest {
+                session_id,
+                request: request(),
+                context: context(tenant_id, workspace_root),
+                initial_stdin: Vec::new(),
+            },
+            80,
+            24,
+        )
+        .await;
+
+    assert!(matches!(result, Err(ProcessSessionError::Io(_))));
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            state
+                .path()
+                .join("process-sessions")
+                .join(session_id.to_string())
+                .join("manifest.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["manifest"]["state"], "terminated");
+    assert_eq!(manifest["manifest"]["resource_phase"], "cleaned");
+    assert_eq!(manifest["manifest"]["last_operation"], "start_failed");
+    assert_eq!(manifest["manifest"]["termination_reason"], "start_failed");
 }
 
 /// The production break this catches is treating an interactive process as
@@ -1178,16 +1246,18 @@ async fn process_start_can_yield_until_first_output_in_the_same_tool_call() {
     );
     let start = ProcessSessionToolExecutor::new(manager, ProcessSessionToolOperation::Start);
     let workspace_root = workspace.path().canonicalize().unwrap();
+    let mut start_context = context(tenant_id, workspace_root);
+    start_context.timeout = Duration::from_secs(15);
 
     let started = start
         .execute(
             operation_request(
                 "call_start_with_yield",
                 PROCESS_START_TOOL,
-                json!({"yield_time_ms": 4_000}),
+                json!({"yield_time_ms": 10_000}),
                 ToolEffect::NonIdempotent,
             ),
-            context(tenant_id, workspace_root),
+            start_context,
         )
         .await
         .expect("process.start should wait for the first durable output when yield is requested");

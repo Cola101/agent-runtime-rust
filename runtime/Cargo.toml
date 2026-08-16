@@ -25,6 +25,17 @@ license = "Apache-2.0"
 rust-version = "1.88"
 repository = "https://github.com/Cola101/agent-runtime-rust"
 
+# Local development favors bounded disk usage over revision-specific codegen
+# caches. Fully compiled crates are still reused whenever Cargo's fingerprint
+# matches, while line tables preserve useful file/line information in failures.
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.test]
+incremental = false
+debug = "line-tables-only"
+
 [workspace.dependencies]
 agent-protocol = { path = "crates/protocol" }
 agent-kernel = { path = "crates/kernel" }

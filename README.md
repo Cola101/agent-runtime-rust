@@ -13,7 +13,8 @@ desktop, cloud, and edge clients. The included Java control plane is a reference
 runtime dependency. Model adapters currently cover OpenAI Responses, Anthropic Messages, and
 OpenAI-compatible Chat Completions through a shared model IR.
 
-> **Status:** technical alpha. The repository contains executable runtime paths, 659 passing Rust
+> **Status:** technical alpha. The repository currently lists 721 Rust tests: 715 pass and 6
+> external live tests are explicitly ignored. It contains executable runtime paths,
 > tests, architecture decisions, threat modeling, and evidence records, but it is not yet production
 > ready and does not claim 1,000 active Runs, 99.9% availability, or SOC 2 certification. See the
 > [implementation status](docs/implementation-status.md) for verified and unverified boundaries.
@@ -38,8 +39,10 @@ cd runtime
 cargo test --workspace
 ```
 
-Local development does not require Docker. Build artifacts can be removed with `cargo clean` and
-all project-local runtime state is confined to the ignored `.local/` directory.
+Local development does not require Docker. Cargo's `target/` is a reusable incremental cache and is
+retained by default (while remaining ignored by Git); clean it only after measuring when the cache is
+corrupt, the toolchain changes materially, or disk pressure requires it. All project-local runtime
+state is confined to the ignored `.local/` directory.
 
 Governance: [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE) ·
 [Third-party sources](docs/third-party-sources.md)

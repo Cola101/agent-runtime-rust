@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod embedded;
 pub mod ipc;
+pub mod retention;
 mod stdio_mcp;
 
 use agent_kernel::ToolPlan;
@@ -25,7 +26,8 @@ use agent_model_gateway::{
 use agent_protocol::{
     AgentLineage, ApprovalMode, ContentPart as ProtocolContentPart, EventEnvelope, HistoryImport,
     HistoryImportSource, HistoryRepairReport, McpClientCapability, McpInputContinuation,
-    McpInputRequired, McpInputResolutionCommand, McpInputResponse, McpProtocolRevision,
+    McpInputRequired, McpInputResolutionCommand, McpInputResponse, McpPromptPage, McpPromptResult,
+    McpProtocolRevision, McpResourcePage, McpResourceReadResult, McpResourceTemplatePage,
     Message as ProtocolMessage, ModelErrorKind, ModelStreamEvent, RUN_EXECUTION_SCHEMA_VERSION,
     Role as ProtocolRole, RunBudget, RunExecutionCommand, RunStatus,
     RuntimeExecutionPolicySnapshot, RuntimeInvocationContext, SandboxClass, SessionBranchSnapshot,
@@ -88,6 +90,7 @@ pub const SHELL_SCOPE: &str = "tool:shell.exec";
 pub const PROCESS_SESSION_SCOPE: &str = "tool:process.session";
 
 pub(crate) const LOCAL_STORE_VERSION: u32 = 1;
+pub(crate) const LOCAL_EVENT_LOG_LINE_MAX_BYTES: usize = 256 * 1024;
 
 /// A local host has exactly one configured provider, so its model policy
 /// identity is a fixed local constant. It must be stable across restarts:
@@ -193,6 +196,26 @@ mod process_start_failure_agent_loop_tests {
 
     const PRIVATE_START_REASON: &str = "private-start-reason-must-not-leak";
     const PRIVATE_AMBIGUOUS_REASON: &str = "private-side-effect-failure-must-not-leak";
+
+    #[test]
+    fn standalone_runtime_rejects_a_gateway_owned_oauth_handle() {
+        let server = agent_protocol::McpServerSnapshot {
+            server_id: Uuid::now_v7(),
+            name: "oauth".into(),
+            endpoint: "https://mcp.example.test/rpc".into(),
+            credential_envelope_base64: String::new(),
+            oauth_credential_id: Some(Uuid::now_v7()),
+            required: true,
+            tool_effect_overrides: BTreeMap::new(),
+            protocol_revision: McpProtocolRevision::V2025_06_18,
+            client_capabilities: BTreeSet::new(),
+        };
+
+        assert!(
+            local_direct_server(&server, &server.endpoint).is_err(),
+            "standalone mode must not collapse the Gateway credential domain"
+        );
+    }
 
     #[derive(Clone)]
     struct StartFailureExecutor {
@@ -966,8 +989,191 @@ impl McpFederationBackend for LocalMcpBackend {
                 .collect::<Result<Vec<_>, McpGatewayClientError>>()?;
             Ok(DiscoveredCatalog {
                 tools,
+                capabilities: catalog.capabilities,
                 digest: catalog.digest,
             })
+        })
+    }
+
+    fn list_resources<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a agent_protocol::McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<McpResourcePage, McpGatewayClientError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self.transport(server)? {
+                LocalMcpTransportConfig::StreamableHttp { endpoint }
+                | LocalMcpTransportConfig::StreamableHttp2026 { endpoint, .. } => {
+                    let direct = local_direct_server(server, endpoint)?;
+                    self.http
+                        .list_resources(identity.tenant_id, &direct, frozen_catalog_digest, cursor)
+                        .await
+                        .map_err(local_mcp_error)
+                }
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::Stdio2026 { .. } => self
+                    .stdio
+                    .list_resources(
+                        server.server_id,
+                        &server.name,
+                        frozen_catalog_digest,
+                        cursor,
+                    )
+                    .await
+                    .map_err(local_mcp_error),
+            }
+        })
+    }
+
+    fn read_resource<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a agent_protocol::McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        uri: &'a str,
+        _workload_token: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<McpResourceReadResult, McpGatewayClientError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self.transport(server)? {
+                LocalMcpTransportConfig::StreamableHttp { endpoint }
+                | LocalMcpTransportConfig::StreamableHttp2026 { endpoint, .. } => {
+                    let direct = local_direct_server(server, endpoint)?;
+                    self.http
+                        .read_resource(identity.tenant_id, &direct, frozen_catalog_digest, uri)
+                        .await
+                        .map_err(local_mcp_error)
+                }
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::Stdio2026 { .. } => self
+                    .stdio
+                    .read_resource(server.server_id, &server.name, frozen_catalog_digest, uri)
+                    .await
+                    .map_err(local_mcp_error),
+            }
+        })
+    }
+
+    fn list_resource_templates<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a agent_protocol::McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<McpResourceTemplatePage, McpGatewayClientError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            match self.transport(server)? {
+                LocalMcpTransportConfig::StreamableHttp { endpoint }
+                | LocalMcpTransportConfig::StreamableHttp2026 { endpoint, .. } => {
+                    let direct = local_direct_server(server, endpoint)?;
+                    self.http
+                        .list_resource_templates(
+                            identity.tenant_id,
+                            &direct,
+                            frozen_catalog_digest,
+                            cursor,
+                        )
+                        .await
+                        .map_err(local_mcp_error)
+                }
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::Stdio2026 { .. } => self
+                    .stdio
+                    .list_resource_templates(
+                        server.server_id,
+                        &server.name,
+                        frozen_catalog_digest,
+                        cursor,
+                    )
+                    .await
+                    .map_err(local_mcp_error),
+            }
+        })
+    }
+
+    fn list_prompts<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a agent_protocol::McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        cursor: Option<&'a str>,
+        _workload_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<McpPromptPage, McpGatewayClientError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self.transport(server)? {
+                LocalMcpTransportConfig::StreamableHttp { endpoint }
+                | LocalMcpTransportConfig::StreamableHttp2026 { endpoint, .. } => {
+                    let direct = local_direct_server(server, endpoint)?;
+                    self.http
+                        .list_prompts(identity.tenant_id, &direct, frozen_catalog_digest, cursor)
+                        .await
+                        .map_err(local_mcp_error)
+                }
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::Stdio2026 { .. } => self
+                    .stdio
+                    .list_prompts(
+                        server.server_id,
+                        &server.name,
+                        frozen_catalog_digest,
+                        cursor,
+                    )
+                    .await
+                    .map_err(local_mcp_error),
+            }
+        })
+    }
+
+    fn get_prompt<'a>(
+        &'a self,
+        identity: &'a FederationIdentity,
+        server: &'a agent_protocol::McpServerSnapshot,
+        frozen_catalog_digest: &'a str,
+        name: &'a str,
+        arguments: Option<&'a serde_json::Value>,
+        _workload_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<McpPromptResult, McpGatewayClientError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self.transport(server)? {
+                LocalMcpTransportConfig::StreamableHttp { endpoint }
+                | LocalMcpTransportConfig::StreamableHttp2026 { endpoint, .. } => {
+                    let direct = local_direct_server(server, endpoint)?;
+                    self.http
+                        .get_prompt(
+                            identity.tenant_id,
+                            &direct,
+                            frozen_catalog_digest,
+                            name,
+                            arguments,
+                        )
+                        .await
+                        .map_err(local_mcp_error)
+                }
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::Stdio2026 { .. } => self
+                    .stdio
+                    .get_prompt(
+                        server.server_id,
+                        &server.name,
+                        frozen_catalog_digest,
+                        name,
+                        arguments,
+                    )
+                    .await
+                    .map_err(local_mcp_error),
+            }
         })
     }
 
@@ -1209,9 +1415,9 @@ fn local_direct_server(
     server: &agent_protocol::McpServerSnapshot,
     endpoint: &str,
 ) -> Result<DirectMcpServerRef, McpGatewayClientError> {
-    if !server.credential_envelope_base64.is_empty() {
+    if !server.credential_envelope_base64.is_empty() || server.oauth_credential_id.is_some() {
         return Err(McpGatewayClientError::InvalidResponse(
-            "standalone MCP cannot open a credential envelope".into(),
+            "standalone MCP cannot resolve a credential-domain credential".into(),
         ));
     }
     Ok(DirectMcpServerRef {
@@ -1219,6 +1425,7 @@ fn local_direct_server(
         name: server.name.clone(),
         endpoint: endpoint.to_owned(),
         credential_envelope_json: String::new(),
+        oauth_credential_id: None,
         protocol_revision: server.protocol_revision,
         client_capabilities: server.client_capabilities.clone(),
     })
@@ -1619,7 +1826,6 @@ pub struct LocalRuntimeHost {
     executors: std::collections::HashMap<String, Arc<dyn ToolExecutor>>,
     process_session_manager: Option<Arc<PersistentProcessSessionManager>>,
     worker_id: Uuid,
-    event_sink: Option<tokio::sync::mpsc::UnboundedSender<LocalEvent>>,
     /// Root of this Run's cancellation tree. A child receives a child token,
     /// so cancellation propagates downward without letting it cancel a parent.
     cancellation: CancellationToken,
@@ -2661,7 +2867,6 @@ impl LocalRuntimeHost {
             executors,
             process_session_manager,
             worker_id,
-            event_sink: None,
             cancellation,
             duration_expired: Arc::new(AtomicBool::new(false)),
             subagent_tasks: HashMap::new(),
@@ -2854,6 +3059,7 @@ impl LocalRuntimeHost {
                     name: server.name.clone(),
                     endpoint: server.transport.binding_endpoint(),
                     credential_envelope_base64: String::new(),
+                    oauth_credential_id: None,
                     required: server.required,
                     tool_effect_overrides: server.tool_effect_overrides.clone(),
                     protocol_revision: server.transport.protocol_revision(),
@@ -3690,6 +3896,124 @@ impl LocalRuntimeHost {
         Ok(found)
     }
 
+    /// Returns the Run ids whose hot artifacts are still required to resume a
+    /// root Session Turn or unfinished child execution. Completed Session and
+    /// subagent histories carry their own digest-bound transcript/result and
+    /// therefore keep provenance ids, not strong artifact references.
+    pub(crate) fn retention_strong_run_references(
+        state_root: &Path,
+    ) -> Result<BTreeSet<Uuid>, LocalRuntimeError> {
+        let mut references = BTreeSet::new();
+        match std::fs::read_dir(state_root.join("sessions")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+                    let Some(session_id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| Uuid::parse_str(name).ok())
+                    else {
+                        continue;
+                    };
+                    let record = Self::read_session_record(state_root, session_id)?;
+                    references.extend(record.branches.values().filter_map(|branch| {
+                        branch.active_turn.as_ref().map(|active| active.run_id)
+                    }));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        }
+
+        references.extend(Self::managed_subagent_run_references(state_root)?);
+        Ok(references)
+    }
+
+    /// Returns unfinished child Runs that remain owned by a parent
+    /// Checkpoint. A replacement must resume the root of that graph and let
+    /// the parent drive its children; independently dispatching both parent
+    /// and child would create two owner-epoch contenders for one child.
+    pub(crate) fn managed_subagent_run_references(
+        state_root: &Path,
+    ) -> Result<BTreeSet<Uuid>, LocalRuntimeError> {
+        let mut references = BTreeSet::new();
+        match std::fs::read_dir(state_root.join("runs")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+                    let Some(run_id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| Uuid::parse_str(name).ok())
+                    else {
+                        continue;
+                    };
+                    if Self::read_run_record(state_root, run_id)?.is_some_and(|record| {
+                        matches!(
+                            record.state,
+                            LocalRunState::Finished { .. } | LocalRunState::Cancelled { .. }
+                        )
+                    }) {
+                        continue;
+                    }
+                    let checkpoint_path = Self::checkpoint_path(state_root, run_id);
+                    if !checkpoint_path.is_file() {
+                        continue;
+                    }
+                    let checkpoint = Self::load_checkpoint(&checkpoint_path)?;
+                    let state: serde_json::Value = serde_json::from_slice(&checkpoint.state)
+                        .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+                    let mut insert_request = |request: &serde_json::Value| {
+                        if let Some(run_id) = request
+                            .get("delegation_id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|value| Uuid::parse_str(value).ok())
+                        {
+                            references.insert(run_id);
+                        }
+                    };
+                    if let Some(request) = state.get("pending_subagent")
+                        && !request.is_null()
+                    {
+                        insert_request(request);
+                    }
+                    if let Some(requests) = state
+                        .get("pending_subagents")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for request in requests {
+                            insert_request(request);
+                        }
+                    }
+                    if let Some(requests) = state
+                        .get("active_subagents")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        for request in requests.values() {
+                            insert_request(request);
+                        }
+                    }
+                    if let Some(reservations) = state
+                        .get("subagent_budget_reservations")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        for run_id in reservations
+                            .keys()
+                            .filter_map(|value| Uuid::parse_str(value).ok())
+                        {
+                            references.insert(run_id);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        }
+        Ok(references)
+    }
+
     fn subagent_result_path(
         state_root: &Path,
         parent_run_id: Uuid,
@@ -4022,10 +4346,6 @@ impl LocalRuntimeHost {
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
     }
 
-    pub fn set_event_sink(&mut self, sink: tokio::sync::mpsc::UnboundedSender<LocalEvent>) {
-        self.event_sink = Some(sink);
-    }
-
     /// Closes transport sessions owned by this Host before the async runtime
     /// itself exits. In particular, stdio MCP cleanup must await process-group
     /// reaping; a normal struct drop cannot perform that asynchronous work.
@@ -4126,6 +4446,11 @@ impl LocalRuntimeHost {
         let mut line = serde_json::to_vec(&event)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         line.push(b'\n');
+        if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES {
+            return Err(LocalRuntimeError::StateRoot(format!(
+                "durable event log line exceeds {LOCAL_EVENT_LOG_LINE_MAX_BYTES} bytes"
+            )));
+        }
         use std::io::Write as _;
         let event_log_path = self.event_log_path(run_id);
         let is_new_log = !event_log_path.exists();
@@ -4143,10 +4468,6 @@ impl LocalRuntimeHost {
             std::fs::File::open(&dir)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        }
-        if let Some(sink) = &self.event_sink {
-            // A detached client is not an execution failure; the Run continues.
-            let _ = sink.send(event);
         }
         Ok(())
     }
@@ -4426,7 +4747,23 @@ impl LocalRuntimeHost {
             None,
             Some(snapshot),
         );
+        Self::persist_managed_run_state(
+            &self.config.state_root,
+            self.invocation,
+            run_id,
+            input,
+            owner_epoch,
+            LocalRunState::Running,
+        )?;
         let run = self.drive(command, checkpoint, resolution).await?;
+        Self::persist_managed_run_state(
+            &self.config.state_root,
+            self.invocation,
+            run_id,
+            input,
+            owner_epoch,
+            Self::managed_run_state(&run),
+        )?;
         let head = if run.status.is_terminal() {
             let transcript = (run.status == RunStatus::Succeeded)
                 .then(|| {
@@ -5391,27 +5728,106 @@ impl LocalRuntimeHost {
         record: &LocalRunRecord,
     ) -> Result<(), LocalRuntimeError> {
         let path = Self::record_path(state_root, record.run_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        }
+        let parent = path.parent().ok_or_else(|| {
+            LocalRuntimeError::StateRoot("local Run record path has no parent".into())
+        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         let staging = path.with_extension("json.partial");
-        std::fs::write(
-            &staging,
-            serde_json::to_vec_pretty(record)
-                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?,
-        )
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        let body = serde_json::to_vec_pretty(record)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&staging)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        file.write_all(&body)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         std::fs::rename(&staging, &path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        Ok(())
+    }
+
+    fn managed_run_state(outcome: &LocalRunOutcome) -> LocalRunState {
+        if let Some(approval) = &outcome.pending_approval {
+            return LocalRunState::AwaitingApproval {
+                approval_id: approval.approval_id,
+                binding_digest: approval.binding_digest.clone(),
+                target_run_id: Some(approval.target_run_id),
+            };
+        }
+        if let Some(input) = &outcome.pending_mcp_input {
+            return LocalRunState::AwaitingMcpInput {
+                input: input.clone(),
+            };
+        }
+        match outcome.status {
+            RunStatus::Cancelled => LocalRunState::Cancelled {
+                reason: "the Runtime execution was cancelled".into(),
+            },
+            status => LocalRunState::Finished {
+                status: status.as_str().into(),
+            },
+        }
+    }
+
+    fn persist_managed_run_state(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        run_id: Uuid,
+        input: &str,
+        owner_epoch: u64,
+        state: LocalRunState,
+    ) -> Result<(), LocalRuntimeError> {
+        let existing = Self::read_run_record(state_root, run_id)?;
+        if let Some(existing) = &existing {
+            let existing_invocation = RuntimeInvocationContext {
+                schema_version: 1,
+                tenant_id: existing.tenant_id,
+                application_id: existing.application_id,
+                workload_identity_id: existing.workload_identity_id,
+                workspace_id: existing.workspace_id,
+                agent_version_id: existing.agent_version_id,
+                model_policy_id: existing.model_policy_id,
+            };
+            if existing_invocation != invocation
+                || existing.input != input
+                || existing.owner_epoch > owner_epoch
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "managed Run record conflicts with its durable invocation".into(),
+                ));
+            }
+        }
+        Self::write_run_record(
+            state_root,
+            &LocalRunRecord {
+                store_version: LOCAL_STORE_VERSION,
+                tenant_id: invocation.tenant_id,
+                application_id: invocation.application_id,
+                workload_identity_id: invocation.workload_identity_id,
+                workspace_id: invocation.workspace_id,
+                agent_version_id: invocation.agent_version_id,
+                model_policy_id: invocation.model_policy_id,
+                run_id,
+                input: input.to_owned(),
+                state,
+                owner_epoch,
+            },
+        )
     }
 
     pub fn read_run_record(
         state_root: &Path,
         run_id: Uuid,
     ) -> Result<Option<LocalRunRecord>, LocalRuntimeError> {
-        let Ok(body) = std::fs::read(Self::record_path(state_root, run_id)) else {
-            return Ok(None);
+        let body = match std::fs::read(Self::record_path(state_root, run_id)) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
         };
         let record: LocalRunRecord = serde_json::from_slice(&body)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
@@ -7301,6 +7717,14 @@ impl LocalRuntimeHost {
             child_lineage,
             request.conversation_history.clone(),
         );
+        Self::persist_managed_run_state(
+            &config.state_root,
+            invocation,
+            child_run_id,
+            &request.input,
+            owner_epoch,
+            LocalRunState::Running,
+        )?;
         // `drive -> drain_tool_calls -> run_subagent -> drive` is intentionally
         // recursive, bounded by AgentLineage depth. Boxing gives the recursive
         // async state machine a finite representation.
@@ -7317,6 +7741,14 @@ impl LocalRuntimeHost {
                 return Err(error);
             }
         };
+        Self::persist_managed_run_state(
+            &config.state_root,
+            invocation,
+            child_run_id,
+            &request.input,
+            owner_epoch,
+            Self::managed_run_state(&child_outcome),
+        )?;
         if let Some(approval) = child_outcome.pending_approval {
             child.shutdown().await;
             return Ok(LocalSubagentProgress::AwaitingApproval(approval));

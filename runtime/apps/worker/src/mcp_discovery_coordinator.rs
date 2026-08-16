@@ -115,7 +115,7 @@ impl McpDiscoveryCoordinator {
                     pending.client,
                     &pending.command,
                     attempt_id,
-                    discovered,
+                    *discovered,
                 )?;
                 match pending.purpose {
                     McpDiscoveryPurpose::Start => {

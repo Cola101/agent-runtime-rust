@@ -330,12 +330,63 @@ Workspace 身份不能复用持久根目录。默认 CLI 仍通过显式兼容 P
 ADR-0103 已补齐多租户身份的 Rust egress 与恢复授权链；ADR-0104 又建立了签名 Edge Task、真实
 `EmbeddedRuntime` 执行、重启去重、终态崩溃恢复和本地持久 outbox 基础层。
 
-下一优先目标固定为：**完成 Rust Edge Node 的可信联网边界**。先实现设备持久密钥与 enrollment、节点
-generation 变更授权、capability manifest/审批，再实现只出站的 mTLS 连接、重连/退避、outbox 上传与经过
-认证的累计 ACK；审批/暂停恢复必须使用新签名命令和更高 Workspace owner epoch，不得重投原任务自动
-续跑。完成这条边界后再以 1000 个混合调用验证公平性、队列内存上限、取消风暴和 Workspace 单写。
-该阶段仍不引入 Java、NATS、PostgreSQL、Docker 或 GUI；Java v20 producer parity、Windows ConPTY、
-MCP OAuth/Resources/Prompts、sampling/roots 与真实 Linux cgroup 门禁保留为后续明确缺口。
+ADR-0105/0106 已完成设备身份、Enrollment 与认证出站会话，但该方向当前暂停，不作为 Runtime 内核阶段的
+完成条件。ADR-0108 已把 `EmbeddedRuntime` 的 resume、精确审批决定和 cancel 收口为统一、协议中立且有
+持久收据的 control contract，并用单 owner、owner epoch、command digest 和双崩溃恢复测试固定语义。
+
+ADR-0109 已让 Unix daemon/CLI adapter 复用同一 Runtime control contract，移除了审批、取消、MCP 输入和
+恢复的双状态机；Attach 也改用持久事件与 Run record，不再依赖进程内 handle。ADR-0110 又完成 10 tenant /
+100 Profile 的混合 execute/control/cancel/resume 风暴，固定 8 active / 92 queued、tenant/Workspace 高水位、
+40 个收据和 130 次 Provider 请求；饱和队列拒绝现在发生在 durable acceptance/epoch 推进之前。
+
+ADR-0111 已完成终态 Runtime 账本的第一段 crash-safe retention/GC：只有完整事件序列、摘要、身份和终态
+一致的 Run 才能先提交 digest-bound Run/control tombstone，再删除热 artifacts 并完成 cleaned commit；中途
+崩溃由替代 Runtime 幂等 repair。活动、等待审批、`indeterminate` 和未完成 `Accepted` receipt 永不自动
+回收。单 Workspace 与同一进程内 tenant 的多 Workspace hard cap 都在模型前执行；没有安全候选时失败关闭。
+1000 个真实 HTTP/SSE 顺序 Run 已证明热目录保持 16、墓碑重启后继续拒绝重放、RSS/FD 与 state root 在
+当前策略下有界。
+
+ADR-0112 已完成 Session/子代理图感知 retention 与分段 terminal ledger：活动 Session Turn、父 Checkpoint
+中的 pending/active/reservation 和未完成 control receipt 是强恢复边；完成 Session/子代理历史内嵌完整
+transcript/result，只保留来源 ID，不再钉住热目录。root Session Turn 与新子代理 Run 现在都写统一
+`run.json`。旧单文件可崩溃安全迁移为 manifest、256-Run immutable segment 与 bounded active segment；
+1000 个真实顺序 Run 为 110.617 秒、16 热目录/984 墓碑，4 tenant×3 Workspace×32 Run 为 36.64 秒且每
+Workspace 最终 6 个热目录。恢复调度现在只启动图根，父 Checkpoint 所有的 child 不会与父并行争抢
+owner epoch。公开 history gap、冷归档读取与外部 tombstone 转储仍未实现。
+
+ADR-0113 已完成本地容量目标：**1000 claimed in-flight / 32 admitted Host+Provider**，不是 1000 个真执行。
+20 tenant、200 Workspace/Profile 的 peak queue 为 968；500 queued abort、16 active durable cancel、484
+成功后无 owner/queue 残留。事件分发已由无界 live sink 改为 durable JSONL + bounded cursor subscription，
+同时限制单订阅、进程订阅数、总缓冲槽与事件行大小。M1 Pro exact RSS 14.6→48.5 MB、FD 211→278→211，
+38.300 秒完成。日常快速门禁采用 256/16；1000 个真正同时执行只留给专用或分布式环境，不能再用排队数
+冒充执行并发。
+
+ADR-0114 已完成版本化、协议中立的 Runtime Event Cursor：有界 page/subscription、显式 terminal/waiting/
+suspended/interrupted/retired Boundary、真实 history gap、typed error 与 Legacy Attach 兼容均已进入 Rust/IPC
+契约。低层 bulk helper 与 Embedded compatibility shim 只保留给内部恢复和暂停中的既有 Edge consumer，
+Runtime Host/IPC 新集成面不再依赖；随机分页的 O(日志长度)扫描保留为 profiling 驱动的优化点。
+
+ADR-0115 已完成 MCP 能力面的第一段安全边界：HTTP 2025/2026、stdio、Model Gateway gRPC 与 Worker 统一
+识别 Tools/Resources/Prompts；只提供 Resources/Prompts 的 Server 是合法空 Tool 目录，且不会误收到
+`tools/list`。directory schema 2 与摘要绑定受支持表面；schema 1 只兼容推断 Tools，未知或自相矛盾的目录
+fail-closed。Roots/Sampling 仍不声明并按原 request ID 拒绝，凭证仍只在 Gateway 域打开。
+
+ADR-0116 已继续完成 Resources list/read 与 Prompts list/get：HTTP 2025/2026、stdio、Gateway gRPC 与 Worker
+共用协议中立有界类型、单页 opaque cursor、完整 workload identity、Server snapshot 和冻结目录摘要；超大响应、
+未知 wire schema、未知 role、越权 Server 与 capability 漂移均 fail-closed。该能力当前是 Runtime/Worker API，
+其模型入口与 Resource Templates 已由 ADR-0117 接续完成。
+
+ADR-0117 已完成五个 Runtime-owned 模型只读 Tool，并复用 ADR-0116 的 tenant/Run/Server/digest、分页、预算
+和审计边界。读取必须具有独立 `mcp:read:<server>` scope，不能从远端 Tool 副作用授权推导；Prompt 只作为
+低权限 Tool Result，Resource Templates 与其他读取共享有界协议。
+
+ADR-0118 的 OAuth 第一阶段已完成稳定句柄、PKCE、加密文件账本、CAS/租约、并发 refresh 单飞、崩溃提交点、
+本地 revoke 与 Gateway 内 Token 解析；独立 Host 明确拒绝凭证域句柄。下一优先目标固定为：**补全
+credential-domain-owned MCP OAuth 的协议发现与消费闭环**——Protected Resource / Authorization Server
+metadata discovery、管理 API/CLI callback、MCP 401 rejected-token CAS 联动、远端 revoke、真实外部 Server
+兼容矩阵，以及可替换的跨平台 CAS/lease store。Roots/Sampling 继续默认关闭，
+不把 Java/GUI/Edge 或外部数据库引入一次 Run。跨进程/跨节点 tenant authority、Windows ConPTY、真实 Linux
+cgroup、生产远端 command ledger 与冷归档继续保留为明确缺口。
 
 ## 本地运行边界
 
@@ -344,8 +395,8 @@ MCP OAuth/Resources/Prompts、sampling/roots 与真实 Linux cgroup 门禁保留
 - 本地 Checkpoint 使用内容寻址文件系统；生产控制面、消息总线和对象存储通过可选适配器接入，
   不进入独立 Runtime 的必需依赖链。
 - 只允许仓库内声明的可信 Tool 原生执行；macOS 本地限制不得冒充 Kata 级强隔离。
-- 测试结束后不得残留进程、端口、临时目录、日志或测试密钥。Rust `target` 是可复用构建缓存，
-  与运行产物分开统计；未经用户明确授权不自动删除。
+- 测试结束后不得残留进程、端口、临时目录、日志或测试密钥。Rust `target` 是可复用的增量构建缓存，
+  默认保留且不提交 Git；只有缓存损坏、工具链大版本切换、磁盘空间紧张或用户明确要求时，先统计再定向清理。
 - 生产 Dockerfile、Kubernetes 清单和 Java/Vue 模块不得被内核 `dev`、`test` 或 `check` 路径调用。
 
 ## 对标规则

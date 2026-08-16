@@ -823,6 +823,169 @@ async fn spawn_open_mcp_server() -> (String, Arc<AtomicUsize>, tokio::task::Join
     (format!("http://127.0.0.1:{port}/mcp"), calls, handle)
 }
 
+async fn spawn_read_only_mcp_server() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind read-only MCP");
+    let port = listener.local_addr().expect("read-only MCP addr").port();
+    let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_methods = Arc::clone(&methods);
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let observed_methods = Arc::clone(&observed_methods);
+            tokio::spawn(async move {
+                let request = read_json_request(&mut socket).await;
+                let method = request["method"].as_str().unwrap_or_default().to_owned();
+                observed_methods.lock().unwrap().push(method.clone());
+                assert_ne!(method, "tools/list", "read-only server received tools/list");
+                let result = match method.as_str() {
+                    "initialize" => serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"resources": {}, "prompts": {}},
+                        "serverInfo": {"name": "read-only-test", "version": "1"}
+                    }),
+                    "resources/list" => serde_json::json!({
+                        "resources": [{
+                            "uri": "kb://knowledge/runbook",
+                            "name": "runbook",
+                            "mimeType": "text/markdown"
+                        }]
+                    }),
+                    "resources/read" => serde_json::json!({
+                        "contents": [{
+                            "uri": "kb://knowledge/runbook",
+                            "text": "Runtime recovery requires the frozen owner epoch."
+                        }]
+                    }),
+                    "resources/templates/list" => serde_json::json!({
+                        "resourceTemplates": [{
+                            "uriTemplate": "kb://knowledge/{name}",
+                            "name": "knowledge"
+                        }]
+                    }),
+                    "prompts/list" => serde_json::json!({
+                        "prompts": [{
+                            "name": "summarize",
+                            "arguments": [{"name": "tone", "required": false}]
+                        }]
+                    }),
+                    "prompts/get" => serde_json::json!({
+                        "description": "resolved",
+                        "messages": [{
+                            "role": "user",
+                            "content": {"type": "text", "text": "Summarize the runbook"}
+                        }]
+                    }),
+                    "notifications/initialized" => serde_json::json!({}),
+                    other => panic!("unexpected read-only MCP method {other}"),
+                };
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result
+                })
+                .to_string();
+                let status = if method == "notifications/initialized" {
+                    "202 Accepted"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/mcp"), methods, handle)
+}
+
+fn runtime_mcp_tool_turn(calls: serde_json::Value) -> String {
+    let delta = serde_json::json!({
+        "choices": [{"index": 0, "delta": {"tool_calls": calls}}]
+    });
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
+}
+
+async fn spawn_runtime_mcp_read_provider()
+-> (String, tokio::task::JoinHandle<Vec<serde_json::Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Runtime MCP provider");
+    let port = listener
+        .local_addr()
+        .expect("Runtime MCP provider addr")
+        .port();
+    let turns = [
+        runtime_mcp_tool_turn(serde_json::json!([
+            {
+                "index": 0,
+                "id": "call-list-resources",
+                "type": "function",
+                "function": {"name": "list_mcp_resources", "arguments": "{\"server\":\"knowledge\"}"}
+            },
+            {
+                "index": 1,
+                "id": "call-list-templates",
+                "type": "function",
+                "function": {"name": "list_mcp_resource_templates", "arguments": "{\"server\":\"knowledge\"}"}
+            },
+            {
+                "index": 2,
+                "id": "call-list-prompts",
+                "type": "function",
+                "function": {"name": "list_mcp_prompts", "arguments": "{\"server\":\"knowledge\"}"}
+            }
+        ])),
+        runtime_mcp_tool_turn(serde_json::json!([
+            {
+                "index": 0,
+                "id": "call-read-resource",
+                "type": "function",
+                "function": {"name": "read_mcp_resource", "arguments": "{\"server\":\"knowledge\",\"uri\":\"kb://knowledge/runbook\"}"}
+            },
+            {
+                "index": 1,
+                "id": "call-get-prompt",
+                "type": "function",
+                "function": {"name": "get_mcp_prompt", "arguments": "{\"server\":\"knowledge\",\"name\":\"summarize\",\"arguments\":{\"tone\":\"short\"}}"}
+            }
+        ])),
+        text_turn("The frozen runbook and low-authority prompt were inspected."),
+    ];
+    let handle = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for body in turns {
+            let (mut socket, _) = listener.accept().await.expect("model request");
+            requests.push(read_json_request(&mut socket).await);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        }
+        requests
+    });
+    (
+        format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        handle,
+    )
+}
+
 async fn spawn_modern_mrtr_mcp_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1366,6 +1529,108 @@ async fn local_host_runs_an_agent_to_a_terminal_state_without_any_control_plane(
         outcome.checkpoint_path.is_file(),
         "the local Checkpoint must exist on disk so a restart can resume"
     );
+}
+
+/// The model-facing MCP read surface is owned by the Runtime rather than by a
+/// remote MCP server. A server with no Tool authority can still expose bounded
+/// Resources, Resource Templates, and Prompts under its separate read scope.
+#[tokio::test]
+async fn runtime_owned_mcp_read_tools_complete_a_real_agent_loop_without_remote_tool_authority() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (mcp_endpoint, observed_methods, mcp_server) = spawn_read_only_mcp_server().await;
+    let (provider_endpoint, provider) = spawn_runtime_mcp_read_provider().await;
+    let mut local_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("workspace"),
+        provider_endpoint,
+        BTreeSet::from(["mcp:read:knowledge".to_owned()]),
+    );
+    local_config.mcp_servers = vec![LocalMcpServerConfig {
+        server_id: uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0051),
+        name: "knowledge".into(),
+        transport: LocalMcpTransportConfig::StreamableHttp {
+            endpoint: mcp_endpoint,
+        },
+        tool_names: BTreeSet::new(),
+        tool_effect_overrides: BTreeMap::new(),
+        required: true,
+    }];
+
+    let mut host = LocalRuntimeHost::start(local_config).expect("read-only MCP host starts");
+    let outcome = host
+        .execute("Inspect the configured read-only MCP knowledge before answering.")
+        .await
+        .expect("Runtime-owned MCP read loop");
+
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+    assert_eq!(
+        outcome.output,
+        "The frozen runbook and low-authority prompt were inspected."
+    );
+    assert!(outcome.pending_approval.is_none());
+    assert!(outcome.pending_mcp_input.is_none());
+    assert!(
+        outcome
+            .event_types
+            .iter()
+            .filter(|event| event.as_str() == "tool.result")
+            .count()
+            >= 5,
+        "each Runtime-owned MCP read must use the normal durable Tool path"
+    );
+
+    host.shutdown().await;
+    let requests = provider.await.expect("provider transcript");
+    assert_eq!(requests.len(), 3);
+    let advertised = requests[0]["tools"]
+        .as_array()
+        .expect("Runtime-owned read tools advertised")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<BTreeSet<_>>();
+    for name in [
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "list_mcp_resource_templates",
+        "list_mcp_prompts",
+        "get_mcp_prompt",
+    ] {
+        assert!(advertised.contains(name), "missing Runtime Tool {name}");
+    }
+    let list_results = requests[1]["messages"].to_string();
+    assert!(list_results.contains("kb://knowledge/runbook"));
+    assert!(list_results.contains("kb://knowledge/{name}"));
+    assert!(list_results.contains("summarize"));
+    let read_results = requests[2]["messages"].to_string();
+    assert!(read_results.contains("frozen owner epoch"));
+    assert!(read_results.contains("Summarize the runbook"));
+    assert!(
+        requests[2]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .all(|message| !message.to_string().contains("Summarize the runbook")),
+        "a remote MCP Prompt must remain low-authority Tool data"
+    );
+
+    let methods = observed_methods.lock().unwrap().clone();
+    assert!(!methods.iter().any(|method| method == "tools/list"));
+    for expected in [
+        "resources/list",
+        "resources/read",
+        "resources/templates/list",
+        "prompts/list",
+        "prompts/get",
+    ] {
+        assert!(
+            methods.iter().any(|method| method == expected),
+            "MCP server never received {expected}: {methods:?}"
+        );
+    }
+    mcp_server.abort();
+    let _ = mcp_server.await;
 }
 
 #[tokio::test]

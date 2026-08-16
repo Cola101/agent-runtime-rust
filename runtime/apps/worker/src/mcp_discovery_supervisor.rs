@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub enum McpDiscoveryUpdate {
     Ready {
         attempt_id: Uuid,
-        discovered: FederatedRunTools,
+        discovered: Box<FederatedRunTools>,
     },
     Cancelled {
         attempt_id: Uuid,
@@ -72,7 +72,7 @@ impl McpDiscoverySupervisor {
                 () = cancellation.cancelled() => McpDiscoveryUpdate::Cancelled { attempt_id },
                 discovered = discovery => McpDiscoveryUpdate::Ready {
                     attempt_id,
-                    discovered,
+                    discovered: Box::new(discovered),
                 },
             };
             let _ = updates.send(update).await;

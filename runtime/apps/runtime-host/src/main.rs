@@ -5,6 +5,7 @@
 //! replay everything from the durable local event log.
 
 use agent_protocol::{RunBudget, SubagentRole};
+use agent_runtime_host::embedded::RuntimeControlCommand;
 use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
@@ -209,7 +210,7 @@ fn load_config() -> Result<LocalRuntimeConfig, Box<dyn std::error::Error>> {
                 pty_supervisor: Some(agent_tool_runtime::ProcessSessionPtySupervisorConfig {
                     executable: runtime_executable.clone(),
                     fixed_args: vec!["__pty-session-supervisor".into()],
-                    startup_timeout: std::time::Duration::from_secs(5),
+                    startup_timeout: std::time::Duration::from_secs(10),
                 }),
             },
         ),
@@ -332,17 +333,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await
         }
-        "approve" | "deny" | "cancel" => {
+        "approve" | "deny" | "cancel" | "resume" => {
             let run_id: Uuid = args
                 .next()
-                .ok_or("usage: runtime-host <approve|deny|cancel> <run-id>")?
+                .ok_or("usage: runtime-host <approve|deny|cancel|resume> <run-id>")?
                 .parse()?;
             let request = match command.as_str() {
                 "approve" => LocalRequest::Approve { run_id },
                 "deny" => LocalRequest::Deny { run_id },
-                _ => LocalRequest::Cancel { run_id },
+                "cancel" => LocalRequest::Cancel { run_id },
+                _ => LocalRequest::Resume { run_id },
             };
             client_request(&request).await
+        }
+        "control" => {
+            let command: RuntimeControlCommand = serde_json::from_str(
+                &args
+                    .next()
+                    .ok_or("usage: runtime-host control <command-json>")?,
+            )?;
+            client_request(&LocalRequest::Control { command }).await
         }
         // One-shot execution without a daemon, for scripting.
         "run" => {

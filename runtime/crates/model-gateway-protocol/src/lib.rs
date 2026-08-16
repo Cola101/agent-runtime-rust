@@ -10,7 +10,11 @@ use sha2::{Digest, Sha256};
 #[must_use]
 pub fn mcp_server_authorization_digest(server: &v1::McpServerRef) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"agent-runtime-mcp-server-v1\0");
+    if server.oauth_credential_id.is_empty() {
+        hasher.update(b"agent-runtime-mcp-server-v1\0");
+    } else {
+        hasher.update(b"agent-runtime-mcp-server-v2\0");
+    }
     update_field(&mut hasher, server.server_id.as_bytes());
     update_field(&mut hasher, server.name.as_bytes());
     update_field(&mut hasher, server.endpoint.as_bytes());
@@ -21,6 +25,9 @@ pub fn mcp_server_authorization_digest(server: &v1::McpServerRef) -> String {
     hasher.update((capabilities.len() as u64).to_be_bytes());
     for capability in capabilities {
         update_field(&mut hasher, capability.as_bytes());
+    }
+    if !server.oauth_credential_id.is_empty() {
+        update_field(&mut hasher, server.oauth_credential_id.as_bytes());
     }
     hex::encode(hasher.finalize())
 }

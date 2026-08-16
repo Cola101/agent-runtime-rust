@@ -16,6 +16,17 @@
 - `cargo check -p agent-runtime-host -p agent-tool-runtime --all-targets`、两包 all-targets Clippy
   `-D warnings` 与 Rust 格式门禁通过。
 
+## 2026-08-15 复核补充
+
+- 全工作区负载下再次出现真实 TTY `indeterminate`，持久证据显示 lifecycle/terminal 均未创建，manifest
+  仍为 `Starting/unprepared`，证明失败发生在任何 process side effect 之前，而不是 supervisor generation
+  已接管后的响应丢失。
+- 新增不可用 supervisor 的行为性 RED 测试，旧实现稳定留下孤儿 `Starting/unprepared`；修复后持久状态为
+  `Terminated/start_failed`，原始 pre-spawn I/O 分类保留。任何 `prepared`、Running、终态不明或读取失败
+  继续返回 `indeterminate`。
+- Tool Runtime 在 8 线程下全绿；Rust 全工作区 708 项中 702 通过、6 个外部 live 用例忽略，0 失败。
+  默认高并发还观察到一次 macOS process-group close `EPERM`，专项重跑通过，未将其误报为已根治。
+
 ## 参考源码复核
 
 - Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c`：`rmcp-client` 的连接可用性读取 service/transport

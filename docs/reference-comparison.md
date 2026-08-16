@@ -1,6 +1,6 @@
 # Codex CLI / OpenClaw 阶段对标
 
-更新时间：2026-08-14
+更新时间：2026-08-15
 
 本文件是每个实施阶段必须更新的偏差检查。结论只基于本地参考源码，不把产品介绍当作实现证据。
 
@@ -14,7 +14,186 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：Runtime 会话权威探活与事件驱动 Process Wait
+## 当前阶段：MCP OAuth 凭证域第一阶段
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 凭证所有权 | rmcp client/store 持有 OAuth token，Agent Loop 不直接持有 | Gateway OAuth store/provider 持有 token | Worker/Run/Checkpoint 只见 `oauth_credential_id`；Token 只在 Model Gateway coordinator/MCP request 内 | 已对齐参考边界，并额外绑定 tenant + Server UUID + endpoint |
+| 登录事务 | discovery、PKCE、credential store、登录入口完整 | MCP SDK auth + provider/store，Gateway 命令面成熟 | 配置 endpoint 的 PKCE begin/complete + owned exchange；无 callback listener/管理 RPC | 状态机核心已完成；发现与产品入口明显落后两者 |
+| 刷新并发 | 跨进程 refresh lock，锁内重读，先持久化再安装 | SQLite shared-state lease，锁内 refresh/update | credential-scoped OS lock + revision CAS；两并发真实请求只打一笔 refresh，提交后才返回 | 核心事务语义对齐；生产多副本外部 lease 尚缺 |
+| 崩溃语义 | owned task 防 caller cancellation；provider timeout 后可序列重试 | lease/AbortSignal 与持久 store 协调 | exchange/refresh intent 先落盘；进程重启一律 authorization-required，不重放旋转 token/code | 比参考更保守，适合未知副作用，但增加重新授权概率 |
+| 401/revoke | auth manager 处理 authorization-required | 仅当 rejected token 仍是当前值才更新；lease-bound logout | stale digest CAS 与本地 revoke 已实现；MCP HTTP 401 尚未自动调用，远端 revoke 未实现 | 正确原语已有，消费链仍未闭合 |
+| 存储/可移植 | keyring/file store 与客户端生态成熟 | 共享 SQLite store、Gateway 运维成熟 | AES-GCM、0600/0700、fsync+rename、Unix flock 的原生 reference adapter | 多租户 AAD/CAS 更明确；Windows/外部数据库 adapter 落后 |
+
+### 本阶段结论
+
+- 已验证：RunExecution v21 降级保护、Worker wire 只传 UUID、授权摘要绑定 OAuth handle；PKCE exchange、过期
+  refresh、跨进程同锁单飞、stale 401、revoke、崩溃恢复与加密落盘均有可执行证据。
+- 相比 Codex，本项目吸收其锁内权威重读和“持久化后才暴露”事务；Codex 的 metadata discovery、keyring、
+  登录入口、真实生态兼容仍领先。
+- 相比 OpenClaw，本项目吸收其 lease 串行 login/refresh/logout 与 rejected-token winner check；OpenClaw 的
+  SQLite 运维、SDK discovery 和产品命令面仍领先。
+- 本项目没有把 Token 放进 Run、Worker 或独立 Host；偏离点是崩溃后禁止自动重试旋转 credential，这对共享
+  多租户 Runtime 更安全，但不是功能领先的笼统声明。
+- 下一目标是 metadata discovery → 管理 API/CLI callback → MCP 401 联动 → remote revoke → 外部兼容矩阵；
+  该结论记录于 ADR-0118 与 `docs/evidence/2026-08-15-credential-domain-mcp-oauth-stage-one.md`。
+
+## 上一阶段：Runtime-owned MCP 只读 Tool 与 Resource Templates
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 模型读取入口 | Runtime-owned `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates` | Session facade 提供 Resources/Templates/Prompts | 五个固定 Runtime-owned Tool 同时覆盖 Resources、Templates、Prompts | Codex 三个入口命名与语义已对齐；Prompts 补齐 OpenClaw 表面 |
+| 权限 | MCP Server 配置与 Runtime Tool policy | requester/session credential 与 Gateway policy | 独立 `mcp:read:<server>`；remote Tool scope 不授内容读取权；每次规划重验 capability | 多租户数据出站授权更显式，不据此宣称整体领先 |
+| 结果与 Prompt 权威 | typed Resource contents 进入 Tool result | facade 返回 typed content/prompt | 单页≤64，模型结果≤128 KiB；Prompt 永不提升为 system/developer | 共享 Runtime 的硬上限与指令注入边界更强；生态兼容仍落后 |
+| Transport | rmcp client 与 App Server 产品链成熟 | stdio/SSE/HTTP、持久 session 与 Apps 成熟 | HTTP 2025/2026、stdio、Gateway gRPC、Worker、独立 Host 同一协议中立契约 | 核心路径可移植；SSE/OAuth/长期 session 运维落后 |
+| 恢复与审计 | Turn/rollout 和 Tool lifecycle 成熟 | Gateway session/transcript 成熟 | 普通 Tool requested/started/result、Checkpoint、取消/恢复；definition digest 绑定 frozen directory | 多租户冻结与副作用路径没有旁路；客户端/Thread 产品链落后 |
+
+### 本阶段结论
+
+- 已验证：无 remote Tool authority 的 Resources/Prompts Server，仅凭精确 read scope 即可在真实 Agent Loop
+  完成五次只读调用并到达终态；HTTP、stdio、认证 Gateway→Worker 与 model transcript 均有执行证据。
+- 相比 Codex，本项目已补齐其三个 Runtime MCP Resource Tool 和 Resource Templates；Codex 仍领先 OAuth、
+  App Server/客户端集成、真实 Server 兼容矩阵和更广工具面。
+- 相比 OpenClaw，本项目已补齐 Resources/Templates/Prompts 模型可用面；未采用其自动遍历所有分页，因为共享
+  多租户 Runtime 需要单页硬上限。OpenClaw 的 OAuth、session lease/reconnect、Apps 和跨平台运维仍领先。
+- 下一 Runtime 目标固定为 credential-domain-owned OAuth 生命周期：onboarding/PKCE、refresh 单飞、持久提交、
+  revoke 与租户/Server 绑定；Roots/Sampling 继续默认关闭。
+- 该结论记录于 ADR-0117 与
+  `docs/evidence/2026-08-15-runtime-owned-mcp-read-tools-and-resource-templates.md`。
+
+## 上一阶段：MCP 服务端能力目录与反向权限防火墙
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| Server capabilities | Resources list/templates/read 已实现 | Tools/Resources/Prompts 摘要与 list/read/get 已实现 | HTTP/stdio 识别 Tools/Resources/Prompts；无 Tools 时形成合法空目录 | 协商边界对齐；实际 Resources/Prompts 操作仍落后 |
+| 反向权限 | 定制 Client Service 聚焦 elicitation | 默认 client capabilities 为空，MCP Apps 才加 extension | Roots/Sampling 不声明、`-32601` 后退役；2026 只开放持久 MRTR Elicitation | 默认拒绝原则对齐且已跨传输验证 |
+| 目录冻结 | MCP client/session 生命周期成熟 | catalog + session lifecycle 成熟 | directory v2 摘要绑定受支持表面与 Tool schema；新调用会话重新验证 Tools，完整 workload identity 约束 gRPC | 多租户窄面更明确；通知/动态刷新仍落后 |
+| 兼容升级 | MCP/OAuth 版本兼容面成熟 | SDK 与 Gateway 产品兼容面成熟 | wire schema 1 仅推断 Tools；schema 2 精确能力；未知/矛盾目录拒绝 | 有 fail-closed 契约；缺少双版本二进制验收 |
+| OAuth | discovery、login、refresh、persist 完整 | OAuth provider/store 与 lease-bound state 成熟 | 只有 Gateway 静态 sealed envelope；Worker 无明文 | 凭证隔离基础正确，但 OAuth 能力明显落后 |
+
+### 本阶段结论
+
+- 已验证：HTTP、stdio 和认证 Gateway→Worker 均接受 Resources/Prompts-only Server，不误发 `tools/list`；
+  schema 1/2、未知/矛盾目录和 capability 摘要有可执行门禁；新调用会话撤销 Tools 时在副作用前拒绝。
+- 相比 Codex，本项目保留其“客户端显式能力才开放反向请求”原则，并增加完整多租户身份与 Run 目录冻结；
+  Codex 的 Resources API、OAuth 和客户端生态明显领先。
+- 相比 OpenClaw，本项目对齐默认空 Client capability、分页表面与 Tool 分离原则；OpenClaw 已完成实际
+  Resources/Prompts 调用和 Session 运维，本项目只完成安全目录基础。
+- 下一 Runtime 目标是 bounded Resources list/read、Prompts list/get，再做 credential-domain-owned OAuth；
+  Roots/Sampling 继续关闭。
+- 该结论记录于 ADR-0115 与 `docs/evidence/2026-08-15-mcp-capability-directory-and-reverse-authority.md`。
+
+## 上一阶段：版本化 Event Cursor、显式 Boundary 与真实 history gap
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 有界读取 | 模型流 mpsc=1600；App Server listener 生命周期成熟 | Session state list limit=1..200 | EventCursor page=1..256；subscription 受进程总槽限制 | 有界原则对齐；外部协议面不再返回无界 Vec |
+| 流终态 | Thread/Turn notification 由完整 App Server 协议表达 | Session/Gateway 产品事件成熟 | Event/Boundary 显式区分 waiting、suspended、interrupted、terminal、retired | Java/CLI/GUI 不再猜 channel close；产品生态仍落后 |
+| 历史缺口 | Thread store/archive/cold rollout 完整 | prune 前写 per-session watermark，`historyGap` 只看真实删除 | tombstone-before-delete，cursor 与 terminal watermark 比较 | 直接吸收 OpenClaw 正确原则，并绑定完整多租户终态摘要 |
+| 完整性 | rollout/thread identity 与 store 校验成熟 | SQLite transaction 与 session identity | tenant/application/workload/Workspace/AgentVersion/model policy/Run、sequence、digest 全校验 | 多租户窄面更严格；存储查询性能仍不及 SQLite |
+| 兼容/性能 | App Server 协议版本治理成熟 | Gateway/SQLite 运营成熟 | 新 typed EventCursor；Legacy Attach 改 persistent tail 且保持旧响应 | 实时链不再重复全读；随机分页仍 O(日志长度) |
+
+### 本阶段结论
+
+- 已验证：bounded page、exclusive reconnect、terminal/waiting/retired Boundary、retired gap/caught-up、cursor
+  ahead、foreign identity、sequence gap、digest tamper 和 capacity=1 慢消费者。
+- 相比 Codex，本项目吸收 bounded channel 与 connection/Run 解耦，并补出协议中立 durable cursor；Codex 的
+  App Server/Thread store、客户端和冷层仍明显领先。
+- 相比 OpenClaw，本项目直接采用 watermark-before-delete，history gap 只由真实删除证明；本项目的 terminal
+  tombstone 额外绑定完整 invocation 和 event digest，但 SQLite 查询与运营能力落后。
+- 下一 Runtime 内核目标转为 MCP Resources/Prompts/Roots/Sampling/OAuth 能力与反向授权，不进入上层产品。
+- 该结论记录于 ADR-0114 与 `docs/evidence/2026-08-15-versioned-runtime-event-cursor.md`。
+
+## 上一阶段：1000 在途 / 32 admitted 与持久事件背压
+
+该阶段已完成 1000 claimed in-flight / 32 admitted、公平取消与 bounded subscriber；详见 ADR-0113 与
+`docs/evidence/2026-08-15-bounded-1000-inflight-runtime-capacity.md`。
+
+## 上一阶段：图感知回收、分段终态账本与多租户长周期 churn
+
+该阶段已完成 Session/子代理恢复图、schema 2 分段账本、1000 顺序 Run 与 384 多租户长周期门禁；详见
+ADR-0112 与 `docs/evidence/2026-08-15-graph-aware-retention-and-segmented-ledger.md`。
+
+## 上一阶段：Crash-safe 终态账本与 1000 Run churn
+
+ADR-0111 已建立 tombstone-before-delete、Workspace/tenant hard cap 和首个 1000 顺序 Run 门禁；其单 JSON
+与 Session/子代理 unmanaged 缺口已由当前阶段收敛。详见 ADR-0111 与
+`docs/evidence/2026-08-15-terminal-ledger-retention-and-1000-run-churn.md`。
+
+## 上一阶段：100 Profile 多租户混合风暴与有界准入
+
+该阶段已完成 10 tenant / 100 Profile 的 8 active / 92 queued 混合门禁、tenant round-robin 和 durable
+acceptance 前置准入；详见 ADR-0110 与 `docs/evidence/2026-08-15-multi-tenant-runtime-storm.md`。
+
+## 上一阶段：Unix daemon/CLI 统一 Runtime 控制适配器
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| Transport 与内核 | app-server 统一 `thread/resume`、`turn/interrupt` 与客户端审批 | Gateway/Node 统一 invoke input、cancel、progress 与 timeout | Unix daemon/CLI 只做适配，execute/control/recovery 共用 `EmbeddedRuntime` | 消除了本项目双状态机；Codex/OpenClaw 的外部协议和产品面仍领先 |
+| 命令重试 | Thread/Turn 生命周期成熟，审批与 interrupt 绑定当前 Turn | pending/active invoke 绑定当前连接与 invoke ID | legacy 和完整 control 均落同一可重放 receipt；命令绑定完整 invocation、epoch 和 digest | 多租户本地 durable 窄面更明确，不等于远端交付能力 |
+| Attach/恢复 | Thread history/rollout 与 app-server resume 成熟 | Gateway/Node 在线 relay、断线清理与重连成熟 | Attach 读取 durable event log + Run record；replacement daemon 不依赖旧 handle | 本地替换恢复成立；实时 fanout、跨平台和远端运维落后 |
+| 审批/MCP/取消 | command approval 与 Turn interrupt 交互完整 | input sequence、AbortController 与 progress 完整 | 精确 approval/MCP binding、cancel/resume 统一经 control receipt；后台与客户端连接解耦 | 内核一致性提升；UI、策略表达和在线反馈仍落后 |
+| 兼容与身份 | Thread/Turn ownership 产品化 | device/session/invoke 身份与连接代际成熟 | 仅完整 nil legacy record 可迁移；部分/外部身份 fail-closed | 防止兼容路径提权；尚无外部认证和撤销 |
+
+### 本阶段结论
+
+- 已实现：Unix daemon 不再拥有第二套 Run handle、取消、审批/MCP 或恢复权威；完整 control command 与旧
+  CLI 命令均进入同一协议中立 Runtime control ledger。
+- 相比 Codex，本平台现在同样只有一个控制语义来源，并在多租户 invocation、owner epoch、摘要收据和
+  replacement Attach 上给出持久契约；Codex 的 app-server 协议、审批 UX、Desktop/CLI 和跨平台执行领先。
+- 相比 OpenClaw，本地 accepted receipt 与 Attach 不依赖当前 pending/active invoke map；OpenClaw 的
+  Gateway/Node relay、progress、timeout、动态能力、连接运维和跨平台节点领先。
+- 下一 Runtime 内核目标固定为本机 100+ Profile 的混合 execute/control/cancel/resume 风暴，验证公平、
+  Workspace 单写、收据收敛和 RSS/FD/任务/队列上限；不以 Edge、Java 或 GUI 替代这项容量证据。
+- 该结论记录于 ADR-0109 与 `docs/evidence/2026-08-15-unified-local-runtime-control-adapter.md`。
+
+## 上一阶段：协议中立的持久 Runtime 控制命令
+
+本轮以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
+GUI 或控制面。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 统一控制面 | app-server 提供 `thread/resume`、`turn/interrupt` 和客户端审批请求，Thread/Turn 产品协议成熟 | Gateway/Node 以 invoke ID、pending invoke、input seq、cancel 管理在线调用 | schema v1 统一 resume、精确审批决定和 cancel；所有 transport adapter 复用同一 `EmbeddedRuntime::control` | 内核控制语义收口；外部协议、SDK 和 UI 仍明显落后 Codex/OpenClaw |
+| 幂等与崩溃 | rollout/thread history 可恢复，但 inspected approval/interrupt 不是本项目同口径 command receipt | Node pending invoke 和 active invoke 主要依赖当前 Gateway/Node 生命周期 | command digest 收据 `accepted → completed`；同 ID 改写拒绝；Accepted resume 的第二任 owner 再崩溃后可继续 | 多租户持久命令窄面更强；没有生产远端 ledger 或 delivery 运维 |
+| 身份与围栏 | Thread/Turn/approval ID 绑定成熟，没有 tenant/application/workload 资源链 | Gateway role、node/device/session/invoke identity 与连接代际成熟 | 命令固定 tenant/application/workload/Workspace/AgentVersion/model policy、Run 和 expected owner epoch | 共享多租户 Runtime 边界更明确；外部认证和撤销尚未实现 |
+| 并发与取消 | Turn interrupt 可结束等待中的 command approval，交互生命周期完整 | AbortController、pending invoke timeout/cancel、Node relay 与进度完整 | 状态写入前取得单 Run owner；并发审批只执行一次 Tool；并发取消共用 token 并收敛全部收据 | durable 并发审计成立；实时 relay、跨平台和产品体验落后 |
+| 持久提交 | rollout/history 产品链成熟 | Session/transcript/queue 有多种持久层，但 Node invoke 本身仍围绕在线 registry | Run record 与 control receipt 使用 fsync + rename + directory fsync；非 NotFound 读取错误 fail-closed | 本地提交点更明确；还不是分布式或远端存储语义 |
+
+### 本阶段结论
+
+- 已验证：8 项真实 HTTP/SSE 行为测试覆盖审批、取消、原 owner 崩溃、Accepted command 再崩溃、错误
+  binding/epoch/ID、并发 owner 和存储错误；Tool 与重复命令均没有二次执行。
+- 相比 Codex，本平台把其统一 Thread/Turn 控制思想下沉为协议中立 Rust 接口，并增加完整多租户身份、
+  owner epoch 与持久 command receipt；Codex 的 app-server、Desktop/CLI 交互、审批表达和跨平台仍领先。
+- 相比 OpenClaw，本平台的 control receipt 不依赖当前 Gateway/Node 内存 pending map；OpenClaw 的
+  Gateway/Node relay、progress、动态能力、连接生命周期和跨平台产品仍领先。
+- 下一 Runtime 内核目标是让现有 Unix daemon/CLI adapter 调用同一 control contract，移除审批/取消/
+  恢复的双实现，再做混合 execute/control/取消风暴的本地容量与公平门禁；继续不进入 Edge 或 GUI。
+- 该结论记录于 ADR-0108 与 `docs/evidence/2026-08-14-durable-embedded-runtime-control.md`。
+
+## 上一阶段：Runtime 会话权威探活与事件驱动 Process Wait
 
 本轮以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
 `58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，不进入 Edge、Java 或控制面。
@@ -281,7 +460,7 @@ flowchart LR
 | 能力协商 | 显式构造 `ClientCapabilities`，当前 inspected 路径启用 elicitation；协议由 rmcp 管理 | loopback Gateway 作为服务端协商 `tools`；未发现对应反向客户端能力路径 | 客户端能力为空；精确验证 `2025-06-18` 和服务端 `tools` | 本平台窄门禁明确，Codex 能力面更完整 |
 | 反向请求 | `elicitation/create` 进入 request manager 和交互响应；未见 sampling/roots 被当前 builder 广告 | inspected Gateway 处理客户端 `initialize/tools/*`，未见 sampling/elicitation/roots 客户端处理 | HTTP JSON/SSE 与 stdio 对任何未协商 `method + id` 回精确 ID 的 `-32601` 并退役会话 | 默认拒绝闭环已验证；不能据此推断参考项目全局缺失 |
 | 模型与副作用边界 | elicitation 有成熟 UI/应用层路由 | Tool 调用与 replay guard 成熟 | 发现违规零模型调用；已开始 Unknown Tool 保持 durable indeterminate，拒绝随后 success | 本平台把窄协议违规接入持久副作用语义 |
-| Resources/Prompts | 客户端能力面广 | MCP Apps、Resources/Prompts 更成熟 | 尚未实现 | 这是客户端查询服务端能力，不是反向请求；两者领先 |
+| Resources/Prompts | 已有分页 Resources list/read、Resource Templates 与模型侧只读内核 Tool | 已有 Resources list/read、Prompts list/get 与成熟 session facade | HTTP 2025/2026、stdio、Gateway gRPC、Worker 已贯通有界单页 list/read/get | 操作链已对齐；Codex 的 Templates/模型入口和 OpenClaw 的成熟会话广度仍领先，本平台的完整多租户 identity/digest 与硬上限更严格 |
 | 下一缺口 | 已有 elicitation 产品回路 | 跨平台 Gateway/Apps 广度领先 | 尚无获批 elicitation、sampling 或 roots | 下一步只启用 Run-frozen elicitation，不开放 sampling/roots |
 
 ### 本阶段结论
@@ -292,8 +471,9 @@ flowchart LR
   `tools/list`/`tools/call`，未发现等价的反向客户端请求路径。不能把角色不同误判为安全能力落后。
 - 真实 HTTP/SSE、sibling POST 与 stdio 进程证明 discovery 和 active Tool 两个边界都会返回精确 ID 的
   `-32601`。四条闭环分别验证零/一次模型调用、session 退役、`run.indeterminate`、事件与 Checkpoint。
-- 旧文档把 Resources/Prompts 列为 server-initiated request 是分类错误，现已纠正。它们仍是 MCP 广度
-  缺口，但不进入本轮反向授权结论。
+- 旧文档把 Resources/Prompts 列为 server-initiated request 是分类错误，现已纠正；ADR-0116 又完成了
+  四个客户端操作的 HTTP/stdio/Gateway/Worker 主链。它们仍不进入反向授权结论，模型入口、Resource Templates、
+  OAuth 与真实外部长稳分页仍是可验证差距。
 - 外部 P0 仍是真实 Linux cgroup 门禁；本机下一项是 Run-frozen、可审批和可恢复的 MCP elicitation。
   sampling/roots、GUI、Java、Docker、NATS 和平台化继续暂停。
 

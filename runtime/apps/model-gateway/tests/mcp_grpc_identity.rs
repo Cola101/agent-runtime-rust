@@ -140,6 +140,7 @@ fn list_request(
             name: "search".into(),
             endpoint,
             credential_envelope_json: Vec::new(),
+            oauth_credential_id: String::new(),
             protocol_revision: "2025-06-18".into(),
             client_capabilities: Vec::new(),
         }),

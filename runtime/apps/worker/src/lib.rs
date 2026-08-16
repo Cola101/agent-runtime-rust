@@ -10,14 +10,15 @@ use agent_nats_security::NatsClientConfig;
 use agent_protocol::{
     ActiveRunAssignment, ApprovalMode, BudgetDimension, EventEnvelope, HistoryRepairReport,
     McpClientCapability, McpElicitationRequest, McpInputContinuation, McpInputRequired,
-    McpInputResolutionCommand, McpProtocolRevision, ModelErrorKind, ModelFinishReason,
-    ModelStreamEvent, Placement, PreparedRunCheckpoint, RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION,
-    RUN_EXECUTION_SCHEMA_VERSION, RunCancellationCommand, RunCheckpointPublished,
-    RunExecutionAccepted, RunExecutionCommand, RunRecoveryCommand, RunStatus, RunSteeringCommand,
-    RunSteeringOutcome, RuntimeExecutionPolicySnapshot, SandboxClass, SubagentConversationTurn,
-    SubagentForkReceipt, SubagentResultDelivery, SubagentRole, SubagentRollbackReceipt,
-    SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalDecision, ToolApprovalDecisionCommand,
-    ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest, WORKER_HEARTBEAT_SCHEMA_VERSION,
+    McpInputResolutionCommand, McpProtocolRevision, McpServerCapability, ModelErrorKind,
+    ModelFinishReason, ModelStreamEvent, Placement, PreparedRunCheckpoint,
+    RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION, RUN_EXECUTION_COMPLETE_IDENTITY_SCHEMA_VERSION,
+    RunCancellationCommand, RunCheckpointPublished, RunExecutionAccepted, RunExecutionCommand,
+    RunRecoveryCommand, RunStatus, RunSteeringCommand, RunSteeringOutcome,
+    RuntimeExecutionPolicySnapshot, SandboxClass, SubagentConversationTurn, SubagentForkReceipt,
+    SubagentResultDelivery, SubagentRole, SubagentRollbackReceipt, SubagentSpawnMode,
+    SubagentSpawnRequest, ToolApprovalDecision, ToolApprovalDecisionCommand, ToolCall,
+    ToolDescriptor, ToolEffect, ToolExecutionRequest, WORKER_HEARTBEAT_SCHEMA_VERSION,
     WorkerHeartbeat, WorkloadIdentityRenewalCommand, WorkloadToken, repair_imported_history,
 };
 use agent_tool_runtime::{
@@ -56,11 +57,13 @@ pub use mcp_discovery_coordinator::{McpDiscoveryCompletion, McpDiscoveryCoordina
 pub use mcp_discovery_supervisor::{McpDiscoverySupervisor, McpDiscoveryUpdate};
 pub use mcp_gateway::{
     DiscoveredCatalog, DiscoveredTool, FederatedRunTools, FederatedToolExecutor,
-    FederationIdentity, GrpcMcpFederationClient, McpCallContext, McpDiscoveryPolicy,
+    FederationIdentity, GET_MCP_PROMPT_TOOL, GrpcMcpFederationClient, LIST_MCP_PROMPTS_TOOL,
+    LIST_MCP_RESOURCE_TEMPLATES_TOOL, LIST_MCP_RESOURCES_TOOL, McpCallContext, McpDiscoveryPolicy,
     McpDiscoveryScheduler, McpDiscoverySchedulerSnapshot, McpFederationBackend,
     McpFederationClient, McpGatewayClientError, McpProgressNotification, McpServerDiscoveryStatus,
-    McpServerHealth, McpToolRoundOutcome, attach_discovered_federated_tools,
-    discover_federated_tools, discover_federated_tools_with_policy,
+    McpServerHealth, McpToolRoundOutcome, READ_MCP_RESOURCE_TOOL,
+    attach_discovered_federated_tools, discover_federated_tools,
+    discover_federated_tools_with_policy, is_runtime_mcp_read_tool,
 };
 pub use model_gateway::{GrpcModelGatewayClient, ModelGatewayClientError};
 pub use tool_execution_supervisor::{ToolExecutionSupervisor, ToolExecutionUpdate};
@@ -743,6 +746,10 @@ struct ActiveExecution {
     federated_discovery_policy: Option<McpDiscoveryPolicy>,
     /// Present only after restoring a schema-7+ MCP checkpoint.
     expected_federated_discovery_policy: Option<McpDiscoveryPolicy>,
+    /// Server-scoped Resources/Prompts authority rebuilt from discovery for
+    /// Runtime-owned read Tools (ADR-0117). This is never inferred from remote
+    /// Tool grants and is empty until the exact frozen directory is attached.
+    runtime_mcp_read_servers: BTreeMap<String, mcp_gateway::RuntimeMcpReadServerBinding>,
     pending_budget_exhaustion: Option<PendingBudgetExhaustion>,
     approval_decisions: HashMap<Uuid, ApprovalDecisionReceipt>,
     applied_approval_decisions: HashMap<Uuid, AppliedApprovalDecision>,
@@ -2526,7 +2533,8 @@ impl WorkerProcessor {
             verified_claims.get_or_insert(claims);
         }
         let claims = verified_claims.expect("at least one capability is required");
-        let complete_identity = active.schema_version >= RUN_EXECUTION_SCHEMA_VERSION;
+        let complete_identity =
+            active.schema_version >= RUN_EXECUTION_COMPLETE_IDENTITY_SCHEMA_VERSION;
         let binding = WorkloadIdentityBinding {
             tenant_id: active.tenant_id,
             application_id: if complete_identity {
@@ -2702,6 +2710,59 @@ impl WorkerProcessor {
         execution.federated_executors = FederatedExecutors(attached_executors);
         execution.federated_tool_bindings = bindings;
         execution.federated_discovery_policy = Some(policy);
+        Ok(())
+    }
+
+    pub fn bind_runtime_mcp_read_servers(
+        &mut self,
+        attempt_id: Uuid,
+        servers: BTreeMap<String, mcp_gateway::RuntimeMcpReadServerBinding>,
+    ) -> Result<(), WorkerAssignmentError> {
+        let execution = self
+            .accepted
+            .get_mut(&attempt_id)
+            .ok_or(WorkerAssignmentError::UnknownAttempt)?;
+        for (name, binding) in &servers {
+            if name != &binding.server.name
+                || !execution
+                    .command
+                    .mcp_servers
+                    .iter()
+                    .any(|server| server == &binding.server)
+                || !execution
+                    .command
+                    .delegated_scopes
+                    .contains(&format!("mcp:read:{name}"))
+                || binding.frozen_catalog_digest.len() != 64
+                || (!binding
+                    .capabilities
+                    .contains(&McpServerCapability::Resources)
+                    && !binding.capabilities.contains(&McpServerCapability::Prompts))
+            {
+                return Err(WorkerAssignmentError::ToolConfiguration(
+                    "Runtime MCP read server binding is invalid".into(),
+                ));
+            }
+        }
+        let expected_names = execution
+            .federated_definitions
+            .iter()
+            .filter(|definition| mcp_gateway::is_runtime_mcp_read_tool(&definition.descriptor.name))
+            .map(|definition| definition.descriptor.name.clone())
+            .collect::<BTreeSet<_>>();
+        let executable_names = execution
+            .federated_executors
+            .0
+            .keys()
+            .filter(|name| mcp_gateway::is_runtime_mcp_read_tool(name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if expected_names != executable_names || (servers.is_empty() != expected_names.is_empty()) {
+            return Err(WorkerAssignmentError::ToolExecutorConfiguration(
+                "Runtime MCP read Tool definitions and executors do not match".into(),
+            ));
+        }
+        execution.runtime_mcp_read_servers = servers;
         Ok(())
     }
 
@@ -3097,6 +3158,7 @@ impl WorkerProcessor {
                 expected_federated_tool_bindings: None,
                 federated_discovery_policy: None,
                 expected_federated_discovery_policy: None,
+                runtime_mcp_read_servers: BTreeMap::new(),
                 pending_budget_exhaustion: None,
                 approval_decisions: HashMap::new(),
                 applied_approval_decisions: HashMap::new(),
@@ -4353,6 +4415,7 @@ impl WorkerProcessor {
                 expected_federated_tool_bindings,
                 federated_discovery_policy: restored_federated_discovery_policy,
                 expected_federated_discovery_policy,
+                runtime_mcp_read_servers: BTreeMap::new(),
                 restored_from_checkpoint: Some(checkpoint.digest),
             },
         );
@@ -5587,8 +5650,16 @@ impl WorkerProcessor {
             .unwrap_or(&self.tool_registry);
         let mut count = 0;
         for call in execution.pending_tool_calls.iter().take(limit) {
+            let runtime_mcp_read = mcp_gateway::is_runtime_mcp_read_tool(&call.name);
             if call.name.starts_with("agent.")
-                || !execution.effective_tool_names.contains(&call.name)
+                || (!runtime_mcp_read && !execution.effective_tool_names.contains(&call.name))
+                || (runtime_mcp_read
+                    && !mcp_gateway::runtime_mcp_read_call_is_authorized(
+                        &call.name,
+                        &call.arguments,
+                        &execution.runtime_mcp_read_servers,
+                        &execution.command.delegated_scopes,
+                    ))
             {
                 break;
             }
@@ -6433,9 +6504,11 @@ impl WorkerProcessor {
             .values()
             .chain(execution.federated_definitions.iter())
             .filter(|definition| {
-                execution
+                (execution
                     .effective_tool_names
                     .contains(&definition.descriptor.name)
+                    || (mcp_gateway::is_runtime_mcp_read_tool(&definition.descriptor.name)
+                        && !execution.runtime_mcp_read_servers.is_empty()))
                     && registry
                         .authorize(&definition.descriptor.name, &command.delegated_scopes)
                         .is_ok()
@@ -7118,7 +7191,18 @@ impl WorkerProcessor {
                 subagent_request: Some(request),
             });
         }
-        if !execution.effective_tool_names.contains(&call.name) {
+        let runtime_mcp_read = mcp_gateway::is_runtime_mcp_read_tool(&call.name);
+        if runtime_mcp_read
+            && !mcp_gateway::runtime_mcp_read_call_is_authorized(
+                &call.name,
+                &call.arguments,
+                &execution.runtime_mcp_read_servers,
+                &execution.command.delegated_scopes,
+            )
+        {
+            return Err(WorkerAssignmentError::InvalidToolCall);
+        }
+        if !runtime_mcp_read && !execution.effective_tool_names.contains(&call.name) {
             return Err(WorkerAssignmentError::ToolConfiguration(format!(
                 "tool {} is not activated by the execution Skill snapshot",
                 call.name
