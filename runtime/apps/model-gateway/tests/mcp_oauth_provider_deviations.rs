@@ -931,6 +931,75 @@ async fn a_token_expiring_inside_the_skew_window_is_refreshed_not_used() {
     assert_eq!(seen[0], "refresh-1");
 }
 
+/// Deviation 21: an authorization endpoint that already carries query
+/// parameters. Some providers publish a tenant or audience discriminator there,
+/// and dropping it would send the user to the wrong authorization context while
+/// every other parameter still looked right.
+#[tokio::test]
+async fn an_authorization_endpoint_with_existing_query_is_preserved() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let request = McpOAuthAuthorizationRequest {
+        authorization_endpoint: "http://127.0.0.1:9/authorize?tenant=acme&audience=mcp".to_owned(),
+        token_endpoint: "http://127.0.0.1:9/token".to_owned(),
+        client_id: "trusted-public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
+        scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: None,
+    };
+    let start = coordinator
+        .begin_authorization(bound, request, Utc::now())
+        .await
+        .expect("an endpoint with an existing query must be usable");
+
+    let url = start.authorization_url;
+    assert!(
+        url.contains("tenant=acme"),
+        "the provider's own query parameters must survive: {url}"
+    );
+    assert!(
+        url.contains("audience=mcp"),
+        "the provider's own query parameters must survive: {url}"
+    );
+    assert!(url.contains("response_type=code"), "{url}");
+    assert!(url.contains("code_challenge_method=S256"), "{url}");
+    // Exactly one '?': the added parameters must extend the existing query
+    // rather than start a second one.
+    assert_eq!(
+        url.matches('?').count(),
+        1,
+        "a second question mark would make the query unparseable: {url}"
+    );
+}
+
+/// Deviation 22: RFC 8707 `resource`. We do not send it, so a provider that
+/// requires it will refuse the exchange. Recorded as a known incompatibility
+/// rather than guessed at: sending a resource indicator that the authorization
+/// server does not expect can itself change which audience is issued.
+#[tokio::test]
+async fn the_authorization_url_does_not_claim_an_rfc8707_resource() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let request = McpOAuthAuthorizationRequest {
+        authorization_endpoint: "http://127.0.0.1:9/authorize".to_owned(),
+        token_endpoint: "http://127.0.0.1:9/token".to_owned(),
+        client_id: "trusted-public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
+        scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: None,
+    };
+    let start = coordinator
+        .begin_authorization(bound, request, Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        !start.authorization_url.contains("resource="),
+        "documenting current behaviour: no resource indicator is sent"
+    );
+}
+
 /// The strictness that must NOT be relaxed for compatibility: a provider whose
 /// metadata omits S256 does not get to fall back to `plain`.
 #[tokio::test]

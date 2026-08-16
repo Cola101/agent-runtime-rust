@@ -125,11 +125,17 @@ left: Some(RecoveredMissing)   right: Some(OutputLimit)
 第 15、16、20 条的断言落在 **token endpoint 实际收到了哪个 refresh token**，而不是"凭证还能解析"：后者在实现
 错误时同样会通过。
 
-### 观测性缺口（本轮发现，未修复）
+| 21 | authorization endpoint 本身已带 query 参数 | 已正确 | `query_pairs_mut().append_pair` 扩展既有 query 而非另起一个。断言 provider 自己的 `tenant=`/`audience=` 存活且全串只有一个 `?`——静默丢掉租户判别参数会把用户送进错误的授权上下文，而其余参数看起来都对 |
+| 22 | provider 要求 RFC 8707 `resource` 参数 | **已知不兼容（有意）** | 我们不发送 `resource`。要求它的 provider 会拒绝兑换。不臆测补上：向不预期该参数的授权服务器发送 resource indicator，本身可能改变签发的 audience。以测试形式记录当前行为 |
 
-第 17 条只能断言"兑换成功"。**授予的 scope 虽被持久化，但没有任何 API 暴露它**——`McpOAuthCredentialStatus`
-不含 scope 字段。因此运维**无法得知 provider 实际授予的权限是否等于所请求的**。这在 provider 静默收窄 scope 时
-是真实的运维盲区。修复属于管理面 API 扩展，本轮未做。
+### 观测性缺口（本轮发现并已闭合）
+
+第 17 条最初只能断言"兑换成功"：授予的 scope 虽被持久化，却没有任何 API 暴露它，运维**无法得知 provider 是否
+静默收窄了权限**，而第一个症状会是某次工具调用失败、状态页却给不出解释。
+
+已修复：`McpOAuthCredentialStatus::Active` 与 `McpOauthStatusResponse` 现在携带 granted scopes。**scope 名不是
+凭证材料**，因此这拓宽的是可见性而非暴露面——管理面响应仍不含 token、code、verifier 或 state，扫描整条渲染
+消息的身份测试继续通过。第 17 条的断言随之升级为"上报的是实际授予的，而非所请求的"。
 
 ### 为什么放宽 4 和 5 不削弱安全边界
 
