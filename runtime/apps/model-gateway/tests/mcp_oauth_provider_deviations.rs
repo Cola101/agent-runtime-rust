@@ -1000,6 +1000,92 @@ async fn the_authorization_url_does_not_claim_an_rfc8707_resource() {
     );
 }
 
+/// Revocation must be terminal under concurrency.
+///
+/// The dangerous interleaving is a refresh that was already in flight when a
+/// revoke commits: if its result landed afterwards it would resurrect a
+/// credential the tenant believes is dead, and every later request would succeed
+/// against a provider the operator thought they had cut off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoke_cannot_be_resurrected_by_a_concurrent_refresh() {
+    let root = TestRoot::new();
+    let coordinator = Arc::new(coordinator(&root));
+    let bound = binding("http://127.0.0.1:9/mcp");
+    // Every token is issued already expired, so each resolve is forced into a
+    // refresh and the window this test cares about is always open.
+    let provider = refresh_recorder(true).await;
+    activate_against(&coordinator, &bound, &provider.origin).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let coordinator = Arc::clone(&coordinator);
+        let bound = bound.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = coordinator.resolve_access_token(bound, Utc::now()).await;
+        }));
+    }
+    let revoker = {
+        let coordinator = Arc::clone(&coordinator);
+        let bound = bound.clone();
+        tokio::spawn(async move { coordinator.revoke(bound).await })
+    };
+    for task in tasks {
+        task.await.unwrap();
+    }
+    revoker.await.unwrap().expect("revoke must succeed");
+
+    // Whatever the interleaving, the credential must end dead and stay dead.
+    assert!(
+        matches!(
+            coordinator.status(bound.clone()).await.unwrap(),
+            McpOAuthCredentialStatus::Revoked { .. }
+        ),
+        "a revoked credential must not be resurrected by an in-flight refresh"
+    );
+    assert!(
+        coordinator
+            .resolve_access_token(bound, Utc::now())
+            .await
+            .is_err(),
+        "nothing may resolve after revocation"
+    );
+}
+
+/// Recording a rejection concurrently with refreshes must never move a
+/// credential the refreshes have already superseded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_rejections_cannot_unseat_a_newer_revision() {
+    let root = TestRoot::new();
+    let coordinator = Arc::new(coordinator(&root));
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = refresh_recorder(true).await;
+    activate_against(&coordinator, &bound, &provider.origin).await;
+
+    // Eight stale digests racing eight refreshes. A stale digest is one no
+    // revision ever had, so none of them may take effect no matter when they
+    // land.
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let coordinator = Arc::clone(&coordinator);
+        let bound = bound.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = coordinator
+                .resolve_access_token(bound.clone(), Utc::now())
+                .await;
+            coordinator
+                .record_rejected_access_token(bound, &format!("{index:064}"))
+                .await
+        }));
+    }
+    for task in tasks {
+        let accepted = task.await.unwrap().expect("recording must not error");
+        assert!(
+            !accepted,
+            "a digest no revision ever held must never be accepted"
+        );
+    }
+}
+
 /// The strictness that must NOT be relaxed for compatibility: a provider whose
 /// metadata omits S256 does not get to fall back to `plain`.
 #[tokio::test]
