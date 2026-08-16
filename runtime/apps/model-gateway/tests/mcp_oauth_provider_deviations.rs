@@ -480,6 +480,127 @@ async fn metadata_content_type_is_advisory() {
     assert!(server.hits() >= 2);
 }
 
+/// Deviation 11: the authorization server on a different origin than the
+/// resource. This is the common production shape -- api.example.com protected by
+/// auth.example.com -- so refusing it would be a serious over-strictness. Only
+/// the challenge-named metadata URL is same-origin constrained; the issuer the
+/// document points to is not.
+#[tokio::test]
+async fn authorization_server_on_a_different_origin_is_permitted() {
+    let root = TestRoot::new();
+    let authorization = scripted_server(|origin| {
+        vec![(
+            "/.well-known/oauth-authorization-server",
+            200,
+            JSON,
+            format!(
+                r#"{{"issuer":"{origin}","authorization_endpoint":"{origin}/authorize","token_endpoint":"{origin}/token","code_challenge_methods_supported":["S256"],"scopes_supported":["tools.read"]}}"#
+            ),
+        )]
+    })
+    .await;
+    let issuer = authorization.origin.clone();
+    let resource = scripted_server(move |origin| {
+        vec![(
+            "/.well-known/oauth-protected-resource",
+            200,
+            JSON,
+            format!(
+                r#"{{"resource":"{origin}/mcp","authorization_servers":["{issuer}"],"scopes_supported":["tools.read"]}}"#
+            ),
+        )]
+    })
+    .await;
+    let endpoint = format!("{}/mcp", resource.origin);
+
+    let discovery = coordinator(&root)
+        .discover(&binding(&endpoint), None)
+        .await
+        .expect("a separate authorization server origin is the common production shape");
+    assert_eq!(discovery.issuer, authorization.origin);
+    assert_eq!(
+        discovery.token_endpoint,
+        format!("{}/token", authorization.origin)
+    );
+    assert!(resource.hits() >= 1 && authorization.hits() >= 1);
+}
+
+/// Deviation 12: a token endpoint that answers HTTP 200 with an OAuth error
+/// body. RFC 6749 requires 4xx, but this happens. It must not yield a
+/// credential.
+#[tokio::test]
+async fn token_error_carried_on_http_200_does_not_create_a_credential() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let error = exchange_token_body(
+        &coordinator,
+        &bound,
+        r#"{"error":"invalid_grant","error_description":"code already used"}"#.to_owned(),
+    )
+    .await
+    .expect_err("an error body must not produce a credential even at HTTP 200");
+    assert!(matches!(error, McpOAuthError::ProviderUnavailable));
+    assert!(!matches!(
+        coordinator.status(bound).await.unwrap(),
+        McpOAuthCredentialStatus::Active { .. }
+    ));
+}
+
+/// Deviation 13: an empty access token at HTTP 200. Structurally valid JSON,
+/// semantically useless, and it must not be stored as a working credential.
+#[tokio::test]
+async fn an_empty_access_token_is_refused() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let error = exchange_token_body(
+        &coordinator,
+        &bound,
+        r#"{"access_token":"","token_type":"Bearer","expires_in":3600}"#.to_owned(),
+    )
+    .await
+    .expect_err("an empty access token must be refused");
+    assert!(matches!(error, McpOAuthError::ProviderUnavailable));
+}
+
+/// Deviation 14: a metadata response whose body is shorter than its declared
+/// Content-Length, then the connection closes. A truncated document must fail
+/// rather than be parsed as whatever arrived.
+#[tokio::test]
+async fn a_truncated_metadata_stream_is_not_a_false_success() {
+    let root = TestRoot::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut chunk = [0_u8; 4_096];
+                let _ = socket.read(&mut chunk).await;
+                // Declares far more than it sends, then hangs up.
+                let partial = r#"{"resource":"http://example"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n{partial}"
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            });
+        }
+    });
+    let endpoint = format!("{origin}/mcp");
+    let error = coordinator(&root)
+        .discover(&binding(&endpoint), None)
+        .await
+        .expect_err("a truncated metadata body must not be accepted");
+    assert!(matches!(
+        error,
+        McpOAuthError::DiscoveryRejected | McpOAuthError::ProviderUnavailable
+    ));
+    task.abort();
+}
+
 /// The strictness that must NOT be relaxed for compatibility: a provider whose
 /// metadata omits S256 does not get to fall back to `plain`.
 #[tokio::test]
