@@ -309,9 +309,10 @@ impl McpOAuthCoordinator {
         &self,
         binding: McpOAuthBinding,
         client: McpOAuthClientConfig,
+        challenge: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<McpOAuthAuthorizationStart, McpOAuthError> {
-        let discovery = self.discover(&binding, None).await?;
+        let discovery = self.discover(&binding, challenge).await?;
         let scopes = negotiate_scopes(&client.requested_scopes, &discovery.scopes_supported)?;
         let request = McpOAuthAuthorizationRequest {
             authorization_endpoint: discovery.authorization_endpoint,

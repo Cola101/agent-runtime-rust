@@ -359,7 +359,7 @@ async fn challenge_drives_protected_resource_then_authorization_server_metadata(
     );
 
     let start = coordinator
-        .begin_discovered_authorization(bound.clone(), client_config(), Utc::now())
+        .begin_discovered_authorization(bound.clone(), client_config(), None, Utc::now())
         .await
         .expect("PKCE begin must succeed from discovered metadata");
     assert!(
@@ -604,7 +604,7 @@ async fn pending_flow_rejects_substituted_metadata_at_callback() {
     let bound = binding(&endpoint);
     coordinator.discover(&bound, None).await.unwrap();
     let start = coordinator
-        .begin_discovered_authorization(bound.clone(), client_config(), Utc::now())
+        .begin_discovered_authorization(bound.clone(), client_config(), None, Utc::now())
         .await
         .unwrap();
 

@@ -13,6 +13,7 @@ mod invocation;
 pub mod mcp;
 pub mod mcp_grpc;
 pub mod mcp_oauth;
+pub mod mcp_oauth_grpc;
 mod openai_compatible;
 mod openai_responses;
 mod provider_registry;

@@ -412,3 +412,103 @@ message McpGetPromptResponse {
   string description = 2;
   repeated McpPromptMessage messages = 3;
 }
+
+// Served by the same process as McpFederation because that process is the only
+// one holding the credential domain. An operator surface that could mint or
+// revoke OAuth credentials from anywhere else would be a second place a tenant's
+// tokens live, which is the thing the credential domain exists to prevent.
+//
+// No response on this service carries an access token, refresh token,
+// authorization code, PKCE verifier or OAuth state. Callers receive a stable
+// credential handle and a status; the secrets never leave the gateway.
+service McpOauthAdmin {
+  rpc BeginAuthorization(McpOauthBeginRequest) returns (McpOauthBeginResponse);
+  rpc CompleteAuthorization(McpOauthCompleteRequest) returns (McpOauthCompleteResponse);
+  rpc GetCredentialStatus(McpOauthStatusRequest) returns (McpOauthStatusResponse);
+  rpc Revoke(McpOauthRevokeRequest) returns (McpOauthRevokeResponse);
+}
+
+// Administering a credential is not something a Run does, so there is no run,
+// attempt or worker identity here. It is a tenant-scoped operator action and
+// binds only the identity that can actually be held outside a Run.
+message McpOauthAdminContext {
+  uint32 schema_version = 1;
+  string tenant_id = 2;
+  string application_id = 3;
+  string workload_identity_id = 4;
+}
+
+// The binding a credential is pinned to. All four fields participate in the
+// stored record's AAD, so the same credential_id under a different tenant,
+// server or endpoint resolves to nothing rather than to someone else's token.
+message McpOauthCredentialRef {
+  string server_id = 1;
+  string endpoint = 2;
+  string credential_id = 3;
+}
+
+message McpOauthBeginRequest {
+  McpOauthAdminContext context = 1;
+  McpOauthCredentialRef credential = 2;
+  // Trusted, pre-configured public client. Dynamic client registration is
+  // deliberately not supported.
+  string client_id = 3;
+  string redirect_uri = 4;
+  repeated string requested_scopes = 5;
+  // Optional WWW-Authenticate value observed from the MCP endpoint. It may only
+  // narrow discovery to a metadata URL on that endpoint's own origin; naming a
+  // foreign origin is refused before any request is issued.
+  string www_authenticate = 6;
+}
+
+message McpOauthBeginResponse {
+  // Carries no secret. The OAuth state and PKCE verifier stay in the credential
+  // domain; only the authorization URL the user must visit is returned.
+  string flow_id = 1;
+  string authorization_url = 2;
+  int64 expires_at_ms = 3;
+}
+
+message McpOauthCompleteRequest {
+  McpOauthAdminContext context = 1;
+  McpOauthCredentialRef credential = 2;
+  string flow_id = 3;
+  // One-time values carried back from the redirect. Never logged and never
+  // echoed in any response.
+  string state = 4;
+  string authorization_code = 5;
+}
+
+message McpOauthCompleteResponse {
+  string status = 1;
+  uint64 revision = 2;
+}
+
+message McpOauthStatusRequest {
+  McpOauthAdminContext context = 1;
+  McpOauthCredentialRef credential = 2;
+}
+
+message McpOauthStatusResponse {
+  // absent | pending_authorization | active | authorization_required | revoked
+  string status = 1;
+  uint64 revision = 2;
+  // Set only for authorization_required, so an operator can tell a expired flow
+  // from a rejected token from an indeterminate crash recovery.
+  string reason = 3;
+  // Zero when the credential has no expiry or the state has none.
+  int64 expires_at_ms = 4;
+}
+
+message McpOauthRevokeRequest {
+  McpOauthAdminContext context = 1;
+  McpOauthCredentialRef credential = 2;
+}
+
+message McpOauthRevokeResponse {
+  uint64 revision = 1;
+  // Whether the authorization server confirmed the remote revocation. Local
+  // revocation has already committed either way: false means "we could not tell
+  // the provider", never "the credential is still usable here".
+  bool remote_confirmed = 2;
+}

@@ -2,6 +2,7 @@ use agent_grpc_security::ServerMtlsMaterials;
 use agent_model_gateway::mcp::McpFederationClient;
 use agent_model_gateway::mcp_grpc::McpFederationGrpcService;
 use agent_model_gateway::mcp_oauth::McpOAuthCoordinator;
+use agent_model_gateway::mcp_oauth_grpc::McpOAuthAdminGrpcService;
 use agent_model_gateway::{
     AnthropicMessagesAdapter, AnthropicMessagesConfig, ModelExecutionGrpcService,
     ModelPolicyRouteResolver, OpenAiCompatibleAdapter, OpenAiCompatibleConfig,
@@ -9,6 +10,7 @@ use agent_model_gateway::{
     ProviderPricing, ProviderProtocol, WorkloadTokenVerifier,
 };
 use agent_model_gateway_protocol::v1::mcp_federation_server::McpFederationServer;
+use agent_model_gateway_protocol::v1::mcp_oauth_admin_server::McpOauthAdminServer;
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecutionServer;
 use agent_runtime_health::{HealthState, serve as serve_health};
 use base64::Engine as _;
@@ -116,19 +118,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loopback_permitted,
         )?);
     }
+    // Shared, not duplicated: the federation client resolves tokens through the
+    // same coordinator the admin surface mutates, so an operator revoking a
+    // credential is immediately visible to in-flight federation calls.
+    let mut oauth_coordinator = None;
     if let Some(coordinator) =
         oauth_coordinator_from_environment(response_timeout, loopback_permitted)?
     {
+        let coordinator = Arc::new(coordinator);
         let client = match mcp_client.take() {
             Some(client) => client,
             None => McpFederationClient::for_open_servers(response_timeout, loopback_permitted)?,
         };
-        mcp_client = Some(client.with_oauth_coordinator(Arc::new(coordinator)));
+        mcp_client = Some(client.with_oauth_coordinator(Arc::clone(&coordinator)));
+        oauth_coordinator = Some(coordinator);
     }
     let mcp_federation = mcp_client
         .map(|client| {
             Ok::<_, Box<dyn std::error::Error>>(McpFederationGrpcService::new(
                 client,
+                WorkloadTokenVerifier::from_base64(&required_environment(
+                    "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
+                )?)?,
+            ))
+        })
+        .transpose()?;
+    let oauth_admin = oauth_coordinator
+        .map(|coordinator| {
+            Ok::<_, Box<dyn std::error::Error>>(McpOAuthAdminGrpcService::new(
+                coordinator,
                 WorkloadTokenVerifier::from_base64(&required_environment(
                     "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
                 )?)?,
@@ -146,6 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = server.add_service(ModelExecutionServer::new(service));
     let router = match mcp_federation {
         Some(federation) => router.add_service(McpFederationServer::new(federation)),
+        None => router,
+    };
+    let router = match oauth_admin {
+        Some(admin) => router.add_service(McpOauthAdminServer::new(admin)),
         None => router,
     };
     router
