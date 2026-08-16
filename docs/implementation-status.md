@@ -73,8 +73,14 @@ PRM 缺 `scopes_supported`、无 `revocation_endpoint` 时降级为仅本地撤�
 非 JSON token body 拒绝、`authorization_servers` 多项只取第一项、`Content-Type` 建议性）；2 条过严已放宽：
 `expires_in` 现接受数字字符串、`scope` 现接受数组。**放宽严格限定在解析层**，解析后仍走同一套上界与字符校验，
 并以 `missing_s256_is_still_refused_after_leniency` 断言只声明 `plain` 的 provider 仍被拒绝，证明宽松未蔓延到
-PKCE 强度。全工作区精确列出 759 项：**753 通过、0 失败、6 个外部 live 用例显式忽略**（121 个测试二进制）；
-Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，总体进度仍维持 70–75%。**
+PKCE 强度。矩阵随后扩到 20 条，新增判定包括：**授权服务器与资源不同 origin 被允许**（标准生产形态，只有
+challenge 指定的 metadata URL 受同源约束，因为那是攻击者可控输入）；HTTP 200 携带 `error`、空 `access_token`、
+body 短于 `Content-Length` 后断流三种伪成功均被拒绝；refresh 轮换与非轮换分别沿用正确的 token；
+`token_type` 非 Bearer 被拒绝；同一 credential 第二次 begin 作废第一次且旧 state 不再可兑换；`expires_in`
+落在 30 秒刷新偏移窗口内时刷新而非呈示。**已发现但未修复的观测性缺口**：授予的 scope 虽持久化却无 API 暴露，
+运维无法得知 provider 是否静默收窄了权限。全工作区精确列出 769 项：**763 通过、0 失败、6 个外部 live 用例
+显式忽略**（121 个测试二进制）；Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，
+总体进度仍维持 70–75%。**
 
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与

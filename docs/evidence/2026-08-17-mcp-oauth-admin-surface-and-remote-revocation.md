@@ -27,8 +27,8 @@ operator token（mcp.oauth.admin）
 | discovery / 拒绝 / 撤销 | `-p agent-model-gateway --test mcp_oauth_discovery` | **15 passed，0 failed，0 ignored** |
 | Gateway 全包 | `-p agent-model-gateway` | **97 passed，0 failed，4 ignored** |
 | tool-runtime 全包 | `-p agent-tool-runtime` | **109 passed，0 failed，0 ignored** |
-| provider 偏差矩阵 | `-p agent-model-gateway --test mcp_oauth_provider_deviations` | **11 passed，0 failed，0 ignored** |
-| 全工作区 | `cargo test --workspace -- --test-threads=4` | **121 个测试二进制，753 passed，0 failed，6 ignored（共 759 项），`CARGO_EXIT=0`** |
+| provider 偏差矩阵 | `-p agent-model-gateway --test mcp_oauth_provider_deviations` | **21 passed，0 failed，0 ignored** |
+| 全工作区 | `cargo test --workspace -- --test-threads=4` | **121 个测试二进制，763 passed，0 failed，6 ignored（共 769 项），`CARGO_EXIT=0`** |
 | Clippy | `--workspace --all-targets --all-features -- -D warnings` | `CLIPPY_EXIT=0`，0 条诊断 |
 
 > 计数方法：把全部 `test result:` 行相加。管道到 `tail` 会掩盖 cargo 退出码，必须单独记录 `$?`；本轮曾因此
@@ -111,6 +111,25 @@ left: Some(RecoveredMissing)   right: Some(OutputLimit)
 | 8 | `WWW-Authenticate` 含多参数 | 已正确 | `realm`/`error`/`error_description` 共存仍能取出 `resource_metadata` |
 | 9 | token endpoint 200 但非 JSON | 已正确 | 拒绝，且不产生凭证 |
 | 10 | metadata `Content-Type` 非 JSON | 已正确（有意宽松） | 能否解析才是真正的门；头部是建议性的，解析失败仍然拒绝 |
+| 11 | 授权服务器与资源**不同 origin** | 已正确 | 这是标准生产形态（API 主机由独立 auth 主机保护）。只有 challenge 指定的 metadata URL 受同源约束，因为那是攻击者可控输入；已验证文档指向的 issuer 不受此限 |
+| 12 | token endpoint HTTP 200 却带 `error` | 已正确 | 拒绝，不产生凭证 |
+| 13 | `access_token` 为空字符串 | 已正确 | 拒绝 |
+| 14 | metadata body 短于声明的 `Content-Length` 后断流 | 已正确 | 拒绝，不按已收到的内容解析——半途断流不形成伪成功 |
+| 15 | refresh **轮换**（返回新 refresh token） | 已正确 | 下一次刷新presenting 新 token |
+| 16 | refresh **非轮换**（省略该字段） | 已正确 | 沿用原 token，不会一次刷新后卡死 |
+| 17 | provider 授予**更窄**的 scope | 已正确 | 接受而非当失败（RFC 6749 允许）。**但见下方观测性缺口** |
+| 18 | `token_type` 非 Bearer（如 `mac`） | 已正确 | 拒绝。存下一个我们不会呈示的方案，会得到一个每次请求都静默失败的凭证 |
+| 19 | 同一 credential 并发两次 begin | 已正确 | 第二次作废第一次；旧 flow 的 id 与 state 都不再可兑换 |
+| 20 | `expires_in` 落在 `REFRESH_SKEW_MS`(30s) 窗口内 | 已正确 | resolve 时刷新而非呈示——呈示等于发一个我们已预期会失败的请求 |
+
+第 15、16、20 条的断言落在 **token endpoint 实际收到了哪个 refresh token**，而不是"凭证还能解析"：后者在实现
+错误时同样会通过。
+
+### 观测性缺口（本轮发现，未修复）
+
+第 17 条只能断言"兑换成功"。**授予的 scope 虽被持久化，但没有任何 API 暴露它**——`McpOAuthCredentialStatus`
+不含 scope 字段。因此运维**无法得知 provider 实际授予的权限是否等于所请求的**。这在 provider 静默收窄 scope 时
+是真实的运维盲区。修复属于管理面 API 扩展，本轮未做。
 
 ### 为什么放宽 4 和 5 不削弱安全边界
 
