@@ -39,10 +39,13 @@ cd runtime
 cargo test --workspace
 ```
 
-Local development does not require Docker. Cargo's `target/` is a reusable incremental cache and is
-retained by default (while remaining ignored by Git); clean it only after measuring when the cache is
-corrupt, the toolchain changes materially, or disk pressure requires it. All project-local runtime
-state is confined to the ignored `.local/` directory.
+Local development does not require Docker. Cargo's `target/` is a reusable cache of compiled
+dependencies and artifacts, retained by default (while remaining ignored by Git); clean it only after
+measuring when the cache is corrupt, the toolchain changes materially, or disk pressure requires it.
+Note that *incremental* compilation is deliberately off (`incremental = false` on the `dev` and
+`test` profiles in `runtime/Cargo.toml`), traded against smaller, more reproducible artifacts; a cold
+`target/` therefore rebuilds the workspace in full. All project-local runtime state is confined to
+the ignored `.local/` directory.
 
 Governance: [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE) ·
 [Third-party sources](docs/third-party-sources.md)
