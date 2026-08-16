@@ -69,6 +69,10 @@ pub struct McpOAuthAuthorizationRequest {
     pub client_id: String,
     pub redirect_uri: String,
     pub scopes: Vec<String>,
+    /// Frozen with the rest of the flow. Resolving this at revoke time instead
+    /// would let a server compromised after authorization name any URL and be
+    /// handed the refresh token we are trying to invalidate.
+    pub revocation_endpoint: Option<String>,
 }
 
 pub struct McpOAuthAuthorizationStart {
@@ -100,6 +104,10 @@ pub struct McpOAuthDiscovery {
     pub token_endpoint: String,
     pub scopes_supported: Vec<String>,
     pub resource: String,
+    /// Frozen here rather than resolved at revoke time. Re-discovering it later
+    /// would let a server that has since been compromised name any URL and
+    /// receive the refresh token we are trying to invalidate.
+    pub revocation_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +141,25 @@ pub enum McpOAuthAuthorizationReason {
     AccessTokenRejected,
     NoRefreshToken,
     Revoked,
+}
+
+/// Outcome of a revocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpOAuthRevocation {
+    pub revision: u64,
+    /// Whether the authorization server confirmed. Local revocation has already
+    /// committed either way, so `false` means the provider could not be told --
+    /// never that the credential is still usable here.
+    pub remote_confirmed: bool,
+}
+
+/// Everything the remote revocation call needs, captured before the stored
+/// record is replaced. Secret-bearing and deliberately not Debug.
+struct RemoteRevocation {
+    endpoint: String,
+    client_id: String,
+    is_refresh: bool,
+    token: Zeroizing<String>,
 }
 
 /// Secret-bearing and credential-domain local. Deliberately not Debug/Clone.
@@ -267,6 +294,7 @@ impl McpOAuthCoordinator {
             token_endpoint: server.token_endpoint,
             scopes_supported,
             resource: binding.endpoint.clone(),
+            revocation_endpoint: server.revocation_endpoint,
         })
     }
 
@@ -291,6 +319,7 @@ impl McpOAuthCoordinator {
             client_id: client.client_id,
             redirect_uri: client.redirect_uri,
             scopes,
+            revocation_endpoint: discovery.revocation_endpoint,
         };
         self.begin_authorization(binding, request, now).await
     }
@@ -381,6 +410,7 @@ impl McpOAuthCoordinator {
                 redirect_uri: request.redirect_uri,
                 scopes: request.scopes,
                 expires_at_ms: expires_at.timestamp_millis(),
+                revocation_endpoint: request.revocation_endpoint,
             },
         };
         lease.persist(current.as_ref().map(|record| record.revision), &record)?;
@@ -419,6 +449,7 @@ impl McpOAuthCoordinator {
             redirect_uri,
             scopes,
             expires_at_ms,
+            revocation_endpoint,
             ..
         } = &current.state
         else {
@@ -442,6 +473,7 @@ impl McpOAuthCoordinator {
             verifier: Zeroizing::new(verifier.clone()),
             code: Zeroizing::new(authorization_code.to_owned()),
             scopes: scopes.clone(),
+            revocation_endpoint: revocation_endpoint.clone(),
         };
         let intent = StoredCredentialRecord {
             schema_version: STORE_SCHEMA_VERSION,
@@ -502,6 +534,7 @@ impl McpOAuthCoordinator {
             client_id: active.client_id.clone(),
             refresh_token: Zeroizing::new(refresh_token.clone()),
             previous_scopes: active.scopes.clone(),
+            revocation_endpoint: active.revocation_endpoint.clone(),
         };
         let intent = StoredCredentialRecord {
             schema_version: STORE_SCHEMA_VERSION,
@@ -584,17 +617,96 @@ impl McpOAuthCoordinator {
         Ok(true)
     }
 
-    pub async fn revoke(&self, binding: McpOAuthBinding) -> Result<(), McpOAuthError> {
+    /// Revokes locally, then tells the provider if it published an endpoint.
+    ///
+    /// The order is the whole point. Local `Revoked` commits first, so a
+    /// provider that is unreachable, slow or hostile cannot leave the credential
+    /// usable here. The remote call is best effort by contract and its failure
+    /// is reported rather than retried into a state change.
+    pub async fn revoke(
+        &self,
+        binding: McpOAuthBinding,
+    ) -> Result<McpOAuthRevocation, McpOAuthError> {
         binding.validate(self.loopback_permitted)?;
         let mut lease = self.acquire(binding.clone()).await?;
         let current = lease.load()?;
+        // Captured before the record is replaced; afterwards the token is gone.
+        let notify = current.as_ref().and_then(|record| match &record.state {
+            StoredCredentialState::Active(active) => {
+                active
+                    .revocation_endpoint
+                    .as_ref()
+                    .map(|endpoint| RemoteRevocation {
+                        endpoint: endpoint.clone(),
+                        client_id: active.client_id.clone(),
+                        // RFC 7009 prefers the refresh token: revoking it invalidates
+                        // the whole grant rather than one access token.
+                        is_refresh: active.refresh_token.is_some(),
+                        token: Zeroizing::new(
+                            active
+                                .refresh_token
+                                .clone()
+                                .unwrap_or_else(|| active.access_token.clone()),
+                        ),
+                    })
+            }
+            _ => None,
+        });
         let record = StoredCredentialRecord {
             schema_version: STORE_SCHEMA_VERSION,
             revision: current.as_ref().map_or(1, |record| record.revision + 1),
             binding: StoredBinding::from(&binding),
             state: StoredCredentialState::Revoked,
         };
-        lease.persist(current.as_ref().map(|record| record.revision), &record)
+        lease.persist(current.as_ref().map(|record| record.revision), &record)?;
+        // The lease is released before the network call: local state is already
+        // committed, and holding a credential-scoped lock across an outbound
+        // request would let a slow provider block every other operation on it.
+        drop(lease);
+
+        let remote_confirmed = match notify {
+            Some(notify) => self.revoke_remote(&notify).await,
+            None => false,
+        };
+        Ok(McpOAuthRevocation {
+            revision: record.revision,
+            remote_confirmed,
+        })
+    }
+
+    /// RFC 7009 token revocation. Returns whether the provider confirmed.
+    async fn revoke_remote(&self, notify: &RemoteRevocation) -> bool {
+        let Ok(http) = crate::mcp::build_pinned_http_client_for_endpoint(
+            &notify.endpoint,
+            self.request_timeout,
+            self.loopback_permitted,
+        ) else {
+            return false;
+        };
+        let form = [
+            ("token", notify.token.as_str()),
+            (
+                "token_type_hint",
+                if notify.is_refresh {
+                    "refresh_token"
+                } else {
+                    "access_token"
+                },
+            ),
+            ("client_id", notify.client_id.as_str()),
+        ];
+        let Ok(Ok(response)) = tokio::time::timeout(
+            self.request_timeout,
+            http.post(&notify.endpoint)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .form(&form)
+                .send(),
+        )
+        .await
+        else {
+            return false;
+        };
+        response.status().is_success()
     }
 
     async fn acquire(&self, binding: McpOAuthBinding) -> Result<CredentialLease, McpOAuthError> {
@@ -627,6 +739,7 @@ impl McpOAuthCoordinator {
             exchange.client_id,
             exchange.scopes,
             None,
+            exchange.revocation_endpoint,
             now,
             McpOAuthAuthorizationReason::ExchangeIndeterminate,
         )
@@ -653,6 +766,7 @@ impl McpOAuthCoordinator {
             refresh.client_id,
             refresh.previous_scopes,
             Some(refresh.refresh_token.as_str()),
+            refresh.revocation_endpoint.clone(),
             now,
             McpOAuthAuthorizationReason::RefreshIndeterminate,
         )
@@ -668,6 +782,7 @@ impl McpOAuthCoordinator {
         client_id: String,
         previous_scopes: Vec<String>,
         previous_refresh_token: Option<&str>,
+        revocation_endpoint: Option<String>,
         now: DateTime<Utc>,
         indeterminate_reason: McpOAuthAuthorizationReason,
     ) -> Result<ResolvedMcpOAuthCredential, McpOAuthError> {
@@ -679,6 +794,7 @@ impl McpOAuthCoordinator {
                     client_id,
                     previous_scopes,
                     previous_refresh_token,
+                    revocation_endpoint,
                     now,
                 ) {
                     Ok(active) => active,
@@ -760,6 +876,7 @@ struct TokenExchange {
     verifier: Zeroizing<String>,
     code: Zeroizing<String>,
     scopes: Vec<String>,
+    revocation_endpoint: Option<String>,
 }
 
 struct TokenRefresh {
@@ -767,6 +884,7 @@ struct TokenRefresh {
     client_id: String,
     refresh_token: Zeroizing<String>,
     previous_scopes: Vec<String>,
+    revocation_endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -831,6 +949,10 @@ enum StoredCredentialState {
         redirect_uri: String,
         scopes: Vec<String>,
         expires_at_ms: i64,
+        /// Defaulted so records written before remote revocation existed still
+        /// decode; they simply have no endpoint to notify.
+        #[serde(default)]
+        revocation_endpoint: Option<String>,
     },
     Exchanging {
         operation_id: Uuid,
@@ -867,6 +989,8 @@ struct ActiveCredential {
     refresh_token: Option<String>,
     expires_at_ms: Option<i64>,
     scopes: Vec<String>,
+    #[serde(default)]
+    revocation_endpoint: Option<String>,
 }
 
 impl Drop for ActiveCredential {
@@ -1123,6 +1247,13 @@ fn validate_authorization_request(
         .map_err(|_| McpOAuthError::InvalidAuthorizationRequest)?;
     crate::mcp::require_permitted_endpoint(&request.token_endpoint, loopback_permitted)
         .map_err(|_| McpOAuthError::InvalidAuthorizationRequest)?;
+    if let Some(revocation_endpoint) = &request.revocation_endpoint {
+        if revocation_endpoint.is_empty() || revocation_endpoint.len() > MAX_FIELD_BYTES {
+            return Err(McpOAuthError::InvalidAuthorizationRequest);
+        }
+        crate::mcp::require_permitted_endpoint(revocation_endpoint, loopback_permitted)
+            .map_err(|_| McpOAuthError::InvalidAuthorizationRequest)?;
+    }
     let authorization_url = Url::parse(&request.authorization_endpoint)
         .map_err(|_| McpOAuthError::InvalidAuthorizationRequest)?;
     let redirect = Url::parse(&request.redirect_uri)
@@ -1157,12 +1288,14 @@ fn valid_public_client_redirect(redirect: &Url) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn active_from_response(
     mut response: TokenResponse,
     token_endpoint: String,
     client_id: String,
     previous_scopes: Vec<String>,
     previous_refresh_token: Option<&str>,
+    revocation_endpoint: Option<String>,
     now: DateTime<Utc>,
 ) -> Result<ActiveCredential, McpOAuthError> {
     if response.access_token.is_empty()
@@ -1206,6 +1339,7 @@ fn active_from_response(
             .and_then(|seconds| i64::try_from(seconds).ok())
             .and_then(|seconds| now.timestamp_millis().checked_add(seconds * 1_000)),
         scopes,
+        revocation_endpoint,
     })
 }
 
@@ -1318,6 +1452,10 @@ struct AuthorizationServerMetadata {
     code_challenge_methods_supported: Vec<String>,
     #[serde(default)]
     response_types_supported: Vec<String>,
+    /// RFC 7009. Optional: a provider that does not publish one simply cannot be
+    /// told remotely, which never blocks local revocation.
+    #[serde(default)]
+    revocation_endpoint: Option<String>,
 }
 
 impl AuthorizationServerMetadata {
@@ -1346,7 +1484,15 @@ impl AuthorizationServerMetadata {
         {
             return Err(McpOAuthError::DiscoveryRejected);
         }
-        for endpoint in [&self.authorization_endpoint, &self.token_endpoint] {
+        // The revocation endpoint is held to the same rules as the others: a
+        // provider may omit it, but if it names one, that URL receives a refresh
+        // token and must be one the issuer actually owns.
+        let mut endpoints = vec![&self.authorization_endpoint, &self.token_endpoint];
+        if let Some(revocation) = &self.revocation_endpoint {
+            bounded_field(revocation)?;
+            endpoints.push(revocation);
+        }
+        for endpoint in endpoints {
             crate::mcp::require_permitted_endpoint(endpoint, loopback_permitted)
                 .map_err(|_| McpOAuthError::DiscoveryRejected)?;
             let parsed = Url::parse(endpoint).map_err(|_| McpOAuthError::DiscoveryRejected)?;

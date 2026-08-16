@@ -244,6 +244,7 @@ async fn oauth_tokens_stay_encrypted_and_concurrent_refresh_is_singleflight() {
                 client_id: "public-client".into(),
                 redirect_uri: "http://127.0.0.1/callback".into(),
                 scopes: vec!["tools.read".into()],
+                revocation_endpoint: None,
             },
             now,
         )
@@ -370,6 +371,7 @@ async fn federation_resolves_only_the_stable_handle_inside_the_gateway() {
                 client_id: "public-client".into(),
                 redirect_uri: "http://127.0.0.1/callback".into(),
                 scopes: vec!["tools.read".into()],
+                revocation_endpoint: None,
             },
             now,
         )

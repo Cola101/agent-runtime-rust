@@ -176,6 +176,7 @@ async fn activate_via_real_exchange(
         client_id: "trusted-public-client".to_owned(),
         redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
         scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: None,
     };
     let start = coordinator
         .begin_authorization(bound.clone(), request, Utc::now())
@@ -201,6 +202,109 @@ async fn activate_via_real_exchange(
         .expect("exchange must succeed against the scripted provider");
     assert_eq!(provider.hits(), 1, "exactly one token request");
     resolved.token_digest().to_owned()
+}
+
+/// Activates a credential whose provider also publishes a revocation endpoint,
+/// so `revoke` has somewhere real to call. The server is returned so the caller
+/// keeps it alive and can assert on its hit count.
+async fn activate_with_revocation(
+    coordinator: &McpOAuthCoordinator,
+    bound: &McpOAuthBinding,
+    revocation_status: u16,
+) -> ScriptedServer {
+    let provider = scripted_server(move |_| {
+        vec![
+            (
+                "/token",
+                200,
+                "",
+                r#"{"access_token":"live-token","refresh_token":"refresh-value","token_type":"Bearer","expires_in":3600}"#
+                    .to_owned(),
+            ),
+            ("/revoke", revocation_status, "", "{}".to_owned()),
+        ]
+    })
+    .await;
+    let request = McpOAuthAuthorizationRequest {
+        authorization_endpoint: format!("{}/authorize", provider.origin),
+        token_endpoint: format!("{}/token", provider.origin),
+        client_id: "trusted-public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
+        scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: Some(format!("{}/revoke", provider.origin)),
+    };
+    let start = coordinator
+        .begin_authorization(bound.clone(), request, Utc::now())
+        .await
+        .expect("begin must succeed");
+    let state = start
+        .authorization_url
+        .split("&state=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("authorization URL must carry state")
+        .to_owned();
+    coordinator
+        .complete_authorization(
+            bound.clone(),
+            start.flow_id,
+            &state,
+            "callback-code",
+            Utc::now(),
+        )
+        .await
+        .expect("exchange must succeed");
+    provider
+}
+
+/// Local revocation commits before the provider is contacted, so a provider
+/// that refuses -- or is hostile, or simply down -- cannot leave the credential
+/// usable here.
+#[tokio::test]
+async fn remote_revocation_failure_still_revokes_locally() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = activate_with_revocation(&coordinator, &bound, 500).await;
+
+    let outcome = coordinator.revoke(bound.clone()).await.unwrap();
+    assert!(
+        !outcome.remote_confirmed,
+        "a 500 from the provider must never be reported as confirmed"
+    );
+    assert!(matches!(
+        coordinator.status(bound.clone()).await.unwrap(),
+        McpOAuthCredentialStatus::Revoked { .. }
+    ));
+    assert!(
+        coordinator
+            .resolve_access_token(bound, Utc::now())
+            .await
+            .is_err(),
+        "a revoked credential must not resolve"
+    );
+    assert!(
+        provider.hits() >= 2,
+        "the token exchange and the revocation must both be real requests, saw {}",
+        provider.hits()
+    );
+}
+
+/// A provider that accepts the revocation is reported as confirmed.
+#[tokio::test]
+async fn remote_revocation_success_is_reported() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = activate_with_revocation(&coordinator, &bound, 200).await;
+
+    let outcome = coordinator.revoke(bound.clone()).await.unwrap();
+    assert!(outcome.remote_confirmed);
+    assert!(matches!(
+        coordinator.status(bound).await.unwrap(),
+        McpOAuthCredentialStatus::Revoked { .. }
+    ));
+    assert!(provider.hits() >= 2);
 }
 
 /// Case 1: WWW-Authenticate challenge -> Protected Resource Metadata ->
