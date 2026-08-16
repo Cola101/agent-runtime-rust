@@ -181,7 +181,20 @@ async fn execution_deadline_terminates_the_process_group_without_a_poll() {
         .unwrap();
 
     let original_pid = started.pid.unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Termination and reaping are both asynchronous, and `process_alive` uses
+    // signal 0, which still succeeds for a killed-but-unreaped zombie. Sampling
+    // once after a fixed sleep therefore races the supervisor: it passed alone
+    // but failed under a parallel workspace run, where the slack between
+    // `max_runtime` and the sample was not enough for the reap to land.
+    //
+    // Wait for the condition the supervisor actually promises instead of
+    // guessing when it will hold. The bound still fails a supervisor that never
+    // terminates the group, and this never polls the *manager*, which is what
+    // "without a poll" in the test name refers to.
+    let kill_deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(original_pid) && Instant::now() < kill_deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(
         !process_alive(original_pid),
         "the deadline supervisor left pid {original_pid} alive"
