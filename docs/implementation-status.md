@@ -88,6 +88,17 @@ granted scopes，运维可看出 provider 是否静默收窄了权限；scope �
 全工作区精确列出 772 项：**766 通过、0 失败、6 个外部 live 用例显式忽略**（121 个测试二进制）；
 Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，总体进度仍维持 70–75%。**
 
+2026-08-17 运维身份形状完成（ADR-0121）：workload token 新增 schema 5，必须命名 tenant、application 与
+workload identity，而 run、attempt、worker、incarnation、model policy、session、workspace、agent version
+**必须全部为 nil**。该"必须缺席"即机制本身——`authorizes` 逐字段全等比较，Run token 的 `run_id` 非 nil 永远
+无法满足运维绑定，运维 token 反之亦然，因此 **`authorizes` 一行未改**。管理面另外显式要求
+`claims.is_operator()`：携带 `mcp.oauth.admin` 的 Run 形态 token 现按**形状**拒绝，而旧契约下那恰恰就是运维
+token 的样子。这解除了 ADR-0120 如实记录的"隔离只建立在 scope 上"限制，使其变为**结构性隔离**。两个方向各有
+测试（Run 形态不能管理、运维形态不能 federate），契约层另有 3 项测试逐字段钉住形状规则（8 个执行字段逐一
+验证）。schema 2/3/4 行为未变，既有 6 项契约测试未改动即通过。全工作区精确列出 776 项：**770 通过、0 失败、
+6 个外部 live 用例显式忽略**（121 个测试二进制）；workspace Clippy `-D warnings` 与 fmt check 通过。
+控制面签发运维 token 的路径尚未实现，真实外部调用方认证未开展，**总体进度仍维持 70–75%**。
+
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与
 `get_mcp_prompt`。Server 必须同时拥有 Run 冻结的 Resources/Prompts capability 和独立

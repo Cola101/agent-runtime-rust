@@ -190,6 +190,104 @@ fn v4_authorization_rejects_a_different_application_identity() {
     assert!(!verified.authorizes(&WorkloadIdentityBinding::from(&different)));
 }
 
+/// An operator identity: it says who is acting and for which tenant, and says
+/// nothing about an execution.
+fn operator_claims() -> WorkloadIdentityClaims {
+    WorkloadIdentityClaims {
+        schema_version: agent_workload_identity::OPERATOR_SCHEMA_VERSION,
+        application_id: Uuid::now_v7(),
+        workload_identity_id: Uuid::now_v7(),
+        run_id: Uuid::nil(),
+        attempt_id: Uuid::nil(),
+        worker_id: Uuid::nil(),
+        worker_incarnation_id: Uuid::nil(),
+        model_policy_id: Uuid::nil(),
+        scopes: BTreeSet::from(["mcp.oauth.admin".to_string()]),
+        ..claims()
+    }
+}
+
+/// The whole point of the shape: an operator token carries no execution, so it
+/// can never satisfy a binding that names one.
+#[test]
+fn an_operator_token_is_accepted_and_names_no_execution() {
+    let signing_key = SigningKey::from_bytes(&[91; 32]);
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
+    let claims = operator_claims();
+    let token = sign_v2(&signing_key, &claims);
+
+    let verified = verifier
+        .verify(
+            &token,
+            RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+            claims.issued_at_unix_ms + 1_000,
+        )
+        .expect("a well-formed operator token must verify");
+    assert!(verified.is_operator());
+    assert!(verified.run_id.is_nil());
+    // `require_incarnation` is satisfied vacuously: an operator has no worker to
+    // pin, and demanding one would make the shape unusable.
+    assert!(verified.worker_incarnation_id.is_nil());
+}
+
+/// A token claiming the operator schema while still naming a Run is neither one
+/// thing nor the other, and is refused rather than being read as whichever half
+/// happens to be checked first.
+#[test]
+fn an_operator_token_that_names_a_run_is_refused() {
+    let signing_key = SigningKey::from_bytes(&[92; 32]);
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
+    for mutate in [
+        (|claims: &mut WorkloadIdentityClaims| claims.run_id = Uuid::now_v7()) as fn(&mut _),
+        |claims: &mut WorkloadIdentityClaims| claims.attempt_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.worker_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.worker_incarnation_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.model_policy_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.session_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.workspace_id = Uuid::now_v7(),
+        |claims: &mut WorkloadIdentityClaims| claims.agent_version_id = Uuid::now_v7(),
+    ] {
+        let mut claims = operator_claims();
+        mutate(&mut claims);
+        let token = sign_v2(&signing_key, &claims);
+        assert_eq!(
+            verifier.verify(
+                &token,
+                RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+                claims.issued_at_unix_ms + 1_000,
+            ),
+            Err(WorkloadTokenError::InvalidClaims),
+            "an operator token naming any execution field must be refused"
+        );
+    }
+}
+
+/// An operator must still say who it is. Without the application and workload
+/// identity there is nothing to authorize against but a tenant, which every
+/// token in that tenant would satisfy.
+#[test]
+fn an_operator_token_without_an_actor_is_refused() {
+    let signing_key = SigningKey::from_bytes(&[93; 32]);
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
+    for mutate in [
+        (|claims: &mut WorkloadIdentityClaims| claims.application_id = Uuid::nil()) as fn(&mut _),
+        |claims: &mut WorkloadIdentityClaims| claims.workload_identity_id = Uuid::nil(),
+    ] {
+        let mut claims = operator_claims();
+        mutate(&mut claims);
+        let token = sign_v2(&signing_key, &claims);
+        assert_eq!(
+            verifier.verify(
+                &token,
+                RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+                claims.issued_at_unix_ms + 1_000,
+            ),
+            Err(WorkloadTokenError::InvalidClaims),
+            "an operator token must name the actor, not only the tenant"
+        );
+    }
+}
+
 fn claims() -> WorkloadIdentityClaims {
     WorkloadIdentityClaims {
         schema_version: 2,
