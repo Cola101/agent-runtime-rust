@@ -601,6 +601,186 @@ async fn a_truncated_metadata_stream_is_not_a_false_success() {
     task.abort();
 }
 
+/// A token server that records every `refresh_token` it is presented with, so a
+/// test can assert which one the second refresh actually used.
+struct RefreshRecorder {
+    origin: String,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RefreshRecorder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// `rotate` decides whether each refresh response carries a NEW refresh token or
+/// omits the field entirely, which is the difference between a rotating and a
+/// non-rotating provider.
+async fn refresh_recorder(rotate: bool) -> RefreshRecorder {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&seen);
+    let task = tokio::spawn(async move {
+        let mut round = 0_usize;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let observed = Arc::clone(&observed);
+            round += 1;
+            let index = round;
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4_096];
+                let header_end = loop {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                let body = String::from_utf8_lossy(&bytes[header_end..]).into_owned();
+                if let Some(rest) = body.split("refresh_token=").nth(1) {
+                    let value = rest.split('&').next().unwrap_or("").to_owned();
+                    observed.lock().unwrap().push(value);
+                }
+                // Every token stays immediately expired so the next resolve is
+                // forced to refresh again.
+                let payload = if body.contains("grant_type=authorization_code") {
+                    r#"{"access_token":"access-1","refresh_token":"refresh-1","token_type":"Bearer","expires_in":0}"#.to_owned()
+                } else if rotate {
+                    format!(
+                        r#"{{"access_token":"access-r{index}","refresh_token":"rotated-{index}","token_type":"Bearer","expires_in":0}}"#
+                    )
+                } else {
+                    format!(
+                        r#"{{"access_token":"access-r{index}","token_type":"Bearer","expires_in":0}}"#
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            });
+        }
+    });
+    RefreshRecorder { origin, seen, task }
+}
+
+async fn activate_against(
+    coordinator: &McpOAuthCoordinator,
+    bound: &McpOAuthBinding,
+    origin: &str,
+) {
+    let request = McpOAuthAuthorizationRequest {
+        authorization_endpoint: format!("{origin}/authorize"),
+        token_endpoint: format!("{origin}/token"),
+        client_id: "trusted-public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1:53535/callback".to_owned(),
+        scopes: vec!["tools.read".to_owned()],
+        revocation_endpoint: None,
+    };
+    let start = coordinator
+        .begin_authorization(bound.clone(), request, Utc::now())
+        .await
+        .expect("begin must succeed");
+    let state = start
+        .authorization_url
+        .split("&state=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("state")
+        .to_owned();
+    coordinator
+        .complete_authorization(
+            bound.clone(),
+            start.flow_id,
+            &state,
+            "callback-code",
+            Utc::now(),
+        )
+        .await
+        .expect("exchange must succeed");
+}
+
+/// Deviation 15: a rotating provider issues a new refresh token on every
+/// refresh. The next refresh must present the new one; presenting the original
+/// again would fail against any provider that invalidates on rotation.
+#[tokio::test]
+async fn a_rotated_refresh_token_replaces_the_previous_one() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = refresh_recorder(true).await;
+    activate_against(&coordinator, &bound, &provider.origin).await;
+
+    // Two resolves, each forced to refresh because every token expires at once.
+    let _ = coordinator
+        .resolve_access_token(bound.clone(), Utc::now())
+        .await;
+    let _ = coordinator.resolve_access_token(bound, Utc::now()).await;
+
+    let seen = provider.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "expected two refreshes, saw {seen:?}");
+    assert_eq!(seen[0], "refresh-1", "the first refresh uses the original");
+    assert!(
+        seen[1].starts_with("rotated-"),
+        "the second refresh must present the rotated token, saw {:?}",
+        seen[1]
+    );
+}
+
+/// Deviation 16: a non-rotating provider omits `refresh_token` on refresh. The
+/// original must be carried forward -- dropping it would strand the credential
+/// after one refresh.
+#[tokio::test]
+async fn a_provider_that_omits_refresh_token_keeps_the_original() {
+    let root = TestRoot::new();
+    let coordinator = coordinator(&root);
+    let bound = binding("http://127.0.0.1:9/mcp");
+    let provider = refresh_recorder(false).await;
+    activate_against(&coordinator, &bound, &provider.origin).await;
+
+    let _ = coordinator
+        .resolve_access_token(bound.clone(), Utc::now())
+        .await;
+    let _ = coordinator.resolve_access_token(bound, Utc::now()).await;
+
+    let seen = provider.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "expected two refreshes, saw {seen:?}");
+    assert!(
+        seen.iter().all(|token| token == "refresh-1"),
+        "a provider that omits the field must keep the original, saw {seen:?}"
+    );
+}
+
 /// The strictness that must NOT be relaxed for compatibility: a provider whose
 /// metadata omits S256 does not get to fall back to `plain`.
 #[tokio::test]
