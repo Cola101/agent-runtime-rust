@@ -33,9 +33,17 @@ WWW-Authenticate challenge（同源校验，发请求前）
 | Gateway 全包 | `-p agent-model-gateway` | **89 passed，0 failed，4 ignored**（4 项需外部服务/凭据的 live 用例） |
 | Gateway clippy | `clippy -p agent-model-gateway --all-targets --all-features -- -D warnings` | 无输出（干净） |
 
-### 全工作区门禁状态：未通过，原因已定位
+### 全工作区门禁：通过
 
-`cargo test --workspace -- --test-threads=4` 出现 1 项失败，**与本阶段改动无关**：
+`cargo test --workspace -- --test-threads=4` → **119 个测试二进制，736 passed，0 failed，6 ignored（共 742 项）**，
+`CARGO_EXIT=0`。6 项 ignored 为需外部服务/凭据的 live 用例。
+
+> 计数方法：把全部 `test result:` 行相加。注意管道到 `tail` 会掩盖 cargo 的真实退出码，必须单独记录 `$?`。
+> 本轮第一次统计就因为这个陷阱把一次失败误读成了成功。
+
+### 途中定位并修复的 flake（与本阶段改动无关）
+
+首次全量门禁出现 1 项失败：
 
 ```text
 test execution_deadline_terminates_the_process_group_without_a_poll ... FAILED
@@ -50,12 +58,27 @@ panicked: the deadline supervisor left pid 98155 alive
 - `--test process_session_governance -- --test-threads=4` 连续 5 次：每次 10 passed，0 failed。
 - `agent-tool-runtime` 是 crate，`agent-model-gateway` 是 app；app 依赖 crate 而非相反，本阶段改动不可能影响它。
 
-真实根因是测试的**定点采样**而非超时不足：该用例设 `max_runtime: 150ms`，随后固定 `sleep(500ms)` 并在那一个
-瞬间断言 `process_alive` 为假，只留约 350ms 余量。全工作区并行时 supervisor 任务未必能在该窗口内被调度。
+真实根因是测试的**定点采样**而非超时不足。该用例设 `max_runtime: 150ms`，随后固定 `sleep(500ms)` 并在那一个
+瞬间断言 `process_alive` 为假，只留约 350ms 余量。而 `process_alive` 用的是 `kill(pid, 0)`，该调用对
+**已终止但尚未被回收的僵尸进程同样返回成功**——所以定点采样 race 的不只是 supervisor 的调度，还有回收窗口。
+全工作区并行时这两者都未必落在 350ms 内。
 
-正确修法是**取消定点采样**（在有界期限内轮询 `process_alive`，到期仍存活才失败），而不是把 500ms 调大、不是
-串行化、也不是删断言。用例名中的 "without_a_poll" 指不轮询 **manager**（`manager.interact`），轮询进程存活不
-违反该语义。该修改尚未实施。
+已实施的修法是**取消定点采样**：在有界期限（5s）内轮询 `process_alive`，到期仍存活才失败。
+
+```rust
+let kill_deadline = Instant::now() + Duration::from_secs(5);
+while process_alive(original_pid) && Instant::now() < kill_deadline {
+    tokio::time::sleep(Duration::from_millis(25)).await;
+}
+assert!(!process_alive(original_pid), "...");
+```
+
+这不是把 500ms 调大：supervisor 若根本不终止进程组，断言照样在期限后失败；也没有串行化测试或删除断言。
+用例名中的 "without_a_poll" 指不轮询 **manager**（`manager.interact`），轮询进程存活不违反该语义。
+
+验证：`-p agent-tool-runtime --test process_session_governance -- --test-threads=4` → 10 passed，0 failed；
+随后的**全工作区并行**门禁中该用例同样 `... ok`。单独跑通不构成证据——修复前它单独跑也通过，只有全工作区
+并行才复现过失败。
 
 ## 真实网络请求计数（反假绿）
 
@@ -83,8 +106,8 @@ endpoint 不同源均被拒绝。
 
 ## 尚未证明与风险
 
-- **全工作区门禁尚未跑出一次全绿**，上述 flake 修复未实施；在此之前不应宣称第 7 项完成定义达成。
 - 真实外部 OAuth MCP Server 的 provider-specific metadata、scope、错误与 token rotation 差异**完全未验证**。
+  这是总体进度不上调的首要原因：本阶段全部证据都来自受控回环 server。
 - Dynamic Client Registration、Client ID Metadata Document、private client secret、管理 gRPC/CLI、callback 承载、
   远端 revocation endpoint 均未实现。
 - discovery 只取 `authorization_servers` 的第一项，多授权服务器选择策略未定义。
@@ -94,9 +117,14 @@ endpoint 不同源均被拒绝。
 ## 缓存与环境事件
 
 - 起始：`runtime/target` 不存在，磁盘剩余 52Gi。冷编译后 662M → 1.7G → 全量门禁中 2.8G。
-- **环境事件**：第二次全量门禁执行期间 `runtime/target` 被**外部**整体删除，cargo 报
-  `error writing dependencies ... No such file or directory`，磁盘剩余由 50Gi 跳到 64Gi。本会话未执行
-  `cargo clean`，也未删除该目录。源码与 Git 状态未受影响（HEAD 仍 `7bfedae`，改动文件完整）。该事件导致全量
-  门禁需要从零重建，是上述"尚未跑出全绿"的直接原因之一。
+- **环境事件**：两次全量门禁执行期间 `runtime/target` 被**外部**整体删除，cargo 报
+  `error writing dependencies ... No such file or directory` 与
+  `expecting a current working directory to exist: PermissionDenied`，磁盘剩余由 50Gi 依次跳到 64Gi、67Gi、71Gi。
+  本会话未执行 `cargo clean`，也未删除该目录。
+  定位：`com.apple.MobileSoftwareUpdate.CleanupPreparePathService`（root）于 `Sun Aug 16 23:15:24 2026` 启动，
+  正是 target 首次消失的时刻；`softwareupdate --list` 显示已暂存 macOS Tahoe 26.6.1（3.8 GB，需重启）。
+  Cargo 会在 `target/` 写入 `CACHEDIR.TAG`，macOS 将带该标记的目录视为**可清除空间**，因此为暂存系统更新而
+  删除构建缓存；cargo registry 缓存也被清过一次。
+  源码与 Git 状态全程未受影响。重建后门禁最终跑出全绿，见上表。
 - 测试创建的 `agent-mcp-oauth-*` 与 `agent-mcp-oauth-disc-*` 临时目录由 `Drop` 清除；未创建 `node_modules`、
   Docker 镜像或项目外长期服务。

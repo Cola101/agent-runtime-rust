@@ -38,6 +38,20 @@ OAuth**：Protected Resource / Authorization Server metadata discovery、动态�
 用例显式忽略；Clippy workspace/all-targets/all-features `-D warnings`、格式与 all-targets check 通过。证据见 ADR-0118 与
 `docs/evidence/2026-08-15-credential-domain-mcp-oauth-stage-one.md`。
 
+2026-08-16 MCP OAuth 第二阶段完成：discovery 走标准两跳（RFC 9728 Protected Resource Metadata → RFC 8414
+Authorization Server Metadata），`WWW-Authenticate` challenge 只能收窄到 MCP endpoint 自身 origin，跨源在发出
+任何请求之前拒绝；`resource` 必须精确等于 endpoint，issuer 必须自有 authorization/token endpoint，缺
+`S256` 不退化为 plain，body ≤64KiB、字段 ≤4KiB、scope ≤32，不跟随重定向。discovery 结果冻结进
+PendingAuthorization，callback 只从记录读 endpoint，因此中途替换 metadata 无法改变授权码兑换地址。凭证解析
+边界改为携带 token digest，真实 MCP 401 + `invalid_token` 经 CAS 精确标记 `authorization_required`，而 403、
+`insufficient_scope`、网络与协议错误不改变凭证状态；认证失败一律不重放。tools/resources/prompts/lifecycle 四个
+入口共用同一解析与上报边界。管理 gRPC/CLI、callback 承载、远端 revocation、Dynamic Client Registration 与真实
+外部 Server 兼容矩阵仍未实现，**全部证据均来自受控回环 server**，因此总体进度维持 70–75% 不变。本轮 Rust
+全工作区精确列出 742 项：**736 通过、0 失败、6 个外部 live 用例显式忽略**（119 个测试二进制）；Clippy
+workspace/all-targets/all-features `-D warnings` 与 fmt check 通过。途中修复了一个与本阶段无关的
+`agent-tool-runtime` flake（定点采样竞态，改为有界轮询）。证据见 ADR-0119 与
+`docs/evidence/2026-08-16-mcp-oauth-discovery-and-rejection-feedback.md`。
+
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与
 `get_mcp_prompt`。Server 必须同时拥有 Run 冻结的 Resources/Prompts capability 和独立

@@ -14,7 +14,39 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：MCP OAuth 凭证域第一阶段
+## 当前阶段：MCP OAuth 第二阶段（discovery 与拒绝反馈）
+
+本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
+`58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只参考执行语义与失败边界，未移植代码，
+因此不涉及第三方来源与 NOTICE 变更。只改 Rust Runtime。
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| metadata discovery | `oauth.rs` 完整 discovery，含 PRM/AS metadata 与 DCR | MCP SDK auth 提供 discovery 与注册 | RFC 9728 PRM → RFC 8414 AS metadata 两跳，真实回环 HTTP；不做 DCR | 标准路径已补齐；DCR 与 client metadata document 仍缺 |
+| challenge 处理 | 从 `WWW-Authenticate` 取 metadata 地址 | SDK 内部处理 challenge | 同源限制：challenge 只能收窄到 MCP endpoint 自身 origin，跨源在**发请求前**拒绝（断言 `hits()==0`） | 比两者更严格；跨源 challenge 连探测都不产生 |
+| metadata 一致性 | issuer/endpoint 校验成熟 | 依赖 SDK 校验 | `resource` 必须精确等于 endpoint；issuer 必须自有 authorization/token endpoint；缺 `S256` 不退化为 plain | 已对齐并额外要求 issuer 自有端点 |
+| 冻结绑定 | 登录态持久化 | store 持有 flow 状态 | discovery 结果写入 PendingAuthorization，callback 只从记录读 endpoint，从不重新解析 | 替换攻击在 callback 处失败，有可执行证据 |
+| 401 联动 | auth manager 处理 authorization-required | 仅当 rejected token 仍是当前值才更新 | digest 随 token 穿过解析边界；401 + `invalid_token` 经 CAS 精确标记；403 与 `insufficient_scope` 不改状态 | 消费链已闭合；401 内部分类比两者更细 |
+| 重放策略 | 失败回到上层错误 | replay guard 判定副作用 | 认证失败一律不重放，只返回 typed `AuthorizationRequired`；测试以请求计数断言 | 对未知副作用更保守 |
+| 登录入口 | CLI 登录、浏览器与 callback listener 完整 | Gateway 命令面与用户侧体验成熟 | 无 callback listener、无管理 gRPC/CLI | 明显落后，且本轮明确不做 |
+
+### 本阶段结论
+
+- 已验证：challenge → PRM → AS metadata → S256 PKCE 的真实回环闭环；冻结绑定使替换攻击失败；真实 MCP 401
+  精确触发 `AuthorizationRequired` 且不重放。证据见
+  `docs/evidence/2026-08-16-mcp-oauth-discovery-and-rejection-feedback.md`。
+- 相比 Codex，本项目补上了它已有的 discovery 与 401 反馈语义；Codex 的用户登录入口、DCR、keyring 与真实生态
+  兼容仍领先。
+- 相比 OpenClaw，本项目沿用其“被拒 token 仍是当前值才更新”的赢家保护，并把它接到真实传输上；OpenClaw 的
+  Gateway 运维与用户侧登录体验仍领先。
+- 偏离点：跨源 challenge 在发出请求前拒绝、缺 `code_challenge_methods_supported` 不退化为 plain、401 内部区分
+  `invalid_token` 与 `insufficient_scope`。这些是边界更严，不是功能更全。
+- **总体进度不因本阶段提高**，仍为 70–75%：没有任何真实外部 OAuth MCP Server 的兼容证据，全工作区门禁也尚未
+  在本机跑出一次全绿（macOS 更新暂存期间会清除 `runtime/target`）。
+- 下一目标：管理 gRPC/CLI 与 callback 承载 → remote best-effort revoke → 真实外部 OAuth Server 兼容矩阵；
+  该结论记录于 ADR-0119。
+
+## 上一阶段：MCP OAuth 凭证域第一阶段
 
 本轮继续以 Codex `ff352fab6209dc0f9d13fc0036ed3f9404682b2c` 和 OpenClaw
 `58b4b9430457e91b44f0ccce73ad1b6c6bb11e28` 的本地源码复核，只改 Rust Runtime，不进入 Edge、Java、
