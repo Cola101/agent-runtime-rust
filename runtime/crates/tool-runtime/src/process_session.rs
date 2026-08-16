@@ -2474,6 +2474,22 @@ impl PersistentProcessSessionManager {
                 ProcessSessionRecovery::Reattached
             }
             (false, false) => {
+                // The session ended while nothing was watching, but why it ended
+                // is still recoverable: the durable logs outlive the process. If
+                // they already reached the budget then the output limit is the
+                // cause, and reporting "missing" would discard that.
+                //
+                // The sibling terminal path makes exactly this check. Without it
+                // here, which path happened to observe the exit would decide
+                // what the caller is told -- under load the recovery path can
+                // win, and a session killed for flooding its log would be
+                // reported as one that simply vanished.
+                let output_limited = session_output_lengths(&session_dir).is_ok_and(
+                    |(stdout_bytes, stderr_bytes)| {
+                        stdout_bytes >= manifest.max_output_bytes_per_stream
+                            || stderr_bytes >= manifest.max_output_bytes_per_stream
+                    },
+                );
                 mutate_manifest(&session_dir, |current| {
                     validate_same_manifest(current, &manifest)?;
                     current.state = ProcessSessionState::Terminated;
@@ -2482,8 +2498,11 @@ impl PersistentProcessSessionManager {
                     current.process_group_id = None;
                     current.exit_code = None;
                     current.last_operation = "terminated_before_recovery".into();
-                    current.termination_reason =
-                        Some(ProcessSessionTerminationReason::RecoveredMissing);
+                    current.termination_reason = Some(if output_limited {
+                        ProcessSessionTerminationReason::OutputLimit
+                    } else {
+                        ProcessSessionTerminationReason::RecoveredMissing
+                    });
                     current.updated_at = Utc::now();
                     Ok(())
                 })?;
