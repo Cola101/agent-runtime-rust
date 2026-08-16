@@ -680,14 +680,26 @@ impl McpFederationClient {
         tenant_id: Uuid,
         server: &McpServerRef,
     ) -> Result<McpCatalog, McpFederationError> {
-        let http = self.http_for_server(server)?;
         let credential = self.resolve_credential(tenant_id, server).await?;
+        let result = self
+            .list_tools_authenticated(server, credential.token.as_deref().map(String::as_str))
+            .await;
+        self.note_rejection(&credential, &result).await;
+        result
+    }
+
+    async fn list_tools_authenticated(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+    ) -> Result<McpCatalog, McpFederationError> {
+        let http = self.http_for_server(server)?;
         if server.protocol_revision == McpProtocolRevision::V2026_07_28 {
             let discover = self
                 .call_modern_json_rpc(
                     &http,
                     server,
-                    credential.as_deref().map(String::as_str),
+                    credential,
                     "server/discover",
                     serde_json::json!({}),
                 )
@@ -700,7 +712,7 @@ impl McpFederationClient {
                 .call_modern_json_rpc(
                     &http,
                     server,
-                    credential.as_deref().map(String::as_str),
+                    credential,
                     "tools/list",
                     serde_json::json!({}),
                 )
@@ -708,9 +720,7 @@ impl McpFederationClient {
             validate_complete_result(&result, "tools/list")?;
             return catalog_from_list_result(&server.name, &result, capabilities);
         }
-        let (session, capabilities) = self
-            .initialize(&http, server, credential.as_deref().map(String::as_str))
-            .await?;
+        let (session, capabilities) = self.initialize(&http, server, credential).await?;
         if !capabilities.contains(&McpServerCapability::Tools) {
             return Ok(empty_catalog_for_capabilities(capabilities));
         }
@@ -718,7 +728,7 @@ impl McpFederationClient {
             .call_json_rpc(
                 &http,
                 server,
-                credential.as_deref().map(String::as_str),
+                credential,
                 session.as_deref(),
                 "tools/list",
                 serde_json::json!({}),
@@ -898,14 +908,35 @@ impl McpFederationClient {
             return Err(McpFederationError::CatalogChanged);
         }
 
-        let http = self.http_for_server(server)?;
         let credential = self.resolve_credential(tenant_id, server).await?;
+        let result = self
+            .read_surface_authenticated(
+                server,
+                credential.token.as_deref().map(String::as_str),
+                required_capability,
+                method,
+                params,
+            )
+            .await;
+        self.note_rejection(&credential, &result).await;
+        result
+    }
+
+    async fn read_surface_authenticated(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+        required_capability: McpServerCapability,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, McpFederationError> {
+        let http = self.http_for_server(server)?;
         if server.protocol_revision == McpProtocolRevision::V2026_07_28 {
             let discovery = self
                 .call_modern_json_rpc(
                     &http,
                     server,
-                    credential.as_deref().map(String::as_str),
+                    credential,
                     "server/discover",
                     serde_json::json!({}),
                 )
@@ -915,28 +946,20 @@ impl McpFederationClient {
                 return Err(McpFederationError::CatalogChanged);
             }
             let result = self
-                .call_modern_json_rpc(
-                    &http,
-                    server,
-                    credential.as_deref().map(String::as_str),
-                    method,
-                    params,
-                )
+                .call_modern_json_rpc(&http, server, credential, method, params)
                 .await?;
             validate_complete_result(&result, method)?;
             return Ok(result);
         }
 
-        let (session, capabilities) = self
-            .initialize(&http, server, credential.as_deref().map(String::as_str))
-            .await?;
+        let (session, capabilities) = self.initialize(&http, server, credential).await?;
         if !capabilities.contains(&required_capability) {
             return Err(McpFederationError::CatalogChanged);
         }
         self.call_json_rpc(
             &http,
             server,
-            credential.as_deref().map(String::as_str),
+            credential,
             session.as_deref(),
             method,
             params,
@@ -1009,8 +1032,29 @@ impl McpFederationClient {
             .ok_or_else(|| McpFederationError::ToolNotInFrozenCatalog(qualified_name.to_owned()))?;
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
             .map_err(|error| McpFederationError::Protocol(error.to_string()))?;
-        let http = self.http_for_server(server)?;
         let credential = self.resolve_credential(tenant_id, server).await?;
+        let result = self
+            .call_tool_round_authenticated(
+                server,
+                credential.token.as_deref().map(String::as_str),
+                bare,
+                arguments,
+                continuation,
+            )
+            .await;
+        self.note_rejection(&credential, &result).await;
+        result
+    }
+
+    async fn call_tool_round_authenticated(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+        bare: &str,
+        arguments: serde_json::Value,
+        continuation: Option<&McpRoundTripContinuation>,
+    ) -> Result<McpToolCallOutcome, McpFederationError> {
+        let http = self.http_for_server(server)?;
         if server.protocol_revision == McpProtocolRevision::V2026_07_28 {
             let round = continuation.map_or(1, |continuation| continuation.round);
             if !(1..=10).contains(&round) {
@@ -1034,13 +1078,7 @@ impl McpFederationClient {
                 params["inputResponses"] = mrtr_responses_value(&continuation.responses)?;
             }
             let result = self
-                .call_modern_json_rpc(
-                    &http,
-                    server,
-                    credential.as_deref().map(String::as_str),
-                    "tools/call",
-                    params,
-                )
+                .call_modern_json_rpc(&http, server, credential, "tools/call", params)
                 .await?;
             return match result.get("resultType").and_then(serde_json::Value::as_str) {
                 Some("complete") => Ok(McpToolCallOutcome::Complete(tool_result_from_call_result(
@@ -1069,9 +1107,7 @@ impl McpFederationClient {
         // A fresh session per call. Reusing one across calls would mean holding
         // server-side state whose lifetime we do not control, and a call that
         // silently ran in an expired session is worse than one extra handshake.
-        let (session, capabilities) = self
-            .initialize(&http, server, credential.as_deref().map(String::as_str))
-            .await?;
+        let (session, capabilities) = self.initialize(&http, server, credential).await?;
         if !capabilities.contains(&McpServerCapability::Tools) {
             return Err(McpFederationError::CatalogChanged);
         }
@@ -1079,7 +1115,7 @@ impl McpFederationClient {
             .call_json_rpc(
                 &http,
                 server,
-                credential.as_deref().map(String::as_str),
+                credential,
                 session.as_deref(),
                 "tools/call",
                 serde_json::json!({ "name": bare, "arguments": arguments }),
@@ -1127,11 +1163,30 @@ impl McpFederationClient {
             .ok_or_else(|| McpFederationError::ToolNotInFrozenCatalog(qualified_name.to_owned()))?;
         let arguments: serde_json::Value = serde_json::from_str(arguments_json)
             .map_err(|error| McpFederationError::Protocol(error.to_string()))?;
-        let http = self.http_for_server(server)?;
         let credential = self.resolve_credential(tenant_id, server).await?;
-        let (session, capabilities) = self
-            .initialize(&http, server, credential.as_deref().map(String::as_str))
-            .await?;
+        let result = self
+            .call_tool_with_lifecycle_authenticated(
+                server,
+                credential.token.as_deref().map(String::as_str),
+                bare,
+                arguments,
+                lifecycle,
+            )
+            .await;
+        self.note_rejection(&credential, &result).await;
+        result
+    }
+
+    async fn call_tool_with_lifecycle_authenticated(
+        &self,
+        server: &McpServerRef,
+        credential: Option<&str>,
+        bare: &str,
+        arguments: serde_json::Value,
+        lifecycle: &McpCallLifecycle,
+    ) -> Result<McpToolResult, McpFederationError> {
+        let http = self.http_for_server(server)?;
+        let (session, capabilities) = self.initialize(&http, server, credential).await?;
         if !capabilities.contains(&McpServerCapability::Tools) {
             return Err(McpFederationError::CatalogChanged);
         }
@@ -1140,7 +1195,7 @@ impl McpFederationClient {
             .call_json_rpc_with_lifecycle(
                 &http,
                 server,
-                credential.as_deref().map(String::as_str),
+                credential,
                 session.as_deref(),
                 request_id,
                 serde_json::json!({
@@ -1208,10 +1263,16 @@ impl McpFederationClient {
             .await
             .map_err(|error| McpFederationError::Unreachable(error.to_string()))?;
         if !response.status().is_success() {
-            return Err(McpFederationError::Unreachable(format!(
-                "server answered HTTP {} to the initialized notification",
-                response.status().as_u16()
-            )));
+            return Err(
+                if is_token_rejection(response.status(), response.headers()) {
+                    McpFederationError::AuthorizationRequired
+                } else {
+                    McpFederationError::Unreachable(format!(
+                        "server answered HTTP {} to the initialized notification",
+                        response.status().as_u16()
+                    ))
+                },
+            );
         }
         Ok(())
     }
@@ -1265,10 +1326,14 @@ impl McpFederationClient {
             return Err(McpFederationError::ResponseTooLarge);
         }
         if !status.is_success() {
-            return Err(McpFederationError::Unreachable(format!(
-                "server answered HTTP {}",
-                status.as_u16()
-            )));
+            // An explicit token refusal is not an outage. Separating them here
+            // is what lets the credential domain move state on a 401 without a
+            // network blip ever being able to.
+            return Err(if is_token_rejection(status, response.headers()) {
+                McpFederationError::AuthorizationRequired
+            } else {
+                McpFederationError::Unreachable(format!("server answered HTTP {}", status.as_u16()))
+            });
         }
         let decoded = if sse {
             self.read_basic_event_stream(
@@ -1396,10 +1461,14 @@ impl McpFederationClient {
             return Err(McpFederationError::ResponseTooLarge);
         }
         if !status.is_success() {
-            return Err(McpFederationError::Unreachable(format!(
-                "server answered HTTP {}",
-                status.as_u16()
-            )));
+            // An explicit token refusal is not an outage. Separating them here
+            // is what lets the credential domain move state on a 401 without a
+            // network blip ever being able to.
+            return Err(if is_token_rejection(status, response.headers()) {
+                McpFederationError::AuthorizationRequired
+            } else {
+                McpFederationError::Unreachable(format!("server answered HTTP {}", status.as_u16()))
+            });
         }
         let decoded = if sse {
             self.read_basic_event_stream(
@@ -1544,10 +1613,14 @@ impl McpFederationClient {
             return Err(McpFederationError::ResponseTooLarge);
         }
         if !status.is_success() {
-            return Err(McpFederationError::Unreachable(format!(
-                "server answered HTTP {}",
-                status.as_u16()
-            )));
+            // An explicit token refusal is not an outage. Separating them here
+            // is what lets the credential domain move state on a 401 without a
+            // network blip ever being able to.
+            return Err(if is_token_rejection(status, response.headers()) {
+                McpFederationError::AuthorizationRequired
+            } else {
+                McpFederationError::Unreachable(format!("server answered HTTP {}", status.as_u16()))
+            });
         }
         if !sse {
             let body = tokio::select! {
@@ -1704,7 +1777,7 @@ impl McpFederationClient {
         &self,
         tenant_id: Uuid,
         server: &McpServerRef,
-    ) -> Result<Option<Zeroizing<String>>, McpFederationError> {
+    ) -> Result<ResolvedCredential, McpFederationError> {
         if let Some(credential_id) = server.oauth_credential_id {
             if !server.credential_envelope_json.trim().is_empty() || credential_id.is_nil() {
                 return Err(McpFederationError::CredentialUnopenable);
@@ -1713,21 +1786,56 @@ impl McpFederationClient {
                 .oauth_coordinator
                 .as_ref()
                 .ok_or(McpFederationError::AuthorizationRequired)?;
+            let binding = McpOAuthBinding {
+                tenant_id,
+                server_id: server.server_id,
+                credential_id,
+                endpoint: server.endpoint.clone(),
+            };
             let credential = coordinator
-                .resolve_access_token(
-                    McpOAuthBinding {
-                        tenant_id,
-                        server_id: server.server_id,
-                        credential_id,
-                        endpoint: server.endpoint.clone(),
-                    },
-                    Utc::now(),
-                )
+                .resolve_access_token(binding.clone(), Utc::now())
                 .await
                 .map_err(map_oauth_error)?;
-            return Ok(Some(credential.into_access_token()));
+            // The digest is carried alongside the token so a later rejection can
+            // be attributed to *this* token rather than to whatever happens to
+            // be current by the time the response arrives.
+            let rejection = CredentialRejectionHandle {
+                binding,
+                token_digest: credential.token_digest().to_owned(),
+            };
+            return Ok(ResolvedCredential {
+                token: Some(credential.into_access_token()),
+                rejection: Some(rejection),
+            });
         }
-        self.open_static_credential(tenant_id, server)
+        Ok(ResolvedCredential {
+            token: self.open_static_credential(tenant_id, server)?,
+            rejection: None,
+        })
+    }
+
+    /// Reports an endpoint's explicit rejection of the token that was just used.
+    ///
+    /// The coordinator's CAS is the arbiter: it only moves the credential to
+    /// `authorization_required` while the rejected digest is still the current
+    /// one, so a late 401 carrying a superseded token cannot undo a refresh that
+    /// already committed a newer revision.
+    async fn note_rejection<T>(
+        &self,
+        resolved: &ResolvedCredential,
+        result: &Result<T, McpFederationError>,
+    ) {
+        let (Some(handle), Some(coordinator)) =
+            (resolved.rejection.as_ref(), self.oauth_coordinator.as_ref())
+        else {
+            return;
+        };
+        if !matches!(result, Err(McpFederationError::AuthorizationRequired)) {
+            return;
+        }
+        let _ = coordinator
+            .record_rejected_access_token(handle.binding.clone(), &handle.token_digest)
+            .await;
     }
 
     fn open_static_credential(
@@ -1797,11 +1905,68 @@ impl McpFederationClient {
     }
 }
 
+/// A credential that passed the resolution boundary, plus what is needed to
+/// report a rejection. Every surface -- tools, resources, prompts, initialize --
+/// goes through this one type, so they cannot drift apart on what counts as an
+/// authentication failure.
+struct ResolvedCredential {
+    token: Option<Zeroizing<String>>,
+    /// `None` for open and statically sealed servers: there is no OAuth
+    /// credential whose state a rejection could move.
+    rejection: Option<CredentialRejectionHandle>,
+}
+
+struct CredentialRejectionHandle {
+    binding: McpOAuthBinding,
+    token_digest: String,
+}
+
+const MAX_CHALLENGE_BYTES: usize = 4 * 1024;
+
+/// Decides whether a response is the endpoint explicitly refusing the token we
+/// presented.
+///
+/// Only a 401 qualifies. A 403 is an authorization decision about a caller that
+/// authenticated fine, and a transport or protocol failure says nothing about
+/// the token at all -- recording either as "token dead" would let an unrelated
+/// outage force every tenant to re-authorize. Within 401, an explicit
+/// `insufficient_scope` is a scope problem, not a dead token. An oversized
+/// challenge is not parsed at all.
+fn is_token_rejection(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+    if status != reqwest::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    let Some(challenge) = headers
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // A bare 401 is still an explicit refusal of what we presented.
+        return true;
+    };
+    if challenge.len() > MAX_CHALLENGE_BYTES {
+        return false;
+    }
+    match challenge_error_code(challenge) {
+        Some(code) => code == "invalid_token",
+        None => true,
+    }
+}
+
+fn challenge_error_code(challenge: &str) -> Option<String> {
+    let rest = challenge.split("error=").nth(1)?;
+    let value = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next().unwrap_or(""),
+        None => rest.split([',', ' ']).next().unwrap_or(""),
+    };
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
 fn map_oauth_error(error: McpOAuthError) -> McpFederationError {
     match error {
         McpOAuthError::AuthorizationRequired
         | McpOAuthError::ProviderRejected
-        | McpOAuthError::InvalidAuthorizationCallback => McpFederationError::AuthorizationRequired,
+        | McpOAuthError::InvalidAuthorizationCallback
+        | McpOAuthError::DiscoveryRejected => McpFederationError::AuthorizationRequired,
         McpOAuthError::InvalidBinding | McpOAuthError::InvalidAuthorizationRequest => {
             McpFederationError::CredentialUnopenable
         }

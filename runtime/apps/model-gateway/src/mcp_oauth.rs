@@ -26,6 +26,7 @@ const STORE_SCHEMA_VERSION: u32 = 1;
 const SEALED_SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 128 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 const MAX_FIELD_BYTES: usize = 4 * 1024;
 const MAX_SCOPES: usize = 32;
@@ -74,6 +75,31 @@ pub struct McpOAuthAuthorizationStart {
     pub flow_id: Uuid,
     pub authorization_url: String,
     pub expires_at: DateTime<Utc>,
+}
+
+/// The trusted, pre-configured public client. Dynamic Client Registration and
+/// private client secrets are deliberately out of scope (ADR-0119).
+#[derive(Clone)]
+pub struct McpOAuthClientConfig {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub requested_scopes: Vec<String>,
+}
+
+/// A frozen discovery result.
+///
+/// Every field has already passed the same outbound address policy as the MCP
+/// endpoint itself. Once this is folded into a pending authorization it is
+/// authoritative: the callback reads the persisted endpoints and never
+/// re-resolves metadata, so a server that changes its documents mid-flow cannot
+/// move where an authorization code is redeemed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthDiscovery {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub scopes_supported: Vec<String>,
+    pub resource: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +174,11 @@ pub enum McpOAuthError {
     ProviderUnavailable,
     #[error("MCP OAuth provider rejected the credential")]
     ProviderRejected,
+    /// Discovery produced a document that failed a binding, consistency or
+    /// capacity rule. The public error stays deliberately coarse so a probe
+    /// cannot use it to map which check tripped.
+    #[error("MCP OAuth discovery was rejected")]
+    DiscoveryRejected,
 }
 
 #[derive(Clone)]
@@ -173,6 +204,131 @@ impl McpOAuthCoordinator {
             request_timeout,
             loopback_permitted,
         })
+    }
+
+    /// Resolves the authorization server for an MCP endpoint.
+    ///
+    /// `challenge` is the raw `WWW-Authenticate` value when the endpoint sent
+    /// one. A challenge may only *narrow* discovery to a metadata URL on the
+    /// endpoint's own origin. Naming a foreign origin is a substitution attempt
+    /// and is refused before any request leaves the process, so a hostile
+    /// challenge cannot even be used to provoke an outbound probe.
+    pub async fn discover(
+        &self,
+        binding: &McpOAuthBinding,
+        challenge: Option<&str>,
+    ) -> Result<McpOAuthDiscovery, McpOAuthError> {
+        binding
+            .validate(self.loopback_permitted)
+            .map_err(|_| McpOAuthError::DiscoveryRejected)?;
+        let endpoint =
+            Url::parse(&binding.endpoint).map_err(|_| McpOAuthError::DiscoveryRejected)?;
+
+        let metadata_url = match challenge.map(challenge_resource_metadata).transpose()? {
+            Some(Some(named)) => {
+                let named = Url::parse(&named).map_err(|_| McpOAuthError::DiscoveryRejected)?;
+                if !same_origin(&endpoint, &named) {
+                    return Err(McpOAuthError::DiscoveryRejected);
+                }
+                named
+            }
+            _ => well_known_url(&endpoint, "oauth-protected-resource"),
+        };
+
+        let protected: ProtectedResourceMetadata =
+            self.fetch_metadata(metadata_url.as_str()).await?;
+        protected.validate_capacity()?;
+        // The document must claim exactly the endpoint we are authenticating to.
+        if !urls_equal(&protected.resource, &binding.endpoint) {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        let issuer = protected
+            .authorization_servers
+            .first()
+            .cloned()
+            .ok_or(McpOAuthError::DiscoveryRejected)?;
+        crate::mcp::require_permitted_endpoint(&issuer, self.loopback_permitted)
+            .map_err(|_| McpOAuthError::DiscoveryRejected)?;
+        let issuer_url = Url::parse(&issuer).map_err(|_| McpOAuthError::DiscoveryRejected)?;
+
+        let server: AuthorizationServerMetadata = self
+            .fetch_metadata(well_known_url(&issuer_url, "oauth-authorization-server").as_str())
+            .await?;
+        server.validate(&issuer_url, self.loopback_permitted)?;
+
+        let scopes_supported = if protected.scopes_supported.is_empty() {
+            server.scopes_supported
+        } else {
+            protected.scopes_supported
+        };
+        Ok(McpOAuthDiscovery {
+            issuer: server.issuer,
+            authorization_endpoint: server.authorization_endpoint,
+            token_endpoint: server.token_endpoint,
+            scopes_supported,
+            resource: binding.endpoint.clone(),
+        })
+    }
+
+    /// Discovers, then opens a PKCE authorization against the discovered
+    /// endpoints.
+    ///
+    /// The endpoints are persisted into the pending record here. That is what
+    /// freezes the flow: `complete_authorization` reads them back from the
+    /// record and never re-resolves metadata, so a server that swaps its
+    /// documents mid-flow cannot move where the code is redeemed.
+    pub async fn begin_discovered_authorization(
+        &self,
+        binding: McpOAuthBinding,
+        client: McpOAuthClientConfig,
+        now: DateTime<Utc>,
+    ) -> Result<McpOAuthAuthorizationStart, McpOAuthError> {
+        let discovery = self.discover(&binding, None).await?;
+        let scopes = negotiate_scopes(&client.requested_scopes, &discovery.scopes_supported)?;
+        let request = McpOAuthAuthorizationRequest {
+            authorization_endpoint: discovery.authorization_endpoint,
+            token_endpoint: discovery.token_endpoint,
+            client_id: client.client_id,
+            redirect_uri: client.redirect_uri,
+            scopes,
+        };
+        self.begin_authorization(binding, request, now).await
+    }
+
+    async fn fetch_metadata<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, McpOAuthError> {
+        crate::mcp::require_permitted_endpoint(url, self.loopback_permitted)
+            .map_err(|_| McpOAuthError::DiscoveryRejected)?;
+        let http = crate::mcp::build_pinned_http_client_for_endpoint(
+            url,
+            self.request_timeout,
+            self.loopback_permitted,
+        )
+        .map_err(|_| McpOAuthError::DiscoveryRejected)?;
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            http.get(url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send(),
+        )
+        .await
+        .map_err(|_| McpOAuthError::ProviderUnavailable)?
+        .map_err(|_| McpOAuthError::ProviderUnavailable)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length as usize > MAX_METADATA_BYTES)
+        {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        // The pinned client refuses redirects, so a 3xx arrives as a non-success
+        // status rather than a silent hop to another origin.
+        if !response.status().is_success() {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        let body = bounded_body(response, MAX_METADATA_BYTES).await?;
+        serde_json::from_slice(&body).map_err(|_| McpOAuthError::DiscoveryRejected)
     }
 
     pub async fn begin_authorization(
@@ -1123,6 +1279,169 @@ fn status_from_record(record: &StoredCredentialRecord) -> McpOAuthCredentialStat
             unreachable!("indeterminate state is recovered before status conversion")
         }
     }
+}
+
+/// RFC 9728 Protected Resource Metadata, reduced to the fields this stage acts
+/// on. Unknown fields are ignored rather than rejected so a richer document from
+/// a conformant server still works.
+#[derive(Deserialize)]
+struct ProtectedResourceMetadata {
+    resource: String,
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+}
+
+impl ProtectedResourceMetadata {
+    fn validate_capacity(&self) -> Result<(), McpOAuthError> {
+        bounded_field(&self.resource)?;
+        if self.authorization_servers.len() > MAX_SCOPES {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        self.authorization_servers
+            .iter()
+            .try_for_each(|issuer| bounded_field(issuer))?;
+        bounded_scopes(&self.scopes_supported)
+    }
+}
+
+/// RFC 8414 Authorization Server Metadata.
+#[derive(Deserialize)]
+struct AuthorizationServerMetadata {
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    response_types_supported: Vec<String>,
+}
+
+impl AuthorizationServerMetadata {
+    fn validate(&self, issuer: &Url, loopback_permitted: bool) -> Result<(), McpOAuthError> {
+        bounded_field(&self.issuer)?;
+        bounded_field(&self.authorization_endpoint)?;
+        bounded_field(&self.token_endpoint)?;
+        bounded_scopes(&self.scopes_supported)?;
+        if !urls_equal(&self.issuer, issuer.as_str()) {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        // S256 only. An absent list is not permission to fall back to `plain`.
+        if !self
+            .code_challenge_methods_supported
+            .iter()
+            .any(|method| method == "S256")
+        {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        // An implicit-only server cannot serve an authorization code flow.
+        if !self.response_types_supported.is_empty()
+            && !self
+                .response_types_supported
+                .iter()
+                .any(|response| response == "code")
+        {
+            return Err(McpOAuthError::DiscoveryRejected);
+        }
+        for endpoint in [&self.authorization_endpoint, &self.token_endpoint] {
+            crate::mcp::require_permitted_endpoint(endpoint, loopback_permitted)
+                .map_err(|_| McpOAuthError::DiscoveryRejected)?;
+            let parsed = Url::parse(endpoint).map_err(|_| McpOAuthError::DiscoveryRejected)?;
+            // The issuer must own its own endpoints. Without this a resource
+            // that names a legitimate issuer could still redirect the code
+            // exchange to an origin the issuer does not control.
+            if !same_origin(issuer, &parsed)
+                || parsed.fragment().is_some()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                return Err(McpOAuthError::DiscoveryRejected);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bounded_field(value: &str) -> Result<(), McpOAuthError> {
+    if value.is_empty() || value.len() > MAX_FIELD_BYTES {
+        return Err(McpOAuthError::DiscoveryRejected);
+    }
+    Ok(())
+}
+
+fn bounded_scopes(scopes: &[String]) -> Result<(), McpOAuthError> {
+    if scopes.len() > MAX_SCOPES {
+        return Err(McpOAuthError::DiscoveryRejected);
+    }
+    scopes.iter().try_for_each(|scope| bounded_field(scope))
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn urls_equal(left: &str, right: &str) -> bool {
+    matches!((Url::parse(left), Url::parse(right)), (Ok(left), Ok(right)) if left == right)
+}
+
+/// RFC 8414 / RFC 9728 place the well-known segment between the authority and
+/// the resource path, so a resource at `/mcp` is described at
+/// `/.well-known/oauth-protected-resource/mcp`.
+fn well_known_url(base: &Url, suffix: &str) -> Url {
+    let path = base.path().trim_end_matches('/').to_owned();
+    let mut url = base.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_path(&format!("/.well-known/{suffix}{path}"));
+    url
+}
+
+/// Extracts `resource_metadata` from a `WWW-Authenticate` challenge.
+///
+/// `Ok(None)` means the header carried no such parameter, which is an ordinary
+/// Bearer challenge. Anything oversized, control-bearing or malformed is
+/// refused outright rather than ignored, so a hostile header fails closed
+/// instead of silently falling back to the default well-known path.
+fn challenge_resource_metadata(raw: &str) -> Result<Option<String>, McpOAuthError> {
+    if raw.len() > MAX_FIELD_BYTES || raw.chars().any(char::is_control) {
+        return Err(McpOAuthError::DiscoveryRejected);
+    }
+    let Some(rest) = raw.split("resource_metadata=").nth(1) else {
+        return Ok(None);
+    };
+    let value = rest
+        .strip_prefix('"')
+        .and_then(|rest| rest.split('"').next())
+        .ok_or(McpOAuthError::DiscoveryRejected)?;
+    bounded_field(value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn negotiate_scopes(
+    requested: &[String],
+    supported: &[String],
+) -> Result<Vec<String>, McpOAuthError> {
+    if requested.is_empty() || requested.len() > MAX_SCOPES {
+        return Err(McpOAuthError::InvalidAuthorizationRequest);
+    }
+    if supported.is_empty() {
+        return Ok(requested.to_vec());
+    }
+    let available = supported.iter().collect::<BTreeSet<_>>();
+    let granted = requested
+        .iter()
+        .filter(|scope| available.contains(scope))
+        .cloned()
+        .collect::<Vec<_>>();
+    if granted.is_empty() {
+        return Err(McpOAuthError::DiscoveryRejected);
+    }
+    Ok(granted)
 }
 
 async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, McpOAuthError> {
