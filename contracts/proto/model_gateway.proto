@@ -498,6 +498,11 @@ message McpOauthStatusResponse {
   string reason = 3;
   // Zero when the credential has no expiry or the state has none.
   int64 expires_at_ms = 4;
+  // What the provider actually granted, which need not equal what was requested.
+  // Present only for an active credential. Scope names are not secret; without
+  // them an operator cannot tell that a provider quietly granted less, and the
+  // first symptom is a tool call failing for reasons nothing explains.
+  repeated string granted_scopes = 5;
 }
 
 message McpOauthRevokeRequest {

@@ -120,6 +120,11 @@ pub enum McpOAuthCredentialStatus {
     Active {
         expires_at: Option<DateTime<Utc>>,
         revision: u64,
+        /// What the provider actually granted, which is not necessarily what was
+        /// requested. Without this an operator cannot tell that a provider
+        /// quietly granted less, and the first symptom is a tool call failing
+        /// for reasons nothing explains. Scope names are not secrets.
+        granted_scopes: Vec<String>,
     },
     AuthorizationRequired {
         reason: McpOAuthAuthorizationReason,
@@ -1447,6 +1452,7 @@ fn status_from_record(record: &StoredCredentialRecord) -> McpOAuthCredentialStat
                 .expires_at_ms
                 .and_then(DateTime::from_timestamp_millis),
             revision: record.revision,
+            granted_scopes: active.scopes.clone(),
         },
         StoredCredentialState::AuthorizationRequired { reason } => {
             McpOAuthCredentialStatus::AuthorizationRequired {

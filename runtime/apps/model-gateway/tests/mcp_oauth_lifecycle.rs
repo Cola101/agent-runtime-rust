@@ -303,6 +303,9 @@ async fn oauth_tokens_stay_encrypted_and_concurrent_refresh_is_singleflight() {
         McpOAuthCredentialStatus::Active {
             expires_at: Some(now + chrono::Duration::seconds(3600)),
             revision: 5,
+            // The refresh response carried no scope, so the originally
+            // requested one is carried forward and reported as granted.
+            granted_scopes: vec!["tools.read".to_owned()],
         }
     );
     assert!(

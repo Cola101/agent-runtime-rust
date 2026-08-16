@@ -797,10 +797,16 @@ async fn a_narrower_granted_scope_is_accepted() {
     )
     .await
     .expect("a narrower granted scope is the provider's prerogative, not a failure");
-    assert!(matches!(
-        coordinator.status(bound).await.unwrap(),
-        McpOAuthCredentialStatus::Active { .. }
-    ));
+    // Accepting it is not enough: the narrowing has to be visible, or the first
+    // symptom of a quiet downgrade is a tool call failing for no stated reason.
+    match coordinator.status(bound).await.unwrap() {
+        McpOAuthCredentialStatus::Active { granted_scopes, .. } => assert_eq!(
+            granted_scopes,
+            vec!["tools.list".to_owned()],
+            "the status must report what was granted, not what was requested"
+        ),
+        other => panic!("expected an active credential, got {other:?}"),
+    }
 }
 
 /// Deviation 18: a non-Bearer token type. We only know how to present Bearer, so

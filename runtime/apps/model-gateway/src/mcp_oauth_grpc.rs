@@ -217,8 +217,8 @@ fn parse_uuid(value: &str, field: &'static str) -> Result<Uuid, Status> {
 }
 
 fn status_response(status: &McpOAuthCredentialStatus) -> McpOauthStatusResponse {
-    let (label, revision, reason, expires_at_ms) = match status {
-        McpOAuthCredentialStatus::Absent => ("absent", 0, "", 0),
+    let (label, revision, reason, expires_at_ms, granted_scopes) = match status {
+        McpOAuthCredentialStatus::Absent => ("absent", 0, "", 0, Vec::new()),
         McpOAuthCredentialStatus::PendingAuthorization {
             expires_at,
             revision,
@@ -227,29 +227,34 @@ fn status_response(status: &McpOAuthCredentialStatus) -> McpOauthStatusResponse 
             *revision,
             "",
             expires_at.timestamp_millis(),
+            Vec::new(),
         ),
         McpOAuthCredentialStatus::Active {
             expires_at,
             revision,
+            granted_scopes,
         } => (
             "active",
             *revision,
             "",
             expires_at.map_or(0, |at| at.timestamp_millis()),
+            granted_scopes.clone(),
         ),
         McpOAuthCredentialStatus::AuthorizationRequired { reason, revision } => (
             "authorization_required",
             *revision,
             reason_label(*reason),
             0,
+            Vec::new(),
         ),
-        McpOAuthCredentialStatus::Revoked { revision } => ("revoked", *revision, "", 0),
+        McpOAuthCredentialStatus::Revoked { revision } => ("revoked", *revision, "", 0, Vec::new()),
     };
     McpOauthStatusResponse {
         status: label.to_owned(),
         revision,
         reason: reason.to_owned(),
         expires_at_ms,
+        granted_scopes,
     }
 }
 
