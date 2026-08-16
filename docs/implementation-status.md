@@ -77,10 +77,16 @@ PKCE 强度。矩阵随后扩到 20 条，新增判定包括：**授权服务器
 challenge 指定的 metadata URL 受同源约束，因为那是攻击者可控输入）；HTTP 200 携带 `error`、空 `access_token`、
 body 短于 `Content-Length` 后断流三种伪成功均被拒绝；refresh 轮换与非轮换分别沿用正确的 token；
 `token_type` 非 Bearer 被拒绝；同一 credential 第二次 begin 作废第一次且旧 state 不再可兑换；`expires_in`
-落在 30 秒刷新偏移窗口内时刷新而非呈示。**已发现但未修复的观测性缺口**：授予的 scope 虽持久化却无 API 暴露，
-运维无法得知 provider 是否静默收窄了权限。全工作区精确列出 769 项：**763 通过、0 失败、6 个外部 live 用例
-显式忽略**（121 个测试二进制）；Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，
-总体进度仍维持 70–75%。**
+落在 30 秒刷新偏移窗口内时刷新而非呈示；authorization endpoint 已带 query 参数时 OAuth 参数扩展既有 query 而非
+另起一个（丢掉 provider 的 `tenant=` 判别参数会把用户送进错误的授权上下文，而其余参数看起来都对）。
+RFC 8707 `resource` 参数记为**有意的已知不兼容**：要求它的 provider 会拒绝兑换，那是可诊断的失败；而向不预期
+它的授权服务器发送 resource indicator 可能改变签发的 audience，那既不可见也不可诊断。
+矩阵过程中发现的观测性缺口**已闭合**：`McpOAuthCredentialStatus::Active` 与 `McpOauthStatusResponse` 现在携带
+granted scopes，运维可看出 provider 是否静默收窄了权限；scope 名不是凭证材料，因此拓宽的是可见性而非暴露面。
+另补两项并发交叉断言：撤销在并发刷新下保持终局（在途 refresh 不能复活已撤销的凭证），以及任何 revision 都
+不曾持有的 digest 无论何时落地都被拒绝——结论建立在 6 次 × 8 线程重复运行上，而非单次绿。
+全工作区精确列出 772 项：**766 通过、0 失败、6 个外部 live 用例显式忽略**（121 个测试二进制）；
+Clippy `-D warnings` 与 fmt check 通过。**脚本化模拟不构成真实外部兼容证据，总体进度仍维持 70–75%。**
 
 2026-08-15 Runtime-owned MCP 只读 Tool 与 Resource Templates 阶段完成：模型现在可在真实 Agent Loop 中调用
 `list_mcp_resources`、`read_mcp_resource`、`list_mcp_resource_templates`、`list_mcp_prompts` 与

@@ -27,8 +27,9 @@ operator token（mcp.oauth.admin）
 | discovery / 拒绝 / 撤销 | `-p agent-model-gateway --test mcp_oauth_discovery` | **15 passed，0 failed，0 ignored** |
 | Gateway 全包 | `-p agent-model-gateway` | **97 passed，0 failed，4 ignored** |
 | tool-runtime 全包 | `-p agent-tool-runtime` | **109 passed，0 failed，0 ignored** |
-| provider 偏差矩阵 | `-p agent-model-gateway --test mcp_oauth_provider_deviations` | **21 passed，0 failed，0 ignored** |
-| 全工作区 | `cargo test --workspace -- --test-threads=4` | **121 个测试二进制，763 passed，0 failed，6 ignored（共 769 项），`CARGO_EXIT=0`** |
+| provider 偏差矩阵与并发交叉 | `-p agent-model-gateway --test mcp_oauth_provider_deviations` | **25 passed，0 failed，0 ignored**（并发两项以 6 次 × 8 线程复跑确认） |
+| discovery / 拒绝 / 撤销 | `-p agent-model-gateway --test mcp_oauth_discovery` | **16 passed，0 failed，0 ignored** |
+| 全工作区 | `cargo test --workspace -- --test-threads=4` | **121 个测试二进制，766 passed，0 failed，6 ignored（共 772 项），`CARGO_EXIT=0`** |
 | Clippy | `--workspace --all-targets --all-features -- -D warnings` | `CLIPPY_EXIT=0`，0 条诊断 |
 
 > 计数方法：把全部 `test result:` 行相加。管道到 `tail` 会掩盖 cargo 退出码，必须单独记录 `$?`；本轮曾因此
