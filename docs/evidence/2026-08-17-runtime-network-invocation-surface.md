@@ -174,9 +174,49 @@ token 在到达**形状检查之前**就以 `InvalidClaims` 被拒了。那样�
 fmt `EXIT=0`；clippy `--workspace --all-targets --all-features -D warnings` `EXIT=0`。
 残留扫描：0 个遗留 `runtime-host` 进程、无遗留临时目录、磁盘 42Gi。
 
+## 第四段：控制路径（同日）
+
+`--test grpc_invocation_control` **3 passed, 0 failed**，TEST_EXIT=0。
+
+| 测试 | 证明 |
+| --- | --- |
+| `a_network_cancel_stops_a_live_run_and_returns_a_receipt` | 网络取消真的停掉一个**活着的** Run，终态边界 `cancelled`，收据带 64 位摘要 |
+| `replaying_the_same_command_id_returns_the_same_receipt` | 同 id 重放 → 同一决定（网络客户端丢响应后必然重试） |
+| `the_same_command_id_cannot_be_reused_for_a_different_action` | 同 id 换 action → `failed_precondition` |
+
+Provider 故意只接收不回应，Run 因此保持存活——否则"取消成功"会变成与 Run 自然结束的赛跑。
+
+### 这一段找到一个真实缺陷：我自己的契约在说谎
+
+`runtime.proto` 里我写的是「改用途会被 receipt 的 command digest 拒绝，不会被静默接受」。
+第三条测试首跑：**被接受了**，返回 `state: Accepted` 的成功收据。
+
+根因：摘要绑定检查存在于 `embedded.rs:1766-1775` 的 `control()` 中，
+而 `control_detached()` **先返回 `Accepted`，再异步执行 `control()`**。
+调用方拿到的是一张账本随后会拒绝的收据。
+
+**本地适配器一直没暴露这个**——`ipc.rs` 自己先做了一遍同样的检查。网络调用方没有那样的适配器，
+所以这个面一测就出来了。这也是本轮唯一一个「新面把旧缺陷照出来」的实例。
+
+修在 `embedded`（账本的性质），不在 gRPC 层（传输的性质）；新增 typed 变体
+`ControlCommandRebound` → `failed_precondition`，因为复用幂等键是调用方**自己能改的错**，
+以 `internal` 返回等于把可行动的错误说成内部故障。
+
+回归确认：`-p agent-runtime-host` 全量 **25 二进制、193 passed、0 failed**——
+本地适配器既有路径未受影响。
+
+### 全量门禁（第四段，fullgate22）——绿
+
+**129 二进制、801 passed、0 failed、6 ignored、`CARGO_EXIT=0`**
+
+对照 fullgate21（128 / 797 passed + 1 failed = 798 总）：+1 二进制、总数 +3 = 三个新控制测试。
+上一轮那条 EPERM 失败本次未复现（与「隔离 3/3 通过」一致，仍是负载相关，仍未被改动）。
+fmt `EXIT=0`；clippy `EXIT=0`；残留扫描：0 个遗留进程，磁盘 45Gi。
+
 ## 没证明什么——**阶段 1 未完成**
 
-- **控制路径只证明了拒绝。** 审批、取消、resume 的成功端到端，以及跨进程崩溃恢复，未在该面验证。
+- **取消已成功闭环；审批与 resume 的成功路径未验证**（审批需要真实 Tool 停在审批门上）。
+- **跨进程崩溃恢复未在该面验证。**
 - 无流式订阅，调用方只能分页轮询。无 Java SDK。
 
 ## 进度

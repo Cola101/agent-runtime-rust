@@ -3,7 +3,8 @@
 - 状态：Accepted
 - 日期：2026-08-17
 - 范围：`contracts/proto/runtime.proto`、新 crate `agent-runtime-invocation-protocol`、
-  `agent-runtime-host` 的 `grpc` 模块与 `serve` 接线；**不含** 流式订阅、Java SDK、控制路径成功闭环
+  `agent-runtime-host` 的 `grpc` 模块与 `serve` 接线、`control_detached` 的绑定前置检查；
+  **不含** 流式订阅、Java SDK、审批/resume 成功路径、跨进程恢复
 
 ## 背景
 
@@ -113,12 +114,33 @@ flowchart LR
 13. **配置性质由真实二进制证明**，不是由库函数证明：测试 spawn 真正的 `runtime-host serve`。
     `load_invocation_surface` 住在 `main.rs`、库测试够不着——那是它应该在的地方，这是证明它的方式。
 
+## 第四段：控制路径，以及它暴露的缺陷
+
+14. **`control_detached` 在返回 `Accepted` 之前检查命令绑定。**
+
+    摘要绑定检查本来就存在，但在 `control()` 里；而 `control_detached()` **先返回 `Accepted`，
+    再异步执行 `control()`**。于是同一 `command_id` 换一个 action 会拿到一张成功收据，
+    而账本随后才拒绝它。
+
+    detached 的 `Accepted` 是一个承诺：调用方据此停止重试、记录命令已落地。让一个已绑定到别的
+    action 的 id 穿过这个承诺，等于让调用方相信一张账本没有的收据。
+
+    **这条我写在 `runtime.proto` 里当成既有保证**（"改用途会被 receipt 的 command digest 拒绝，
+    不会被静默接受"）。它当时不成立。**本地适配器从未暴露它，因为 `ipc.rs` 自己先做了一遍检查；
+    网络调用方没有那样的适配器。**
+
+15. **修在 `embedded`，不在 gRPC 层。** 这是持久命令账本的性质，不是传输的性质。修在适配器里
+    会变成本地适配器和 embedded 测试都够不着的规则——正是本 ADR 开头说不做的事。
+
+16. **`ControlCommandRebound` 独立成 typed 变体**，映射为 `failed_precondition`。
+    调用方复用幂等键是它自己能改的错，以 `internal` 返回会把可行动的错误说成内部故障。
+
 ## 风险与后续——本轮**未**完成的部分
 
 **仍未达到 `docs/roadmap.md` 阶段 1 的完整出口标准。**
 
-- **控制路径只证明了拒绝。** 审批、取消、resume 的**成功**端到端，以及跨进程崩溃恢复，
-  尚未在该面上验证。真实闭环测试目前覆盖 Submit + ReadEvents。
+- **取消已证明成功端到端**（含幂等重放与改用途拒绝）；**审批与 resume 的成功路径、
+  以及跨进程崩溃恢复仍未在该面验证**。审批需要真实 Tool 停在审批门上，本轮未做。
 - 无流式订阅（`subscribe_events` 未暴露），调用方只能分页轮询。
 - 无 Java SDK。`option java_package` 只是让契约可被生成，不等于有 SDK。
 - **总体进度不因本 ADR 提高**，仍为 70–75%：这是边界层，不是内核能力，也不属于并发/真实厂商/

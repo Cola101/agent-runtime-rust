@@ -424,6 +424,13 @@ pub enum EmbeddedRuntimeError {
     Configuration(String),
     #[error("Runtime invocation is not registered")]
     UnregisteredInvocation,
+    /// A control command id is already bound to a different command.
+    ///
+    /// Its own variant rather than a `Configuration` string because it is the
+    /// one failure here a caller can act on: it did not mistype configuration,
+    /// it reused an idempotency key. An adapter needs to be able to say so.
+    #[error("control command id was already used for another command")]
+    ControlCommandRebound,
     #[error(transparent)]
     Admission(#[from] RuntimeAdmissionError),
     #[error(transparent)]
@@ -1528,7 +1535,25 @@ impl EmbeddedRuntime {
         command: RuntimeControlCommand,
     ) -> Result<RuntimeControlReceipt, EmbeddedRuntimeError> {
         self.validate_control_command(&command)?;
-        self.profile(command.invocation)?;
+        let config = self.profile(command.invocation)?;
+        // The binding `control` enforces, applied *before* the caller is told
+        // Accepted rather than after.
+        //
+        // Detached acceptance is a promise: the caller stops retrying and
+        // records that its command landed. Letting a command id that is already
+        // bound to a different action through that promise, only for the
+        // asynchronous half to reject it, leaves the caller believing in a
+        // receipt the ledger does not have. The local adapter never showed this
+        // because it runs its own check first; a network caller has no such
+        // adapter, which is how it surfaced.
+        let digest = Self::control_command_digest(&command)?;
+        if let Some(receipt) = Self::load_control_receipt(&config.state_root, command.command_id)?
+            && (receipt.command_digest != digest
+                || receipt.invocation != command.invocation
+                || receipt.run_id != command.run_id)
+        {
+            return Err(EmbeddedRuntimeError::ControlCommandRebound);
+        }
         let invocation = command.invocation;
         let command_id = command.command_id;
         let runtime = Arc::clone(self);
@@ -1769,9 +1794,7 @@ impl EmbeddedRuntime {
                 || receipt.invocation != command.invocation
                 || receipt.run_id != command.run_id
             {
-                return Err(EmbeddedRuntimeError::Configuration(
-                    "control command id was already used for another command".into(),
-                ));
+                return Err(EmbeddedRuntimeError::ControlCommandRebound);
             }
             if receipt.state == RuntimeControlReceiptState::Completed {
                 return Ok(RuntimeControlResult {

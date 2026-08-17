@@ -318,6 +318,11 @@ fn runtime_status(error: EmbeddedRuntimeError) -> Status {
         EmbeddedRuntimeError::UnregisteredInvocation => {
             Status::permission_denied("this invocation is not registered")
         }
+        // The caller reused an idempotency key for a different action. It is
+        // actionable and it is theirs, so it must not arrive as `internal`.
+        EmbeddedRuntimeError::ControlCommandRebound => {
+            Status::failed_precondition("this command id is already bound to a different command")
+        }
         EmbeddedRuntimeError::Admission(_) => {
             Status::resource_exhausted("the Runtime is at its admission ceiling")
         }
