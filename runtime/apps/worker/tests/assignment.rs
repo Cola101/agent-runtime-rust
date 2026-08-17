@@ -2305,7 +2305,7 @@ fn async_subagent_message_receipt_replays_after_recovery_and_rejects_key_reuse()
         .checkpoint(replacement_command.attempt_id)
         .unwrap();
     let checkpoint: serde_json::Value = serde_json::from_slice(&checkpoint.state).unwrap();
-    assert_eq!(checkpoint["schema_version"], 26);
+    assert_eq!(checkpoint["schema_version"], 27);
     assert_eq!(
         checkpoint["subagent_message_receipts"][agent_id.to_string()]
             .as_object()
@@ -3149,7 +3149,7 @@ fn terminal_model_turn_can_be_checkpointed_before_its_event_is_published() {
     assert_eq!(
         transcript[0].content,
         vec![agent_protocol::ContentPart::Text {
-            text: command.input,
+            text: command.input.clone(),
         }]
     );
     assert_eq!(transcript[1].role, agent_protocol::Role::Assistant);
@@ -3158,6 +3158,44 @@ fn terminal_model_turn_can_be_checkpointed_before_its_event_is_published() {
         vec![agent_protocol::ContentPart::Text {
             text: "terminal transcript evidence".into(),
         }]
+    );
+    let terminal = WorkerProcessor::terminal_event_from_checkpoint(&checkpoint)
+        .expect("terminal receipt must decode")
+        .expect("schema-27 checkpoint carries its exact terminal event");
+    assert_eq!(terminal.event_type, "run.succeeded");
+    assert_eq!(terminal.run_id, command.run_id);
+    assert_eq!(terminal.attempt_id, command.attempt_id);
+    assert_eq!(terminal.sequence, checkpoint.sequence);
+    let mut replacement = command.clone();
+    replacement.attempt_id = uuid::Uuid::now_v7();
+    replacement.owner_epoch = command.owner_epoch + 1;
+    replacement.fencing_token = uuid::Uuid::now_v7();
+    worker
+        .validate_terminal_checkpoint_binding(&replacement, &checkpoint)
+        .expect("a fresh owner may collect the exact terminal result");
+    replacement.input = "different input must not inherit this result".into();
+    assert!(
+        worker
+            .validate_terminal_checkpoint_binding(&replacement, &checkpoint)
+            .is_err(),
+        "terminal collection must preserve the original execution binding"
+    );
+
+    let mut corrupted_state: serde_json::Value =
+        serde_json::from_slice(&checkpoint.state).expect("worker checkpoint JSON");
+    corrupted_state["terminal_event"]["event_id"] = serde_json::json!(uuid::Uuid::nil());
+    let corrupted = agent_protocol::CheckpointSnapshot::new(
+        checkpoint.run_id,
+        checkpoint.tenant_id,
+        checkpoint.session_id,
+        checkpoint.attempt_id,
+        checkpoint.status,
+        checkpoint.sequence,
+        serde_json::to_vec(&corrupted_state).unwrap(),
+    );
+    assert!(
+        WorkerProcessor::terminal_event_from_checkpoint(&corrupted).is_err(),
+        "a digest-valid Checkpoint must not authorize a malformed terminal receipt"
     );
 }
 

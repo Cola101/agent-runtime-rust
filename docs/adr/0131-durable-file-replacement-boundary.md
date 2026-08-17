@@ -43,8 +43,8 @@ Embedded control receipt 和 retention ledger 也已经使用“临时文件同�
 
 - 本轮的操作记录器证明调用顺序和错误传播，不是硬件断电或存储控制器撒谎测试；macOS `sync_all` 也不等于
   对所有硬件声明绝对持久。
-- 多个权威文件之间仍无原子事务。Checkpoint→terminal Event→Session head 的恢复顺序已有专项测试，但不能
-  等价为数据库事务。
+- 多个权威文件之间仍无原子事务。Checkpoint→terminal Event→Session head 的两个终态窗口已由 ADR-0134
+  使用摘要绑定的原始 Event receipt 收敛，但不能等价为任意多记录数据库事务。
 - 可预测 staging 文件假设每个 state root 只有一个进程 owner；EmbeddedRuntime 在 Unix 已持有 `flock`，
   普通 LocalRuntimeHost 的跨进程写者治理仍需继续收口。Windows rename/目录同步语义未验证。
 - 模型路由 journal 的有界 WAL 已由 ADR-0132 完成；自动 quarantine/repair、真实硬件掉电和跨机器共享存储

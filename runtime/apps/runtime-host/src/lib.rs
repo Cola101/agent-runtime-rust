@@ -5067,7 +5067,20 @@ impl LocalRuntimeHost {
             self.persist_checkpoint(run_id, envelope.attempt_id)?;
         }
         types.push(envelope.event_type.clone());
-        let event = LocalEvent {
+        self.append_event(run_id, envelope)
+    }
+
+    fn local_event_from_envelope(
+        &self,
+        run_id: Uuid,
+        envelope: &EventEnvelope,
+    ) -> Result<LocalEvent, LocalRuntimeError> {
+        if envelope.run_id != run_id || envelope.tenant_id != self.invocation.tenant_id {
+            return Err(LocalRuntimeError::Checkpoint(
+                "event envelope is bound to another Runtime invocation".into(),
+            ));
+        }
+        Ok(LocalEvent {
             event_id: envelope.event_id,
             schema_version: envelope.schema_version,
             tenant_id: self.invocation.tenant_id,
@@ -5085,7 +5098,33 @@ impl LocalRuntimeHost {
             event_type: envelope.event_type.clone(),
             payload: envelope.payload.clone(),
             digest: envelope.digest.clone(),
-        };
+        })
+    }
+
+    fn local_event_is_bound_to_invocation(&self, run_id: Uuid, event: &LocalEvent) -> bool {
+        let payload_digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(&event.payload)
+                .expect("JSON event payload serialization is infallible"),
+        ));
+        event.schema_version == 1
+            && !event.event_id.is_nil()
+            && !event.trace_id.is_nil()
+            && event.run_id == run_id
+            && event.tenant_id == self.invocation.tenant_id
+            && event.application_id == self.invocation.application_id
+            && event.workload_identity_id == self.invocation.workload_identity_id
+            && event.workspace_id == self.invocation.workspace_id
+            && event.agent_version_id == self.invocation.agent_version_id
+            && event.model_policy_id == self.invocation.model_policy_id
+            && event.digest == payload_digest
+    }
+
+    fn append_event(
+        &self,
+        run_id: Uuid,
+        envelope: &EventEnvelope,
+    ) -> Result<(), LocalRuntimeError> {
+        let event = self.local_event_from_envelope(run_id, envelope)?;
         let dir = self.run_dir(run_id);
         std::fs::create_dir_all(&dir)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
@@ -5118,6 +5157,65 @@ impl LocalRuntimeHost {
                 .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// Converges the only valid state between a terminal Checkpoint commit and
+    /// its Event publication. The Checkpoint carries the exact Kernel envelope,
+    /// so recovery appends that identity once; it never manufactures a new
+    /// terminal event and never resumes model or Tool execution.
+    fn reconcile_terminal_event_from_checkpoint(
+        &self,
+        run_id: Uuid,
+        checkpoint: &agent_protocol::CheckpointSnapshot,
+    ) -> Result<(), LocalRuntimeError> {
+        let receipt = WorkerProcessor::terminal_event_from_checkpoint(checkpoint)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        let events = Self::replay_events(&self.config.state_root, run_id, 0)?;
+        let event_prefix_is_valid = events.first().is_none_or(|event| event.sequence == 1)
+            && events
+                .iter()
+                .all(|event| self.local_event_is_bound_to_invocation(run_id, event))
+            && events
+                .windows(2)
+                .all(|pair| pair[0].sequence.checked_add(1) == Some(pair[1].sequence));
+        let terminal_position = events.iter().position(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "run.succeeded"
+                    | "run.failed"
+                    | "run.cancelled"
+                    | "run.timed_out"
+                    | "run.indeterminate"
+            )
+        });
+        if let Some(position) = terminal_position {
+            let terminal = &events[position];
+            if !event_prefix_is_valid
+                || position + 1 != events.len()
+                || receipt.as_ref().is_some_and(|receipt| {
+                    self.local_event_from_envelope(run_id, receipt)
+                        .map_or(true, |expected| expected != *terminal)
+                })
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "durable terminal Event disagrees with its Checkpoint receipt".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let receipt = receipt.ok_or_else(|| {
+            LocalRuntimeError::Checkpoint(
+                "legacy terminal Checkpoint cannot repair a missing terminal Event".into(),
+            )
+        })?;
+        let last_sequence = events.last().map_or(0, |event| event.sequence);
+        if !event_prefix_is_valid || last_sequence.checked_add(1) != Some(receipt.sequence) {
+            return Err(LocalRuntimeError::Checkpoint(
+                "event prefix cannot accept the Checkpoint-bound terminal receipt".into(),
+            ));
+        }
+        self.append_event(run_id, &receipt)
     }
 
     /// Replays a Run's durable event log from `after_sequence` (exclusive).
@@ -5534,6 +5632,7 @@ impl LocalRuntimeHost {
                 "terminal root Session Checkpoint does not match its active head".into(),
             ));
         }
+        self.reconcile_terminal_event_from_checkpoint(run_id, checkpoint)?;
         let transcript = WorkerProcessor::conversation_transcript_from_checkpoint(checkpoint)
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
         let events = Self::replay_events(&self.config.state_root, run_id, 0)?;
@@ -5840,6 +5939,7 @@ impl LocalRuntimeHost {
                 "continuation terminal Checkpoint identity is invalid".into(),
             ));
         }
+        self.reconcile_terminal_event_from_checkpoint(run_id, checkpoint)?;
         let events = Self::replay_events(&self.config.state_root, run_id, 0)?;
         let status = events
             .iter()
@@ -8430,6 +8530,36 @@ impl LocalRuntimeHost {
             child_lineage,
             request.conversation_history.clone(),
         );
+        if let Some(terminal_checkpoint) = checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.status.is_terminal())
+        {
+            let recovered = (|| {
+                child
+                    .processor
+                    .validate_terminal_checkpoint_binding(&child_command, terminal_checkpoint)
+                    .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+                let child_outcome =
+                    child.terminal_local_outcome(child_run_id, terminal_checkpoint)?;
+                Self::persist_managed_run_state(
+                    &config.state_root,
+                    invocation,
+                    child_run_id,
+                    &request.input,
+                    owner_epoch,
+                    Self::managed_run_state(&child_outcome),
+                )?;
+                Self::completed_subagent_result(&config.state_root, &request)?.ok_or_else(|| {
+                    LocalRuntimeError::Execution(
+                        "terminal child Checkpoint could not publish a durable result".into(),
+                    )
+                })
+            })();
+            child.shutdown().await;
+            let result = recovered?;
+            Self::persist_subagent_result(&config.state_root, parent_run_id, &result)?;
+            return Ok(LocalSubagentProgress::Completed(result));
+        }
         Self::persist_managed_run_state(
             &config.state_root,
             invocation,

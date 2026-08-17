@@ -3318,7 +3318,7 @@ async fn different_handles_share_one_parent_budget_in_the_real_host_loop() {
         .expect("terminal budget checkpoint");
     let checkpoint: serde_json::Value =
         serde_json::from_slice(&checkpoint.state).expect("checkpoint state");
-    assert_eq!(checkpoint["schema_version"], 26);
+    assert_eq!(checkpoint["schema_version"], 27);
     assert_eq!(
         checkpoint["subagent_budget_reservations"]
             .as_object()
@@ -3613,6 +3613,25 @@ async fn replacement_recovers_child_tool_history_from_the_terminal_checkpoint() 
     ))
     .expect("child terminal checkpoint");
     assert_eq!(child_checkpoint.status, RunStatus::Succeeded);
+    let child_events_path = state
+        .path()
+        .join("runs")
+        .join(agent_id.to_string())
+        .join("events.jsonl");
+    let mut child_events = std::fs::read_to_string(&child_events_path)
+        .expect("completed child event log")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let unpublished: serde_json::Value = serde_json::from_str(
+        &child_events
+            .pop()
+            .expect("completed child has a terminal event"),
+    )
+    .expect("terminal child event JSON");
+    assert_eq!(unpublished["type"], "run.succeeded");
+    std::fs::write(&child_events_path, format!("{}\n", child_events.join("\n")))
+        .expect("recreate child Checkpoint-before-Event crash window");
 
     std::fs::write(&parent_checkpoint_path, active_checkpoint)
         .expect("restore the exact pre-result parent checkpoint");
@@ -3686,7 +3705,7 @@ async fn send_queues_behind_a_running_child_and_promotes_in_fifo_order() {
         LocalRuntimeHost::load_checkpoint(&outcome.checkpoint_path).expect("mailbox checkpoint");
     let checkpoint: serde_json::Value =
         serde_json::from_slice(&checkpoint.state).expect("checkpoint state");
-    assert_eq!(checkpoint["schema_version"], 26);
+    assert_eq!(checkpoint["schema_version"], 27);
     assert_eq!(
         checkpoint["subagent_message_queues"][agent_id.to_string()]
             .as_array()

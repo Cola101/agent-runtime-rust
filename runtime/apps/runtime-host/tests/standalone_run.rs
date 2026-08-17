@@ -2501,6 +2501,142 @@ async fn terminal_checkpoint_closes_the_session_head_commit_crash_window_without
     let _ = mcp_server.await;
 }
 
+#[tokio::test]
+async fn terminal_checkpoint_republishes_a_missing_terminal_event_before_session_commit() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (provider_endpoint, provider) = spawn_terminal_recovery_provider().await;
+    let (mcp_endpoint, mcp_calls, mcp_server) = spawn_open_mcp_server().await;
+    let mut local_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("workspace"),
+        provider_endpoint,
+        BTreeSet::from(["tool:mcp:local".to_owned()]),
+    );
+    local_config.mcp_servers = vec![LocalMcpServerConfig {
+        server_id: uuid::Uuid::now_v7(),
+        name: "local".into(),
+        transport: LocalMcpTransportConfig::StreamableHttp {
+            endpoint: mcp_endpoint,
+        },
+        tool_names: BTreeSet::from(["search".to_owned()]),
+        tool_effect_overrides: BTreeMap::new(),
+        required: true,
+    }];
+    let mut host = LocalRuntimeHost::start(local_config.clone()).expect("first host");
+    let first = host
+        .start_session("Read evidence before the terminal publication test.")
+        .await
+        .expect("first Turn");
+    let session_path = state
+        .path()
+        .join("sessions")
+        .join(first.head.session_id.to_string())
+        .join("session.json");
+    let pre_second: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&session_path).unwrap()).unwrap();
+    let second_input = "Complete the Turn whose terminal event is not yet published.";
+    let second = host
+        .continue_session(
+            first.head.session_id,
+            first.head.branch_id,
+            first.head.generation,
+            second_input,
+        )
+        .await
+        .expect("second Turn");
+    assert_eq!(second.run.status, RunStatus::Succeeded);
+    let checkpoint = LocalRuntimeHost::load_checkpoint(&second.run.checkpoint_path).unwrap();
+    assert_eq!(checkpoint.status, RunStatus::Succeeded);
+
+    // Recreate the earlier half of the actual commit order: the terminal
+    // Checkpoint is durable, but the process died before appending its terminal
+    // Event or advancing the Session head.
+    let event_path = state
+        .path()
+        .join("runs")
+        .join(second.run.run_id.to_string())
+        .join("events.jsonl");
+    let mut committed = std::fs::read_to_string(&event_path)
+        .expect("completed second Turn event log")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let terminal: serde_json::Value =
+        serde_json::from_str(&committed.pop().expect("second Turn has a terminal event"))
+            .expect("terminal event JSON");
+    assert_eq!(terminal["type"], "run.succeeded");
+    let valid_prefix = format!("{}\n", committed.join("\n"));
+    std::fs::write(&event_path, &valid_prefix)
+        .expect("remove only the uncommitted terminal publication");
+    let mut crashed = pre_second;
+    crashed["branches"][first.head.branch_id.to_string()]["active_turn"] = serde_json::json!({
+        "run_id": second.run.run_id,
+        "generation": first.head.generation,
+        "history_digest": first.head.history_digest,
+        "input": second_input
+    });
+    std::fs::write(&session_path, serde_json::to_vec_pretty(&crashed).unwrap()).unwrap();
+    host.shutdown().await;
+    drop(host);
+
+    let mut replacement = LocalRuntimeHost::start(local_config).expect("replacement host");
+    let mut corrupted = committed.clone();
+    let mut first_event: serde_json::Value =
+        serde_json::from_str(&corrupted[0]).expect("first committed event JSON");
+    first_event["workspace_id"] = serde_json::json!(uuid::Uuid::now_v7());
+    corrupted[0] = serde_json::to_string(&first_event).unwrap();
+    std::fs::write(&event_path, format!("{}\n", corrupted.join("\n")))
+        .expect("inject an identity-valid JSON row for fail-closed recovery");
+    assert!(
+        replacement
+            .resume(second.run.run_id, second_input, 2)
+            .await
+            .is_err(),
+        "a foreign event prefix must not receive the terminal receipt"
+    );
+    std::fs::write(&event_path, valid_prefix).expect("restore the exact committed prefix");
+    let recovered = replacement
+        .resume(second.run.run_id, second_input, 2)
+        .await
+        .expect("terminal Checkpoint republishes its exact Event before Session commit");
+    assert_eq!(recovered.status, RunStatus::Succeeded);
+    assert_eq!(recovered.output, "terminal recovery second answer");
+    let events = LocalRuntimeHost::replay_events(state.path(), second.run.run_id, 0)
+        .expect("reconciled event log");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.succeeded")
+            .count(),
+        1,
+        "terminal publication must be exactly once"
+    );
+    assert_eq!(
+        events.last().map(|event| event.event_id),
+        terminal["event_id"]
+            .as_str()
+            .and_then(|event_id| uuid::Uuid::parse_str(event_id).ok()),
+        "recovery must republish the Checkpoint-bound terminal identity"
+    );
+    let head = replacement
+        .session_head(first.head.session_id, first.head.branch_id)
+        .expect("committed head");
+    assert_eq!(head.turn_count, 2);
+    assert_eq!(head.active_run_id, None);
+    assert_eq!(mcp_calls.load(Ordering::SeqCst), 1);
+    replacement.shutdown().await;
+
+    let requests = provider.await.expect("provider request count");
+    assert_eq!(
+        requests.len(),
+        3,
+        "terminal publication recovery must not invoke the model again"
+    );
+    mcp_server.abort();
+    let _ = mcp_server.await;
+}
+
 /// The production break this catches is silently flattening, trusting or
 /// replaying a damaged imported Tool turn. Repair must be explicit, must not
 /// promote imported System authority, and must remain identical after a Host
@@ -2993,7 +3129,7 @@ async fn standalone_checkpoint_contains_the_runtime_policy_accepted_before_execu
     let checkpoint = LocalRuntimeHost::load_checkpoint(&outcome.checkpoint_path).unwrap();
     let state: serde_json::Value = serde_json::from_slice(&checkpoint.state).unwrap();
 
-    assert_eq!(state["schema_version"], 26);
+    assert_eq!(state["schema_version"], 27);
     assert_eq!(
         state["runtime_policy"]["tool_execution"]["timeout_ms"],
         1_234

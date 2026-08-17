@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：有界模型路由 WAL 与终态控制收据收敛
+## 当前阶段：Checkpoint 绑定的终态事件发布
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 写入顺序 | rollout 单 writer，Flush/Shutdown 有 ack | Session writer queue + SQLite transaction/WAL | terminal Checkpoint → terminal Event → Session/parent projection | transcript 先于可见终态，核心顺序对齐 |
+| 崩溃恢复 | 从已提交 rollout 重建 Thread | `BEGIN IMMEDIATE` 内重验后提交多行状态 | Checkpoint schema 27 保存原始 terminal envelope，缺失 Event 可补发 | 文件模式窄窗已闭合；通用事务仍落后 |
+| 幂等身份 | rollout item/Thread owner | SQLite row identity/revision | event id、tenant、六维 invocation、attempt、sequence、status、payload digest 联合验证 | 多租户嵌入边界更显式 |
+| 已完成子任务 | Thread/child history 由产品生命周期管理 | Session/Agent registry 与 owner 管理 | 终态 child 只验证并收集，绝不送入普通 restore | 消除重复 Provider/Tool 风险 |
+
+### 本阶段结论
+
+- 已验证 Root Session 与角色子代理两条真实故障窗口：保留 terminal Checkpoint、删除最后 terminal Event、
+  恢复上游 active binding。替代 Host 补发同一 event id，Provider/MCP/Tool 均不重放，最终 Event 恰好一次。
+- 相比 Codex，本项目吸收其单 writer、flush acknowledgement 和持久历史优先原则，并增加协议中立的多租户
+  execution binding；Codex 的 rollout/Thread 长期迁移、客户端与跨平台产品链仍领先。
+- 相比 OpenClaw，本项目无需 SQLite 即可独立完成 Run，但只关闭一个已证明的跨文件窗口；OpenClaw 的事务、
+  writer queue、schema migration、quarantine 和并发写成熟度仍明显领先。
+- **未外推**：任意多文件事务、共享文件系统、跨机器 owner、硬件掉电和 Windows 未验证；总体仍为
+  70–75%。架构审查选择在摘要 Checkpoint 内保存原始 terminal receipt，而不是生成新终态或引入外部服务。
+
+## 上一阶段：有界模型路由 WAL 与终态控制收据收敛
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

@@ -75,7 +75,7 @@ pub const EXECUTION_ACCEPTED_SUBJECT: &str = "runtime.worker.execution.accepted.
 pub const RUN_EVENT_SUBJECT: &str = "runtime.worker.run.event.v1";
 pub const CHECKPOINT_SUBJECT: &str = "runtime.worker.run.checkpoint.v1";
 pub const RUN_STEERING_OUTCOME_SUBJECT: &str = "runtime.worker.run.steering.outcome.v1";
-pub const WORKER_CHECKPOINT_SCHEMA_VERSION: u32 = 26;
+pub const WORKER_CHECKPOINT_SCHEMA_VERSION: u32 = 27;
 const SUBAGENT_MAX_GENERATIONS: u64 = 32;
 const SUBAGENT_ARCHIVE_MAX_TURNS: usize = 512;
 const SUBAGENT_ARCHIVE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -2225,6 +2225,11 @@ struct WorkerCheckpointState {
     /// worker/attempt identity; only the reviewed binding remains valid.
     #[serde(default)]
     applied_approval_decisions: BTreeMap<Uuid, AppliedApprovalDecision>,
+    /// Schema 27 stores the exact Kernel terminal envelope before an adapter
+    /// publishes it. The Checkpoint and Event log can therefore converge after
+    /// a crash without inventing a new event identity or replaying execution.
+    #[serde(default)]
+    terminal_event: Option<EventEnvelope>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3261,6 +3266,7 @@ impl WorkerProcessor {
                 .iter()
                 .map(|(id, decision)| (*id, decision.clone()))
                 .collect(),
+            terminal_event: execution.terminal_event.clone(),
         };
         let state = serde_json::to_vec(&state)
             .map_err(|error| WorkerAssignmentError::InvalidCheckpoint(error.to_string()))?;
@@ -3347,6 +3353,138 @@ impl WorkerProcessor {
             .map(|message| message.and_then(|message| protocol_message_from_model(&message)))
             .filter_map(Result::transpose)
             .collect()
+    }
+
+    /// Returns the exact terminal envelope committed inside a schema-27+
+    /// Checkpoint. Older Checkpoints remain readable, but cannot repair a
+    /// missing terminal publication because reconstructing its event id,
+    /// timestamp or trace id would create different evidence.
+    pub fn terminal_event_from_checkpoint(
+        checkpoint: &agent_protocol::CheckpointSnapshot,
+    ) -> Result<Option<EventEnvelope>, WorkerAssignmentError> {
+        if !checkpoint.verify_digest() || !checkpoint.status.is_terminal() {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(
+                "terminal publication Checkpoint identity is invalid".into(),
+            ));
+        }
+        let state: WorkerCheckpointState = serde_json::from_slice(&checkpoint.state)
+            .map_err(|error| WorkerAssignmentError::InvalidCheckpoint(error.to_string()))?;
+        if !(1..=WORKER_CHECKPOINT_SCHEMA_VERSION).contains(&state.schema_version) {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(format!(
+                "unsupported schema version {}",
+                state.schema_version
+            )));
+        }
+        let Some(event) = state.terminal_event else {
+            if state.schema_version >= 27 {
+                return Err(WorkerAssignmentError::InvalidCheckpoint(
+                    "schema-27 terminal Checkpoint has no terminal event receipt".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        if state.schema_version < 27 {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(
+                "legacy Checkpoint carries a schema-27 terminal event receipt".into(),
+            ));
+        }
+        let expected_type = match checkpoint.status {
+            RunStatus::Succeeded => "run.succeeded",
+            RunStatus::Failed => "run.failed",
+            RunStatus::Cancelled => "run.cancelled",
+            RunStatus::TimedOut => "run.timed_out",
+            RunStatus::Indeterminate => "run.indeterminate",
+            _ => {
+                return Err(WorkerAssignmentError::InvalidCheckpoint(
+                    "terminal publication Checkpoint has a nonterminal status".into(),
+                ));
+            }
+        };
+        let payload_digest = digest_bytes(
+            &serde_json::to_vec(&event.payload)
+                .expect("JSON event payload serialization is infallible"),
+        );
+        if event.schema_version != 1
+            || event.event_id.is_nil()
+            || event.trace_id.is_nil()
+            || event.tenant_id != checkpoint.tenant_id
+            || event.session_id != checkpoint.session_id
+            || event.run_id != checkpoint.run_id
+            || event.attempt_id != checkpoint.attempt_id
+            || event.sequence != checkpoint.sequence
+            || event.event_type != expected_type
+            || event.digest != payload_digest
+        {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(
+                "terminal event receipt does not match its Checkpoint".into(),
+            ));
+        }
+        Ok(Some(event))
+    }
+
+    /// Verifies that a terminal Checkpoint belongs to the exact replacement
+    /// command that is collecting its result. This performs no state-machine
+    /// transition: terminal work must be observed, never resumed.
+    pub fn validate_terminal_checkpoint_binding(
+        &self,
+        command: &RunExecutionCommand,
+        checkpoint: &agent_protocol::CheckpointSnapshot,
+    ) -> Result<(), WorkerAssignmentError> {
+        command
+            .validate()
+            .map_err(|error| WorkerAssignmentError::InvalidCommand(error.to_string()))?;
+        if checkpoint.attempt_id == command.attempt_id
+            || Self::terminal_event_from_checkpoint(checkpoint)?.is_none()
+        {
+            return Err(WorkerAssignmentError::CheckpointIdentityMismatch);
+        }
+        let state: WorkerCheckpointState = serde_json::from_slice(&checkpoint.state)
+            .map_err(|error| WorkerAssignmentError::InvalidCheckpoint(error.to_string()))?;
+        if state.schema_version != WORKER_CHECKPOINT_SCHEMA_VERSION {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(
+                "missing terminal publication requires the current Checkpoint schema".into(),
+            ));
+        }
+        let effective_skill_state = self.effective_skill_state(command)?;
+        let expected_history_repair = command
+            .history_import
+            .as_ref()
+            .map(repair_imported_history)
+            .transpose()
+            .map_err(|error| WorkerAssignmentError::InvalidTranscript(error.to_string()))?
+            .map(|repaired| repaired.report);
+        if checkpoint.tenant_id != command.tenant_id
+            || checkpoint.run_id != command.run_id
+            || checkpoint.session_id != command.session_id
+            || state.application_id != command.application_id
+            || state.workload_identity_id != command.workload_identity_id
+            || state.workspace_id != command.workspace_id
+            || state.agent_version_id != command.agent_version_id
+            || state.model_policy_id != command.model_policy_id
+            || state.input_digest != digest_bytes(command.input.as_bytes())
+            || state.subagent_history_digest
+                != agent_protocol::subagent_conversation_history_digest(&command.subagent_history)
+            || state.session_branch != command.session_branch
+            || state.agent_instructions_digest
+                != digest_bytes(effective_skill_state.agent_instructions.as_bytes())
+            || state.skill_binding_digest != effective_skill_state.skill_binding_digest
+            || state.lineage != command.lineage
+            || state.subagent_roles != command.subagent_roles
+            || state.budget != command.budget
+            || state.delegated_scopes != command.delegated_scopes
+            || state.runtime_policy != command.runtime_policy
+            || state.history_repair != expected_history_repair
+            || state.federated_server_binding_digest
+                != mcp_server_binding_digest(command.schema_version, &command.mcp_servers)
+            || state.tool_catalog_digest != effective_skill_state.tool_catalog_digest
+        {
+            return Err(WorkerAssignmentError::CheckpointIdentityMismatch);
+        }
+        if command.owner_epoch <= state.owner_epoch || command.fencing_token == state.fencing_token
+        {
+            return Err(WorkerAssignmentError::StaleCheckpointLease);
+        }
+        Ok(())
     }
 
     pub fn checkpoint_message(
@@ -3473,6 +3611,11 @@ impl WorkerProcessor {
                 "unsupported schema version {}",
                 state.schema_version
             )));
+        }
+        if state.terminal_event.is_some() {
+            return Err(WorkerAssignmentError::InvalidCheckpoint(
+                "nonterminal recovery Checkpoint carries a terminal event receipt".into(),
+            ));
         }
         if state.schema_version < 15 {
             // Schema 14 receipts predate both the mailbox and interrupt flag.
