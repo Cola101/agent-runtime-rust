@@ -1032,11 +1032,17 @@ impl EmbeddedRuntime {
                 if read == 0 {
                     break;
                 }
-                if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES || line.last() != Some(&b'\n') {
+                if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES {
                     return Err(RuntimeEventCursorError::new(
                         RuntimeEventCursorErrorCode::CorruptLog,
-                        "durable event log contains a torn or oversized row",
+                        "durable event log contains an oversized row",
                     ));
+                }
+                if line.last() != Some(&b'\n') {
+                    // A JSONL row commits only with its final newline. A
+                    // bounded prefix at EOF is an uncommitted crash tail;
+                    // the next writer truncates it before appending.
+                    break;
                 }
                 line.pop();
                 if line.last() == Some(&b'\r') {
@@ -1157,7 +1163,7 @@ impl EmbeddedRuntime {
         let stop = CancellationToken::new();
         let stop_for_task = stop.clone();
         let task = runtime.spawn(async move {
-            use std::io::{BufRead as _, Read as _};
+            use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
 
             let mut cursor = after_sequence;
             if matches!(initial_page.state, RuntimeEventCursorState::Retired { .. }) {
@@ -1180,12 +1186,19 @@ impl EmbeddedRuntime {
                 .join(run_id.to_string())
                 .join("events.jsonl");
             let mut reader = None::<std::io::BufReader<std::fs::File>>;
+            let mut committed_log_bytes = 0_u64;
             let mut last_log_sequence = 0_u64;
             let mut terminal_status = None;
             loop {
                 if reader.is_none() {
                     match std::fs::File::open(&event_path) {
-                        Ok(file) => reader = Some(std::io::BufReader::new(file)),
+                        Ok(mut file) => {
+                            if file.seek(SeekFrom::Start(committed_log_bytes)).is_err() {
+                                let _ = sender.send(Err(Self::cursor_storage_error().into())).await;
+                                return;
+                            }
+                            reader = Some(std::io::BufReader::new(file));
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(_) => {
                             let _ = sender.send(Err(Self::cursor_storage_error().into())).await;
@@ -1194,6 +1207,7 @@ impl EmbeddedRuntime {
                     }
                 }
 
+                let mut reopen_after_uncommitted_tail = false;
                 let read = if let Some(reader) = reader.as_mut() {
                     let mut line = Vec::new();
                     let mut bounded = reader
@@ -1201,12 +1215,28 @@ impl EmbeddedRuntime {
                         .take((LOCAL_EVENT_LOG_LINE_MAX_BYTES + 1) as u64);
                     match bounded.read_until(b'\n', &mut line) {
                         Ok(0) => None,
+                        Ok(_) if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES => {
+                            Some(Err(RuntimeEventCursorError::new(
+                                RuntimeEventCursorErrorCode::CorruptLog,
+                                "durable event log contains an oversized row",
+                            )))
+                        }
+                        Ok(_) if line.last() != Some(&b'\n') => {
+                            reopen_after_uncommitted_tail = true;
+                            None
+                        }
                         Ok(_) => Some(Ok(line)),
                         Err(_) => Some(Err(Self::cursor_storage_error())),
                     }
                 } else {
                     None
                 };
+                if reopen_after_uncommitted_tail {
+                    // A JSONL row commits only with its final newline. Treat
+                    // this bounded EOF prefix as absent, then reopen after the
+                    // writer has had a chance to truncate or finish it.
+                    reader = None;
+                }
                 if let Some(read) = read {
                     let mut line = match read {
                         Ok(line) => line,
@@ -1215,14 +1245,7 @@ impl EmbeddedRuntime {
                             return;
                         }
                     };
-                    if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES || line.last() != Some(&b'\n') {
-                        let error = RuntimeEventCursorError::new(
-                            RuntimeEventCursorErrorCode::CorruptLog,
-                            "durable event log contains a torn or oversized row",
-                        );
-                        let _ = sender.send(Err(error.into())).await;
-                        return;
-                    }
+                    let committed_row_bytes = line.len() as u64;
                     line.pop();
                     if line.last() == Some(&b'\r') {
                         line.pop();
@@ -1252,6 +1275,7 @@ impl EmbeddedRuntime {
                         }
                     };
                     last_log_sequence = event.sequence;
+                    committed_log_bytes = committed_log_bytes.saturating_add(committed_row_bytes);
                     terminal_status = next_terminal;
                     if event.sequence <= after_sequence {
                         continue;

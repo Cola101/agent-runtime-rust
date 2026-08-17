@@ -4596,6 +4596,55 @@ impl LocalRuntimeHost {
         self.run_dir(run_id).join("events.jsonl")
     }
 
+    /// Drops only a final row that never reached the JSONL commit marker.
+    ///
+    /// Every successful append writes and syncs one buffer ending in `\n`.
+    /// A process crash can leave a strict prefix of that buffer at EOF. That
+    /// prefix was never committed and must not be joined to the next event.
+    /// Complete rows -- including malformed ones -- are never repaired here;
+    /// readers continue to fail closed on those.
+    fn repair_uncommitted_event_tail(file: &mut std::fs::File) -> Result<(), LocalRuntimeError> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let length = file
+            .metadata()
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?
+            .len();
+        if length == 0 {
+            return Ok(());
+        }
+        file.seek(SeekFrom::End(-1))
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        let mut final_byte = [0_u8; 1];
+        file.read_exact(&mut final_byte)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        if final_byte[0] == b'\n' {
+            return Ok(());
+        }
+
+        const SCAN_BLOCK_BYTES: usize = 8 * 1024;
+        let mut cursor = length;
+        let mut committed_length = 0_u64;
+        let mut buffer = vec![0_u8; SCAN_BLOCK_BYTES];
+        while cursor > 0 {
+            let start = cursor.saturating_sub(SCAN_BLOCK_BYTES as u64);
+            let width = (cursor - start) as usize;
+            file.seek(SeekFrom::Start(start))
+                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            file.read_exact(&mut buffer[..width])
+                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            if let Some(index) = buffer[..width].iter().rposition(|byte| *byte == b'\n') {
+                committed_length = start + index as u64 + 1;
+                break;
+            }
+            cursor = start;
+        }
+        file.set_len(committed_length)
+            .and_then(|()| file.sync_data())
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        Ok(())
+    }
+
     /// Persists the event, then broadcasts it. The order matters: a client that
     /// reconnects replays from the log, so an event that was broadcast but not
     /// yet durable would be visible to a connected client and invisible to a
@@ -4668,9 +4717,11 @@ impl LocalRuntimeHost {
         let is_new_log = !event_log_path.exists();
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(event_log_path)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        Self::repair_uncommitted_event_tail(&mut file)?;
         file.write_all(&line)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         file.sync_data()
@@ -4694,14 +4745,27 @@ impl LocalRuntimeHost {
             .join("runs")
             .join(run_id.to_string())
             .join("events.jsonl");
-        let body = match std::fs::read_to_string(&path) {
+        let body = match std::fs::read(&path) {
             Ok(body) => body,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
         };
         let mut events = Vec::new();
-        for line in body.lines().filter(|line| !line.trim().is_empty()) {
-            let event: LocalEvent = serde_json::from_str(line)
+        let committed_length = body
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        if committed_length == 0 {
+            return Ok(events);
+        }
+        for line in body[..committed_length - 1].split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() || line.len() + 1 > LOCAL_EVENT_LOG_LINE_MAX_BYTES {
+                return Err(LocalRuntimeError::StateRoot(
+                    "durable event log contains an empty or oversized committed row".into(),
+                ));
+            }
+            let event: LocalEvent = serde_json::from_slice(line)
                 .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
             if event.sequence > after_sequence {
                 events.push(event);

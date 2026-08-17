@@ -276,6 +276,95 @@ async fn approving_over_ipc_lets_the_parked_run_execute_its_tool_and_finish() {
     );
 }
 
+/// A process can die after the kernel has copied only a prefix of one JSONL
+/// row. Complete rows before that prefix are committed; the unterminated tail
+/// is not. Recovery must neither lose the committed prefix nor concatenate a
+/// resumed event onto the torn bytes.
+#[tokio::test]
+async fn a_torn_event_tail_is_repaired_before_approval_resume() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let (socket, _serving) = start(config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider().await,
+    ))
+    .await;
+
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+    let probe = state_root.clone();
+    wait_for("the approval to be recorded", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+        )
+    })
+    .await;
+
+    let committed =
+        LocalRuntimeHost::replay_events(&state_root, run_id, 0).expect("committed event prefix");
+    assert!(!committed.is_empty());
+    let event_log = state_root
+        .join("runs")
+        .join(run_id.to_string())
+        .join("events.jsonl");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&event_log)
+        .expect("event log")
+        .write_all(b"{\"event_id\":\"torn")
+        .expect("inject torn tail");
+
+    let after_crash = LocalRuntimeHost::replay_events(&state_root, run_id, 0)
+        .expect("an unterminated tail is not a committed event");
+    assert_eq!(after_crash, committed);
+
+    let response = request(&socket, &LocalRequest::Approve { run_id }).await;
+    assert!(
+        matches!(response, LocalResponse::Accepted { .. }),
+        "approval was refused: {response:?}"
+    );
+    let probe = state_root.clone();
+    wait_for("the resumed Run to finish", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::Finished { .. })
+        )
+    })
+    .await;
+
+    let recovered =
+        LocalRuntimeHost::replay_events(&state_root, run_id, 0).expect("repaired event log");
+    assert!(recovered.len() > committed.len());
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        (1..=recovered.len() as u64).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recovered.last().map(|event| event.event_type.as_str()),
+        Some("run.succeeded")
+    );
+    assert!(
+        std::fs::read(&event_log)
+            .expect("event log bytes")
+            .ends_with(b"\n")
+    );
+}
+
 #[tokio::test]
 async fn approval_wait_does_not_consume_the_run_duration_budget() {
     let state = tempfile::tempdir().expect("state");

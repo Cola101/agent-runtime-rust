@@ -14,7 +14,26 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：多 Profile 孤儿 Run 自动恢复
+## 当前阶段：JSONL 崩溃尾部修复
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 权威存储 | rollout JSONL + SQLite metadata | Session transcript 已以 SQLite 事务/WAL 为主 | 本地 Event JSONL + 原子 Checkpoint/Run record | OpenClaw 存储引擎成熟度领先 |
+| 未换行尾部 | append 前补换行；合法尾行保留，非法行可被解析层跳过 | SQLite row transaction 不暴露 JSONL 半行 | 最终换行是 commit marker；未换行尾部截断 | 本项目更保守，适合事件直接决定副作用恢复 |
+| 已提交损坏 | rollout loader 收集/跳过部分 parse error | SQLite 完整性与 schema 约束 | 已换行坏 JSON、空行、超限、身份/序号/digest 错误全部 fail-closed | 不以可用性掩盖多租户审计损坏 |
+| 实时追随 | rollout writer/reader 产品链成熟 | Gateway/Session 订阅产品链成熟 | durable byte cursor 跨尾部修复继续，typed boundary 停止 | 内核闭环成立；产品订阅面仍落后 |
+
+### 本阶段结论
+
+- 已验证：审批中的 Run 和模型请求阻塞中的流式订阅，都能在事件半行后保留完整前缀、截断未提交尾部并
+  继续到唯一终态；已提交坏行仍失败。
+- 相比 Codex，本项目沿用 append 前修复尾部的方向，但没有采用“补换行保留合法尾行”：缺少 commit marker
+  就不能证明同步成功，因此必须丢弃。这是多租户副作用账本要求导致的有意偏离。
+- 相比 OpenClaw，本阶段维持无外部数据库的独立 Host；SQLite 事务/WAL 的长期成熟度仍领先，本项目不声称
+  JSONL 在共享存储或多进程写入上等价。
+- **未外推**：掉电、共享文件系统、介质损坏和跨机器日志未验证；总体仍为 70–75%。
+
+## 上一阶段：多 Profile 孤儿 Run 自动恢复
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

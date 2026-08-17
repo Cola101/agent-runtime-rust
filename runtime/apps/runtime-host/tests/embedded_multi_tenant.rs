@@ -5,7 +5,7 @@ use agent_protocol::{
 use agent_runtime_host::admission::RuntimeAdmissionLimits;
 use agent_runtime_host::embedded::{
     EmbeddedRuntime, RUNTIME_EVENT_CURSOR_SCHEMA_VERSION, RuntimeEventCursorRequest,
-    RuntimeEventCursorState, RuntimeProfile,
+    RuntimeEventCursorState, RuntimeEventStreamItem, RuntimeProfile,
 };
 use agent_runtime_host::{
     LocalMcpLifecycleConfig, LocalMcpServerConfig, LocalMcpTransportConfig,
@@ -198,6 +198,112 @@ async fn a_provider_selection_failure_is_a_durable_terminal_run() {
         1,
         "one Run must have exactly one terminal event"
     );
+
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(
+            state
+                .path()
+                .join("runs")
+                .join(run_id.to_string())
+                .join("events.jsonl"),
+        )
+        .expect("event log")
+        .write_all(b"{\"event_id\":\"torn")
+        .expect("inject crash tail");
+    let after_crash = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id,
+            after_sequence: 0,
+            limit: 64,
+        })
+        .expect("an unterminated row is not committed");
+    assert_eq!(after_crash.events, page.events);
+    assert_eq!(after_crash.state, page.state);
+}
+
+#[tokio::test]
+async fn a_live_subscription_continues_after_a_torn_tail_is_repaired() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation(Uuid::now_v7());
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (endpoint, provider) = spawn_provider("resumed", 1, Some(release_rx), order_tx).await;
+    let runtime = Arc::new(
+        EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: 1,
+                max_active_runs_per_tenant: 1,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: 1,
+                max_queued_runs_per_tenant: 1,
+            },
+            vec![RuntimeProfile {
+                invocation: identity,
+                config: config(
+                    state.path().to_path_buf(),
+                    workspace.path().canonicalize().expect("workspace"),
+                    endpoint,
+                ),
+            }],
+        )
+        .expect("Runtime"),
+    );
+    let run_id = Uuid::now_v7();
+    runtime
+        .execute_detached(identity, run_id, "wait for the Provider".into())
+        .await
+        .expect("Run admission");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), order_rx.recv())
+            .await
+            .expect("Provider request was never observed"),
+        Some("resumed")
+    );
+
+    let event_log = state
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("events.jsonl");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&event_log)
+        .expect("event log")
+        .write_all(b"{\"event_id\":\"torn")
+        .expect("inject crash tail");
+
+    let mut subscription = runtime
+        .subscribe_events(identity, run_id, 0, 16)
+        .expect("subscription accepts an uncommitted tail");
+    release_tx.send(()).expect("release Provider");
+    let mut sequences = Vec::new();
+    let boundary = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match subscription.recv().await.expect("subscription item") {
+                Ok(RuntimeEventStreamItem::Event { event, .. }) => {
+                    sequences.push(event.sequence);
+                }
+                Ok(RuntimeEventStreamItem::Boundary { state, .. }) => return state,
+                Err(error) => panic!("subscription failed after tail repair: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("subscription never reached a boundary");
+    assert_eq!(
+        boundary,
+        RuntimeEventCursorState::Terminal {
+            status: RunStatus::Succeeded
+        }
+    );
+    assert_eq!(sequences, (1..=sequences.len() as u64).collect::<Vec<_>>());
+    provider.await.expect("Provider");
 }
 
 #[tokio::test]
@@ -637,6 +743,17 @@ fn durable_event_log_read_errors_fail_closed() {
             .join("events.jsonl"),
     )
     .expect("invalid event-log directory");
+
+    assert!(agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0).is_err());
+}
+
+#[test]
+fn committed_event_log_corruption_is_never_tail_repaired() {
+    let state = tempfile::tempdir().expect("state");
+    let run_id = Uuid::now_v7();
+    let run_dir = state.path().join("runs").join(run_id.to_string());
+    std::fs::create_dir_all(&run_dir).expect("Run directory");
+    std::fs::write(run_dir.join("events.jsonl"), b"{not-json}\n").expect("corrupt committed row");
 
     assert!(agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0).is_err());
 }
