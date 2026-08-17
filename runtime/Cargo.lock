@@ -221,24 +221,39 @@ dependencies = [
  "agent-model-gateway",
  "agent-model-gateway-protocol",
  "agent-protocol",
+ "agent-runtime-invocation-protocol",
  "agent-runtime-worker",
  "agent-tool-runtime",
+ "agent-workload-identity",
  "base64",
  "chrono",
  "ed25519-dalek",
  "futures-util",
  "hex",
  "libc",
+ "prost",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "agent-runtime-invocation-protocol"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

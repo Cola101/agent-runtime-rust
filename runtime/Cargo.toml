@@ -6,6 +6,7 @@ members = [
   "crates/protocol",
   "crates/kernel",
   "crates/model-gateway-protocol",
+  "crates/runtime-invocation-protocol",
   "crates/workload-identity",
   "crates/grpc-security",
   "crates/checkpoint-gateway-protocol",
@@ -40,6 +41,7 @@ debug = "line-tables-only"
 agent-protocol = { path = "crates/protocol" }
 agent-kernel = { path = "crates/kernel" }
 agent-model-gateway-protocol = { path = "crates/model-gateway-protocol" }
+agent-runtime-invocation-protocol = { path = "crates/runtime-invocation-protocol" }
 agent-workload-identity = { path = "crates/workload-identity" }
 agent-grpc-security = { path = "crates/grpc-security" }
 agent-checkpoint-gateway-protocol = { path = "crates/checkpoint-gateway-protocol" }

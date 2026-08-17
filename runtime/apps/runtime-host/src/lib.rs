@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod embedded;
+pub mod grpc;
 pub mod ipc;
 pub mod retention;
 mod stdio_mcp;

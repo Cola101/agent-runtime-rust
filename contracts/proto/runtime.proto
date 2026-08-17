@@ -5,79 +5,148 @@ package agent.runtime.v1;
 option java_multiple_files = true;
 option java_package = "com.agentplatform.contract.runtime.v1";
 
-service RuntimeControl {
-  rpc Connect(stream NodeMessage) returns (stream ControlMessage);
+// The Runtime's own invocation surface.
+//
+// Before ADR-0123 this file declared a `RuntimeControl` node-lease stream that
+// nothing implemented and nothing called -- it was not compiled by any crate.
+// A contract sitting in `contracts/` that nothing serves is worse than an
+// absent one, because a reader takes it for a capability. The node/lease
+// direction it described belongs to `edge_node.proto`, which does have an
+// implementation; git retains the removed messages.
+//
+// Three operations, matching the three things an external caller needs and
+// nothing more: start a Run, act on one, observe one. Everything else the
+// Runtime can do is reached through these.
+//
+// The caller authenticates with an OPERATOR workload token (claims schema 5,
+// ADR-0121): an identity that is not bound to any Run. tenant, application and
+// workload identity are taken from the verified claims -- the fields below may
+// only agree with them, never widen them.
+service RuntimeInvocation {
+  // Start a Run under a pre-registered invocation Profile.
+  rpc Submit(SubmitRunRequest) returns (SubmitRunResponse);
+  // Resume, approve, deny, cancel or answer MCP input on an existing Run.
+  rpc Control(ControlRunRequest) returns (ControlRunResponse);
+  // One bounded page of a Run's durable event log.
+  rpc ReadEvents(ReadRunEventsRequest) returns (ReadRunEventsResponse);
 }
 
-message NodeMessage {
-  oneof body {
-    NodeHello hello = 1;
-    Heartbeat heartbeat = 2;
-    EventBatch event_batch = 3;
-    Checkpoint checkpoint = 4;
-  }
-}
-
-message ControlMessage {
-  oneof body {
-    RunLease run_lease = 1;
-    LeaseRevoked lease_revoked = 2;
-    EventAck event_ack = 3;
-    RunCancellation run_cancellation = 4;
-  }
-}
-
-message RunCancellation {
-  string message_id = 1;
+// Selects a pre-registered invocation Profile.
+//
+// The Runtime does not accept caller-supplied paths, state roots or
+// credentials: these ids must resolve to a Profile registered at startup, or
+// the request is refused before anything is created.
+message RuntimeInvocationRef {
+  uint32 schema_version = 1;
   string tenant_id = 2;
-  string run_id = 3;
-  string attempt_id = 4;
-  string worker_id = 5;
-  int64 issued_at_unix_ms = 6;
-  int64 expires_at_unix_ms = 7;
-  string reason = 8;
-  string worker_incarnation_id = 9;
+  string application_id = 3;
+  string workload_identity_id = 4;
+  string workspace_id = 5;
+  string agent_version_id = 6;
+  string model_policy_id = 7;
 }
 
-message NodeHello {
-  string node_id = 1;
-  string runtime_version = 2;
-  repeated string capabilities = 3;
-  string node_incarnation_id = 4;
-}
-
-message Heartbeat {
-  string node_id = 1;
-  int64 observed_at_unix_ms = 2;
-  repeated ActiveRunAssignment active_assignments = 3;
-  string node_incarnation_id = 4;
-}
-
-message ActiveRunAssignment {
-  string tenant_id = 1;
+message SubmitRunRequest {
+  RuntimeInvocationRef invocation = 1;
+  // Chosen by the caller so a retried Submit cannot start a second Run.
   string run_id = 2;
-  string attempt_id = 3;
-  string workspace_id = 4;
-  int64 owner_epoch = 5;
-  string fencing_token = 6;
+  string input = 3;
 }
 
-message RunLease {
-  string tenant_id = 1;
-  string run_id = 2;
-  string workspace_id = 3;
-  int64 owner_epoch = 4;
-  string fencing_token = 5;
-  int64 expires_at_unix_ms = 6;
-  string policy_digest = 7;
-  string worker_id = 8;
-  string worker_incarnation_id = 9;
-}
-
-message LeaseRevoked {
+message SubmitRunResponse {
   string run_id = 1;
-  int64 owner_epoch = 2;
-  string reason = 3;
+  uint64 owner_epoch = 2;
+  string status = 3;
+}
+
+message ControlRunRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  // Durable idempotency key. Reusing it for a different action is refused by
+  // the receipt's command digest, not silently accepted.
+  string command_id = 3;
+  string run_id = 4;
+  uint64 expected_owner_epoch = 5;
+  // A protocol-neutral `RuntimeControlAction`, carried as JSON for the same
+  // reason `model_gateway.proto` carries policy snapshots and tool arguments
+  // that way: the document has exactly one schema definition, on the Rust
+  // side, and duplicating it here would create a second one free to drift.
+  bytes action_json = 6;
+}
+
+enum ControlReceiptState {
+  CONTROL_RECEIPT_STATE_UNSPECIFIED = 0;
+  // Durably recorded; the Run has not reached a terminal state yet.
+  CONTROL_RECEIPT_STATE_ACCEPTED = 1;
+  CONTROL_RECEIPT_STATE_COMPLETED = 2;
+}
+
+message ControlRunResponse {
+  string command_id = 1;
+  string command_digest = 2;
+  string run_id = 3;
+  uint64 expected_owner_epoch = 4;
+  uint64 applied_owner_epoch = 5;
+  ControlReceiptState state = 6;
+  // Empty until the Run is terminal.
+  string run_status = 7;
+}
+
+message ReadRunEventsRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string run_id = 3;
+  uint64 after_sequence = 4;
+  uint32 limit = 5;
+}
+
+// Lifecycle boundary, kept typed rather than inferred from the event list
+// (ADR-0114). A caller that has drained a page must be able to tell "nothing
+// more yet" from "nothing more ever" without parsing event payloads.
+message RunLifecycleBoundary {
+  oneof boundary {
+    Running running = 1;
+    Cancelling cancelling = 2;
+    WaitingApproval waiting_approval = 3;
+    Suspended suspended = 4;
+    Interrupted interrupted = 5;
+    Terminal terminal = 6;
+    Retired retired = 7;
+  }
+
+  message Running {}
+  message Cancelling {}
+  message WaitingApproval {}
+  message Suspended {}
+  message Interrupted {}
+  message Terminal {
+    string status = 1;
+  }
+  // The hot events are gone but the terminal fact is retained, so a late
+  // reader learns the outcome instead of a missing Run.
+  message Retired {
+    string status = 1;
+    string terminal_event_id = 2;
+    uint64 terminal_sequence = 3;
+    string terminal_event_digest = 4;
+  }
+}
+
+message ReadRunEventsResponse {
+  uint32 schema_version = 1;
+  string run_id = 2;
+  uint64 requested_after_sequence = 3;
+  uint64 next_after_sequence = 4;
+  // Absent when no hot event remains; distinguishes "log starts here" from
+  // "sequence 0".
+  optional uint64 earliest_available_sequence = 5;
+  uint64 highest_committed_sequence = 6;
+  // The requested cursor precedes the oldest retained event, so events between
+  // them are permanently unavailable. Never silently skipped.
+  bool history_gap = 7;
+  bool has_more = 8;
+  RunLifecycleBoundary boundary = 9;
+  repeated RuntimeEvent events = 10;
 }
 
 message RuntimeEvent {
@@ -92,23 +161,4 @@ message RuntimeEvent {
   string type = 9;
   bytes payload_json = 10;
   string digest = 11;
-}
-
-message EventBatch {
-  string run_id = 1;
-  int64 owner_epoch = 2;
-  string fencing_token = 3;
-  repeated RuntimeEvent events = 4;
-}
-
-message EventAck {
-  string run_id = 1;
-  uint64 through_sequence = 2;
-}
-
-message Checkpoint {
-  string run_id = 1;
-  int64 owner_epoch = 2;
-  string object_ref = 3;
-  string digest = 4;
 }

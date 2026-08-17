@@ -9,9 +9,11 @@ rust-version.workspace = true
 agent-kernel.workspace = true
 agent-model-gateway = { path = "../model-gateway" }
 agent-model-gateway-protocol.workspace = true
+agent-runtime-invocation-protocol.workspace = true
 agent-protocol.workspace = true
 agent-runtime-worker = { path = "../worker" }
 agent-tool-runtime.workspace = true
+agent-workload-identity.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +25,8 @@ futures-util.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 tokio-util.workspace = true
+tonic.workspace = true
+prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
@@ -30,3 +34,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23.0"
+tokio-stream.workspace = true
