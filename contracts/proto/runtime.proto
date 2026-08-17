@@ -76,6 +76,8 @@ message ControlRunRequest {
   // reason `model_gateway.proto` carries policy snapshots and tool arguments
   // that way: the document has exactly one schema definition, on the Rust
   // side, and duplicating it here would create a second one free to drift.
+  // The minimal explicit crash-recovery action is `{ "type": "resume" }`;
+  // it never implies permission to exceed the Run's frozen retry budget.
   bytes action_json = 6;
 }
 

@@ -186,8 +186,9 @@ flowchart LR
 审批决定、取消、跨进程崩溃恢复，均由独立网络调用方在真实回环 Provider 上闭环验证。
 以下仍未做，且不在该标准内：
 
-- **取消、审批、跨进程崩溃恢复均已证明成功端到端**；**`resume` 的成功路径仍未在该面验证**
-  （其前置状态 `Interrupted` 构造成本高，且不在 roadmap 阶段 1 的出口标准内）。
+- **取消、审批、跨进程崩溃恢复均已证明成功端到端**；`resume` 的成功路径后来已由 ADR-0127 补齐：
+  原 Runtime 在模型出网后消失，替代 Runtime 服从冻结重试预算继续同一 Running Run。该结论仍不覆盖
+  `Interrupted`、无 Checkpoint 或跨机器恢复。
 - Provider 确定性终局与 required MCP 初始化失败已分别由本 ADR 和 ADR-0124 闭合。Tool/子代理
   编排以及 Host 存储/Checkpoint 错误仍有直接返回 `Err` 的路径；尚未逐条证明 detached adapter
   不会再次形成“终态记录但无终态事件”。因此不得把结论外推成“所有 Host 错误均满足终态一致性”。

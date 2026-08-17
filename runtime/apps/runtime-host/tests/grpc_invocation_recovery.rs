@@ -33,6 +33,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -77,6 +78,52 @@ async fn spawn_provider() -> String {
         }
     });
     endpoint
+}
+
+/// Holds the first model request forever and completes the replacement's
+/// request. The first connection therefore represents an in-flight request
+/// lost with the original Runtime; the replacement must use the durable route
+/// journal rather than pretend the first request never happened.
+async fn spawn_recoverable_provider()
+-> (String, tokio::sync::oneshot::Receiver<()>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    tokio::spawn(async move {
+        let mut first_seen_tx = Some(first_seen_tx);
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+            let first_seen_tx = if call == 0 {
+                first_seen_tx.take()
+            } else {
+                None
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 64 * 1024];
+                let _ = socket.read(&mut buffer).await;
+                if let Some(first_seen_tx) = first_seen_tx {
+                    let _ = first_seen_tx.send(());
+                    std::future::pending::<()>().await;
+                }
+
+                let body = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{ANSWER}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (endpoint, first_seen_rx, calls)
 }
 
 fn trusted_tool_binary() -> PathBuf {
@@ -471,4 +518,180 @@ async fn a_run_survives_the_runtime_that_started_it_and_is_finished_over_a_repla
         1,
         "the replacement restarted the Run instead of resuming it; observed {kinds:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_network_resume_recovers_an_inflight_run_over_a_replacement_runtime() {
+    let tool = trusted_tool_binary();
+    let signing_key = SigningKey::from_bytes(&[132; 32]);
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_root = workspace.path().canonicalize().unwrap();
+    let (provider_endpoint, first_seen, provider_calls) = spawn_recoverable_provider().await;
+    let claims = operator_claims(Uuid::now_v7());
+    let token = sign(&signing_key, &claims);
+    let profile = RuntimeInvocationContext {
+        schema_version: 1,
+        tenant_id: claims.tenant_id,
+        application_id: claims.application_id,
+        workload_identity_id: claims.workload_identity_id,
+        workspace_id: Uuid::now_v7(),
+        agent_version_id: Uuid::now_v7(),
+        model_policy_id: Uuid::now_v7(),
+    };
+    let invocation = RuntimeInvocationRef {
+        schema_version: 1,
+        tenant_id: claims.tenant_id.to_string(),
+        application_id: claims.application_id.to_string(),
+        workload_identity_id: claims.workload_identity_id.to_string(),
+        workspace_id: profile.workspace_id.to_string(),
+        agent_version_id: profile.agent_version_id.to_string(),
+        model_policy_id: profile.model_policy_id.to_string(),
+    };
+    let run_id = Uuid::now_v7();
+
+    let first_state = state.path().to_path_buf();
+    let first_workspace = workspace_root.clone();
+    let first_provider = provider_endpoint.clone();
+    let first_tool = tool.clone();
+    let first_invocation = invocation.clone();
+    let first_token = token.clone();
+    let owner_epoch = tokio::task::spawn_blocking(move || {
+        let thread_runtime = tokio::runtime::Runtime::new().unwrap();
+        thread_runtime.block_on(async move {
+            let signing_key = SigningKey::from_bytes(&[132; 32]);
+            let mut first_config =
+                config(&first_state, first_workspace, first_provider, first_tool);
+            first_config
+                .model_routing
+                .health_policy
+                .max_same_provider_attempts = 2;
+            let first = spawn_surface(&signing_key, profile, first_config).await;
+            let mut client = RuntimeInvocationClient::connect(format!("http://{}", first.address))
+                .await
+                .unwrap();
+            let accepted = client
+                .submit(with_token(
+                    SubmitRunRequest {
+                        invocation: Some(first_invocation.clone()),
+                        run_id: run_id.to_string(),
+                        input: "Answer after recovery.".into(),
+                    },
+                    &first_token,
+                ))
+                .await
+                .expect("submit to the first Runtime")
+                .into_inner();
+
+            first_seen
+                .await
+                .expect("the first Runtime never crossed model egress");
+            let page = client
+                .read_events(with_token(
+                    ReadRunEventsRequest {
+                        schema_version: 1,
+                        invocation: Some(first_invocation),
+                        run_id: run_id.to_string(),
+                        after_sequence: 0,
+                        limit: 256,
+                    },
+                    &first_token,
+                ))
+                .await
+                .expect("the first Runtime must expose its durable boundary")
+                .into_inner();
+            assert!(matches!(
+                page.boundary.and_then(|boundary| boundary.boundary),
+                Some(Boundary::Running(_))
+            ));
+            assert_eq!(
+                page.events
+                    .iter()
+                    .filter(|event| event.r#type == "run.started")
+                    .count(),
+                1
+            );
+            accepted.owner_epoch
+        })
+    })
+    .await
+    .expect("first Runtime thread");
+
+    let mut replacement_config = config(state.path(), workspace_root, provider_endpoint, tool);
+    replacement_config
+        .model_routing
+        .health_policy
+        .max_same_provider_attempts = 2;
+    let second = spawn_surface(&signing_key, profile, replacement_config).await;
+    let mut client = RuntimeInvocationClient::connect(format!("http://{}", second.address))
+        .await
+        .unwrap();
+    let command_id = Uuid::now_v7();
+    let request = ControlRunRequest {
+        schema_version: 1,
+        invocation: Some(invocation.clone()),
+        command_id: command_id.to_string(),
+        run_id: run_id.to_string(),
+        expected_owner_epoch: owner_epoch,
+        action_json: br#"{"type":"resume"}"#.to_vec(),
+    };
+    let accepted = client
+        .control(with_token(request.clone(), &token))
+        .await
+        .expect("the replacement must accept the public Resume")
+        .into_inner();
+    assert_eq!(accepted.command_id, command_id.to_string());
+    assert_eq!(accepted.applied_owner_epoch, owner_epoch + 1);
+
+    let (status, kinds) = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let page = client
+                .read_events(with_token(
+                    ReadRunEventsRequest {
+                        schema_version: 1,
+                        invocation: Some(invocation.clone()),
+                        run_id: run_id.to_string(),
+                        after_sequence: 0,
+                        limit: 256,
+                    },
+                    &token,
+                ))
+                .await
+                .expect("read resumed events")
+                .into_inner();
+            let kinds = page
+                .events
+                .iter()
+                .map(|event| event.r#type.clone())
+                .collect::<Vec<_>>();
+            match page.boundary.and_then(|boundary| boundary.boundary) {
+                Some(Boundary::Terminal(terminal)) => return (terminal.status, kinds),
+                Some(Boundary::Retired(retired)) => return (retired.status, kinds),
+                _ => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("the explicitly resumed Run never reached a terminal boundary");
+
+    assert_eq!(status, "succeeded", "observed {kinds:?}");
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "run.started").count(),
+        1,
+        "Resume started a second logical Run; observed {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| kind == "model.output.delta"),
+        "the replacement response never reached the public event log; observed {kinds:?}"
+    );
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+
+    let replayed = client
+        .control(with_token(request, &token))
+        .await
+        .expect("a lost Resume response must be safely replayable")
+        .into_inner();
+    assert_eq!(replayed.command_id, accepted.command_id);
+    assert_eq!(replayed.command_digest, accepted.command_digest);
+    assert_eq!(replayed.run_status, "succeeded");
 }

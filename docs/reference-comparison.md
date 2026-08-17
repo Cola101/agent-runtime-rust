@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：公开 MCP 输入回答与版本绑定
+## 当前阶段：公开显式 Resume 与冻结 Provider 重试预算
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 恢复主语 | `InitialHistory::Resumed` 从 rollout 重建 Thread，SDK 以 thread id 继续 | Gateway 扫描 aborted main Session，以 cycle/revision 和 owner claim 自动接管 | 外部调用方以 Run、旧 owner epoch 和幂等 command id 显式接管 | 三者都不依赖旧进程内句柄；本项目绑定维度更适合多租户服务 |
+| 重复启动防护 | resumed v2 child 不重复写 `ThreadStarted` | reservation、charged attempt 与 resumed-session dedupe | owner epoch 递增、command digest 收据；`run.started` 始终一次 | 本轮已用真实 replacement 证明 |
+| 恢复预算 | inspected Thread resume 未见同口径 Provider attempt ledger | 自动恢复最多 3 次；模糊 Tool 强制 restart-safe 集合 | 每个 Run 冻结同 Provider 尝试预算；Resume 不能扩充 | 默认一次时正确 failed，显式两次才重试成功 |
+| 产品广度 | TypeScript/Python SDK、Thread read/fork/rollback 产品链成熟 | 自动扫描、退避、通知和 transcript tail 分类成熟 | 只有协议中立 gRPC 显式 Resume；无 Java SDK、自动 orphan 管理面 | 核心账本窄面较强，产品恢复面仍落后 |
+
+### 本阶段结论
+
+- 已验证：第一 Runtime 在真实模型请求已出网、响应未持久化时整体消失；替代 Runtime 只在冻结策略允许
+  第二次尝试时提升 owner epoch、继续同一 Run，并由同一命令收据保证重放幂等。
+- 相比 Codex，本项目补的是同一在途 Run 的 Provider 尝试账本与 owner fencing；Codex 的公开 SDK、持久
+  Thread 恢复和分支产品面仍明显成熟得多。
+- 相比 OpenClaw，本项目没有照搬固定三次自动恢复，而是服从每个 Run 的冻结模型策略；OpenClaw 的自动
+  发现、恢复 reservation、transcript 分类和用户通知仍更完整。
+- **未外推**：真实厂商、跨机器、主机掉电、自动 orphan 扫描与分布式 command ledger 未完成；总体仍为
+  70–75%。
+
+## 上一阶段：公开 MCP 输入回答与版本绑定
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
