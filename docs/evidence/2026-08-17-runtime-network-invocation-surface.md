@@ -1,4 +1,4 @@
-# 证据：Runtime 网络调用契约第一段（ADR-0123）
+# 证据：Runtime 网络调用契约（ADR-0123）
 
 - 日期：2026-08-17
 - 机器：M1 Pro 16GB，macOS darwin 25.5.0
@@ -28,7 +28,7 @@
 | `clippy --workspace --all-targets --all-features -D warnings` | CLIPPY_EXIT=0 |
 | `cargo test --workspace -- --test-threads=4` | 见下 |
 
-### 全量门禁——**不是绿的**
+### 全量门禁（第一段，fullgate19）——**不是绿的**
 
 `cargo test --workspace --no-fail-fast -- --test-threads=4`（fullgate19）：
 
@@ -97,11 +97,44 @@ token 在到达**形状检查之前**就以 `InvalidClaims` 被拒了。那样�
 更糟的是 `LocalRunState` 是 `#[serde(tag = "state")]` 的带数据枚举，`Cancelling { reason }` 会把
 **操作员填写的 reason 文本**写进一个被文档描述为状态标记的字段。改为从 serde 取规范标记。
 
+## 第二段：binary 接线（同日）
+
+`--test invocation_surface_config` **3 passed, 0 failed**，TEST_EXIT=0。三条都 spawn**真实的
+`runtime-host serve` 二进制**，不是调用库函数——被测的性质是「部署出来的东西会怎样」。
+
+- 设了 `AGENT_RUNTIME_INVOCATION_BIND`、缺 mTLS 材料 → 拒绝启动，错误具名到缺失的变量
+- 有 mTLS 材料、缺 workload 验签公钥 → 拒绝启动（不能验签的面不得接受连接）
+- 不设 bind 地址 → 启动失败来自**完全无关的原因**，四个材料变量一个都没被要求
+  （证明这个面默认关闭，既有安装升级不会静默多出网络监听器）
+
+### 这一段暴露了我 `main.rs` 里的真实顺序问题
+
+首跑红：错误是 `AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT is required`，不是缺 TLS。
+因为我把 `load_invocation_surface()` 放在了 `load_config()` **之后**——
+「你要了网络面却没给 mTLS」这个**唯一与安全相关的门**，被一个无关配置错误盖住了。
+操作员会先修 provider endpoint、重启，才发现真正的问题。已把该检查移到所有配置之前。
+
+**这不是测试写错，是产品的诊断顺序错了，测试把它抓出来了。**
+
+### 全量门禁（第二段，fullgate20）——绿
+
+**127 二进制、795 passed、0 failed、6 ignored、`CARGO_EXIT=0`**
+
+对照 fullgate19（126 / 790 / 2 failed）：二进制 **+1**（新增配置测试文件），
+通过 **+5** = 3 个新测试 + **上一轮那两条墙钟失败这次都通过了**。差值精确闭合。
+
+这一次的通过**同时也是证据**：那两条失败是负载相关的偶发，不是确定性失败——
+与「单独重跑 114s / 全量并行 216s」的取证一致。两条门禁仍未被修改、放宽或排除，
+仍等用户决定。fmt `EXIT=0`；clippy `--workspace --all-targets --all-features -D warnings` `EXIT=0`。
+
+机器状态：磁盘 42Gi 可用（下限 20Gi）。
+
 ## 没证明什么——**阶段 1 未完成**
 
-- **binary 未接线。** `main.rs` 仍只绑 Unix socket。**部署出来的 Runtime 不提供这个面。**
-  测试跑在真实 TCP 上，但服务端由测试进程自己拉起。
-- **没有 TLS/mTLS。** `grpc-security` 已有材料类型，本段未接。接线前不得在回环之外暴露。
+- **mTLS 只证明了「缺了就不启动」，没证明「配好了能握手」。** 上述测试用的是无效证书文件，
+  验的是拒绝路径；**从未有一次请求真正穿过 TLS**。真实闭环测试的服务端是明文回环。
+  生成测试 CA 与证书链、跑一次真实 mTLS 握手仍是缺口。
+
 - **控制路径只证明了拒绝。** 审批、取消、resume 的成功端到端，以及跨进程崩溃恢复，未在该面验证。
 - 无流式订阅，调用方只能分页轮询。无 Java SDK。
 

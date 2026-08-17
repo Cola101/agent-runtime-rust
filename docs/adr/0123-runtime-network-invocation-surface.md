@@ -1,9 +1,9 @@
-# ADR-0123：Runtime 的网络调用契约（第一段）
+# ADR-0123：Runtime 的网络调用契约
 
 - 状态：Accepted
 - 日期：2026-08-17
 - 范围：`contracts/proto/runtime.proto`、新 crate `agent-runtime-invocation-protocol`、
-  `agent-runtime-host` 的 `grpc` 模块；**不含** binary 接线、TLS 配置、流式订阅、Java SDK
+  `agent-runtime-host` 的 `grpc` 模块与 `serve` 接线；**不含** 流式订阅、Java SDK、控制路径成功闭环
 
 ## 背景
 
@@ -88,15 +88,32 @@ flowchart LR
 - **先做 REST/SSE**：gRPC 已是本仓库既有的跨语言契约形态（Model Gateway、Checkpoint Gateway、Edge），
   且 `option java_package` 已就位。REST 网关可在其上叠加，反之则要先定义第二套类型。
 
-## 风险与后续——本段**未**完成的部分
+## 第二段：binary 接线与不可绕过的 mTLS
 
-**这一段没有达到 `docs/roadmap.md` 阶段 1 的完整出口标准，不得当作阶段 1 已完成。**
+9. **默认关闭，且无法在没有 mTLS 的情况下打开。** `AGENT_RUNTIME_INVOCATION_BIND` 未设置即没有这个面，
+   既有安装升级后不会静默多出一个网络监听器。设置了 bind 地址却缺少证书、私钥、客户端 CA 或
+   workload 验签公钥，是**拒绝启动的配置错误**，绝不退化为明文服务。
 
-- **binary 未接线。** `RuntimeInvocationGrpcService` 是库级服务，`runtime-host` 的 `main.rs`
-  仍然只绑定 Unix socket。**部署出来的 Runtime 二进制目前不提供这个面。** 测试在真实 TCP 上跑，
-  但服务端由测试进程自己拉起。
-- **没有 TLS/mTLS 配置。** `grpc-security` 已有 `ServerMtlsMaterials`，本段未接。在接线之前，
-  这个面不得在回环之外暴露。
+   Unix socket 可以把「你能打开这个文件」当作授权；TCP 端口没有等价物，而一个能开 Run、
+   花掉租户预算的面，不该是我们发现这件事的地方。
+
+10. **该检查排在所有配置之前。** 它便宜、独立，且是这里唯一与安全相关的门。若排在 `load_config()`
+    之后，「你要了网络面却没给 mTLS」会被一个无关的配置错误盖住——操作员修好那个、重启，才发现
+    真正的问题。（这不是假设：第二段的测试首跑就是这样红的。）
+
+11. **两个适配器共用同一个 `EmbeddedRuntime`**（`LocalRuntimeDaemon::runtime()`）。同一 state root 上
+    起两个实例会让各自拥有独立的准入上限、owner epoch 与 retention gate，而两者都认为自己拥有该目录。
+
+12. **配置性质由真实二进制证明**，不是由库函数证明：测试 spawn 真正的 `runtime-host serve`。
+    `load_invocation_surface` 住在 `main.rs`、库测试够不着——那是它应该在的地方，这是证明它的方式。
+
+## 风险与后续——本轮**未**完成的部分
+
+**仍未达到 `docs/roadmap.md` 阶段 1 的完整出口标准。**
+
+- **mTLS 只证明了"缺了就不启动"，没有证明"配好了能握手"。** 测试用的是无效证书文件，
+  验证的是拒绝路径；**从未有一次请求真正穿过 TLS**。真实闭环测试里的服务端是明文回环。
+  生成测试用 CA 与证书链、跑一次真实 mTLS 握手，仍是缺口——在此之前不得声称传输安全已验证。
 - **控制路径只证明了拒绝。** 审批、取消、resume 的**成功**端到端，以及跨进程崩溃恢复，
   尚未在该面上验证。真实闭环测试目前覆盖 Submit + ReadEvents。
 - 无流式订阅（`subscribe_events` 未暴露），调用方只能分页轮询。
