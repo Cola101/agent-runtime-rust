@@ -17,7 +17,7 @@ use agent_runtime_host::embedded::{
 };
 use agent_runtime_host::{
     LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig,
-    LocalToolConsent,
+    LocalRuntimeHost, LocalToolConsent,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -328,4 +328,43 @@ async fn one_corrupt_profile_cannot_block_another_tenants_recovery() {
     assert_eq!(repeated.recovered_runs, 0);
     assert_eq!(repeated.failures.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_unreadable_run_directory_is_reported_instead_of_looking_empty() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation(Uuid::now_v7());
+    let runtime = Arc::new(
+        EmbeddedRuntime::new(
+            limits(),
+            vec![profile(
+                identity,
+                state.path(),
+                workspace.path(),
+                "http://127.0.0.1:1/v1/chat/completions".into(),
+            )],
+        )
+        .expect("Runtime"),
+    );
+    let runs = state.path().join("runs");
+    if runs.is_dir() {
+        std::fs::remove_dir_all(&runs).expect("remove empty runs directory");
+    }
+    std::fs::write(&runs, b"not a directory").expect("replace runs directory");
+
+    assert!(
+        LocalRuntimeHost::list_run_records(state.path()).is_err(),
+        "the authoritative Run enumerator must not convert a scan failure into an empty list"
+    );
+
+    let report = runtime.recover_all_unfinished_detached().await;
+    assert_eq!(report.scanned_profiles, 1);
+    assert_eq!(report.recovered_runs, 0);
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "storage failure must not look empty"
+    );
+    assert_eq!(report.failures[0].invocation, identity);
 }

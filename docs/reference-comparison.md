@@ -14,7 +14,26 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：JSONL 崩溃尾部修复
+## 当前阶段：权威目录扫描失败关闭
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 存储读取失败 | rollout 打开/逐行 I/O 错误向上返回 | SQLite 查询、解码与事务错误向上返回 | Run/Session 目录除 `NotFound` 外全部 typed fail-closed | 已消除“存储坏了等于没有数据”的偏离 |
+| 坏记录处理 | 已读取的 rollout JSON parse error 可计数后跳过 | SQLite schema/事务与 snapshot revalidation | Event/Run 权威不跳过已提交损坏；非 UUID 外部项不纳入管理 | 本项目因多租户恢复/副作用证据更保守 |
+| 故障隔离 | Thread 级历史加载 | Session/Gateway 生命周期成熟 | 聚合恢复按 Profile 隔离失败，健康租户继续 | 窄面满足共享 Runtime；运维产品面落后 |
+| 终态安全 | Thread/rollout 生命周期 | Session transcript/lifecycle | Session 归属不可读时禁止发布 Run 终态 | 消除伪终态；仍仅证明本地文件系统 |
+
+### 本阶段结论
+
+- 已验证：损坏 `runs` 命名空间会进入 Profile failure report；损坏 `sessions` 命名空间会阻止终态发布，
+  相关六组 Runtime Host 集成测试共 52 项通过。
+- 相比 Codex，本项目与其 I/O 错误传播原则对齐，但不采用“已提交坏 JSON 继续跳过”，因为本地 Event/Run
+  直接决定多租户恢复和副作用安全。
+- 相比 OpenClaw，SQLite 的事务、并发写与迁移体系仍更成熟；本项目只证明无外部数据库时的嵌入式
+  fail-closed 边界，没有证明共享存储或主机掉电。
+- **未外推**：自动 quarantine/修复、跨机器 owner、共享文件系统与介质损坏未完成；总体仍为 70–75%。
+
+## 上一阶段：JSONL 崩溃尾部修复
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

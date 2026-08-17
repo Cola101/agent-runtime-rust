@@ -226,6 +226,60 @@ async fn a_provider_selection_failure_is_a_durable_terminal_run() {
 }
 
 #[tokio::test]
+async fn a_session_directory_scan_failure_cannot_publish_a_fake_terminal_event() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation(Uuid::now_v7());
+    let mut profile_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("workspace"),
+        "http://127.0.0.1:1/v1/chat/completions".into(),
+    );
+    profile_config
+        .model_routing
+        .max_cost_per_million_tokens_micros = 0;
+    let runtime = EmbeddedRuntime::new(
+        RuntimeAdmissionLimits {
+            max_active_runs: 1,
+            max_active_runs_per_tenant: 1,
+            max_active_runs_per_workspace: 1,
+            max_queued_runs: 1,
+            max_queued_runs_per_tenant: 1,
+        },
+        vec![RuntimeProfile {
+            invocation: identity,
+            config: profile_config,
+        }],
+    )
+    .expect("Runtime");
+    std::fs::write(state.path().join("sessions"), b"not a directory")
+        .expect("break Session authority scan");
+    let run_id = Uuid::now_v7();
+
+    let result = runtime
+        .execute(identity, run_id, "fail before Provider egress")
+        .await;
+    assert!(
+        result.is_err(),
+        "a terminal event cannot be published when Session ownership cannot be checked"
+    );
+    assert!(
+        agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0)
+            .expect("committed prefix")
+            .iter()
+            .all(|event| !matches!(
+                event.event_type.as_str(),
+                "run.succeeded"
+                    | "run.failed"
+                    | "run.cancelled"
+                    | "run.timed_out"
+                    | "run.indeterminate"
+            )),
+        "storage uncertainty must not be converted into a terminal Run"
+    );
+}
+
+#[tokio::test]
 async fn a_live_subscription_continues_after_a_torn_tail_is_repaired() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");

@@ -3893,11 +3893,14 @@ impl LocalRuntimeHost {
         state_root: &Path,
         run_id: Uuid,
     ) -> Result<Option<(Uuid, Uuid, u64, String)>, LocalRuntimeError> {
-        let Ok(entries) = std::fs::read_dir(state_root.join("sessions")) else {
-            return Ok(None);
+        let entries = match std::fs::read_dir(state_root.join("sessions")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
         };
         let mut found = None;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
             let Some(session_id) = entry
                 .file_name()
                 .to_str()
@@ -6144,11 +6147,14 @@ impl LocalRuntimeHost {
 
     /// Every Run this state root knows about, oldest first by Run id.
     pub fn list_run_records(state_root: &Path) -> Result<Vec<LocalRunRecord>, LocalRuntimeError> {
-        let Ok(entries) = std::fs::read_dir(state_root.join("runs")) else {
-            return Ok(Vec::new());
+        let entries = match std::fs::read_dir(state_root.join("runs")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
         };
         let mut records = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
             let Some(run_id) = entry
                 .file_name()
                 .to_str()
