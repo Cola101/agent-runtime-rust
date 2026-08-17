@@ -630,6 +630,8 @@ pub enum LocalRuntimeError {
     AlreadyRunning(String),
     #[error("local execution was refused: {0}")]
     Execution(String),
+    #[error("no model provider can serve this Run: {0}")]
+    ProviderSelection(String),
     #[error("model provider call failed: {0}")]
     Provider(String),
     #[error("trusted tool execution failed: {0}")]
@@ -3160,7 +3162,7 @@ impl LocalRuntimeHost {
             })
             .collect::<Vec<_>>();
         if ranked.is_empty() {
-            return Err(LocalRuntimeError::Provider(
+            return Err(LocalRuntimeError::ProviderSelection(
                 "no healthy local Provider satisfies the Run region, data, capability and cost constraints"
                     .into(),
             ));
@@ -5493,6 +5495,33 @@ impl LocalRuntimeHost {
         self.emit(run_id, &event, emitted)
     }
 
+    /// Converts a Provider-layer failure that happens after `run.started` into
+    /// the Run's durable terminal fact. Returning the transport error here
+    /// would leave the record terminal but the event log non-terminal, making
+    /// every external event cursor correctly reject the Run as corrupt.
+    fn terminate_provider_failure(
+        &mut self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        message: String,
+        emitted: &mut Vec<String>,
+    ) -> Result<(), LocalRuntimeError> {
+        let event = self
+            .processor
+            .apply_model_event(
+                attempt_id,
+                ModelStreamEvent::Failed {
+                    kind: ModelErrorKind::Unavailable,
+                    retryable: false,
+                    message,
+                },
+            )
+            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?;
+        self.emit(run_id, &event, emitted)?;
+        self.persist_checkpoint(run_id, attempt_id)?;
+        Ok(())
+    }
+
     /// Executes under a caller-supplied Run id so a daemon can hand the id to a
     /// client before the work starts, and so the client can attach to the event
     /// log immediately.
@@ -6318,11 +6347,17 @@ impl LocalRuntimeHost {
                 self.terminate_interrupted(run_id, attempt_id, &mut event_types)?;
                 break;
             }
-            if self
+            match self
                 .compact_transcript_if_needed(run_id, attempt_id, &mut event_types)
-                .await?
+                .await
             {
-                continue;
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(LocalRuntimeError::ProviderSelection(message)) => {
+                    self.terminate_provider_failure(run_id, attempt_id, message, &mut event_types)?;
+                    break;
+                }
+                Err(error) => return Err(error),
             }
             let prepared = self
                 .processor
@@ -6338,7 +6373,14 @@ impl LocalRuntimeHost {
                 self.terminate_interrupted(run_id, attempt_id, &mut event_types)?;
                 break;
             }
-            let (route_journal_path, events) = routed?;
+            let (route_journal_path, events) = match routed {
+                Ok(routed) => routed,
+                Err(LocalRuntimeError::ProviderSelection(message)) => {
+                    self.terminate_provider_failure(run_id, attempt_id, message, &mut event_types)?;
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
 
             for event in events {
                 match &event {

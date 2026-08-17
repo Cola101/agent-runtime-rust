@@ -3,7 +3,10 @@ use agent_protocol::{
     RunBudget, RunStatus, RuntimeExecutionPolicySnapshot, RuntimeInvocationContext,
 };
 use agent_runtime_host::admission::RuntimeAdmissionLimits;
-use agent_runtime_host::embedded::{EmbeddedRuntime, RuntimeProfile};
+use agent_runtime_host::embedded::{
+    EmbeddedRuntime, RUNTIME_EVENT_CURSOR_SCHEMA_VERSION, RuntimeEventCursorRequest,
+    RuntimeEventCursorState, RuntimeProfile,
+};
 use agent_runtime_host::{
     LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig,
     LocalToolConsent,
@@ -116,6 +119,85 @@ async fn wait_for_queue(runtime: &EmbeddedRuntime, expected: usize) {
     })
     .await
     .expect("Run did not enter admission queue");
+}
+
+#[tokio::test]
+async fn a_provider_selection_failure_is_a_durable_terminal_run() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation(Uuid::now_v7());
+    let mut profile_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().unwrap(),
+        "http://127.0.0.1:1/v1/chat/completions".into(),
+    );
+    // The candidate is valid configuration but cannot satisfy this Run's cost
+    // policy. Selection therefore fails before any Provider request is made.
+    profile_config
+        .model_routing
+        .max_cost_per_million_tokens_micros = 0;
+    let runtime = Arc::new(
+        EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: 1,
+                max_active_runs_per_tenant: 1,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: 1,
+                max_queued_runs_per_tenant: 1,
+            },
+            vec![RuntimeProfile {
+                invocation: identity,
+                config: profile_config,
+            }],
+        )
+        .expect("embedded Runtime"),
+    );
+    let run_id = Uuid::now_v7();
+
+    runtime
+        .execute_detached(identity, run_id, "fail before Provider egress".into())
+        .await
+        .expect("Run admission");
+
+    let page = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.event_cursor(RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: identity,
+                run_id,
+                after_sequence: 0,
+                limit: 64,
+            }) {
+                Ok(page)
+                    if matches!(
+                        page.state,
+                        RuntimeEventCursorState::Terminal {
+                            status: RunStatus::Failed
+                        }
+                    ) =>
+                {
+                    return page;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("terminal Run became unreadable: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("provider selection failure never reached a terminal boundary");
+
+    assert_eq!(
+        page.events.last().map(|event| event.event_type.as_str()),
+        Some("run.failed")
+    );
+    assert_eq!(
+        page.events
+            .iter()
+            .filter(|event| event.event_type == "run.failed")
+            .count(),
+        1,
+        "one Run must have exactly one terminal event"
+    );
 }
 
 #[tokio::test]

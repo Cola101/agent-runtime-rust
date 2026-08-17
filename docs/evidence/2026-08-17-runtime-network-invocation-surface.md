@@ -233,14 +233,18 @@ fmt `EXIT=0`；clippy `EXIT=0`；残留扫描：0 个遗留进程，磁盘 45Gi�
 3. **clippy 抓到的循环**：`for` + `?` 会在第一个不可解析事件处**从整个函数返回 `None`**，
    而不是继续下一个。改为 `find_map` 才是本意。这次 clippy 抓的不只是风格。
 
-### 一个单独记录的观察（未定性，未修）
+### Provider 选择失败终态补证（同日）
 
-诊断第 1 项时看到：Run 在 Provider 选择阶段失败后，事件日志**只有 `run.started`**、
-无终态事件，而 `run.json` 写着 `finished/failed`。游标对此返回 `CorruptLog`，
-网络调用方拿到 `DataLoss`，**永远学不到该 Run 的结局**。
+上述诊断暴露的缺口已经单独复现并修复。新增测试先证明原行为：候选因费用策略无法入选后，
+`run.json` 为 failed，日志却只有 `run.started`，事件游标返回 `CorruptLog`。修复后 Host 将
+`ProviderSelection` 与仍可恢复的普通 `Provider` 调用失败分型；前者经 Kernel 状态机提交唯一
+`run.failed` 和终态 Checkpoint，游标稳定返回 `Terminal { failed }`。
 
-游标判定"日志与记录不一致"本身可能是正确行为。但只有网络的消费者拿不到结局，
-是这个面的真实可观察缺口。**只在这一条路径上观察到一次，不外推，本轮不修。**
+这次没有把所有 Provider 错误都终止：真实 503 的压缩恢复测试继续通过，证明仍有预算的暂态失败
+仍可由替代 Host 恢复。聚焦证据：`embedded_multi_tenant` 8/8、`grpc_invocation_loop` 1/1、
+`replacement_host_retries_the_same_pending_compaction_without_replaying_tools` 1/1；
+`an_interrupted_provider_attempt_is_never_replayed_past_its_durable_budget` 1/1；
+`agent-runtime-host` library clippy `-D warnings` 与全工作区 fmt check 通过。
 
 ### 全量门禁（第五段，fullgate23）——绿
 

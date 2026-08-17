@@ -1,6 +1,6 @@
 # Codex CLI / OpenClaw 阶段对标
 
-更新时间：2026-08-15
+更新时间：2026-08-17
 
 本文件是每个实施阶段必须更新的偏差检查。结论只基于本地参考源码，不把产品介绍当作实现证据。
 
@@ -14,27 +14,28 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：Runtime 网络调用契约（第一段）
+## 当前阶段：Runtime 网络调用契约与终态一致性
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
-| 外部调用入口 | CLI 进程内，无远程调用契约 | Gateway/Node 协议成熟，远程调用是其核心 | `RuntimeInvocation` gRPC：Submit/Control/ReadEvents，**库级已实现，binary 未接线** | 相比 Codex 是本项目多出来的面；相比 OpenClaw **明显落后**（无流式、无 SDK、未部署） |
+| 外部调用入口 | CLI 进程内，无远程调用契约 | Gateway/Node 协议成熟，远程调用是其核心 | `RuntimeInvocation` gRPC：Submit/Control/ReadEvents/WatchEvents；binary 已接线但默认关闭 | 相比 Codex 是本项目多出来的面；相比 OpenClaw 仍缺成熟 SDK 与长期部署证据 |
 | 调用方身份 | 单用户本地，不适用 | Gateway 会话 | 运维形状（schema 5）+ 独立 scope `runtime.invoke`；Run 形状带该 scope 也被拒 | 更严：能执行不等于能开 Run |
 | 越权断言 | 不适用 | 依赖会话 | tenant/app/workload 取自 claims，请求体只能同意；Profile 以完整六元组为键 | 更严：请求体无法拓宽自己的 token |
-| 生命周期边界 | CLI 内存态 | 连接态事件 | `RunLifecycleBoundary` oneof，`Terminal`/`Retired` 各带字段，`history_gap` 显式 | 更严：不必解析载荷即可分辨「暂时没有」与「永远没有」 |
-| 传输安全 | 不适用 | TLS 成熟 | **未接 TLS/mTLS**，当前仅回环可用 | **落后**，且未接线前不得对外暴露 |
+| 生命周期边界 | 错误以 `EventMsg::Error` 显式送达调用方 | `run_failed` 等终态进入 Session 状态事件 | `RunLifecycleBoundary` typed；不可选路由经 Kernel 提交唯一 `run.failed`，不再留下 failed record + 非终态日志 | 已对齐两者的“失败必须可观察”，并增加持久一致性校验 |
+| 传输安全 | 本地进程，不适用 | TLS 成熟 | binary 默认无监听；启用必须提供 mTLS 与验签公钥，无客户端证书/错误 CA 均拒绝 | 契约边界已对齐，生产证书轮换与部署运维仍落后 |
 
 ### 本阶段结论
 
-- 已验证：8 项身份边界（无 token、Run 形状、错 scope、跨租户断言、未注册 Profile、读/控同等认证、
-  未知 action、消息不泄漏主机路径），以及**一次真实 Run 的完整网络闭环**——调用方只持地址与 token，
-  Submit → 按 typed 边界排空游标 → 读回模型回答，Provider 是真实回环 HTTP/SSE。
+- 已验证：身份边界、真实 Run 提交与流式/分页订阅、mTLS、审批、取消、跨进程恢复，以及不可选路由
+  的 failed 终态。调用方只持地址、token 与 `run_id`，不读状态目录。
 - 相比 Codex：Codex 没有远程调用契约，这是本项目多出来的面，不构成落后。
-- 相比 OpenClaw：**明显落后**。它的远程调用、流式、重连与 SDK 都是成熟能力，本段只有分页轮询、
-  没有 TLS、没有 SDK，而且**部署出来的二进制还不提供这个面**。
-- **偏离点**：运维身份与执行身份结构隔离、Profile 六元组精确匹配、错误不透传内部消息。边界更严，非功能更全。
+- 相比 OpenClaw：协议形状、流式重连和节点式远程调用已不再是空白；但 SDK、客户端生态、节点发现、
+  长连运维与长期生产证据仍明显落后。
+- **领先点**：运维身份与执行身份结构隔离、Profile 六元组精确匹配、终态事件与权威记录交叉校验，
+  更适合多租户嵌入。不可选路由和仍可恢复的 503 已分型，不用牺牲恢复语义换可观测性。
 - **总体进度不因本阶段提高**，仍为 70–75%：边界层，不属于并发/真实厂商/跨平台/生产持久层四类证据。
-- 下一目标：`docs/roadmap.md` 阶段 1 剩余部分——binary 接线 + mTLS、控制路径成功端到端、跨进程恢复。
+- 下一目标：按 `docs/roadmap.md` 进入需要外部环境的阶段 2/3；本机继续补不依赖外部环境的内核一致性，
+  不用模拟容器或虚构真实厂商证据。
 
 ## 上一阶段：声明式 Tool 容器边界能力
 
