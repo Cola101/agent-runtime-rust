@@ -70,6 +70,22 @@ fn budget_exhaustion_is_a_classified_terminal_failure() {
 }
 
 #[test]
+fn required_mcp_failure_can_end_a_run_before_model_start() {
+    let mut run = machine();
+
+    let event = run
+        .record_required_mcp_unavailable(&["required-search".into()])
+        .expect("an exhausted required dependency must end the queued Run");
+
+    assert_eq!(run.status(), RunStatus::Failed);
+    assert_eq!(event.sequence, 1);
+    assert_eq!(event.event_type, "run.failed");
+    assert_eq!(event.payload["kind"], "required_mcp_unavailable");
+    assert_eq!(event.payload["servers"][0], "required-search");
+    assert_eq!(event.payload["retryable"], false);
+}
+
+#[test]
 fn durable_subagent_request_suspends_the_parent_before_child_admission() {
     let mut run = machine();
     run.apply(RunCommand::Start).unwrap();

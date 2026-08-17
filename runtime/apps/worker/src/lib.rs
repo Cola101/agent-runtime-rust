@@ -5886,6 +5886,40 @@ impl WorkerProcessor {
         Ok(event)
     }
 
+    pub fn record_required_mcp_unavailable(
+        &mut self,
+        attempt_id: Uuid,
+        server_names: &[String],
+    ) -> Result<EventEnvelope, WorkerAssignmentError> {
+        if server_names.is_empty()
+            || server_names
+                .iter()
+                .any(|name| name.trim().is_empty() || name.len() > 128)
+        {
+            return Err(WorkerAssignmentError::ToolConfiguration(
+                "required MCP failure has no valid bound server identity".into(),
+            ));
+        }
+        if self.completed.contains_key(&attempt_id) {
+            return Err(WorkerAssignmentError::AttemptAlreadyTerminal);
+        }
+        let execution = self
+            .accepted
+            .get_mut(&attempt_id)
+            .ok_or(WorkerAssignmentError::UnknownAttempt)?;
+        if execution.terminal_event.is_some() {
+            return Err(WorkerAssignmentError::AttemptAlreadyTerminal);
+        }
+        let event = execution
+            .machine
+            .record_required_mcp_unavailable(server_names)
+            .map_err(|error| WorkerAssignmentError::KernelTransition(error.to_string()))?;
+        execution.cancellation.cancel();
+        execution.subagent_budget_reservations.clear();
+        execution.terminal_event = Some(event.clone());
+        Ok(event)
+    }
+
     pub fn apply_model_event(
         &mut self,
         attempt_id: Uuid,

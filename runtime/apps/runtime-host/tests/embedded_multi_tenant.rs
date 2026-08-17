@@ -8,10 +8,10 @@ use agent_runtime_host::embedded::{
     RuntimeEventCursorState, RuntimeProfile,
 };
 use agent_runtime_host::{
-    LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig,
-    LocalToolConsent,
+    LocalMcpLifecycleConfig, LocalMcpServerConfig, LocalMcpTransportConfig,
+    LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig, LocalToolConsent,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,6 +197,118 @@ async fn a_provider_selection_failure_is_a_durable_terminal_run() {
             .count(),
         1,
         "one Run must have exactly one terminal event"
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_required_mcp_server_is_a_durable_terminal_run() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation(Uuid::now_v7());
+    let mut profile_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().unwrap(),
+        "http://127.0.0.1:1/v1/chat/completions".into(),
+    );
+    profile_config
+        .runtime_policy
+        .mcp_discovery
+        .max_attempts_per_server = 1;
+    profile_config
+        .runtime_policy
+        .mcp_discovery
+        .initial_retry_backoff_ms = 0;
+    profile_config
+        .delegated_scopes
+        .insert("tool:mcp:required-local".into());
+    profile_config.mcp_servers = vec![LocalMcpServerConfig {
+        server_id: Uuid::now_v7(),
+        name: "required-local".into(),
+        transport: LocalMcpTransportConfig::StreamableHttp {
+            endpoint: "http://127.0.0.1:1/mcp".into(),
+        },
+        tool_names: BTreeSet::from(["lookup".into()]),
+        tool_effect_overrides: BTreeMap::new(),
+        required: true,
+    }];
+    let runtime = Arc::new(
+        EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: 1,
+                max_active_runs_per_tenant: 1,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: 1,
+                max_queued_runs_per_tenant: 1,
+            },
+            vec![RuntimeProfile {
+                invocation: identity,
+                config: profile_config,
+            }],
+        )
+        .expect("embedded Runtime"),
+    );
+    let run_id = Uuid::now_v7();
+
+    runtime
+        .execute_detached(identity, run_id, "require the unavailable Tool".into())
+        .await
+        .expect("Run admission");
+
+    let page = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.event_cursor(RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: identity,
+                run_id,
+                after_sequence: 0,
+                limit: 64,
+            }) {
+                Ok(page)
+                    if matches!(
+                        page.state,
+                        RuntimeEventCursorState::Terminal {
+                            status: RunStatus::Failed
+                        }
+                    ) =>
+                {
+                    return page;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!(
+                    "required MCP failure became unreadable: {error}; record={:?}; events={:?}",
+                    agent_runtime_host::LocalRuntimeHost::read_run_record(state.path(), run_id),
+                    agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0)
+                ),
+            }
+        }
+    })
+    .await
+    .expect("required MCP failure never reached a terminal boundary");
+
+    assert_eq!(
+        page.events.last().map(|event| event.event_type.as_str()),
+        Some("run.failed")
+    );
+    assert_eq!(
+        page.events.last().unwrap().payload["kind"],
+        "required_mcp_unavailable"
+    );
+    assert_eq!(
+        page.events.last().unwrap().payload["servers"][0],
+        "required-local"
+    );
+    assert_eq!(
+        page.events
+            .iter()
+            .filter(|event| event.event_type == "run.failed")
+            .count(),
+        1
+    );
+    assert!(
+        page.events
+            .iter()
+            .all(|event| event.event_type != "run.started"),
+        "MCP discovery failed before model execution started"
     );
 }
 

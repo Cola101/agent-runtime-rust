@@ -1370,6 +1370,9 @@ async fn a_slow_run_does_not_block_a_fast_run_in_the_discovery_coordinator() {
         McpDiscoveryCompletion::Restored { attempt_id, .. } => {
             panic!("the new fast Run was unexpectedly treated as restored: {attempt_id}")
         }
+        McpDiscoveryCompletion::Failed { attempt_id, .. } => {
+            panic!("the fast Run unexpectedly failed required MCP discovery: {attempt_id}")
+        }
     }
 
     slow_cancellation.cancel();

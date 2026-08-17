@@ -6058,6 +6058,30 @@ impl LocalRuntimeHost {
                     })?;
                     self.emit(run_id, event, &mut event_types)?;
                 }
+                McpDiscoveryCompletion::Failed {
+                    event, mcp_servers, ..
+                } => {
+                    self.emit(run_id, &event, &mut event_types)?;
+                    let checkpoint_path = self.persist_checkpoint(run_id, attempt_id)?;
+                    return Ok(LocalRunOutcome {
+                        run_id,
+                        attempt_id,
+                        status: self
+                            .processor
+                            .status(attempt_id)
+                            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?,
+                        event_types,
+                        output: String::new(),
+                        checkpoint_path,
+                        pending_approval: None,
+                        pending_mcp_input: None,
+                        mcp_servers,
+                        history_repair: self
+                            .processor
+                            .history_repair_report(attempt_id)
+                            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?,
+                    });
+                }
                 McpDiscoveryCompletion::Cancelled { .. } => {
                     if let Some(restored) = restored_event.as_ref() {
                         self.emit(run_id, restored, &mut event_types)?;

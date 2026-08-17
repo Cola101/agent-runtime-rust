@@ -188,9 +188,9 @@ flowchart LR
 
 - **取消、审批、跨进程崩溃恢复均已证明成功端到端**；**`resume` 的成功路径仍未在该面验证**
   （其前置状态 `Interrupted` 构造成本高，且不在 roadmap 阶段 1 的出口标准内）。
-- 本轮只闭合了 Provider 确定性终局。源码审计显示 MCP 初始化、Tool/子代理编排以及 Host
-  存储/Checkpoint 错误仍有直接返回 `Err` 的路径；尚未逐条证明 detached adapter 不会再次形成
-  “终态记录但无终态事件”。因此不得把本轮结论外推成“所有 Host 错误均满足终态一致性”。
+- Provider 确定性终局与 required MCP 初始化失败已分别由本 ADR 和 ADR-0124 闭合。Tool/子代理
+  编排以及 Host 存储/Checkpoint 错误仍有直接返回 `Err` 的路径；尚未逐条证明 detached adapter
+  不会再次形成“终态记录但无终态事件”。因此不得把结论外推成“所有 Host 错误均满足终态一致性”。
 - 无 Java SDK。`option java_package` 只是让契约可被生成，不等于有 SDK。
 - **总体进度不因本 ADR 提高**，仍为 70–75%：这是边界层，不是内核能力，也不属于并发/真实厂商/
   跨平台/生产持久层四类证据中的任何一类。

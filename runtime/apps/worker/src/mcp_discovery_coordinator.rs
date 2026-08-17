@@ -1,6 +1,6 @@
 use crate::{
     GrpcMcpFederationClient, McpDiscoverySupervisor, McpDiscoveryUpdate, McpServerDiscoveryStatus,
-    WorkerAssignmentError, WorkerProcessor, attach_discovered_federated_tools,
+    McpServerHealth, WorkerAssignmentError, WorkerProcessor, attach_discovered_federated_tools,
 };
 use agent_protocol::{EventEnvelope, RunExecutionCommand};
 use std::collections::HashMap;
@@ -22,6 +22,11 @@ pub enum McpDiscoveryCompletion {
     },
     Restored {
         attempt_id: Uuid,
+        mcp_servers: Vec<McpServerDiscoveryStatus>,
+    },
+    Failed {
+        attempt_id: Uuid,
+        event: EventEnvelope,
         mcp_servers: Vec<McpServerDiscoveryStatus>,
     },
     Cancelled {
@@ -110,13 +115,33 @@ impl McpDiscoveryCoordinator {
         match update {
             McpDiscoveryUpdate::Ready { discovered, .. } => {
                 let mcp_servers = discovered.statuses.clone();
-                attach_discovered_federated_tools(
+                let attached = attach_discovered_federated_tools(
                     processor,
                     pending.client,
                     &pending.command,
                     attempt_id,
                     *discovered,
-                )?;
+                );
+                match attached {
+                    Ok(()) => {}
+                    Err(WorkerAssignmentError::RequiredMcpServersUnavailable(_)) => {
+                        let failed_servers = mcp_servers
+                            .iter()
+                            .filter(|status| {
+                                status.required && status.health == McpServerHealth::Unavailable
+                            })
+                            .map(|status| status.server_name.clone())
+                            .collect::<Vec<_>>();
+                        let event = processor
+                            .record_required_mcp_unavailable(attempt_id, &failed_servers)?;
+                        return Ok(Some(McpDiscoveryCompletion::Failed {
+                            attempt_id,
+                            event,
+                            mcp_servers,
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
                 match pending.purpose {
                     McpDiscoveryPurpose::Start => {
                         let event = processor.start(attempt_id)?;

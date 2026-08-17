@@ -14,7 +14,25 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：Runtime 网络调用契约与终态一致性
+## 当前阶段：必需 MCP 启动失败终态
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 显式依赖不可用 | required MCP/Plugin 无法形成 Turn context 时返回错误并发出 error event | MCP CLI/Node Host 启动失败显式报错 | 冻结 discovery 预算耗尽后由 Kernel 提交 `run.failed` | 已对齐 fail-closed，不会缺 Tool 仍调用模型 |
+| 启动前状态 | Turn 未进入采样 | Host/manager 启动失败 | `Queued → Failed`，不伪造 `run.started` | 语义更精确 |
+| 持久权威 | rollout/event | Gateway/进程生命周期 | tenant/Run/attempt 绑定 event + terminal Checkpoint + typed Event Cursor | 更适合多租户嵌入 |
+| 诊断暴露 | 用户可见错误事件 | CLI 日志 | terminal event 只含绑定 Server 名称；远端正文留在有界 status | 更严格地限制跨租户诊断泄漏 |
+
+### 本阶段结论
+
+- 已验证：真实 required stdio MCP 两次启动失败后模型零出站、子进程全回收；Embedded HTTP MCP
+  故障通过 Event Cursor 得到 typed failed，而不是 `DataLoss`。
+- 相比 Codex/OpenClaw，本项目功能没有更多，但失败同时进入 Kernel、事件与 Checkpoint，适合无状态
+  Java/CLI/GUI 调用方重连观察。
+- **未外推**：optional MCP、coordinator 内部错误、Tool/子代理及存储错误保持原语义，后者仍需逐类审计。
+- 总体进度仍为 70–75%；本轮修的是失败契约，不是真实外部 MCP 兼容证据。
+
+## 上一阶段：Runtime 网络调用契约与终态一致性
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
@@ -34,7 +52,7 @@
 - **领先点**：运维身份与执行身份结构隔离、Profile 六元组精确匹配、终态事件与权威记录交叉校验，
   更适合多租户嵌入。不可选路由、预算耗尽与仍可恢复的 503 已分型，不用牺牲恢复语义换可观测性。
 - **总体进度不因本阶段提高**，仍为 70–75%：边界层，不属于并发/真实厂商/跨平台/生产持久层四类证据。
-- 下一目标：本机先继续审计 MCP 初始化、Tool/子代理编排与 Host 存储错误的终态一致性；随后按
+- 下一目标：本机先继续审计 Tool/子代理编排与 Host 存储错误的终态一致性；随后按
   `docs/roadmap.md` 进入需要外部环境的阶段 2/3，不用模拟容器或虚构真实厂商证据。
 
 ## 上一阶段：声明式 Tool 容器边界能力

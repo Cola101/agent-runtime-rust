@@ -3891,11 +3891,26 @@ async fn unavailable_required_stdio_mcp_fails_before_model_egress() {
     local_config.mcp_servers = vec![server];
 
     let mut host = LocalRuntimeHost::start(local_config).expect("host");
-    let error = host
+    let outcome = host
         .execute("Do not answer without the required Tool.")
         .await
-        .expect_err("required server failure must reject the Run");
-    assert!(error.to_string().contains("required MCP server"), "{error}");
+        .expect("required server exhaustion is a terminal Run outcome");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    assert_eq!(outcome.mcp_servers.len(), 1);
+    assert_eq!(
+        outcome.mcp_servers[0].health,
+        agent_runtime_worker::McpServerHealth::Unavailable
+    );
+    let events = LocalRuntimeHost::replay_events(state.path(), outcome.run_id, 0)
+        .expect("required MCP failure events");
+    assert_eq!(
+        events.last().map(|event| event.event_type.as_str()),
+        Some("run.failed")
+    );
+    assert_eq!(
+        events.last().unwrap().payload["kind"],
+        "required_mcp_unavailable"
+    );
     assert_eq!(
         std::fs::read_to_string(&start_marker).unwrap(),
         "started\nstarted\n"

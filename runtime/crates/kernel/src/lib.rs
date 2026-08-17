@@ -660,6 +660,31 @@ impl RunMachine {
         ))
     }
 
+    pub fn record_required_mcp_unavailable(
+        &mut self,
+        server_names: &[String],
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        if !matches!(self.status, RunStatus::Queued | RunStatus::Running) {
+            return Err(TransitionError::InvalidTransition {
+                status: self.status,
+                command: RunCommand::Start,
+            });
+        }
+        Ok(self.emit(
+            RunStatus::Failed,
+            "run.failed",
+            json!({
+                "status": RunStatus::Failed,
+                "kind": "required_mcp_unavailable",
+                "servers": server_names,
+                "retryable": false
+            }),
+        ))
+    }
+
     pub fn record_duration_timed_out(&mut self) -> Result<EventEnvelope, TransitionError> {
         if self.status.is_terminal() {
             return Err(TransitionError::TerminalState(self.status));
