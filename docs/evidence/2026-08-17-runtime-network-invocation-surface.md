@@ -129,11 +129,52 @@ token 在到达**形状检查之前**就以 `InvalidClaims` 被拒了。那样�
 
 机器状态：磁盘 42Gi 可用（下限 20Gi）。
 
-## 没证明什么——**阶段 1 未完成**
+## 第三段：真实 mTLS（同日）
 
-- **mTLS 只证明了「缺了就不启动」，没证明「配好了能握手」。** 上述测试用的是无效证书文件，
-  验的是拒绝路径；**从未有一次请求真正穿过 TLS**。真实闭环测试的服务端是明文回环。
-  生成测试 CA 与证书链、跑一次真实 mTLS 握手仍是缺口。
+`--test grpc_invocation_mtls` **3 passed, 0 failed**，TEST_EXIT=0。证书用 `rcgen` 现场生成，
+不落盘、不入库、测试结束即消失。
+
+| 测试 | 证明 |
+| --- | --- |
+| `a_real_run_completes_over_mutual_tls` | 一次**完整真实 Run** 穿过 mTLS：Submit → 分页排空游标 → `Terminal { succeeded }` |
+| `a_client_presenting_no_certificate_is_refused` | 不出示客户端证书 → 被拒 |
+| `a_client_certificate_from_another_authority_is_refused` | 出示他方 CA 签发的合法证书 → 被拒（CA 钉定是真的，不是装饰） |
+
+**只证明成功路径的话，这个面是 TLS 而不是 mTLS。** 两条拒绝是「mutual」的全部含义所在。
+
+### 防假绿的对照组
+
+两条拒绝测试各自起自己的服务端。若服务端根本没起来，`connect` 会失败，断言会**因为错误的理由变绿**。
+因此每条拒绝测试前先用**同一 CA 签发的另一张合法证书**连一次并断言成功——服务端确实在跑、
+确实接受合法证书，差别只在证书本身。加上对照后仍然 3/3。
+
+（这正是本轮第一段栽过的坑：Run 形状 token 测试当时也是因为错误理由才红的。）
+
+### 全量门禁（第三段，fullgate21）——1 项失败
+
+**128 二进制、797 passed、1 failed、6 ignored、`CARGO_EXIT=101`**
+
+对照 fullgate20（127 / 795 / 0）：二进制 **+1**、总数 **+3** = 三个新 mTLS 测试。
+797 passed + 1 failed = 798 = 795 + 3，差值精确闭合——**三个新测试全过**。
+
+唯一失败的是 `sixty_four_sessions_keep_one_thousand_waits_bounded_and_tenant_fair`。
+**它与前两轮是同一个测试，但不是同一个失败**，这点必须分清：
+
+- 本次的延迟三项**全部通过**：p50=950.916ms（<1s）、p95=1.065s（<2s）、p100=1.089s（<4s）。
+- 失败发生在 `process_wait_multi_session_capacity.rs:471`，不是 438：
+  `session 55 failed close: persistent process session I/O failed: Operation not permitted (os error 1)`。
+
+这是**第三个、此前未见的失败模式**，而且**不是墙钟预算断言**——EPERM 是真实的 OS 层错误。
+隔离下连跑三次均通过（EXIT=0，3/3），因此同样只在全工作区并行负载下出现。
+
+**成因未确定，不做猜测。** 关闭时收到 EPERM 可能指向重度进程churn 下的 PID 复用
+（`ADR-0098` 曾修过一条相关竞态：身份租约释放后仍终止旧 PGID），也可能是别的。
+一次观测不足以定因，本轮未做任何修改。**它应作为独立的新开项记录，不得并入已有的延迟门禁条目。**
+
+fmt `EXIT=0`；clippy `--workspace --all-targets --all-features -D warnings` `EXIT=0`。
+残留扫描：0 个遗留 `runtime-host` 进程、无遗留临时目录、磁盘 42Gi。
+
+## 没证明什么——**阶段 1 未完成**
 
 - **控制路径只证明了拒绝。** 审批、取消、resume 的成功端到端，以及跨进程崩溃恢复，未在该面验证。
 - 无流式订阅，调用方只能分页轮询。无 Java SDK。
