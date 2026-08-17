@@ -7,6 +7,7 @@
 // to host other things.
 const { app, BrowserWindow, ipcMain, shell } = require("electron");
 const path = require("node:path");
+const runtime = require("./runtime.cjs");
 
 /// Where the shell expects to find a Runtime.
 ///
@@ -14,6 +15,13 @@ const path = require("node:path");
 /// some default address is a client that will one day be pointed at a Runtime
 /// nobody meant to reach.
 const endpoint = process.env.RUNTIME_DESK_ENDPOINT ?? null;
+
+/// The operator bearer token, read once at launch.
+///
+/// It stays in the main process and is never sent to the renderer. A surface
+/// rendering transcript content it did not author must not be able to read the
+/// credential that transcript was fetched with.
+const token = process.env.RUNTIME_DESK_TOKEN ?? null;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -62,12 +70,30 @@ ipcMain.on("shell:mounted", (_event, surfaces) => {
 
 ipcMain.handle("shell:endpoint", () => endpoint);
 
+// The renderer asks; the main process owns the connection. Every reply is a
+// plain value — the renderer never holds a channel, a stream or a token.
+ipcMain.handle("runtime:status", () => runtime.status());
+ipcMain.handle("runtime:connect", (_e, options) => runtime.connect(options));
+ipcMain.handle("runtime:readEvents", (_e, request) => runtime.readEvents(request, token));
+ipcMain.handle("runtime:submit", (_e, request) => runtime.submit(request, token));
+ipcMain.handle("runtime:control", (_e, request) => runtime.control(request, token));
+
 app.whenReady().then(() => {
   console.log(
     endpoint
       ? `runtime-desk: runtime at ${endpoint}`
       : "runtime-desk: no RUNTIME_DESK_ENDPOINT set — running without a Runtime connection",
   );
+  if (endpoint) {
+    try {
+      const opened = runtime.connect({ endpoint });
+      console.log(`runtime-desk: connected${opened.secure ? " over mTLS" : " (loopback, plaintext)"}`);
+    } catch (error) {
+      // Refusing to connect is not a reason to refuse to start: the window can
+      // still show why, which is more useful than a process that exits.
+      console.error(`runtime-desk: not connected — ${error.message}`);
+    }
+  }
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

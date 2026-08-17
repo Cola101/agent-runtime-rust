@@ -1,6 +1,7 @@
 import { register } from "./registry";
 import { lifecycleLabel, lifecycleTone } from "./model";
 import { runs } from "../sample";
+import { useConnection } from "../useConnection";
 
 function RunsToolbar() {
   return (
@@ -15,8 +16,14 @@ function RunsToolbar() {
 }
 
 function RunsView() {
+  const link = useConnection();
   return (
     <div className="pane">
+      {link.state === "absent" && (
+        <div className="offline">
+          Not connected to a runtime — these rows are placeholders, not runs.
+        </div>
+      )}
       <table className="rows">
         <thead>
           <tr><th>Run</th><th>State</th><th>Tokens</th><th>Cost</th><th>When</th></tr>
