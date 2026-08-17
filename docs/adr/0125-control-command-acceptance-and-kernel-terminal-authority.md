@@ -44,5 +44,5 @@ Event Cursor 因而只能按 ADR-0114 报告 `CorruptLog`。
   换取错误接纳风险。
 - 本 ADR 不把一般 Host I/O 错误伪装成业务失败。无法恢复的损坏会持续 fail-closed，需由后续运维修复或
   显式事故处置；不能用一个没有 Kernel event 的假终态“解决”。
-- MCP 输入的真实 Embedded 网络闭环仍需补充独立专项证据；现有 HTTP/stdio MRTR 主链与本轮静态门禁
-  证明契约未回退，但不把它外推成新的生态兼容结论。
+- MCP 输入的真实 Embedded 网络闭环不在本 ADR 的原始证据内；后续 ADR-0126 已补专项，但仍不把单个
+  loopback 网络闭环外推成外部生态兼容结论。

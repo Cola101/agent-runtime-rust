@@ -376,6 +376,9 @@ fn runtime_status(error: EmbeddedRuntimeError) -> Status {
         EmbeddedRuntimeError::ControlCommandRebound => {
             Status::failed_precondition("this command id is already bound to a different command")
         }
+        EmbeddedRuntimeError::InvalidControlCommand(_) => {
+            Status::invalid_argument("invalid Runtime control command")
+        }
         EmbeddedRuntimeError::Admission(_) => {
             Status::resource_exhausted("the Runtime is at its admission ceiling")
         }

@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：控制命令接纳与 Kernel 终态权威
+## 当前阶段：公开 MCP 输入回答与版本绑定
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 请求公开 | form/url elicitation 转为客户端事件，带公共 request id | inspected MCP Apps 暴露 UI resource/bridge，不是同口径 input-required | `mcp.input.required` 暴露 input id、version、binding 和 request set | 调用方不再依赖 Rust 内部常量 |
+| 回答路由 | `(server_name, request_id)` pending oneshot | 未发现同口径回答路由 | tenant/Run/Checkpoint/owner epoch + durable control receipt | 窄面跨进程恢复强于 inspected 进程内 router |
+| 版本错误 | typed protocol/request error | Gateway/MCP Apps 错误面成熟 | 未支持 input version → gRPC `InvalidArgument`，Tool 零继续执行 | 对外错误不再误报 Runtime Internal |
+| Runtime replacement | inspected pending map 随进程生命周期 | Session MCP runtime 有 manager，未见 MRTR durable receipt | 第一 Runtime 消失；替代 Runtime 从事件回答同一 suspended Tool | 本轮核心多租户增强已实跑 |
+| 产品广度 | 客户端交互、form/url、策略和 MCP 兼容明显更成熟 | MCP Apps sandbox/bridge 与 Gateway 产品面更成熟 | 只完成 form Accept 网络专项；内部另有 URL/decline/cancel 语义 | 不能宣称 MCP 产品总体领先 |
+
+### 本阶段结论
+
+- 已验证：外部调用方只持 token、`run_id` 与事件字节；错误版本在 continuation 前拒绝，正确回答跨
+  Runtime replacement 完成同一 Tool 和 Run，`run.started` 只有一次。
+- 相比 Codex，本项目保留其“请求必须精确路由”的语义，并增加持久 Checkpoint/receipt/owner epoch；Codex
+  的客户端、策略、form/url 和生态兼容仍明显领先。
+- 相比 OpenClaw，本项目补的是它 inspected MCP Apps 之外的 durable MRTR 控制面；OpenClaw 的 UI bridge、
+  sandbox 和 Gateway 运维仍更成熟。
+- **未外推**：真实外部 MCP、跨机器、URL elicitation 网络专项与 Java SDK 未完成；总体仍为 70–75%。
+
+## 上一阶段：控制命令接纳与 Kernel 终态权威
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
@@ -31,8 +51,8 @@
 - 相比 Codex/OpenClaw，本轮没有扩展审批 UI 或决定种类，只消除了“控制适配器可以制造 Run 终态”的偏离。
 - **领先点仅限窄面**：Checkpoint digest、root→child lineage、owner epoch 和 durable receipt 的组合更适合
   多租户无状态调用方；Codex 的客户端产品链和 OpenClaw 的 Gateway 运维仍明显更成熟。
-- **未外推**：真实 Embedded MCP 输入网络闭环、一般 Host 损坏的自动修复、跨节点 command ledger 仍未完成。
-  总体进度仍为 70–75%。
+- **未外推**：一般 Host 损坏的自动修复、跨节点 command ledger 仍未完成。真实 Embedded MCP 输入网络闭环
+  已由 ADR-0126 完成；总体进度仍为 70–75%。
 
 ## 上一阶段：必需 MCP 启动失败终态
 

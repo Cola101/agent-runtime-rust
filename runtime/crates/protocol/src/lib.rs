@@ -19,6 +19,12 @@ pub const TOOL_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 pub const TOOL_RECONCILIATION_MAX_CONTENT_BYTES: usize = 256 * 1024;
 pub const MCP_INPUT_REQUIRED_SCHEMA_VERSION: u32 = 1;
 pub const MCP_INPUT_RESOLUTION_SCHEMA_VERSION: u32 = 1;
+/// Version of the response binding expected for one `McpInputRequired`.
+///
+/// This is separate from both document schema versions: an external Runtime
+/// caller must echo it from `mcp.input.required` rather than infer it from the
+/// Rust type or hard-code the first implementation's value.
+pub const MCP_INPUT_VERSION: u32 = 1;
 pub const WORKER_HEARTBEAT_SCHEMA_VERSION: u32 = 2;
 pub const RUN_EXECUTION_ACCEPTED_SCHEMA_VERSION: u32 = 2;
 pub const RUNTIME_INVOCATION_SCHEMA_VERSION: u32 = 1;
@@ -945,7 +951,7 @@ impl McpInputResolutionCommand {
             || self.worker_id.is_nil()
             || self.worker_incarnation_id.is_nil()
             || self.input_id != pending.input_id
-            || self.input_version != 1
+            || self.input_version != MCP_INPUT_VERSION
             || self.binding_digest != pending.binding_digest
         {
             return Err(McpInputResolutionValidationError::InvalidBinding);

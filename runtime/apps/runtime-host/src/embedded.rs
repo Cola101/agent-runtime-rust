@@ -422,6 +422,10 @@ pub struct RuntimeProfile {
 pub enum EmbeddedRuntimeError {
     #[error("embedded Runtime configuration is invalid: {0}")]
     Configuration(String),
+    /// The caller supplied a structurally valid transport document whose
+    /// command identity, version, or bounded action is invalid.
+    #[error("Runtime control command is invalid: {0}")]
+    InvalidControlCommand(String),
     #[error("Runtime invocation is not registered")]
     UnregisteredInvocation,
     /// A control command id is already bound to a different command.
@@ -2557,18 +2561,20 @@ impl EmbeddedRuntime {
         command: &RuntimeControlCommand,
     ) -> Result<(), EmbeddedRuntimeError> {
         if command.schema_version != RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION {
-            return Err(EmbeddedRuntimeError::Configuration(
+            return Err(EmbeddedRuntimeError::InvalidControlCommand(
                 "unsupported Runtime control command schema".into(),
             ));
         }
         command.invocation.validate().map_err(|error| {
-            EmbeddedRuntimeError::Configuration(format!("invalid Runtime invocation: {error}"))
+            EmbeddedRuntimeError::InvalidControlCommand(format!(
+                "invalid Runtime invocation: {error}"
+            ))
         })?;
         if command.command_id.is_nil()
             || command.run_id.is_nil()
             || command.expected_owner_epoch == 0
         {
-            return Err(EmbeddedRuntimeError::Configuration(
+            return Err(EmbeddedRuntimeError::InvalidControlCommand(
                 "Runtime control command identity is incomplete".into(),
             ));
         }
@@ -2576,7 +2582,7 @@ impl EmbeddedRuntime {
             RuntimeControlAction::Resume => {}
             RuntimeControlAction::Cancel { reason } => {
                 if reason.trim().is_empty() || reason.len() > 512 {
-                    return Err(EmbeddedRuntimeError::Configuration(
+                    return Err(EmbeddedRuntimeError::InvalidControlCommand(
                         "cancellation reason must contain 1 to 512 bytes".into(),
                     ));
                 }
@@ -2591,7 +2597,7 @@ impl EmbeddedRuntime {
                     || approval_id.is_nil()
                     || !Self::is_sha256(binding_digest)
                 {
-                    return Err(EmbeddedRuntimeError::Configuration(
+                    return Err(EmbeddedRuntimeError::InvalidControlCommand(
                         "approval command binding is invalid".into(),
                     ));
                 }
@@ -2603,12 +2609,12 @@ impl EmbeddedRuntime {
                 responses,
             } => {
                 if input_id.is_nil()
-                    || *input_version != 1
+                    || *input_version != agent_protocol::MCP_INPUT_VERSION
                     || !Self::is_sha256(binding_digest)
                     || responses.is_empty()
                     || responses.len() > 64
                 {
-                    return Err(EmbeddedRuntimeError::Configuration(
+                    return Err(EmbeddedRuntimeError::InvalidControlCommand(
                         "MCP input command binding is invalid".into(),
                     ));
                 }

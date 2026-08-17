@@ -4,10 +4,10 @@ pub use read_only_shell::{ShellCommandClass, classify_shell_command};
 
 use agent_protocol::{
     ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope,
-    McpInputContinuation, McpInputRequired, ModelErrorKind, ModelFinishReason, ModelStreamEvent,
-    RunStatus, SandboxClass, SubagentForkReceipt, SubagentResultDelivery, SubagentRollbackReceipt,
-    SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalPolicySnapshot, ToolApprovalRequest,
-    ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
+    MCP_INPUT_VERSION, McpInputContinuation, McpInputRequired, ModelErrorKind, ModelFinishReason,
+    ModelStreamEvent, RunStatus, SandboxClass, SubagentForkReceipt, SubagentResultDelivery,
+    SubagentRollbackReceipt, SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalPolicySnapshot,
+    ToolApprovalRequest, ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1111,7 +1111,11 @@ impl RunMachine {
         Ok(self.emit(
             RunStatus::Suspended,
             "mcp.input.required",
-            json!({"input": pending, "status": RunStatus::Suspended}),
+            json!({
+                "input": pending,
+                "input_version": MCP_INPUT_VERSION,
+                "status": RunStatus::Suspended,
+            }),
         ))
     }
 

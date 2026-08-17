@@ -4199,7 +4199,7 @@ impl WorkerProcessor {
                         worker_id: command.worker_id,
                         worker_incarnation_id: command.worker_incarnation_id,
                         input_id: pending.input_id,
-                        input_version: 1,
+                        input_version: agent_protocol::MCP_INPUT_VERSION,
                         binding_digest: pending.binding_digest.clone(),
                         responses: resolved.continuation.responses.clone(),
                         issued_at,

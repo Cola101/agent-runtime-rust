@@ -193,6 +193,10 @@ message RuntimeEvent {
   int64 occurred_at_unix_ms = 7;
   string trace_id = 8;
   string type = 9;
+  // Protocol-neutral event document. In particular, `mcp.input.required`
+  // carries `{ input, input_version, status }`; an external caller must echo
+  // `input.input_id`, `input_version`, `input.binding_digest` and one response
+  // for every `input.requests` key in `ResolveMcpInput`.
   bytes payload_json = 10;
   string digest = 11;
 }
