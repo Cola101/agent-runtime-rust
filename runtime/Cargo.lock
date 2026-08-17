@@ -233,6 +233,7 @@ dependencies = [
  "hex",
  "libc",
  "prost",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",
