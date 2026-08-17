@@ -249,11 +249,38 @@ fmt `EXIT=0`；clippy `EXIT=0`；残留扫描：0 个遗留进程，磁盘 45Gi�
 对照 fullgate22（129 / 801 / 0）：+1 二进制、+1 通过 = 审批测试本身，精确闭合。
 fmt `EXIT=0`；clippy `EXIT=0`；残留扫描 0；磁盘 41Gi。
 
+## 第六段：跨进程恢复（同日）
+
+`--test grpc_invocation_recovery` **1 passed, 0 failed**，TEST_EXIT=0。**又是零产品代码改动。**
+
+第一个 Runtime 起 Run → 停在审批 → **整个 tokio runtime（连同服务、执行任务、state-root 锁）被丢弃**
+→ 第二个 Runtime 打开同一 state root → 调用方**只带崩溃前的 `run_id`** 重连 → 读到死掉 Runtime 写的
+完整历史 → 用第一个 Runtime 签发的 `owner_epoch` 送出审批 → 工具执行 → `succeeded`。
+
+反向断言：整段历史里 `run.started` **只出现一次**——替代者接着干，不是重跑。
+
+### 三次纠正，全是我的测试错，产品每次都对
+
+1. `Workspace state root already has another Runtime owner`——丢 `Arc` 模拟不了崩溃：
+   **Run 自己的执行任务持有一个 `Arc` 并停在审批上**，锁不释放。单写守卫是对的。
+2. `await` 掉被 abort 的 server 仍不够，同一原因。最终沿用 `daemon_recovery.rs` 的既有形状：
+   第一个 Runtime 跑在独立线程的独立 tokio runtime 上，drop 掉整个 runtime。
+3. `recover_unfinished_detached` 返回 0 而我断言 1。读代码确认 `AwaitingApproval`
+   **被显式跳过**——等人的 Run 没有东西可重新派发。**0 才是契约**，断言据此改写。
+
+### 全量门禁（第六段，fullgate24）——绿
+
+**131 二进制、803 passed、0 failed、6 ignored、`CARGO_EXIT=0`**
+
+对照 fullgate23（130 / 802 / 0）：+1 二进制、+1 通过 = 恢复测试本身。
+fmt `EXIT=0`；clippy `EXIT=0`（抓到一个改写后残留的死字段，已删）；残留扫描 0；磁盘 41Gi。
+
 ## 没证明什么——**阶段 1 未完成**
 
-- **取消与审批已成功闭环；resume 的成功路径未验证。**
-- **跨进程崩溃恢复未在该面验证。**
-- 无流式订阅，调用方只能分页轮询。无 Java SDK。
+- **取消、审批、跨进程恢复均已成功闭环；`resume` 的成功路径未验证**
+  （其前置状态构造成本高，且不在阶段 1 出口标准内）。
+- **无流式订阅**：`subscribe_events` 未暴露，只能分页轮询。这是出口标准「事件订阅」剩下的一半。
+- 无 Java SDK。
 
 ## 进度
 
