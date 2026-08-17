@@ -29,6 +29,11 @@ service RuntimeInvocation {
   rpc Control(ControlRunRequest) returns (ControlRunResponse);
   // One bounded page of a Run's durable event log.
   rpc ReadEvents(ReadRunEventsRequest) returns (ReadRunEventsResponse);
+  // Follow a Run from the durable log. Same exclusive cursor semantics as
+  // ReadEvents, so a dropped stream is resumed by reconnecting with the last
+  // sequence seen -- there is no in-memory broadcaster to fall out of sync
+  // with, and no best-effort queue that can silently lose a gap.
+  rpc WatchEvents(WatchRunEventsRequest) returns (stream RunEventStreamItem);
 }
 
 // Selects a pre-registered invocation Profile.
@@ -147,6 +152,35 @@ message ReadRunEventsResponse {
   bool has_more = 8;
   RunLifecycleBoundary boundary = 9;
   repeated RuntimeEvent events = 10;
+}
+
+message WatchRunEventsRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string run_id = 3;
+  uint64 after_sequence = 4;
+  // Bounded buffer for this subscription. The Runtime rejects a capacity
+  // outside its own limits rather than silently clamping.
+  uint32 capacity = 5;
+}
+
+// Either a durable event or the lifecycle boundary that follows the ones
+// delivered so far. The boundary is a separate item rather than a field on
+// every event: a follower needs to learn "you are now at the end, and here is
+// what kind of end" without that repeating on each row.
+message RunEventStreamItem {
+  oneof item {
+    RuntimeEvent event = 1;
+    RunEventBoundary boundary = 2;
+  }
+}
+
+message RunEventBoundary {
+  uint64 next_after_sequence = 1;
+  optional uint64 earliest_available_sequence = 2;
+  uint64 highest_committed_sequence = 3;
+  bool history_gap = 4;
+  RunLifecycleBoundary lifecycle = 5;
 }
 
 message RuntimeEvent {

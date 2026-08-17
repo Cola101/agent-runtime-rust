@@ -12,6 +12,7 @@
 //! comment says authentication belongs to the adapter -- this is that adapter.
 
 use crate::LocalRunState;
+use crate::embedded::RuntimeEventStreamItem;
 use crate::embedded::{
     EmbeddedRuntime, EmbeddedRuntimeError, RuntimeControlAction, RuntimeControlCommand,
     RuntimeControlReceiptState, RuntimeEventCursorErrorCode, RuntimeEventCursorRequest,
@@ -21,14 +22,18 @@ use agent_protocol::{RUNTIME_INVOCATION_SCHEMA_VERSION, RunStatus, RuntimeInvoca
 use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocation;
 use agent_runtime_invocation_protocol::v1::{
     ControlReceiptState, ControlRunRequest, ControlRunResponse, ReadRunEventsRequest,
-    ReadRunEventsResponse, RunLifecycleBoundary, RuntimeEvent, RuntimeInvocationRef,
-    SubmitRunRequest, SubmitRunResponse, run_lifecycle_boundary,
+    ReadRunEventsResponse, RunEventBoundary, RunEventStreamItem, RunLifecycleBoundary,
+    RuntimeEvent, RuntimeInvocationRef, SubmitRunRequest, SubmitRunResponse, WatchRunEventsRequest,
+    run_event_stream_item, run_lifecycle_boundary,
 };
 use agent_workload_identity::{
     RequiredCapability, WorkloadIdentityBinding, WorkloadTokenError, WorkloadTokenVerifier,
 };
 use chrono::Utc;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -216,6 +221,54 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
         }))
     }
 
+    type WatchEventsStream =
+        Pin<Box<dyn Stream<Item = Result<RunEventStreamItem, Status>> + Send + 'static>>;
+
+    /// Follows a Run from the durable log.
+    ///
+    /// The subscription is pumped into a bounded channel rather than polled by
+    /// the client: a follower that stops reading applies backpressure here
+    /// instead of accumulating an unbounded queue in the Runtime. Dropping the
+    /// stream drops the receiver, which ends the pump on its next send.
+    ///
+    /// Cursor semantics are the same exclusive ones `ReadEvents` uses, so a
+    /// dropped stream is resumed by reconnecting with the last sequence seen.
+    async fn watch_events(
+        &self,
+        request: Request<WatchRunEventsRequest>,
+    ) -> Result<Response<Self::WatchEventsStream>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        if message.schema_version != EVENT_PAGE_SCHEMA_VERSION {
+            return Err(Status::invalid_argument(
+                "unsupported Runtime event page schema version",
+            ));
+        }
+        let run_id = parse_uuid(&message.run_id, "run_id")?;
+        let capacity = message.capacity as usize;
+        // Rejected, not clamped: a caller that asked for a buffer it will not
+        // get should learn that rather than silently receive another one.
+        let mut subscription = self
+            .runtime
+            .subscribe_events(invocation, run_id, message.after_sequence, capacity)
+            .map_err(runtime_status)?;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
+        tokio::spawn(async move {
+            while let Some(item) = subscription.recv().await {
+                let message = match item {
+                    Ok(item) => Ok(wire_stream_item(item)),
+                    Err(error) => Err(runtime_status(error)),
+                };
+                let failed = message.is_err();
+                if sender.send(message).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
     async fn read_events(
         &self,
         request: Request<ReadRunEventsRequest>,
@@ -249,24 +302,24 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
             history_gap: page.history_gap,
             has_more: page.has_more,
             boundary: Some(wire_boundary(&page.state)),
-            events: page
-                .events
-                .iter()
-                .map(|event| RuntimeEvent {
-                    event_id: event.event_id.to_string(),
-                    tenant_id: event.tenant_id.to_string(),
-                    session_id: event.session_id.to_string(),
-                    run_id: event.run_id.to_string(),
-                    sequence: event.sequence,
-                    attempt_id: event.attempt_id.to_string(),
-                    occurred_at_unix_ms: event.timestamp.timestamp_millis(),
-                    trace_id: event.trace_id.to_string(),
-                    r#type: event.event_type.clone(),
-                    payload_json: event.payload.to_string().into_bytes(),
-                    digest: event.digest.clone(),
-                })
-                .collect(),
+            events: page.events.iter().map(wire_event).collect(),
         }))
+    }
+}
+
+fn wire_event(event: &crate::LocalEvent) -> RuntimeEvent {
+    RuntimeEvent {
+        event_id: event.event_id.to_string(),
+        tenant_id: event.tenant_id.to_string(),
+        session_id: event.session_id.to_string(),
+        run_id: event.run_id.to_string(),
+        sequence: event.sequence,
+        attempt_id: event.attempt_id.to_string(),
+        occurred_at_unix_ms: event.timestamp.timestamp_millis(),
+        trace_id: event.trace_id.to_string(),
+        r#type: event.event_type.clone(),
+        payload_json: event.payload.to_string().into_bytes(),
+        digest: event.digest.clone(),
     }
 }
 
@@ -351,6 +404,29 @@ fn runtime_status(error: EmbeddedRuntimeError) -> Status {
             Status::internal("the Runtime could not complete this request")
         }
     }
+}
+
+fn wire_stream_item(item: RuntimeEventStreamItem) -> RunEventStreamItem {
+    let item = match item {
+        RuntimeEventStreamItem::Event { event, .. } => {
+            run_event_stream_item::Item::Event(wire_event(&event))
+        }
+        RuntimeEventStreamItem::Boundary {
+            next_after_sequence,
+            earliest_available_sequence,
+            highest_committed_sequence,
+            history_gap,
+            state,
+            ..
+        } => run_event_stream_item::Item::Boundary(RunEventBoundary {
+            next_after_sequence,
+            earliest_available_sequence,
+            highest_committed_sequence,
+            history_gap,
+            lifecycle: Some(wire_boundary(&state)),
+        }),
+    };
+    RunEventStreamItem { item: Some(item) }
 }
 
 fn parse_uuid(value: &str, field: &'static str) -> Result<Uuid, Status> {
