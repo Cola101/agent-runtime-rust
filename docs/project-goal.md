@@ -352,7 +352,8 @@ transcript/result，只保留来源 ID，不再钉住热目录。root Session Tu
 `run.json`。旧单文件可崩溃安全迁移为 manifest、256-Run immutable segment 与 bounded active segment；
 1000 个真实顺序 Run 为 110.617 秒、16 热目录/984 墓碑，4 tenant×3 Workspace×32 Run 为 36.64 秒且每
 Workspace 最终 6 个热目录。恢复调度现在只启动图根，父 Checkpoint 所有的 child 不会与父并行争抢
-owner epoch。公开 history gap、冷归档读取与外部 tombstone 转储仍未实现。
+owner epoch。当时公开 history gap、冷归档读取与外部 tombstone 转储仍未实现；前两项后来由 ADR-0114/0136
+完成，外部 tombstone 转储仍缺。
 
 ADR-0113 已完成本地容量目标：**1000 claimed in-flight / 32 admitted Host+Provider**，不是 1000 个真执行。
 20 tenant、200 Workspace/Profile 的 peak queue 为 968；500 queued abort、16 active durable cancel、484
@@ -386,13 +387,19 @@ credential-domain-owned MCP OAuth 的协议发现与消费闭环**——Protecte
 metadata discovery、管理 API/CLI callback、MCP 401 rejected-token CAS 联动、远端 revoke、真实外部 Server
 兼容矩阵，以及可替换的跨平台 CAS/lease store。Roots/Sampling 继续默认关闭，
 不把 Java/GUI/Edge 或外部数据库引入一次 Run。跨进程/跨节点 tenant authority、Windows ConPTY、真实 Linux
-cgroup、生产远端 command ledger 与冷归档继续保留为明确缺口。
+cgroup、生产远端 command ledger 与外部冷存储适配继续保留为明确缺口。
 
 ADR-0132—0135 已把本地文件模式的模型路由与 Run 终态提交链收敛为统一语义：有界 route WAL 先保存 Provider
 出站/响应事实，Kernel terminal Event 先进入摘要有效的终态 Checkpoint，再发布原始 Event，随后封口路由 WAL
 并收敛 adapter 投影。Direct Host、Embedded 与网络入口对终态 Run 都只验证和观察，不再把 `resume` 当成新的
 模型回合；继续对话必须创建新 Run/Session Turn。该机制不依赖数据库，但也不冒充通用多文件事务；跨机器 owner、
 共享文件系统、硬件掉电与 Windows 仍是明确缺口。
+
+ADR-0136 已补上 opt-in 的有界冷 Event 层：只有读回校验通过的内容寻址对象和摘要索引先提交，retention 才会
+提交 tombstone 并删除热 Run；公开 Cursor/subscription 可继续读取退休历史。单 Run、Workspace 和 tenant
+条数/字节预算共同限制磁盘，跨 Workspace 不会放大 tenant 上限；淘汰形成真实 history gap，损坏承诺则失败
+关闭。该层默认关闭，不给本地 1000 Run 路径施加持续 fsync/磁盘成本；压缩、自动 quarantine、外部对象存储、
+共享文件系统和 Windows 仍未实现。
 
 ## 本地运行边界
 

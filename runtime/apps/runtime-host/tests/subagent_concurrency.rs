@@ -3105,6 +3105,7 @@ async fn two_subagents_are_inflight_before_either_child_completes() {
             max_run_tombstones_per_tenant: 32,
             max_control_tombstones_per_workspace: 16,
             max_control_tombstones_per_tenant: 32,
+            ..RuntimeRetentionPolicy::default()
         },
     )
     .expect("retention Runtime");

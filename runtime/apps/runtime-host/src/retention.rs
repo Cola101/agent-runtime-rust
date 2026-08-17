@@ -2,6 +2,7 @@ use crate::embedded::{
     RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION, RUNTIME_CONTROL_RECEIPT_SCHEMA_VERSION,
     RuntimeControlReceipt, RuntimeControlReceiptState,
 };
+use crate::event_archive::{EventArchiveEntry, inspect_event_archive, reconcile_event_archives};
 use crate::{LocalRunRecord, LocalRunState, LocalRuntimeError, LocalRuntimeHost};
 use agent_protocol::{RunStatus, RuntimeInvocationContext};
 use chrono::{DateTime, Utc};
@@ -31,6 +32,13 @@ pub struct RuntimeRetentionPolicy {
     pub max_run_tombstones_per_tenant: usize,
     pub max_control_tombstones_per_workspace: usize,
     pub max_control_tombstones_per_tenant: usize,
+    /// A zero value disables the optional cold Event tier. All five archive
+    /// limits must be zero together or positive together.
+    pub max_event_archive_bytes_per_run: u64,
+    pub max_event_archives_per_workspace: usize,
+    pub max_event_archives_per_tenant: usize,
+    pub max_event_archive_bytes_per_workspace: u64,
+    pub max_event_archive_bytes_per_tenant: u64,
 }
 
 impl Default for RuntimeRetentionPolicy {
@@ -44,12 +52,33 @@ impl Default for RuntimeRetentionPolicy {
             max_run_tombstones_per_tenant: 100_000,
             max_control_tombstones_per_workspace: 40_000,
             max_control_tombstones_per_tenant: 400_000,
+            // Cold Event preservation is opt-in: the existing local default
+            // keeps retirement cheap and reports an exact history gap. Hosts
+            // that need cold reads must choose explicit count and byte caps.
+            max_event_archive_bytes_per_run: 0,
+            max_event_archives_per_workspace: 0,
+            max_event_archives_per_tenant: 0,
+            max_event_archive_bytes_per_workspace: 0,
+            max_event_archive_bytes_per_tenant: 0,
         }
     }
 }
 
 impl RuntimeRetentionPolicy {
     pub(crate) fn validate(self) -> Result<Self, LocalRuntimeError> {
+        let archive_limits = [
+            self.max_event_archive_bytes_per_run > 0,
+            self.max_event_archives_per_workspace > 0,
+            self.max_event_archives_per_tenant > 0,
+            self.max_event_archive_bytes_per_workspace > 0,
+            self.max_event_archive_bytes_per_tenant > 0,
+        ];
+        let archives_disabled = archive_limits.iter().all(|enabled| !enabled);
+        let archives_valid = archive_limits.iter().all(|enabled| *enabled)
+            && self.max_event_archives_per_tenant >= self.max_event_archives_per_workspace
+            && self.max_event_archive_bytes_per_workspace >= self.max_event_archive_bytes_per_run
+            && self.max_event_archive_bytes_per_tenant
+                >= self.max_event_archive_bytes_per_workspace;
         if self.max_run_directories_per_workspace == 0
             || self.max_run_directories_per_tenant < self.max_run_directories_per_workspace
             || self.retain_terminal_runs_per_workspace >= self.max_run_directories_per_workspace
@@ -58,6 +87,7 @@ impl RuntimeRetentionPolicy {
             || self.max_control_tombstones_per_workspace == 0
             || self.max_control_tombstones_per_tenant < self.max_control_tombstones_per_workspace
             || self.min_terminal_age > Duration::from_secs(365 * 24 * 60 * 60)
+            || (!archives_disabled && !archives_valid)
         {
             return Err(LocalRuntimeError::Configuration(
                 "Runtime retention limits are invalid".into(),
@@ -96,6 +126,9 @@ pub struct RuntimeRetentionReport {
     pub total_run_tombstones: usize,
     pub total_control_tombstones: usize,
     pub terminal_ledger_bytes: u64,
+    pub event_archives: usize,
+    pub event_archive_bytes: u64,
+    pub evicted_event_archives: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +273,7 @@ pub(crate) struct RuntimeRetentionCandidate {
     pub invocation: RuntimeInvocationContext,
     pub run_id: Uuid,
     tombstone: RuntimeTerminalTombstone,
+    pub(crate) event_archive: Option<EventArchiveEntry>,
     pub(crate) control_tombstones: Vec<RetiredControlCommand>,
     receipt_paths: Vec<PathBuf>,
 }
@@ -976,22 +1010,29 @@ pub(crate) fn scan_retention_candidates(
             })
             .collect();
         let receipt_paths = run_receipts.into_iter().map(|(_, path)| path).collect();
+        let tombstone = RuntimeTerminalTombstone {
+            schema_version: RUNTIME_TERMINAL_LEDGER_SCHEMA_VERSION,
+            invocation,
+            run_id,
+            run_binding_digest: run_binding_digest(invocation, run_id, &record.input),
+            owner_epoch: record.owner_epoch,
+            status,
+            terminal_event_id: terminal.event_id,
+            terminal_sequence: terminal.sequence,
+            terminal_event_digest: terminal.digest,
+            completed_at: terminal.timestamp,
+            artifacts_removed: false,
+        };
+        let event_archive = inspect_event_archive(
+            state_root,
+            &tombstone,
+            policy.max_event_archive_bytes_per_run,
+        )?;
         candidates.push(RuntimeRetentionCandidate {
             invocation,
             run_id,
-            tombstone: RuntimeTerminalTombstone {
-                schema_version: RUNTIME_TERMINAL_LEDGER_SCHEMA_VERSION,
-                invocation,
-                run_id,
-                run_binding_digest: run_binding_digest(invocation, run_id, &record.input),
-                owner_epoch: record.owner_epoch,
-                status,
-                terminal_event_id: terminal.event_id,
-                terminal_sequence: terminal.sequence,
-                terminal_event_digest: terminal.digest,
-                completed_at: terminal.timestamp,
-                artifacts_removed: false,
-            },
+            tombstone,
+            event_archive,
             control_tombstones,
             receipt_paths,
         });
@@ -1114,9 +1155,19 @@ pub(crate) fn commit_retention_candidates(
     state_root: &Path,
     policy: RuntimeRetentionPolicy,
     candidates: Vec<RuntimeRetentionCandidate>,
-) -> Result<(usize, usize), LocalRuntimeError> {
+) -> Result<(usize, usize, crate::event_archive::EventArchiveStats), LocalRuntimeError> {
+    let archives = candidates
+        .iter()
+        .filter_map(|candidate| candidate.event_archive.clone())
+        .collect::<Vec<_>>();
+    let archive_stats = reconcile_event_archives(
+        state_root,
+        &archives,
+        policy.max_event_archives_per_workspace,
+        policy.max_event_archive_bytes_per_workspace,
+    )?;
     if candidates.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, archive_stats));
     }
     let mut store = load_ledger_store(state_root)?;
     let mut control_count = 0usize;
@@ -1161,7 +1212,7 @@ pub(crate) fn commit_retention_candidates(
         }
     }
     if committed_run_ids.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, archive_stats));
     }
     // This is the replay-safety commit point. No artifact is deleted before
     // the exact Run and command digests are durable.
@@ -1190,7 +1241,7 @@ pub(crate) fn commit_retention_candidates(
     // the next maintenance pass repeats deletion and closes the transaction.
     persist_active_segment(state_root, policy, &mut store)?;
     seal_full_active_segments(state_root, &mut store)?;
-    Ok((committed_run_ids.len(), control_count))
+    Ok((committed_run_ids.len(), control_count, archive_stats))
 }
 
 pub(crate) fn load_run_tombstone_index(
@@ -1241,6 +1292,11 @@ fn retention_file_bytes(path: &Path) -> Result<u64, LocalRuntimeError> {
     let mut bytes = 0_u64;
     for entry in entries {
         let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        if entry.file_name() == "event-archives" {
+            // Cold history has its own count/byte accounting and must not make
+            // terminal-ledger metrics look like replay evidence is unbounded.
+            continue;
+        }
         let metadata = entry
             .metadata()
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
@@ -1319,6 +1375,7 @@ mod tests {
             max_run_tombstones_per_tenant: 32,
             max_control_tombstones_per_workspace: 16,
             max_control_tombstones_per_tenant: 32,
+            ..RuntimeRetentionPolicy::default()
         }
     }
 
@@ -1335,6 +1392,42 @@ mod tests {
             terminal_event_digest: "b".repeat(64),
             completed_at: Utc::now(),
             artifacts_removed: false,
+        }
+    }
+
+    #[test]
+    fn cold_event_limits_are_either_fully_disabled_or_consistently_bounded() {
+        RuntimeRetentionPolicy::default()
+            .validate()
+            .expect("the default disabled cold tier is valid");
+
+        let partial = RuntimeRetentionPolicy {
+            max_event_archive_bytes_per_run: 1,
+            ..RuntimeRetentionPolicy::default()
+        };
+        assert!(partial.validate().is_err());
+
+        let inverted = RuntimeRetentionPolicy {
+            max_event_archive_bytes_per_run: 2,
+            max_event_archives_per_workspace: 2,
+            max_event_archives_per_tenant: 1,
+            max_event_archive_bytes_per_workspace: 2,
+            max_event_archive_bytes_per_tenant: 2,
+            ..RuntimeRetentionPolicy::default()
+        };
+        assert!(inverted.validate().is_err());
+
+        one_archive_policy().validate().expect("bounded cold tier");
+    }
+
+    fn one_archive_policy() -> RuntimeRetentionPolicy {
+        RuntimeRetentionPolicy {
+            max_event_archive_bytes_per_run: 1,
+            max_event_archives_per_workspace: 1,
+            max_event_archives_per_tenant: 1,
+            max_event_archive_bytes_per_workspace: 1,
+            max_event_archive_bytes_per_tenant: 1,
+            ..RuntimeRetentionPolicy::default()
         }
     }
 

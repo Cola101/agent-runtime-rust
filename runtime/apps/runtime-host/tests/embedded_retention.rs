@@ -222,6 +222,39 @@ fn churn_retention_policy() -> RuntimeRetentionPolicy {
         max_run_tombstones_per_tenant: 4_000,
         max_control_tombstones_per_workspace: 2_000,
         max_control_tombstones_per_tenant: 4_000,
+        ..RuntimeRetentionPolicy::default()
+    }
+}
+
+fn one_archive_retention_policy() -> RuntimeRetentionPolicy {
+    RuntimeRetentionPolicy {
+        max_run_directories_per_workspace: 4,
+        max_run_directories_per_tenant: 8,
+        retain_terminal_runs_per_workspace: 0,
+        min_terminal_age: Duration::ZERO,
+        max_run_tombstones_per_workspace: 16,
+        max_run_tombstones_per_tenant: 32,
+        max_control_tombstones_per_workspace: 16,
+        max_control_tombstones_per_tenant: 32,
+        max_event_archive_bytes_per_run: 1024 * 1024,
+        max_event_archives_per_workspace: 1,
+        max_event_archives_per_tenant: 1,
+        max_event_archive_bytes_per_workspace: 1024 * 1024,
+        max_event_archive_bytes_per_tenant: 1024 * 1024,
+    }
+}
+
+fn archive_disabled_retention_policy() -> RuntimeRetentionPolicy {
+    RuntimeRetentionPolicy {
+        max_run_directories_per_workspace: 4,
+        max_run_directories_per_tenant: 8,
+        retain_terminal_runs_per_workspace: 0,
+        min_terminal_age: Duration::ZERO,
+        max_run_tombstones_per_workspace: 16,
+        max_run_tombstones_per_tenant: 32,
+        max_control_tombstones_per_workspace: 16,
+        max_control_tombstones_per_tenant: 32,
+        ..RuntimeRetentionPolicy::default()
     }
 }
 
@@ -286,28 +319,40 @@ async fn completed_session_history_survives_hot_run_artifact_retention() {
     let runtime = build_runtime_with_policy(
         identity,
         local_config.clone(),
-        RuntimeRetentionPolicy {
-            max_run_directories_per_workspace: 4,
-            max_run_directories_per_tenant: 8,
-            retain_terminal_runs_per_workspace: 0,
-            min_terminal_age: Duration::ZERO,
-            max_run_tombstones_per_workspace: 16,
-            max_run_tombstones_per_tenant: 32,
-            max_control_tombstones_per_workspace: 16,
-            max_control_tombstones_per_tenant: 32,
-        },
+        one_archive_retention_policy(),
     );
     let report = runtime
         .maintain_retention(identity)
         .expect("Session Run retention");
     assert_eq!(report.tombstoned_runs, 1);
     assert_eq!(report.strongly_referenced_runs, 0);
+    assert_eq!(report.event_archives, 1);
+    assert!(report.event_archive_bytes > 0);
     assert!(
         !state
             .path()
             .join("runs")
             .join(first.run.run_id.to_string())
             .exists()
+    );
+    let archived = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id: first.run.run_id,
+            after_sequence: 0,
+            limit: 256,
+        })
+        .expect("retired Session Run cold history");
+    assert!(
+        !archived.events.is_empty(),
+        "retention must preserve verified cold Event history before deleting the hot Run"
+    );
+    assert!(!archived.history_gap);
+    assert_eq!(archived.earliest_available_sequence, Some(1));
+    assert_eq!(
+        archived.events.last().map(|event| event.sequence),
+        Some(archived.highest_committed_sequence)
     );
     drop(runtime);
 
@@ -341,44 +386,398 @@ async fn completed_session_history_survives_hot_run_artifact_retention() {
     provider.await.expect("provider shutdown");
 }
 
+#[tokio::test]
+async fn cold_event_history_is_bounded_streamable_and_fails_closed_on_corruption() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let identity = invocation();
+    let local_config = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        "http://127.0.0.1:9/v1/chat/completions".into(),
+    );
+    let runtime = build_runtime_with_policy(
+        identity,
+        local_config.clone(),
+        one_archive_retention_policy(),
+    );
+
+    let first = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        state.path(),
+        &record(
+            identity,
+            first,
+            "first-cold-history",
+            LocalRunState::Finished {
+                status: "succeeded".into(),
+            },
+        ),
+    )
+    .expect("first terminal record");
+    write_terminal_event(state.path(), identity, first, "run.succeeded");
+    let first_report = runtime
+        .maintain_retention(identity)
+        .expect("first cold archive");
+    assert_eq!(first_report.event_archives, 1);
+    assert_eq!(first_report.evicted_event_archives, 0);
+
+    std::thread::sleep(Duration::from_millis(2));
+    let second = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        state.path(),
+        &record(
+            identity,
+            second,
+            "second-cold-history",
+            LocalRunState::Finished {
+                status: "succeeded".into(),
+            },
+        ),
+    )
+    .expect("second terminal record");
+    write_event_sequence(
+        state.path(),
+        identity,
+        second,
+        &["run.started", "model.output.delta", "run.succeeded"],
+    );
+    let second_report = runtime
+        .maintain_retention(identity)
+        .expect("second cold archive");
+    assert_eq!(second_report.event_archives, 1);
+    assert_eq!(second_report.evicted_event_archives, 1);
+
+    let retired_gap = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id: first,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("evicted archive becomes an explicit gap");
+    assert!(retired_gap.events.is_empty());
+    assert!(retired_gap.history_gap);
+    assert_eq!(retired_gap.earliest_available_sequence, None);
+
+    let archived = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id: second,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("newest archive remains readable");
+    assert_eq!(archived.events.len(), 1);
+    assert!(!archived.history_gap);
+    assert_eq!(archived.earliest_available_sequence, Some(1));
+
+    let mut stream = runtime
+        .subscribe_events(identity, second, 0, 1)
+        .expect("retired archive subscription");
+    for sequence in 1..=3 {
+        assert!(matches!(
+            stream.recv().await.expect("archive event").expect("event"),
+            RuntimeEventStreamItem::Event { event, .. } if event.sequence == sequence
+        ));
+    }
+    assert!(matches!(
+        stream
+            .recv()
+            .await
+            .expect("archive boundary")
+            .expect("boundary"),
+        RuntimeEventStreamItem::Boundary {
+            history_gap: false,
+            state: RuntimeEventCursorState::Retired { .. },
+            ..
+        }
+    ));
+
+    let archive_root = state.path().join("retention").join("event-archives");
+    let objects = archive_root.join("objects");
+    let object = std::fs::read_dir(&objects)
+        .expect("archive objects")
+        .next()
+        .expect("one archive object")
+        .expect("archive entry")
+        .path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&archive_root)
+                .expect("archive root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(archive_root.join("index.json"))
+                .expect("archive index metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&object)
+                .expect("archive object metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    std::fs::write(&object, b"tampered\n").expect("tamper cold archive");
+    let error = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id: second,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect_err("promised cold history corruption cannot become a silent gap");
+    assert!(matches!(
+        error,
+        agent_runtime_host::embedded::EmbeddedRuntimeError::EventCursor(error)
+            if error.code == RuntimeEventCursorErrorCode::CorruptLog
+    ));
+
+    drop(runtime);
+    let replacement =
+        build_runtime_with_policy(identity, local_config, archive_disabled_retention_policy());
+    let pruned = replacement
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id: second,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("disabling the optional tier removes its promise, not terminal evidence");
+    assert!(pruned.events.is_empty());
+    assert!(pruned.history_gap);
+    assert_eq!(
+        std::fs::read_dir(&objects)
+            .expect("archive object directory")
+            .count(),
+        0,
+        "lowering the opt-in policy must reclaim the old cold object"
+    );
+}
+
+#[test]
+fn oversized_cold_event_history_becomes_an_explicit_gap_without_blocking_retirement() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let identity = invocation();
+    let mut policy = one_archive_retention_policy();
+    policy.max_event_archive_bytes_per_run = 1;
+    let runtime = build_runtime_with_policy(
+        identity,
+        config(
+            state.path().to_path_buf(),
+            workspace.path().to_path_buf(),
+            "http://127.0.0.1:9/v1/chat/completions".into(),
+        ),
+        policy,
+    );
+    let run_id = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        state.path(),
+        &record(
+            identity,
+            run_id,
+            "oversized-cold-history",
+            LocalRunState::Finished {
+                status: "succeeded".into(),
+            },
+        ),
+    )
+    .expect("terminal Run record");
+    write_terminal_event(state.path(), identity, run_id, "run.succeeded");
+
+    let report = runtime
+        .maintain_retention(identity)
+        .expect("oversized history does not block safe retirement");
+    assert_eq!(report.tombstoned_runs, 1);
+    assert_eq!(report.event_archives, 0);
+    assert_eq!(report.evicted_event_archives, 0);
+    let retired = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: identity,
+            run_id,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("retired cursor");
+    assert!(retired.events.is_empty());
+    assert!(retired.history_gap);
+}
+
+#[test]
+fn tenant_cold_archive_capacity_is_shared_across_workspace_roots() {
+    let first_state = tempfile::tempdir().expect("first state root");
+    let first_workspace = tempfile::tempdir().expect("first workspace root");
+    let second_state = tempfile::tempdir().expect("second state root");
+    let second_workspace = tempfile::tempdir().expect("second workspace root");
+    let first = invocation();
+    let second = RuntimeInvocationContext {
+        tenant_id: first.tenant_id,
+        application_id: first.application_id,
+        ..invocation()
+    };
+    let runtime = EmbeddedRuntime::new_with_retention(
+        admission_limits(),
+        vec![
+            RuntimeProfile {
+                invocation: first,
+                config: config(
+                    first_state.path().to_path_buf(),
+                    first_workspace.path().to_path_buf(),
+                    "http://127.0.0.1:9/v1/chat/completions".into(),
+                ),
+            },
+            RuntimeProfile {
+                invocation: second,
+                config: config(
+                    second_state.path().to_path_buf(),
+                    second_workspace.path().to_path_buf(),
+                    "http://127.0.0.1:9/v1/chat/completions".into(),
+                ),
+            },
+        ],
+        one_archive_retention_policy(),
+    )
+    .expect("tenant Runtime");
+
+    let first_run = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        first_state.path(),
+        &record(
+            first,
+            first_run,
+            "first-workspace",
+            LocalRunState::Finished {
+                status: "succeeded".into(),
+            },
+        ),
+    )
+    .expect("first Run record");
+    write_terminal_event(first_state.path(), first, first_run, "run.succeeded");
+    assert_eq!(
+        runtime
+            .maintain_retention(first)
+            .expect("first Workspace retention")
+            .event_archives,
+        1
+    );
+
+    let second_run = Uuid::now_v7();
+    LocalRuntimeHost::write_run_record(
+        second_state.path(),
+        &record(
+            second,
+            second_run,
+            "second-workspace",
+            LocalRunState::Finished {
+                status: "succeeded".into(),
+            },
+        ),
+    )
+    .expect("second Run record");
+    write_terminal_event(second_state.path(), second, second_run, "run.succeeded");
+    assert_eq!(
+        runtime
+            .maintain_retention(second)
+            .expect("second Workspace retention")
+            .event_archives,
+        0,
+        "one tenant cannot multiply its cold archive cap by registering more Workspaces"
+    );
+
+    let first_page = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: first,
+            run_id: first_run,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("first Workspace archive");
+    assert_eq!(first_page.events.len(), 1);
+    assert!(!first_page.history_gap);
+    let second_page = runtime
+        .event_cursor(RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation: second,
+            run_id: second_run,
+            after_sequence: 0,
+            limit: 1,
+        })
+        .expect("second Workspace explicit gap");
+    assert!(second_page.events.is_empty());
+    assert!(second_page.history_gap);
+}
+
 fn write_terminal_event(
     state_root: &Path,
     identity: RuntimeInvocationContext,
     run_id: Uuid,
     event_type: &str,
 ) {
-    let envelope = EventEnvelope::new(
-        identity.tenant_id,
-        Uuid::now_v7(),
-        run_id,
-        1,
-        Uuid::now_v7(),
-        event_type,
-        serde_json::json!({"status": event_type}),
-    );
-    let event = LocalEvent {
-        event_id: envelope.event_id,
-        schema_version: envelope.schema_version,
-        tenant_id: identity.tenant_id,
-        application_id: identity.application_id,
-        workload_identity_id: identity.workload_identity_id,
-        workspace_id: identity.workspace_id,
-        agent_version_id: identity.agent_version_id,
-        model_policy_id: identity.model_policy_id,
-        session_id: envelope.session_id,
-        sequence: envelope.sequence,
-        run_id,
-        attempt_id: envelope.attempt_id,
-        timestamp: envelope.timestamp,
-        trace_id: envelope.trace_id,
-        event_type: envelope.event_type,
-        payload: envelope.payload,
-        digest: envelope.digest,
-    };
+    write_event_sequence(state_root, identity, run_id, &[event_type]);
+}
+
+fn write_event_sequence(
+    state_root: &Path,
+    identity: RuntimeInvocationContext,
+    run_id: Uuid,
+    event_types: &[&str],
+) {
+    let session_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let mut body = Vec::new();
+    for (index, event_type) in event_types.iter().enumerate() {
+        let envelope = EventEnvelope::new(
+            identity.tenant_id,
+            session_id,
+            run_id,
+            u64::try_from(index + 1).expect("event sequence"),
+            attempt_id,
+            *event_type,
+            serde_json::json!({"status": event_type}),
+        );
+        let event = LocalEvent {
+            event_id: envelope.event_id,
+            schema_version: envelope.schema_version,
+            tenant_id: identity.tenant_id,
+            application_id: identity.application_id,
+            workload_identity_id: identity.workload_identity_id,
+            workspace_id: identity.workspace_id,
+            agent_version_id: identity.agent_version_id,
+            model_policy_id: identity.model_policy_id,
+            session_id: envelope.session_id,
+            sequence: envelope.sequence,
+            run_id,
+            attempt_id: envelope.attempt_id,
+            timestamp: envelope.timestamp,
+            trace_id: envelope.trace_id,
+            event_type: envelope.event_type,
+            payload: envelope.payload,
+            digest: envelope.digest,
+        };
+        body.extend(serde_json::to_vec(&event).expect("event JSON"));
+        body.push(b'\n');
+    }
     let directory = state_root.join("runs").join(run_id.to_string());
     std::fs::create_dir_all(&directory).expect("Run directory");
-    let mut body = serde_json::to_vec(&event).expect("event JSON");
-    body.push(b'\n');
     std::fs::write(directory.join("events.jsonl"), body).expect("event log");
 }
 
@@ -574,6 +973,7 @@ async fn retired_control_command_replays_from_the_compact_ledger_without_side_ef
             max_run_tombstones_per_tenant: 16,
             max_control_tombstones_per_workspace: 8,
             max_control_tombstones_per_tenant: 16,
+            ..RuntimeRetentionPolicy::default()
         },
     );
     let report = runtime
@@ -654,6 +1054,7 @@ async fn hard_state_capacity_fails_closed_when_only_unfinished_or_indeterminate_
             max_run_tombstones_per_tenant: 16,
             max_control_tombstones_per_workspace: 8,
             max_control_tombstones_per_tenant: 16,
+            ..RuntimeRetentionPolicy::default()
         },
     );
     let new_run_id = Uuid::now_v7();
@@ -728,6 +1129,7 @@ async fn tenant_capacity_is_enforced_across_workspace_state_roots() {
         max_run_tombstones_per_tenant: 8,
         max_control_tombstones_per_workspace: 4,
         max_control_tombstones_per_tenant: 8,
+        ..RuntimeRetentionPolicy::default()
     };
     let runtime = EmbeddedRuntime::new_with_retention(
         admission_limits(),
@@ -831,6 +1233,7 @@ async fn tenant_capacity_can_retire_another_workspaces_terminal_run() {
         max_run_tombstones_per_tenant: 8,
         max_control_tombstones_per_workspace: 4,
         max_control_tombstones_per_tenant: 8,
+        ..RuntimeRetentionPolicy::default()
     };
     let runtime = EmbeddedRuntime::new_with_retention(
         admission_limits(),
@@ -1004,6 +1407,7 @@ fn preexisting_tenant_tombstone_overflow_is_rejected_at_startup() {
             max_run_tombstones_per_tenant: 8,
             max_control_tombstones_per_workspace: 4,
             max_control_tombstones_per_tenant: 8,
+            ..RuntimeRetentionPolicy::default()
         },
     )
     .expect("initial Runtime");
@@ -1035,6 +1439,7 @@ fn preexisting_tenant_tombstone_overflow_is_rejected_at_startup() {
             max_run_tombstones_per_tenant: 1,
             max_control_tombstones_per_workspace: 1,
             max_control_tombstones_per_tenant: 1,
+            ..RuntimeRetentionPolicy::default()
         },
     )
     .err()
@@ -1095,6 +1500,7 @@ async fn multi_tenant_multi_workspace_churn_keeps_every_root_bounded_and_recover
         max_run_tombstones_per_tenant: 192,
         max_control_tombstones_per_workspace: 64,
         max_control_tombstones_per_tenant: 192,
+        ..RuntimeRetentionPolicy::default()
     };
     let limits = RuntimeAdmissionLimits {
         max_active_runs: 4,

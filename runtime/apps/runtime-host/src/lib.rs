@@ -8,6 +8,7 @@
 pub mod admission;
 mod durable_file;
 pub mod embedded;
+mod event_archive;
 pub mod grpc;
 pub mod ipc;
 pub mod retention;

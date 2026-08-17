@@ -14,7 +14,28 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：统一终态 Run 收敛
+## 当前阶段：有界冷 Event 历史
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 生命周期顺序 | rollout/Thread metadata 保存 path 与 archived 状态；单 writer 有 flush ack | archive 临时写、rename/fsync、完整 readback 后才允许回收 SQLite row | 对象 fsync/readback→摘要 index→terminal tombstone→删除热 Run | 核心“先有可读副本再回收”已对齐 |
+| 历史缺口 | archived Thread/rollout 可继续索引读取 | prune 前写 per-session watermark，gap 只由真实删除证明 | archive 命中则完整校验；淘汰/超限后由 tombstone watermark 返回 gap | 不再把未知状态猜成 gap |
+| 容量 | rollout 压缩与 Thread store 生命周期成熟 | SQLite/WAL、zstd、bounded plaintext cache | 单 Run/Workspace/tenant count+byte cap；index 16 MiB hard limit；流式 SHA/读取 | 多租户预算更显式，存储引擎成熟度仍落后 |
+| 损坏 | rollout repair/Thread migration 产品链成熟 | SQLite integrity/migration/quarantine 与 archive readback | promised object 缺失、摘要/终态不一致 typed corrupt_log；无自动 quarantine | fail-closed 成立，运维修复仍落后 |
+
+### 本阶段结论
+
+- 已验证：真实 Session 第一轮 Run 在热目录退休后仍能分页/订阅完整 Event；count cap、单 Run byte cap、跨
+  Workspace tenant cap、策略降低、对象篡改和 Unix 权限均有可执行测试。
+- 相比 Codex，本项目吸收 rollout 单 writer/可读历史优先原则，并增加 tenant/Workspace 双层预算与完整
+  invocation/terminal digest；Codex 的压缩 rollout、Thread 查询、迁移和客户端生命周期仍领先。
+- 相比 OpenClaw，本项目吸收 archive readback 和 prune watermark 原则；OpenClaw 的 SQLite 多记录事务、
+  schema migration、quarantine、zstd 和长期 Session 运维仍明显领先。
+- 架构差异：本项目保持冷层 opt-in、无外部数据库、内容寻址且与 replay tombstone 分离，以满足可嵌入和本地
+  资源边界；没有证据证明文件索引能替代 SQLite。总体进度仍为 70–75%。
+- **未外推**：硬件掉电、共享文件系统、跨机器 owner、Windows、介质修复、外部对象存储和真实长期归档分布。
+
+## 上一阶段：统一终态 Run 收敛
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

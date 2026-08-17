@@ -10,6 +10,9 @@ use crate::admission::{
     RuntimeAdmissionController, RuntimeAdmissionError, RuntimeAdmissionLimits,
     RuntimeAdmissionPermit, RuntimeAdmissionSnapshot,
 };
+use crate::event_archive::{
+    EventArchiveLookupError, event_archive_stats, open_event_archive, reconcile_event_archives,
+};
 use crate::retention::{
     RuntimeRetentionPolicy, RuntimeRetentionReport, RuntimeTerminalTombstone,
     available_tombstone_capacity, commit_retention_candidates, count_run_directories,
@@ -87,6 +90,14 @@ pub struct RuntimeEventCursorPage {
     pub has_more: bool,
     pub state: RuntimeEventCursorState,
     pub events: Vec<LocalEvent>,
+}
+
+struct CursorLogSummary {
+    events: Vec<LocalEvent>,
+    highest_sequence: u64,
+    terminal_status: Option<RunStatus>,
+    terminal_event_id: Option<Uuid>,
+    terminal_event_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -636,6 +647,7 @@ impl EmbeddedRuntime {
             let _retention = gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runtime.enforce_tenant_event_archive_capacity_locked(tenant_id)?;
             runtime.ensure_tenant_capacity_locked(tenant_id, 0)?;
             runtime.validate_tenant_tombstone_capacity(tenant_id)?;
         }
@@ -950,12 +962,89 @@ impl EmbeddedRuntime {
         Ok(Self::terminal_event_status(&event.event_type))
     }
 
+    fn read_cursor_log<R: std::io::BufRead>(
+        mut reader: R,
+        invocation: RuntimeInvocationContext,
+        run_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<CursorLogSummary, RuntimeEventCursorError> {
+        use std::io::{BufRead as _, Read as _};
+
+        let mut events = Vec::with_capacity(limit.min(32));
+        let mut highest_sequence = 0_u64;
+        let mut terminal_status = None;
+        let mut terminal_event_id = None;
+        let mut terminal_event_digest = None;
+        loop {
+            let mut line = Vec::new();
+            let mut bounded = reader
+                .by_ref()
+                .take((LOCAL_EVENT_LOG_LINE_MAX_BYTES + 1) as u64);
+            let read = bounded
+                .read_until(b'\n', &mut line)
+                .map_err(|_| Self::cursor_storage_error())?;
+            if read == 0 {
+                break;
+            }
+            if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES {
+                return Err(RuntimeEventCursorError::new(
+                    RuntimeEventCursorErrorCode::CorruptLog,
+                    "durable event log contains an oversized row",
+                ));
+            }
+            if line.last() != Some(&b'\n') {
+                // A hot log may end with one uncommitted crash tail. Cold
+                // archives always end at a committed newline and are checked
+                // before entering this parser.
+                break;
+            }
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                return Err(RuntimeEventCursorError::new(
+                    RuntimeEventCursorErrorCode::CorruptLog,
+                    "durable event log contains an empty row",
+                ));
+            }
+            let event: LocalEvent = serde_json::from_slice(&line).map_err(|_| {
+                RuntimeEventCursorError::new(
+                    RuntimeEventCursorErrorCode::CorruptLog,
+                    "durable event log contains invalid JSON",
+                )
+            })?;
+            let next_terminal = Self::validate_cursor_event(
+                &event,
+                invocation,
+                run_id,
+                highest_sequence.saturating_add(1),
+                terminal_status.is_some(),
+            )?;
+            highest_sequence = event.sequence;
+            if let Some(status) = next_terminal {
+                terminal_status = Some(status);
+                terminal_event_id = Some(event.event_id);
+                terminal_event_digest = Some(event.digest.clone());
+            }
+            if event.sequence > after_sequence && events.len() < limit {
+                events.push(event);
+            }
+        }
+        Ok(CursorLogSummary {
+            events,
+            highest_sequence,
+            terminal_status,
+            terminal_event_id,
+            terminal_event_digest,
+        })
+    }
+
     fn read_event_cursor_page(
         state_root: &Path,
         request: &RuntimeEventCursorRequest,
     ) -> Result<RuntimeEventCursorPage, RuntimeEventCursorError> {
-        use std::io::{BufRead as _, Read as _};
-
         let record = LocalRuntimeHost::read_run_record(state_root, request.run_id)
             .map_err(|_| Self::cursor_storage_error())?;
         let tombstone = if record.is_none() {
@@ -977,6 +1066,60 @@ impl EmbeddedRuntime {
                     RuntimeEventCursorErrorCode::CursorAhead,
                     "event cursor is ahead of the retired terminal sequence",
                 ));
+            }
+            let archived = match open_event_archive(state_root, &tombstone) {
+                Ok(archived) => archived,
+                Err(EventArchiveLookupError::Corrupt) => {
+                    return Err(RuntimeEventCursorError::new(
+                        RuntimeEventCursorErrorCode::CorruptLog,
+                        "retired Event archive is corrupt or incomplete",
+                    ));
+                }
+                Err(EventArchiveLookupError::StorageUnavailable) => {
+                    return Err(Self::cursor_storage_error());
+                }
+            };
+            if let Some(archived) = archived {
+                let summary = Self::read_cursor_log(
+                    std::io::BufReader::new(archived),
+                    request.invocation,
+                    request.run_id,
+                    request.after_sequence,
+                    request.limit,
+                )?;
+                if summary.highest_sequence != tombstone.terminal_sequence
+                    || summary.terminal_status != Some(tombstone.status)
+                    || summary.terminal_event_id != Some(tombstone.terminal_event_id)
+                    || summary.terminal_event_digest.as_deref()
+                        != Some(tombstone.terminal_event_digest.as_str())
+                {
+                    return Err(RuntimeEventCursorError::new(
+                        RuntimeEventCursorErrorCode::CorruptLog,
+                        "retired Event archive disagrees with terminal evidence",
+                    ));
+                }
+                let next_after_sequence = summary
+                    .events
+                    .last()
+                    .map_or(request.after_sequence, |event| event.sequence);
+                return Ok(RuntimeEventCursorPage {
+                    schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                    invocation: request.invocation,
+                    run_id: request.run_id,
+                    requested_after_sequence: request.after_sequence,
+                    next_after_sequence,
+                    earliest_available_sequence: Some(1),
+                    highest_committed_sequence: tombstone.terminal_sequence,
+                    history_gap: false,
+                    has_more: next_after_sequence < tombstone.terminal_sequence,
+                    state: RuntimeEventCursorState::Retired {
+                        status: tombstone.status,
+                        terminal_event_id: tombstone.terminal_event_id,
+                        terminal_sequence: tombstone.terminal_sequence,
+                        terminal_event_digest: tombstone.terminal_event_digest,
+                    },
+                    events: summary.events,
+                });
             }
             return Ok(RuntimeEventCursorPage {
                 schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
@@ -1019,65 +1162,26 @@ impl EmbeddedRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(Self::cursor_storage_error()),
         };
-        let mut events = Vec::with_capacity(request.limit.min(32));
-        let mut highest = 0_u64;
-        let mut terminal_status = None;
-        if let Some(file) = file {
-            let mut reader = std::io::BufReader::new(file);
-            loop {
-                let mut line = Vec::new();
-                let mut bounded = reader
-                    .by_ref()
-                    .take((LOCAL_EVENT_LOG_LINE_MAX_BYTES + 1) as u64);
-                let read = bounded
-                    .read_until(b'\n', &mut line)
-                    .map_err(|_| Self::cursor_storage_error())?;
-                if read == 0 {
-                    break;
-                }
-                if line.len() > LOCAL_EVENT_LOG_LINE_MAX_BYTES {
-                    return Err(RuntimeEventCursorError::new(
-                        RuntimeEventCursorErrorCode::CorruptLog,
-                        "durable event log contains an oversized row",
-                    ));
-                }
-                if line.last() != Some(&b'\n') {
-                    // A JSONL row commits only with its final newline. A
-                    // bounded prefix at EOF is an uncommitted crash tail;
-                    // the next writer truncates it before appending.
-                    break;
-                }
-                line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                if line.is_empty() {
-                    return Err(RuntimeEventCursorError::new(
-                        RuntimeEventCursorErrorCode::CorruptLog,
-                        "durable event log contains an empty row",
-                    ));
-                }
-                let event: LocalEvent = serde_json::from_slice(&line).map_err(|_| {
-                    RuntimeEventCursorError::new(
-                        RuntimeEventCursorErrorCode::CorruptLog,
-                        "durable event log contains invalid JSON",
-                    )
-                })?;
-                let expected_sequence = highest.saturating_add(1);
-                let next_terminal = Self::validate_cursor_event(
-                    &event,
-                    request.invocation,
-                    request.run_id,
-                    expected_sequence,
-                    terminal_status.is_some(),
-                )?;
-                highest = event.sequence;
-                terminal_status = next_terminal;
-                if event.sequence > request.after_sequence && events.len() < request.limit {
-                    events.push(event);
-                }
+        let summary = if let Some(file) = file {
+            Self::read_cursor_log(
+                std::io::BufReader::new(file),
+                request.invocation,
+                request.run_id,
+                request.after_sequence,
+                request.limit,
+            )?
+        } else {
+            CursorLogSummary {
+                events: Vec::new(),
+                highest_sequence: 0,
+                terminal_status: None,
+                terminal_event_id: None,
+                terminal_event_digest: None,
             }
-        }
+        };
+        let events = summary.events;
+        let highest = summary.highest_sequence;
+        let terminal_status = summary.terminal_status;
 
         if request.after_sequence > highest {
             return Err(RuntimeEventCursorError::new(
@@ -1170,18 +1274,55 @@ impl EmbeddedRuntime {
 
             let mut cursor = after_sequence;
             if matches!(initial_page.state, RuntimeEventCursorState::Retired { .. }) {
-                let boundary = RuntimeEventStreamItem::Boundary {
-                    schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
-                    invocation,
-                    run_id,
-                    next_after_sequence: cursor,
-                    earliest_available_sequence: initial_page.earliest_available_sequence,
-                    highest_committed_sequence: initial_page.highest_committed_sequence,
-                    history_gap: initial_page.history_gap,
-                    state: initial_page.state,
-                };
-                let _ = sender.send(Ok(boundary)).await;
-                return;
+                let mut page = initial_page;
+                loop {
+                    for event in std::mem::take(&mut page.events) {
+                        cursor = event.sequence;
+                        let item = RuntimeEventStreamItem::Event {
+                            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                            event: Box::new(event),
+                        };
+                        tokio::select! {
+                            () = stop_for_task.cancelled() => return,
+                            result = sender.send(Ok(item)) => {
+                                if result.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if page.has_more {
+                        page = match Self::read_event_cursor_page(
+                            &state_root,
+                            &RuntimeEventCursorRequest {
+                                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                                invocation,
+                                run_id,
+                                after_sequence: cursor,
+                                limit: capacity,
+                            },
+                        ) {
+                            Ok(page) => page,
+                            Err(error) => {
+                                let _ = sender.send(Err(error.into())).await;
+                                return;
+                            }
+                        };
+                        continue;
+                    }
+                    let boundary = RuntimeEventStreamItem::Boundary {
+                        schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                        invocation,
+                        run_id,
+                        next_after_sequence: cursor,
+                        earliest_available_sequence: page.earliest_available_sequence,
+                        highest_committed_sequence: page.highest_committed_sequence,
+                        history_gap: page.history_gap,
+                        state: page.state,
+                    };
+                    let _ = sender.send(Ok(boundary)).await;
+                    return;
+                }
             }
 
             let event_path = state_root
@@ -2931,6 +3072,8 @@ impl EmbeddedRuntime {
     ) -> Result<RuntimeRetentionPolicy, EmbeddedRuntimeError> {
         let mut other_run_tombstones = 0usize;
         let mut other_control_tombstones = 0usize;
+        let mut other_event_archives = 0usize;
+        let mut other_event_archive_bytes = 0_u64;
         for root in self.tenant_state_roots(tenant_id) {
             if root == state_root {
                 continue;
@@ -2938,6 +3081,10 @@ impl EmbeddedRuntime {
             let (runs, controls, _) = ledger_counts_and_bytes(&root)?;
             other_run_tombstones = other_run_tombstones.saturating_add(runs);
             other_control_tombstones = other_control_tombstones.saturating_add(controls);
+            let archives = event_archive_stats(&root)?;
+            other_event_archives = other_event_archives.saturating_add(archives.entries);
+            other_event_archive_bytes =
+                other_event_archive_bytes.saturating_add(archives.committed_bytes);
         }
         let mut policy = self.retention_policy;
         policy.max_run_tombstones_per_workspace = policy.max_run_tombstones_per_workspace.min(
@@ -2950,6 +3097,17 @@ impl EmbeddedRuntime {
                 policy
                     .max_control_tombstones_per_tenant
                     .saturating_sub(other_control_tombstones),
+            );
+        policy.max_event_archives_per_workspace = policy.max_event_archives_per_workspace.min(
+            policy
+                .max_event_archives_per_tenant
+                .saturating_sub(other_event_archives),
+        );
+        policy.max_event_archive_bytes_per_workspace =
+            policy.max_event_archive_bytes_per_workspace.min(
+                policy
+                    .max_event_archive_bytes_per_tenant
+                    .saturating_sub(other_event_archive_bytes),
             );
         Ok(policy)
     }
@@ -3005,25 +3163,54 @@ impl EmbeddedRuntime {
         self.validate_tenant_tombstone_capacity(tenant_id)
     }
 
+    fn enforce_tenant_event_archive_capacity_locked(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<(), EmbeddedRuntimeError> {
+        for root in self.tenant_state_roots(tenant_id) {
+            let policy = self.effective_retention_policy(tenant_id, &root)?;
+            reconcile_event_archives(
+                &root,
+                &[],
+                policy.max_event_archives_per_workspace,
+                policy.max_event_archive_bytes_per_workspace,
+            )?;
+        }
+        Ok(())
+    }
+
     fn validate_tenant_tombstone_capacity(
         &self,
         tenant_id: Uuid,
     ) -> Result<(), EmbeddedRuntimeError> {
         let mut total_run_tombstones = 0usize;
         let mut total_control_tombstones = 0usize;
+        let mut total_event_archives = 0usize;
+        let mut total_event_archive_bytes = 0_u64;
         for root in self.tenant_state_roots(tenant_id) {
             let (runs, controls, _) = ledger_counts_and_bytes(&root)?;
             total_run_tombstones = total_run_tombstones.saturating_add(runs);
             total_control_tombstones = total_control_tombstones.saturating_add(controls);
+            let archives = event_archive_stats(&root)?;
+            total_event_archives = total_event_archives.saturating_add(archives.entries);
+            total_event_archive_bytes =
+                total_event_archive_bytes.saturating_add(archives.committed_bytes);
         }
-        if total_run_tombstones <= self.retention_policy.max_run_tombstones_per_tenant
-            && total_control_tombstones <= self.retention_policy.max_control_tombstones_per_tenant
+        if total_run_tombstones > self.retention_policy.max_run_tombstones_per_tenant
+            || total_control_tombstones > self.retention_policy.max_control_tombstones_per_tenant
         {
-            return Ok(());
+            return Err(EmbeddedRuntimeError::Configuration(
+                "tenant Runtime tombstone capacity is exhausted".into(),
+            ));
         }
-        Err(EmbeddedRuntimeError::Configuration(
-            "tenant Runtime tombstone capacity is exhausted".into(),
-        ))
+        if total_event_archives > self.retention_policy.max_event_archives_per_tenant
+            || total_event_archive_bytes > self.retention_policy.max_event_archive_bytes_per_tenant
+        {
+            return Err(EmbeddedRuntimeError::Configuration(
+                "tenant Runtime Event archive capacity is exhausted".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn reject_retired_run(
@@ -3091,7 +3278,7 @@ impl EmbeddedRuntime {
             selected.push(candidate);
             maintenance_guards.push(guard);
         }
-        let (tombstoned_runs, tombstoned_control_commands) =
+        let (tombstoned_runs, tombstoned_control_commands, archive_stats) =
             commit_retention_candidates(state_root, policy, selected)?;
         drop(maintenance_guards);
         if tombstoned_runs > 0 || repaired_tombstones > 0 {
@@ -3128,6 +3315,9 @@ impl EmbeddedRuntime {
             total_run_tombstones,
             total_control_tombstones,
             terminal_ledger_bytes,
+            event_archives: archive_stats.entries,
+            event_archive_bytes: archive_stats.committed_bytes,
+            evicted_event_archives: archive_stats.evicted,
         })
     }
 
