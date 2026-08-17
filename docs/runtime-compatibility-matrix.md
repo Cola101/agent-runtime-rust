@@ -19,7 +19,7 @@
 | --- | --- | --- | --- |
 | MCP 2026 stdio | Codex `ff352fab6209` strict fixture | 原始 hash-pinned source；真实 Agent Loop、input-required、Host replacement | **已验证 1 个样本** |
 | MCP 2025/2026 Streamable HTTP | `@modelcontextprotocol/server-everything@2026.7.4` / SDK `1.30.0` | 完整 npm lock + SHA；官方 discovery、echo call、stale digest 拒绝及完整 Agent Loop | **已验证 1 个官方样本** |
-| 多个第三方 MCP discovery | 无当前端点 | ignored discovery matrix 已存在 | **未验证** |
+| 多个第三方 MCP discovery | Context7、Microsoft Learn | 两个无需凭据的公开生产端点；只读 initialize/`tools/list`，分别观测 2/3 个 Tool；schema、namespace、digest 通过 | **已验证 2 个运营方部署** |
 | 认证 MCP / sealed credential | 无当前端点 | ignored public authenticated test 已存在 | **未验证** |
 | OAuth discovery/login/refresh/revoke | 无真实 provider | 受控回环覆盖协议和偏差边界 | **外部未验证** |
 | Resources/Templates/Prompts 长稳分页 | 无外部 server | 本地 HTTP/stdio/Gateway 契约与 Agent Loop 已验证 | **外部未验证** |
@@ -28,7 +28,7 @@
 
 - 每种 Provider 协议至少两个独立外部实现或一个官方实现加一个兼容实现；覆盖成功、限流、认证失败、服务器
   错误、半途断流和能力不兼容。
-- MCP 已覆盖 Codex strict stdio 与官方 Streamable HTTP；完成仍要求另一个非官方 SDK/手写实现和一个真实 OAuth
-  Server；分页、
+- MCP 已覆盖 Codex strict stdio、官方 Streamable HTTP，以及 Context7/Microsoft Learn 两个公开生产部署；
+  公开部署的实现栈独立性未证明，完成仍要求一个**已知**非官方 SDK/手写实现和一个真实 OAuth Server；分页、
   elicitation、取消、progress、Resources/Templates/Prompts 与断线恢复按 capability 分项记录。
 - 每条外部证据必须固定版本/摘要、明确是否消耗凭据或产生副作用，并使用脚本区分“未运行”和“通过”。

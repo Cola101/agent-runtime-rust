@@ -129,8 +129,10 @@ cgroup 限制对真实进程树生效；九处免责声明逐条删除并替换�
 
 **当前部分证据。** ADR-0137 已用 hash-pinned Codex strict MCP 2026 stdio fixture 完成 2026 input-required 与
 Host replacement continuation。ADR-0138 又用完整 npm lock 固定官方 `server-everything@2026.7.4` 与 SDK
-`1.30.0`，完成 Streamable HTTP discovery、真实 Tool call、目录冻结拒绝和完整 Agent Loop。MCP 外部样本已从
-0 增至 2，但仍没有非官方 SDK/手写第三方实现、真实 OAuth、长稳公网流或真实 Provider 矩阵，因此阶段未完成。
+`1.30.0`，完成 Streamable HTTP discovery、真实 Tool call、目录冻结拒绝和完整 Agent Loop。ADR-0139 再以
+Context7 与 Microsoft Learn 两个无需凭据的公开生产端点完成只读 discovery，证明真实 TLS/DNS/CDN 后的运营方
+部署多样性。当前仍没有**已知实现栈独立**的非官方 SDK/手写第三方实现、真实 OAuth、长稳公网流或真实
+Provider 矩阵，因此阶段未完成。
 
 **做什么。**
 - 真实厂商三协议兼容矩阵：`openai_responses` / `anthropic_messages` / `openai_compatible`

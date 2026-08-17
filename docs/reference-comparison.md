@@ -14,7 +14,29 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：官方 Streamable HTTP MCP 外部兼容门禁
+## 当前阶段：公开第三方 MCP 只读发现门禁
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 真实部署 | 支持动态远端 MCP 配置与目录发现，产品客户端链成熟 | integrations 与 Gateway MCP 运营面广 | 固定 Context7、Microsoft Learn 两个公开生产端点 | 首次证明两个独立运营方部署互操作，不等于实现栈独立 |
+| 授权边界 | 支持 OAuth 与用户配置 | Auth Profile、OAuth、代理和 TLS 生命周期更成熟 | 显式清除认证环境，只做 initialize/initialized/`tools/list` | 无凭据只读边界成立；真实 OAuth 仍落后两者 |
+| 目录安全 | Tool 目录进入 session/turn 配置 | Session/Requester 缓存与目录重验证成熟 | 非空对象 schema、tenant namespace、64 位 catalog digest | 多租户冻结更显式；连接管理和生态广度仍落后 |
+| 可重复性 | 上游测试与产品发布管理版本 | 项目依赖与 integrations 管理版本 | live endpoint 不可固定二进制，失败不降级为 skip | 证明实时兼容，不是可重放的供应链证据 |
+
+### 本阶段结论
+
+- 已确认：Context7 与 Microsoft Learn 同轮 discovery **1/1 通过**，分别返回 2/3 个 Tool；没有远端 Tool
+  调用、用户数据、凭据或生产协议修改。
+- 相比 Codex，本项目补上了两个真实公网部署的动态目录证据，并继续冻结 namespace/schema/digest；Codex 的
+  OAuth、配置入口、长期连接和客户端生命周期仍领先。
+- 相比 OpenClaw，本项目的只读门禁更窄且适合无副作用发布验证；OpenClaw 的 Auth Profile、代理/TLS、重连、
+  integrations 和运维广度仍明显领先。
+- Context7 公开源码仍使用 MCP Server helper，Microsoft Learn 服务端实现栈未验证；因此只声称运营方/部署
+  多样性，不声称非官方 SDK 或手写协议实现多样性。
+- **未外推**：真实 Tool call、真实 OAuth、长期 SSE、分页/通知/限流恢复、已知独立实现栈和三类 Provider
+  外部矩阵。总体仍为 70–75%。
+
+## 上一阶段：官方 Streamable HTTP MCP 外部兼容门禁
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

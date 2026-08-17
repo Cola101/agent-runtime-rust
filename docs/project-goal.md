@@ -413,6 +413,12 @@ ADR-0138 已把历史上人工启动的官方 Streamable HTTP 验证升级为锁
 共 3/3 通过；每条还验证 test name 与 `1 passed`，不存在零测试假绿。当前 MCP 有两个外部样本，但真实 OAuth、
 非官方 SDK/手写 Server、长稳公网流和三类真实 Provider 兼容矩阵仍未完成。
 
+ADR-0139 又把只读 discovery 扩展到 Context7 与 Microsoft Learn 两个无需凭据的公开生产端点：门禁显式清除
+本地认证变量，只执行 initialize/initialized/`tools/list`，并要求每个端点都有非空对象 schema 目录、租户
+namespace 和稳定格式摘要。两端首轮共同运行 1/1 通过，分别观测 2/3 个 Tool；没有远端 Tool 调用、用户数据或
+生产协议修改。该阶段证明运营方与真实部署多样性，不证明实现栈独立；已知非官方 SDK/手写 Server、真实 OAuth、
+长稳公网流和三类真实 Provider 兼容矩阵仍未完成。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault

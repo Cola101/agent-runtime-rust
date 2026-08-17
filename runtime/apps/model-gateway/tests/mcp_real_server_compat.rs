@@ -170,6 +170,9 @@ async fn a_tool_call_round_trips_against_the_reference_server() {
 ///
 /// One server proves the fixes work; several written by different people prove
 /// they were fixes to the protocol rather than to one implementation's quirks.
+/// The credential-free public release gate is
+/// `runtime/scripts/test-mcp-public-discovery-compat.sh`; it fixes the endpoint
+/// set and verifies that each server produced a non-empty catalog.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs third-party MCP servers running; see the module comment"]
 async fn discovery_works_against_every_configured_server() {

@@ -24,6 +24,15 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-17 公开第三方 MCP 只读发现门禁完成（ADR-0139）：固定 Context7
+`https://mcp.context7.com/mcp` 与 Microsoft Learn `https://learn.microsoft.com/api/mcp` 两个无需凭据的
+公开生产端点，显式清除本地认证环境变量后，只执行 initialize、initialized 与 `tools/list`。两端分别返回
+2 与 3 个 Tool，schema、namespace 和 64 位目录摘要检查通过；exact gate **1 通过、0 失败、0 忽略**。
+本轮没有调用远端 Tool、发送用户或 Workspace 数据，也没有修改生产协议代码。该证据把外部部署样本扩展到
+两个独立运营方，但 Context7 公开源码仍使用 MCP Server helper，Microsoft Learn 服务端实现栈未验证，故不把
+运营方多样性冒充为非官方 SDK/手写实现多样性；真实 OAuth、长期流和 Provider 外部矩阵仍缺，总体仍为
+70–75%。证据见 `docs/evidence/2026-08-17-public-third-party-mcp-discovery.md`。
+
 2026-08-17 官方 Streamable HTTP 外部门禁完成（ADR-0138）：完整 npm lock 固定
 `@modelcontextprotocol/server-everything@2026.7.4` 与 SDK `1.30.0`，临时安装使用空环境、临时 HOME/cache、
 `--ignore-scripts` 和随机 loopback 端口；退出按精确 PID identity 回收并删除完整临时目录。Model Gateway 对
