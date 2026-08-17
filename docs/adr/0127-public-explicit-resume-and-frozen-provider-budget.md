@@ -45,6 +45,6 @@ GUI 因而还不能把公开 `Control` 当作已验证的崩溃恢复入口。
 - 本轮补的是公开证据；现有 Runtime 实现无需修改。首次测试在默认单次 Provider 预算下得到
   `model.provider.failed → run.failed`，这是正确围栏，不是缺陷；显式配置两次尝试后才得到成功路径。
 - 测试使用同机真实 gRPC 与 HTTP/SSE，但不是跨机器、真实厂商或主机掉电验证。
-- 当前没有自动发现所有 orphaned Running Run 的公共管理 API；`recover_unfinished_detached` 属于 Runtime
-  生命周期管理入口，外部调度与多进程 command ledger 仍未完成。
+- ADR-0128 后已有进程内全 Profile orphan 扫描与公平恢复入口；生产宿主启动编排、外部调度与多进程
+  command ledger 仍未完成。
 - `action_json` 仍没有生成式 Java SDK；本 ADR 只冻结 Resume 的最小 JSON 形状。

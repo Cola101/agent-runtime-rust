@@ -25,11 +25,11 @@ use agent_protocol::{McpInputResponse, RunStatus, RuntimeInvocationContext};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -210,6 +210,32 @@ pub struct EmbeddedRuntimeSnapshot {
     pub peak_active_event_subscriptions: usize,
     pub peak_buffered_event_slots: usize,
     pub admission: RuntimeAdmissionSnapshot,
+}
+
+/// One immutable invocation whose startup reconciliation could not be planned
+/// or durably accepted. The error remains typed for an in-process operator;
+/// network adapters must continue mapping it without leaking local paths.
+#[derive(Debug)]
+pub struct EmbeddedRuntimeProfileRecoveryFailure {
+    pub invocation: RuntimeInvocationContext,
+    pub error: EmbeddedRuntimeError,
+}
+
+/// Aggregate startup-recovery evidence for a multi-profile Runtime.
+///
+/// `recovered_runs` counts Run groups whose durable control commands were
+/// accepted. A failed profile is isolated: its remaining plans are not issued,
+/// while other registered profiles continue through the shared fair admission
+/// controller.
+#[derive(Debug)]
+pub struct EmbeddedRuntimeRecoveryReport {
+    pub scanned_profiles: usize,
+    pub recovered_runs: usize,
+    pub failures: Vec<EmbeddedRuntimeProfileRecoveryFailure>,
+}
+
+struct PlannedRunRecovery {
+    commands: Vec<RuntimeControlCommand>,
 }
 
 #[derive(Default)]
@@ -450,6 +476,7 @@ pub struct EmbeddedRuntime {
     profiles: HashMap<RuntimeInvocationContext, LocalRuntimeConfig>,
     admission: Arc<RuntimeAdmissionController>,
     active: ActiveExecutionMap,
+    recovery_gate: AsyncMutex<()>,
     peak_active_execution_owners: AtomicUsize,
     event_subscriptions: Arc<EventSubscriptionCapacity>,
     retention_policy: RuntimeRetentionPolicy,
@@ -587,6 +614,7 @@ impl EmbeddedRuntime {
             profiles: by_identity,
             admission,
             active: Arc::new(Mutex::new(HashMap::new())),
+            recovery_gate: AsyncMutex::new(()),
             peak_active_execution_owners: AtomicUsize::new(0),
             event_subscriptions: Arc::new(EventSubscriptionCapacity::default()),
             retention_policy,
@@ -1547,12 +1575,42 @@ impl EmbeddedRuntime {
         // because it runs its own check first; a network caller has no such
         // adapter, which is how it surfaced.
         let digest = Self::control_command_digest(&command)?;
-        if let Some(receipt) = Self::load_control_receipt(&config.state_root, command.command_id)?
+        let existing = Self::load_control_receipt(&config.state_root, command.command_id)?;
+        if let Some(receipt) = existing.as_ref()
             && (receipt.command_digest != digest
                 || receipt.invocation != command.invocation
                 || receipt.run_id != command.run_id)
         {
             return Err(EmbeddedRuntimeError::ControlCommandRebound);
+        }
+        if let Some(receipt) = existing {
+            if receipt.state == RuntimeControlReceiptState::Completed {
+                return Ok(receipt);
+            }
+            if let Some(terminal) =
+                Self::terminal_state_from_events(&config.state_root, command.run_id)?
+            {
+                let status = Self::terminal_status(&terminal).ok_or_else(|| {
+                    EmbeddedRuntimeError::Configuration(
+                        "terminal event did not map to a terminal Run status".into(),
+                    )
+                })?;
+                let mut record = self.owned_run_record(command.invocation, command.run_id)?;
+                record.state = terminal;
+                Self::write_run_record(&config.state_root, &record)?;
+                Self::complete_receipts_for_run(
+                    &config.state_root,
+                    command.invocation,
+                    command.run_id,
+                    status,
+                )?;
+                return Self::load_control_receipt(&config.state_root, command.command_id)?
+                    .ok_or_else(|| {
+                        EmbeddedRuntimeError::Configuration(
+                            "terminal control receipt vanished during reconciliation".into(),
+                        )
+                    });
+            }
         }
         let invocation = command.invocation;
         let command_id = command.command_id;
@@ -1584,20 +1642,30 @@ impl EmbeddedRuntime {
         }
     }
 
-    /// Reconciles every unfinished Run for one invocation and redispatches its
-    /// durable control command. The daemon is only a transport adapter; owner
-    /// epochs, exact decisions and cancellation precedence stay here.
-    pub async fn recover_unfinished_detached(
-        self: &Arc<Self>,
+    fn plan_unfinished_recovery(
+        &self,
         invocation: RuntimeInvocationContext,
-    ) -> Result<usize, EmbeddedRuntimeError> {
+    ) -> Result<VecDeque<PlannedRunRecovery>, EmbeddedRuntimeError> {
         let config = self.profile(invocation)?.clone();
         let records = LocalRuntimeHost::list_run_records(&config.state_root)?;
         let parent_owned_children =
             LocalRuntimeHost::managed_subagent_run_references(&config.state_root)?;
-        let mut recovered = 0usize;
+        let mut planned = VecDeque::new();
         for mut record in records {
             if !Self::record_is_owned(invocation, &record) {
+                continue;
+            }
+            // Recovery only owns orphaned work. A Run still registered in
+            // this process is either executing or projecting its terminal
+            // event into the durable record and control receipts. Competing
+            // with that finalizer can redispatch a model/Tool side effect or
+            // observe a transient staging file.
+            if self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&(invocation, record.run_id))
+            {
                 continue;
             }
             // The parent Checkpoint is the recovery authority for its child
@@ -1680,10 +1748,12 @@ impl EmbeddedRuntime {
             }
 
             if !receipts.is_empty() {
-                for receipt in receipts {
-                    self.control_detached(receipt.command()).await?;
-                }
-                recovered += 1;
+                planned.push_back(PlannedRunRecovery {
+                    commands: receipts
+                        .into_iter()
+                        .map(|receipt| receipt.command())
+                        .collect(),
+                });
                 continue;
             }
 
@@ -1713,18 +1783,116 @@ impl EmbeddedRuntime {
                 }
                 _ => continue,
             };
-            self.control_detached(RuntimeControlCommand {
-                schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
-                command_id: Uuid::now_v7(),
-                invocation,
-                run_id: record.run_id,
-                expected_owner_epoch: record.owner_epoch,
-                action,
-            })
-            .await?;
+            planned.push_back(PlannedRunRecovery {
+                commands: vec![RuntimeControlCommand {
+                    schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+                    command_id: Uuid::now_v7(),
+                    invocation,
+                    run_id: record.run_id,
+                    expected_owner_epoch: record.owner_epoch,
+                    action,
+                }],
+            });
+        }
+        Ok(planned)
+    }
+
+    async fn dispatch_planned_recovery(
+        self: &Arc<Self>,
+        plan: PlannedRunRecovery,
+    ) -> Result<(), EmbeddedRuntimeError> {
+        for command in plan.commands {
+            self.control_detached(command).await?;
+        }
+        Ok(())
+    }
+
+    /// Reconciles every unfinished Run for one invocation and redispatches its
+    /// durable control command. The daemon is only a transport adapter; owner
+    /// epochs, exact decisions and cancellation precedence stay here.
+    pub async fn recover_unfinished_detached(
+        self: &Arc<Self>,
+        invocation: RuntimeInvocationContext,
+    ) -> Result<usize, EmbeddedRuntimeError> {
+        let _recovery = self.recovery_gate.lock().await;
+        let planned = self.plan_unfinished_recovery(invocation)?;
+        let mut recovered = 0usize;
+        for plan in planned {
+            self.dispatch_planned_recovery(plan).await?;
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    /// Scans every registered invocation without making an embedding adapter
+    /// enumerate tenant profiles or reproduce recovery ordering.
+    ///
+    /// Planning failures are isolated per profile. Runnable plans are then
+    /// dispatched one Run per profile in round-robin order, so one tenant with
+    /// many orphaned Runs cannot fill the admission queue before another
+    /// tenant gets a recovery opportunity.
+    pub async fn recover_all_unfinished_detached(
+        self: &Arc<Self>,
+    ) -> EmbeddedRuntimeRecoveryReport {
+        let _recovery = self.recovery_gate.lock().await;
+        let mut invocations = self.profiles.keys().copied().collect::<Vec<_>>();
+        invocations.sort_by_key(|invocation| {
+            (
+                invocation.tenant_id,
+                invocation.application_id,
+                invocation.workspace_id,
+                invocation.agent_version_id,
+                invocation.model_policy_id,
+                invocation.workload_identity_id,
+            )
+        });
+        let scanned_profiles = invocations.len();
+        let mut failures = Vec::new();
+        let mut profile_plans = VecDeque::new();
+        for invocation in invocations {
+            match self.plan_unfinished_recovery(invocation) {
+                Ok(plans) if !plans.is_empty() => {
+                    profile_plans.push_back((invocation, plans));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failures.push(EmbeddedRuntimeProfileRecoveryFailure { invocation, error })
+                }
+            }
+        }
+
+        let mut recovered_runs = 0usize;
+        while let Some((invocation, mut plans)) = profile_plans.pop_front() {
+            let plan = plans
+                .pop_front()
+                .expect("only non-empty recovery queues are scheduled");
+            match self.dispatch_planned_recovery(plan).await {
+                Ok(()) => {
+                    recovered_runs += 1;
+                    if !plans.is_empty() {
+                        profile_plans.push_back((invocation, plans));
+                    }
+                }
+                Err(error) => {
+                    failures.push(EmbeddedRuntimeProfileRecoveryFailure { invocation, error })
+                }
+            }
+        }
+        failures.sort_by_key(|failure| {
+            (
+                failure.invocation.tenant_id,
+                failure.invocation.application_id,
+                failure.invocation.workspace_id,
+                failure.invocation.agent_version_id,
+                failure.invocation.model_policy_id,
+                failure.invocation.workload_identity_id,
+            )
+        });
+        EmbeddedRuntimeRecoveryReport {
+            scanned_profiles,
+            recovered_runs,
+            failures,
+        }
     }
 
     /// Applies a versioned approval, cancellation or crash-resume command. The

@@ -14,7 +14,28 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：公开显式 Resume 与冻结 Provider 重试预算
+## 当前阶段：多 Profile 孤儿 Run 自动恢复
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 启动扫描 | ThreadManager/SDK 按 Thread 恢复持久历史 | Gateway 自动扫描 aborted main Session | 一个聚合入口扫描全部注册 Profile | 已消除 Java/CLI/GUI 复制恢复状态机的需要 |
+| 多租户公平 | inspected 主链不是共享 tenant Runtime 调度器 | owner claim/reservation 防重复，产品面成熟 | Run 计划按 Profile round-robin 进入全局/tenant/Workspace 准入 | 本项目窄面更贴合共享多租户 Runtime |
+| 重复与竞态 | resumed child 避免重复 ThreadStarted | cycle/revision、charged attempt、owner 检查 | 共享恢复门、active-owner 跳过、owner epoch、持久 command receipt | 并发双扫描总计只接纳一次 |
+| 部分故障 | Thread/rollout 生命周期成熟 | transcript 分类、退避、通知成熟 | 一个坏 Profile 返回 typed failure，健康租户继续 | 故障隔离已验证；修复和告警产品面落后 |
+| 终态一致性 | Thread event/history 是恢复基础 | Session lifecycle 管终态 | Kernel terminal event 收敛 record 与 Accepted receipt | 修掉“事件终态、重放非终态”窗口 |
+
+### 本阶段结论
+
+- 已验证：两个租户的第一 Runtime 在真实 HTTP/SSE 请求出网后消失；替代 Runtime 的并发双扫描总计只接纳
+  两个 Run，各自仅使用冻结预算允许的第二次 Provider 尝试；坏 Profile 不阻塞健康租户。
+- 相比 Codex，本项目新增的是共享多租户 Profile 的公平孤儿扫描与持久命令围栏；Codex 的 SDK、Thread
+  生命周期、历史分支和客户端产品链仍明显成熟。
+- 相比 OpenClaw，本项目在 tenant/Workspace 精确身份、轮转公平、冻结 Provider 预算和 durable receipt 的
+  组合上更严格；OpenClaw 的宿主自动触发、退避、通知、长期运行与运维体验仍领先。
+- **未外推**：跨机器 owner 选举、分布式 command ledger、主机掉电、真实厂商和生产告警未完成；总体仍为
+  70–75%。
+
+## 上一阶段：公开显式 Resume 与冻结 Provider 重试预算
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
