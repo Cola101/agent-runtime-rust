@@ -3585,11 +3585,18 @@ impl LocalRuntimeHost {
                 let failure = journal
                     .terminal_failure
                     .as_ref()
-                    .expect("terminal failure was checked");
-                return Err(LocalRuntimeError::Provider(format!(
-                    "Provider {} exhausted the frozen same-provider attempt budget; diagnostic digest {}",
-                    failure.provider_id, failure.message_digest
-                )));
+                    .expect("terminal failure was checked")
+                    .clone();
+                journal.staged_events = vec![ModelStreamEvent::Failed {
+                    kind: failure.kind,
+                    retryable: false,
+                    message: format!(
+                        "Provider {} exhausted the frozen same-provider attempt budget; diagnostic digest {}",
+                        failure.provider_id, failure.message_digest
+                    ),
+                }];
+                Self::persist_model_route_journal(&path, &journal)?;
+                return Ok((path, journal.staged_events.clone()));
             }
             journal.terminal_failure = None;
             journal.terminal_failure_reported = false;
@@ -3756,6 +3763,24 @@ impl LocalRuntimeHost {
                             &mut journal,
                             event_types,
                         )?;
+                        if journal.same_provider_attempts
+                            >= self
+                                .config
+                                .model_routing
+                                .health_policy
+                                .max_same_provider_attempts
+                        {
+                            journal.staged_events = vec![ModelStreamEvent::Failed {
+                                kind: failure.kind,
+                                retryable: false,
+                                message: format!(
+                                    "Provider {} exhausted the frozen same-provider attempt budget; diagnostic digest {}",
+                                    failure.provider_id, failure.message_digest
+                                ),
+                            }];
+                            Self::persist_model_route_journal(&path, &journal)?;
+                            return Ok((path, journal.staged_events.clone()));
+                        }
                         return Err(LocalRuntimeError::Provider(format!(
                             "retryable Provider {} failure before output; diagnostic digest {}",
                             failure.provider_id, failure.message_digest

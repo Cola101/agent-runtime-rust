@@ -246,6 +246,13 @@ fmt `EXIT=0`；clippy `EXIT=0`；残留扫描：0 个遗留进程，磁盘 45Gi�
 `an_interrupted_provider_attempt_is_never_replayed_past_its_durable_budget` 1/1；
 `agent-runtime-host` library clippy `-D warnings` 与全工作区 fmt check 通过。
 
+同一审计随后覆盖了“崩溃后发现 Provider 尝试预算已耗尽”的路径。RED 证明日志只有
+`run.started`、`run.restored`、`model.provider.failed`，run 记录却已 Finished。修复把 journal 中
+已经报告过的终局失败作为 staged `ModelStreamEvent::Failed` 交回 Kernel，而不是从 Host 旁路写状态。
+因此 diagnostic 仍只暴露摘要、`run.failed` 恰好一次且位于日志末尾。完整 `daemon_recovery` 9/9、
+`multi_provider` 14/14 通过；新增测试还直接覆盖了不经替代 Host 的 live exhaustion。真实 503 压缩恢复
+聚焦测试继续通过，证明暂态与终局没有重新混在一起。
+
 ### 全量门禁（第五段，fullgate23）——绿
 
 **130 二进制、802 passed、0 failed、6 ignored、`CARGO_EXIT=0`**
@@ -318,6 +325,8 @@ roadmap 原文：「一个**独立进程**（非嵌入、非同机 socket）通�
 
 - **取消、审批、跨进程恢复均已成功闭环；`resume` 的成功路径未验证**
   （其前置状态构造成本高，且不在阶段 1 出口标准内）。
+- Provider 确定性终局已闭合，但 MCP 初始化、Tool/子代理编排、存储/Checkpoint `Err` 路径尚未
+  逐条做同样的终态一致性故障测试；不将本轮证据外推到这些类别。
 - 无 Java SDK。
 
 ## 进度

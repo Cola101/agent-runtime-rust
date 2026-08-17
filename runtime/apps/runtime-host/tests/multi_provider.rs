@@ -670,6 +670,48 @@ async fn zero_output_failure_retries_the_same_provider_before_crossing_candidate
 }
 
 #[tokio::test]
+async fn an_exhausted_single_provider_budget_is_a_terminal_run_without_replacement() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let (endpoint, calls, server) = spawn_repeated_compatible_responses(vec![503], "unused").await;
+    let mut cfg = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        vec![candidate(
+            "only-provider",
+            ProviderProtocol::OpenAiCompatible,
+            endpoint,
+            1,
+        )],
+    );
+    cfg.model_routing.health_policy.max_same_provider_attempts = 1;
+    let mut host = LocalRuntimeHost::start(cfg).expect("Host");
+
+    let outcome = host
+        .execute("fail after the frozen Provider budget is exhausted")
+        .await
+        .expect("Provider exhaustion is a Run outcome, not a Host failure");
+
+    assert_eq!(outcome.status, RunStatus::Failed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        outcome
+            .event_types
+            .iter()
+            .filter(|event| event.as_str() == "run.failed")
+            .count(),
+        1
+    );
+    let events = LocalRuntimeHost::replay_events(state.path(), outcome.run_id, 0)
+        .expect("terminal event log");
+    assert_eq!(
+        events.last().map(|event| event.event_type.as_str()),
+        Some("run.failed")
+    );
+    server.await.expect("Provider fixture");
+}
+
+#[tokio::test]
 async fn replacement_host_skips_a_provider_in_persisted_cooldown() {
     let state = tempfile::tempdir().expect("state root");
     let workspace = tempfile::tempdir().expect("workspace root");

@@ -467,13 +467,27 @@ async fn an_interrupted_provider_attempt_is_never_replayed_past_its_durable_budg
     let recovered = LocalRuntimeHost::read_run_record(&state_root, run_id)
         .expect("record readable")
         .expect("recovered record");
-    assert!(
-        matches!(
-            recovered.state,
-            LocalRunState::Finished { ref status } if status.contains("exhausted the frozen same-provider attempt budget")
-        ),
-        "the ambiguous request must terminate explicitly instead of being replayed: {:?}",
-        recovered.state
+    assert_eq!(
+        recovered.state,
+        LocalRunState::Finished {
+            status: "failed".into()
+        },
+        "the exhausted request must terminate explicitly instead of being replayed"
+    );
+    let events = LocalRuntimeHost::replay_events(&state_root, run_id, 0)
+        .expect("exhausted Run event log remains readable");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.failed")
+            .count(),
+        1,
+        "an exhausted durable Provider budget must publish one terminal event: {events:?}"
+    );
+    assert_eq!(
+        events.last().map(|event| event.event_type.as_str()),
+        Some("run.failed"),
+        "no observation may follow the terminal event"
     );
 
     drop(first_replacement);

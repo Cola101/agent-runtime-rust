@@ -21,7 +21,7 @@
 | 外部调用入口 | CLI 进程内，无远程调用契约 | Gateway/Node 协议成熟，远程调用是其核心 | `RuntimeInvocation` gRPC：Submit/Control/ReadEvents/WatchEvents；binary 已接线但默认关闭 | 相比 Codex 是本项目多出来的面；相比 OpenClaw 仍缺成熟 SDK 与长期部署证据 |
 | 调用方身份 | 单用户本地，不适用 | Gateway 会话 | 运维形状（schema 5）+ 独立 scope `runtime.invoke`；Run 形状带该 scope 也被拒 | 更严：能执行不等于能开 Run |
 | 越权断言 | 不适用 | 依赖会话 | tenant/app/workload 取自 claims，请求体只能同意；Profile 以完整六元组为键 | 更严：请求体无法拓宽自己的 token |
-| 生命周期边界 | 错误以 `EventMsg::Error` 显式送达调用方 | `run_failed` 等终态进入 Session 状态事件 | `RunLifecycleBoundary` typed；不可选路由经 Kernel 提交唯一 `run.failed`，不再留下 failed record + 非终态日志 | 已对齐两者的“失败必须可观察”，并增加持久一致性校验 |
+| 生命周期边界 | 错误以 `EventMsg::Error` 显式送达调用方 | `run_failed` 等终态进入 Session 状态事件 | `RunLifecycleBoundary` typed；不可选路由及持久重试预算耗尽都经 Kernel 提交唯一 `run.failed`，不再留下 failed record + 非终态日志 | 已对齐两者的“失败必须可观察”，并增加持久一致性校验 |
 | 传输安全 | 本地进程，不适用 | TLS 成熟 | binary 默认无监听；启用必须提供 mTLS 与验签公钥，无客户端证书/错误 CA 均拒绝 | 契约边界已对齐，生产证书轮换与部署运维仍落后 |
 
 ### 本阶段结论
@@ -32,10 +32,10 @@
 - 相比 OpenClaw：协议形状、流式重连和节点式远程调用已不再是空白；但 SDK、客户端生态、节点发现、
   长连运维与长期生产证据仍明显落后。
 - **领先点**：运维身份与执行身份结构隔离、Profile 六元组精确匹配、终态事件与权威记录交叉校验，
-  更适合多租户嵌入。不可选路由和仍可恢复的 503 已分型，不用牺牲恢复语义换可观测性。
+  更适合多租户嵌入。不可选路由、预算耗尽与仍可恢复的 503 已分型，不用牺牲恢复语义换可观测性。
 - **总体进度不因本阶段提高**，仍为 70–75%：边界层，不属于并发/真实厂商/跨平台/生产持久层四类证据。
-- 下一目标：按 `docs/roadmap.md` 进入需要外部环境的阶段 2/3；本机继续补不依赖外部环境的内核一致性，
-  不用模拟容器或虚构真实厂商证据。
+- 下一目标：本机先继续审计 MCP 初始化、Tool/子代理编排与 Host 存储错误的终态一致性；随后按
+  `docs/roadmap.md` 进入需要外部环境的阶段 2/3，不用模拟容器或虚构真实厂商证据。
 
 ## 上一阶段：声明式 Tool 容器边界能力
 

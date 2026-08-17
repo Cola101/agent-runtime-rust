@@ -174,10 +174,11 @@ flowchart LR
 
 24. **流式与一元调用认证完全一致。** 只在请求/响应路径检查的面，会让任何调用方 tail 别人的 Run。
 
-25. **Provider 选择失败也是 Run 终态，不是传输损坏。** `run.started` 之后若没有候选满足地域、
-    数据等级、能力、健康与费用约束，Host 通过 Kernel 状态机提交唯一 `run.failed`，再写终态
-    Checkpoint。事件游标因此返回 `Terminal { failed }`，而不是因 `run.json` 与日志不一致返回
-    `CorruptLog`。这只适用于确定性不可选路由；仍有恢复预算的 503/超时继续保留替代 Host 重试语义。
+25. **Provider 的确定性终局是 Run 终态，不是传输损坏。** `run.started` 之后若没有候选满足地域、
+    数据等级、能力、健康与费用约束，或冻结路由已耗尽持久 same-provider 尝试预算，Host 都通过
+    Kernel 状态机提交唯一 `run.failed`，再写终态 Checkpoint。事件游标因此返回
+    `Terminal { failed }`，而不是因 `run.json` 与日志不一致返回 `CorruptLog`。仍有恢复预算的
+    503/超时继续返回可恢复错误，替代 Host 可以重试，不能为了可观测性提前终止。
 
 ## 风险与后续——本轮**未**完成的部分
 
@@ -187,6 +188,9 @@ flowchart LR
 
 - **取消、审批、跨进程崩溃恢复均已证明成功端到端**；**`resume` 的成功路径仍未在该面验证**
   （其前置状态 `Interrupted` 构造成本高，且不在 roadmap 阶段 1 的出口标准内）。
+- 本轮只闭合了 Provider 确定性终局。源码审计显示 MCP 初始化、Tool/子代理编排以及 Host
+  存储/Checkpoint 错误仍有直接返回 `Err` 的路径；尚未逐条证明 detached adapter 不会再次形成
+  “终态记录但无终态事件”。因此不得把本轮结论外推成“所有 Host 错误均满足终态一致性”。
 - 无 Java SDK。`option java_package` 只是让契约可被生成，不等于有 SDK。
 - **总体进度不因本 ADR 提高**，仍为 70–75%：这是边界层，不是内核能力，也不属于并发/真实厂商/
   跨平台/生产持久层四类证据中的任何一类。
