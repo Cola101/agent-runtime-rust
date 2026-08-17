@@ -2123,7 +2123,10 @@ mod tests {
         };
         let client = StdioMcpClient::new(
             HashMap::from([(server_id, config)]),
-            Duration::from_millis(200),
+            // The fixture deliberately stalls only `ping`; initialization and
+            // directory discovery must still have enough wall time when the
+            // full Runtime Host suite is running other process tests.
+            Duration::from_secs(1),
             LocalMcpLifecycleConfig {
                 catalog_ttl: Duration::from_secs(30),
                 ..LocalMcpLifecycleConfig::default()

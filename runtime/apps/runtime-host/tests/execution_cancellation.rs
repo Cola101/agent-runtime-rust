@@ -891,15 +891,21 @@ async fn http_mcp_reverse_request_during_discovery_fails_before_model_egress() {
     }];
     let mut host = LocalRuntimeHost::start(local_config).expect("host");
 
-    let error = timeout(
+    let outcome = timeout(
         Duration::from_secs(5),
         host.execute("Do not answer without the required Tool."),
     )
     .await
     .expect("reverse-request discovery hung")
-    .expect_err("required MCP protocol violation must reject the Run");
+    .expect("required MCP protocol violation must become a durable Run failure");
 
-    assert!(error.to_string().contains("required MCP server"), "{error}");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    let events = LocalRuntimeHost::replay_events(state.path(), outcome.run_id, 0).unwrap();
+    assert_eq!(events.last().unwrap().event_type, "run.failed");
+    assert_eq!(
+        events.last().unwrap().payload["kind"],
+        "required_mcp_unavailable"
+    );
     let rejection = timeout(Duration::from_secs(2), rejected)
         .await
         .expect("MCP client did not answer the discovery reverse request")
@@ -957,15 +963,21 @@ async fn stdio_mcp_reverse_request_during_discovery_fails_before_model_egress() 
     }];
     let mut host = LocalRuntimeHost::start(local_config).expect("host");
 
-    let error = timeout(
+    let outcome = timeout(
         Duration::from_secs(5),
         host.execute("Do not answer without the required Tool."),
     )
     .await
     .expect("stdio reverse-request discovery hung")
-    .expect_err("required stdio MCP protocol violation must reject the Run");
+    .expect("required stdio MCP protocol violation must become a durable Run failure");
 
-    assert!(error.to_string().contains("required MCP server"), "{error}");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    let events = LocalRuntimeHost::replay_events(state.path(), outcome.run_id, 0).unwrap();
+    assert_eq!(events.last().unwrap().event_type, "run.failed");
+    assert_eq!(
+        events.last().unwrap().payload["kind"],
+        "required_mcp_unavailable"
+    );
     wait_for_file(&rejection_marker).await;
     let rejection: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&rejection_marker).expect("stdio discovery rejection marker"),

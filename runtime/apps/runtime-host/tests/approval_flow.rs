@@ -7,15 +7,16 @@
 
 use agent_protocol::RunBudget;
 use agent_runtime_host::embedded::{
-    RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION, RuntimeControlAction, RuntimeControlCommand,
-    RuntimeControlReceipt, RuntimeControlReceiptState,
+    RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION, RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+    RuntimeControlAction, RuntimeControlCommand, RuntimeControlReceipt, RuntimeControlReceiptState,
+    RuntimeEventCursorRequest, RuntimeEventCursorState,
 };
 use agent_runtime_host::ipc::{
     LocalRequest, LocalResponse, LocalRuntimeDaemon, default_socket_path,
 };
 use agent_runtime_host::{
     LocalModelRoutingConfig, LocalRunState, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
-    WORKSPACE_READ_SCOPE,
+    WORKSPACE_READ_SCOPE, local_invocation_context,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -541,6 +542,36 @@ async fn cancelling_a_parked_run_closes_it_without_executing_the_tool() {
     assert!(
         !types.iter().any(|event| event == "tool.execution.started"),
         "a cancelled Run must never execute the Tool it was parked on: {types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|event| event.as_str() == "run.cancelled")
+            .count(),
+        1,
+        "the Kernel terminal event, not only run.json, must commit cancellation: {types:?}"
+    );
+    let LocalResponse::EventCursor { page } = request(
+        &socket,
+        &LocalRequest::EventCursor {
+            request: RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation: local_invocation_context(),
+                run_id,
+                after_sequence: 0,
+                limit: 256,
+            },
+        },
+    )
+    .await
+    else {
+        panic!("cancelled Run did not expose a valid event cursor");
+    };
+    assert_eq!(
+        page.state,
+        RuntimeEventCursorState::Terminal {
+            status: agent_protocol::RunStatus::Cancelled
+        }
     );
     // A cancelled Run must stay cancelled across a restart.
     let _ = Uuid::nil();

@@ -1484,10 +1484,6 @@ impl EmbeddedRuntime {
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = runtime.execute(invocation, run_id, &input).await;
-            if let Err(error) = &result {
-                let _ =
-                    runtime.finish_detached_failure(invocation, run_id, None, &error.to_string());
-            }
             let _ = finished_tx.send(result);
         });
         loop {
@@ -1557,18 +1553,9 @@ impl EmbeddedRuntime {
         let invocation = command.invocation;
         let command_id = command.command_id;
         let runtime = Arc::clone(self);
-        let recovery_command = command.clone();
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = runtime.control(command).await;
-            if let Err(error) = &result {
-                let _ = runtime.finish_detached_failure(
-                    recovery_command.invocation,
-                    recovery_command.run_id,
-                    Some(recovery_command.command_id),
-                    &error.to_string(),
-                );
-            }
             let _ = finished_tx.send(result);
         });
         loop {
@@ -1942,6 +1929,11 @@ impl EmbeddedRuntime {
                         ));
                     }
                 }
+                LocalRuntimeHost::validate_approval_resolution_checkpoint(
+                    &config.state_root,
+                    command.run_id,
+                    &resolution,
+                )?;
                 (
                     LocalRunState::ApprovalDecided {
                         target_run_id: resolution.target_run_id,
@@ -1966,6 +1958,11 @@ impl EmbeddedRuntime {
                         ));
                     }
                 }
+                LocalRuntimeHost::validate_mcp_resolution_checkpoint(
+                    &config.state_root,
+                    command.run_id,
+                    &resolution,
+                )?;
                 (
                     LocalRunState::McpInputDecided {
                         resolution: resolution.clone(),
@@ -2096,53 +2093,20 @@ impl EmbeddedRuntime {
                 outcome: None,
             });
         }
-        if matches!(
-            current.state,
-            LocalRunState::AwaitingApproval { .. } | LocalRunState::AwaitingMcpInput { .. }
-        ) || !LocalRuntimeHost::checkpoint_path(&config.state_root, command.run_id).is_file()
-        {
-            let _gate = execution
-                .record_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            current = self.owned_run_record(command.invocation, command.run_id)?;
-            if let Some(status) = Self::terminal_status(&current.state) {
-                receipt.state = RuntimeControlReceiptState::Completed;
-                receipt.run_status = Some(status);
-                Self::write_control_receipt(&config.state_root, &receipt)?;
-                return Ok(RuntimeControlResult {
-                    receipt,
-                    outcome: None,
-                });
-            }
-            Self::write_control_receipt(&config.state_root, &receipt)?;
-            let cancelled = LocalRunRecord {
-                state: LocalRunState::Cancelled { reason },
-                ..current
-            };
-            Self::write_run_record(&config.state_root, &cancelled)?;
-            receipt.state = RuntimeControlReceiptState::Completed;
-            receipt.run_status = Some(RunStatus::Cancelled);
-            Self::write_control_receipt(&config.state_root, &receipt)?;
-            Self::complete_cancellation_receipts(
-                &config.state_root,
-                &execution,
-                RunStatus::Cancelled,
-            )?;
-            return Ok(RuntimeControlResult {
-                receipt,
-                outcome: None,
-            });
-        }
         if !matches!(
             current.state,
-            LocalRunState::Running | LocalRunState::Cancelling { .. }
+            LocalRunState::Running
+                | LocalRunState::Cancelling { .. }
+                | LocalRunState::AwaitingApproval { .. }
+                | LocalRunState::AwaitingMcpInput { .. }
         ) {
             return Err(EmbeddedRuntimeError::Configuration(
                 "Run is not cancellable".into(),
             ));
         }
 
+        let has_checkpoint =
+            LocalRuntimeHost::checkpoint_path(&config.state_root, command.run_id).is_file();
         let next_epoch = current.owner_epoch.checked_add(1).ok_or_else(|| {
             EmbeddedRuntimeError::Configuration("Workspace owner epoch is exhausted".into())
         })?;
@@ -2160,7 +2124,11 @@ impl EmbeddedRuntime {
                 config.clone(),
                 command.invocation,
                 record,
-                RecordedOperation::Resume,
+                if has_checkpoint {
+                    RecordedOperation::Resume
+                } else {
+                    RecordedOperation::Execute
+                },
                 execution,
                 active_guard,
                 permit,
@@ -2264,7 +2232,7 @@ impl EmbeddedRuntime {
             invocation,
             cancellation.clone(),
         )?;
-        let mut result = match operation {
+        let result = match operation {
             RecordedOperation::Execute => {
                 host.execute_as_at_epoch(record.run_id, &record.input, record.owner_epoch)
                     .await
@@ -2312,29 +2280,31 @@ impl EmbeddedRuntime {
                     _ => None,
                 },
             );
-        if committed_cancellation.is_some()
-            && let Ok(outcome) = &mut result
-        {
-            outcome.status = RunStatus::Cancelled;
-            outcome.output.clear();
-            outcome.pending_approval = None;
-            outcome.pending_mcp_input = None;
-        }
-        let (state, status) = match (&result, committed_cancellation) {
-            (_, Some(reason)) => (LocalRunState::Cancelled { reason }, RunStatus::Cancelled),
-            (Ok(outcome), None) => Self::recorded_outcome_state(outcome),
-            (Err(_), None) if cancellation.is_cancelled() => (
-                LocalRunState::Cancelled {
-                    reason: "cancelled by the embedding application".into(),
-                },
-                RunStatus::Cancelled,
-            ),
-            (Err(error), None) => (
-                LocalRunState::Finished {
-                    status: format!("failed: {error}"),
-                },
-                RunStatus::Failed,
-            ),
+        let terminal_from_events =
+            Self::terminal_state_from_events(&config.state_root, record.run_id)?;
+        let (state, status) = if let Some(terminal) = terminal_from_events {
+            let status = Self::terminal_status(&terminal).ok_or_else(|| {
+                LocalRuntimeError::StateRoot(
+                    "terminal Kernel event did not map to a terminal Run status".into(),
+                )
+            })?;
+            let state = match (status, committed_cancellation) {
+                (RunStatus::Cancelled, Some(reason)) => LocalRunState::Cancelled { reason },
+                _ => terminal,
+            };
+            (state, status)
+        } else {
+            let outcome = match &result {
+                Ok(outcome) => outcome,
+                Err(_) => return result,
+            };
+            let (state, status) = Self::recorded_outcome_state(outcome);
+            if status.is_terminal() {
+                return Err(LocalRuntimeError::StateRoot(
+                    "terminal Runtime outcome has no committed Kernel terminal event".into(),
+                ));
+            }
+            (state, status)
         };
         let updated = LocalRunRecord { state, ..record };
         Self::write_run_record(&config.state_root, &updated)?;
@@ -2560,53 +2530,6 @@ impl EmbeddedRuntime {
                 receipt.run_status = Some(status);
                 Self::write_control_receipt(state_root, &receipt)?;
             }
-        }
-        Ok(())
-    }
-
-    fn finish_detached_failure(
-        &self,
-        invocation: RuntimeInvocationContext,
-        run_id: Uuid,
-        command_id: Option<Uuid>,
-        error: &str,
-    ) -> Result<(), EmbeddedRuntimeError> {
-        let config = self.profile(invocation)?;
-        let Some(mut record) = self.read_run_record(invocation, run_id)? else {
-            return Ok(());
-        };
-        let (next_state, status) = match &record.state {
-            LocalRunState::Cancelling { reason } => (
-                Some(LocalRunState::Cancelled {
-                    reason: reason.clone(),
-                }),
-                RunStatus::Cancelled,
-            ),
-            state if Self::terminal_status(state).is_some() => (
-                None,
-                Self::terminal_status(state).expect("checked terminal state"),
-            ),
-            LocalRunState::AwaitingApproval { .. } | LocalRunState::AwaitingMcpInput { .. } => {
-                return Ok(());
-            }
-            _ => (
-                Some(LocalRunState::Finished {
-                    status: format!("failed: {error}"),
-                }),
-                RunStatus::Failed,
-            ),
-        };
-        if let Some(state) = next_state {
-            record.state = state;
-            Self::write_run_record(&config.state_root, &record)?;
-        }
-        if let Some(command_id) = command_id
-            && let Some(mut receipt) = Self::load_control_receipt(&config.state_root, command_id)?
-            && receipt.state == RuntimeControlReceiptState::Accepted
-        {
-            receipt.state = RuntimeControlReceiptState::Completed;
-            receipt.run_status = Some(status);
-            Self::write_control_receipt(&config.state_root, &receipt)?;
         }
         Ok(())
     }

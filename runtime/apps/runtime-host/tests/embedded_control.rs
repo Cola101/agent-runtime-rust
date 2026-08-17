@@ -358,6 +358,82 @@ async fn exact_approval_command_is_durable_idempotent_and_executes_the_tool_once
 }
 
 #[tokio::test]
+async fn accepted_approval_storage_failure_keeps_recoverable_state_without_fake_terminal() {
+    let trusted_tool = trusted_tool_binary().expect("agent-trusted-workspace-tool must be built");
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.txt"), "approval evidence\n").unwrap();
+    let identity = invocation();
+    let (endpoint, _) = spawn_approval_provider().await;
+    let runtime = runtime(RuntimeProfile {
+        invocation: identity,
+        config: config(
+            state.path().to_path_buf(),
+            workspace.path().canonicalize().unwrap(),
+            endpoint,
+            Some(trusted_tool),
+        ),
+    });
+    let run_id = Uuid::now_v7();
+    let parked = runtime
+        .execute(identity, run_id, "Read README.txt")
+        .await
+        .expect("park on approval");
+    let approval = parked.pending_approval.expect("pending approval");
+    let record = runtime
+        .read_run_record(identity, run_id)
+        .expect("record read")
+        .expect("durable Run record");
+
+    // Force the restored event append to fail only after the command has
+    // passed its Checkpoint preflight and obtained a durable receipt.
+    let event_log = state
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("events.jsonl");
+    std::fs::remove_file(&event_log).expect("remove test event log");
+    std::fs::create_dir(&event_log).expect("replace event log with a directory");
+    let command = RuntimeControlCommand {
+        schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+        command_id: Uuid::now_v7(),
+        invocation: identity,
+        run_id,
+        expected_owner_epoch: record.owner_epoch,
+        action: RuntimeControlAction::DecideApproval {
+            target_run_id: approval.target_run_id,
+            approval_id: approval.approval_id,
+            binding_digest: approval.binding_digest,
+            decision: LocalApprovalDecision::AllowOnce,
+        },
+    };
+    let accepted = runtime
+        .control_detached(command.clone())
+        .await
+        .expect("durably accepted command");
+    assert_eq!(accepted.state, RuntimeControlReceiptState::Accepted);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = wait_for_record(&runtime, identity, run_id, |state| {
+        matches!(
+            state,
+            LocalRunState::ApprovalDecided { .. } | LocalRunState::Finished { .. }
+        )
+    })
+    .await;
+    assert!(
+        matches!(after.state, LocalRunState::ApprovalDecided { .. }),
+        "an adapter/storage failure must leave the accepted decision recoverable, not invent a Run failure: {:?}",
+        after.state
+    );
+    let receipt = runtime
+        .read_control_receipt(identity, command.command_id)
+        .expect("receipt read")
+        .expect("receipt retained");
+    assert_eq!(receipt.state, RuntimeControlReceiptState::Accepted);
+    assert_eq!(receipt.run_status, None);
+}
+
+#[tokio::test]
 async fn cancelling_an_active_embedded_run_persists_intent_and_wakes_the_owner() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");

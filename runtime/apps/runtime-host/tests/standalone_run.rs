@@ -4072,9 +4072,15 @@ async fn standalone_stdio_mcp_timeout_reaps_the_entire_process_group() {
     local_config.mcp_servers = vec![stdio_mcp_config(marker, pid_file.clone(), true, false)];
 
     let mut host = LocalRuntimeHost::start(local_config).expect("host");
-    host.execute("This must not reach the model.")
+    let outcome = host
+        .execute("Continue after the optional MCP server times out.")
         .await
-        .expect_err("stalled stdio discovery must fail");
+        .expect("a downstream provider failure must remain a terminal Run outcome");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    assert_eq!(
+        outcome.event_types,
+        vec!["run.started", "model.provider.failed", "run.failed"]
+    );
     let grandchild = read_pid(&pid_file);
     assert!(
         wait_for_process_exit(grandchild).await,
@@ -4115,9 +4121,15 @@ async fn standalone_stdio_mcp_initialize_timeout_reaps_the_process_group() {
     )];
 
     let mut host = LocalRuntimeHost::start(local_config).expect("host");
-    host.execute("This must not reach the model.")
+    let outcome = host
+        .execute("Continue after the optional MCP server fails to initialize.")
         .await
-        .expect_err("stalled stdio initialize must fail");
+        .expect("a downstream provider failure must remain a terminal Run outcome");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    assert_eq!(
+        outcome.event_types,
+        vec!["run.started", "model.provider.failed", "run.failed"]
+    );
     let grandchild = read_pid(&pid_file);
     assert!(
         wait_for_process_exit(grandchild).await,

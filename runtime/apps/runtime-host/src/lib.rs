@@ -35,8 +35,8 @@ use agent_protocol::{
     SessionConversationTurn, SkillSnapshot, SubagentBudgetUsage, SubagentConversationTurn,
     SubagentResultDelivery, SubagentResultOutcome, SubagentResultSource, SubagentRole,
     SubagentSpawnMode, TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision,
-    ToolApprovalDecisionCommand, ToolDescriptor, ToolEffect, ToolReconciliationCommand,
-    ToolReconciliationDecision,
+    ToolApprovalDecisionCommand, ToolApprovalRequest, ToolDescriptor, ToolEffect,
+    ToolReconciliationCommand, ToolReconciliationDecision,
 };
 use agent_runtime_worker::{
     DiscoveredCatalog, DiscoveredTool, FederationIdentity, McpCallContext, McpDiscoveryCompletion,
@@ -1578,6 +1578,12 @@ pub struct LocalMcpInputResolution {
     pub input_version: u32,
     pub binding_digest: String,
     pub responses: BTreeMap<String, McpInputResponse>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointResolvedMcpInput {
+    pending: McpInputRequired,
+    continuation: McpInputContinuation,
 }
 
 enum LocalResumeResolution {
@@ -4374,6 +4380,184 @@ impl LocalRuntimeHost {
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
     }
 
+    fn load_validated_checkpoint_state(
+        state_root: &Path,
+        run_id: Uuid,
+    ) -> Result<(agent_protocol::CheckpointSnapshot, serde_json::Value), LocalRuntimeError> {
+        let checkpoint = Self::load_checkpoint(&Self::checkpoint_path(state_root, run_id))?;
+        if checkpoint.run_id != run_id || !checkpoint.verify_digest() {
+            return Err(LocalRuntimeError::Checkpoint(
+                "Checkpoint identity or digest is invalid".into(),
+            ));
+        }
+        let state = serde_json::from_slice(&checkpoint.state)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        Ok((checkpoint, state))
+    }
+
+    /// Confirms a decision against the Checkpoint that owns the pending Tool,
+    /// not only the adapter's Run projection. The projection is useful for
+    /// discovery, but the Worker Checkpoint is the authority that will consume
+    /// the decision after a replacement attempt is created.
+    pub(crate) fn validate_approval_resolution_checkpoint(
+        state_root: &Path,
+        root_run_id: Uuid,
+        resolution: &LocalApprovalResolution,
+    ) -> Result<(), LocalRuntimeError> {
+        let (root_checkpoint, root_state) =
+            Self::load_validated_checkpoint_state(state_root, root_run_id)?;
+        if resolution.target_run_id != root_run_id {
+            let mut requests = Vec::new();
+            if let Some(request) = root_state.get("pending_subagent")
+                && !request.is_null()
+            {
+                requests.push(
+                    serde_json::from_value(request.clone())
+                        .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?,
+                );
+            }
+            if let Some(pending) = root_state
+                .get("pending_subagents")
+                .and_then(serde_json::Value::as_array)
+            {
+                for request in pending {
+                    let request: agent_protocol::SubagentSpawnRequest =
+                        serde_json::from_value(request.clone())
+                            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+                    if !requests
+                        .iter()
+                        .any(|existing: &agent_protocol::SubagentSpawnRequest| {
+                            existing.delegation_id == request.delegation_id
+                        })
+                    {
+                        requests.push(request);
+                    }
+                }
+            }
+            if Self::subagent_resolution_owner_in_state_root(
+                state_root,
+                root_run_id,
+                &requests,
+                resolution.target_run_id,
+            )?
+            .is_none()
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "approval target is not owned by the root Run Checkpoint".into(),
+                ));
+            }
+        }
+
+        let (target_checkpoint, target_state) =
+            Self::load_validated_checkpoint_state(state_root, resolution.target_run_id)?;
+        if target_checkpoint.tenant_id != root_checkpoint.tenant_id {
+            return Err(LocalRuntimeError::Checkpoint(
+                "approval target Checkpoint belongs to another tenant".into(),
+            ));
+        }
+        let pending_matches = target_state
+            .get("pending_approval")
+            .filter(|pending| !pending.is_null())
+            .map(|pending| {
+                serde_json::from_value::<ToolApprovalRequest>(pending.clone())
+                    .map(|pending| {
+                        target_checkpoint.status == RunStatus::WaitingApproval
+                            && resolution.approval_id == Some(pending.approval_id)
+                            && resolution.binding_digest.as_deref()
+                                == Some(pending.execution.binding_digest.as_str())
+                    })
+                    .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let applied_matches = resolution.approval_id.is_some_and(|approval_id| {
+            target_state
+                .get("applied_approval_decisions")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|decisions| decisions.get(&approval_id.to_string()))
+                .is_some_and(|applied| {
+                    applied
+                        .get("binding_digest")
+                        .and_then(serde_json::Value::as_str)
+                        == resolution.binding_digest.as_deref()
+                        && applied.get("decision").and_then(serde_json::Value::as_str)
+                            == Some(match resolution.decision {
+                                LocalApprovalDecision::AllowOnce => "allow_once",
+                                LocalApprovalDecision::Deny => "deny",
+                            })
+                })
+        });
+        if !pending_matches && !applied_matches {
+            return Err(LocalRuntimeError::Checkpoint(
+                "approval decision does not match a pending or applied Checkpoint binding".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Applies the same authority rule to a multi-round MCP response. A local
+    /// Run record is an index for adapters; only the Worker Checkpoint proves
+    /// which opaque request state and response binding may continue a Tool.
+    pub(crate) fn validate_mcp_resolution_checkpoint(
+        state_root: &Path,
+        run_id: Uuid,
+        resolution: &LocalMcpInputResolution,
+    ) -> Result<(), LocalRuntimeError> {
+        let (checkpoint, state) = Self::load_validated_checkpoint_state(state_root, run_id)?;
+        let validates_pending = |pending: &McpInputRequired| {
+            let now = Utc::now();
+            pending.validate().is_ok()
+                && McpInputResolutionCommand {
+                    schema_version: agent_protocol::MCP_INPUT_RESOLUTION_SCHEMA_VERSION,
+                    message_id: Uuid::from_u128(1),
+                    tenant_id: checkpoint.tenant_id,
+                    run_id,
+                    attempt_id: Uuid::from_u128(2),
+                    worker_id: Uuid::from_u128(3),
+                    worker_incarnation_id: Uuid::from_u128(4),
+                    input_id: resolution.input_id,
+                    input_version: resolution.input_version,
+                    binding_digest: resolution.binding_digest.clone(),
+                    responses: resolution.responses.clone(),
+                    issued_at: now,
+                    expires_at: now + ChronoDuration::minutes(1),
+                }
+                .validate_for(pending)
+                .is_ok()
+        };
+        let pending_matches = state
+            .get("pending_mcp_input")
+            .filter(|pending| !pending.is_null())
+            .map(|pending| {
+                serde_json::from_value::<McpInputRequired>(pending.clone())
+                    .map(|pending| {
+                        checkpoint.status == RunStatus::Suspended && validates_pending(&pending)
+                    })
+                    .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let resolved_matches = state
+            .get("resolved_mcp_input")
+            .filter(|resolved| !resolved.is_null())
+            .map(|resolved| {
+                serde_json::from_value::<CheckpointResolvedMcpInput>(resolved.clone())
+                    .map(|resolved| {
+                        validates_pending(&resolved.pending)
+                            && resolved.continuation.responses == resolution.responses
+                    })
+                    .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !pending_matches && !resolved_matches {
+            return Err(LocalRuntimeError::Checkpoint(
+                "MCP input decision does not match a pending or applied Checkpoint binding".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Closes transport sessions owned by this Host before the async runtime
     /// itself exits. In particular, stdio MCP cleanup must await process-group
     /// reaping; a normal struct drop cannot perform that asynchronous work.
@@ -7006,6 +7190,20 @@ impl LocalRuntimeHost {
         requests: &[agent_protocol::SubagentSpawnRequest],
         target_run_id: Uuid,
     ) -> Result<Option<Uuid>, LocalRuntimeError> {
+        Self::subagent_resolution_owner_in_state_root(
+            &self.config.state_root,
+            parent_run_id,
+            requests,
+            target_run_id,
+        )
+    }
+
+    fn subagent_resolution_owner_in_state_root(
+        state_root: &Path,
+        parent_run_id: Uuid,
+        requests: &[agent_protocol::SubagentSpawnRequest],
+        target_run_id: Uuid,
+    ) -> Result<Option<Uuid>, LocalRuntimeError> {
         let mut cursor = target_run_id;
         for _ in 0..=3 {
             if let Some(request) = requests
@@ -7017,7 +7215,7 @@ impl LocalRuntimeHost {
             if cursor == parent_run_id {
                 return Ok(None);
             }
-            let checkpoint_path = Self::checkpoint_path(&self.config.state_root, cursor);
+            let checkpoint_path = Self::checkpoint_path(state_root, cursor);
             if !checkpoint_path.is_file() {
                 return Ok(None);
             }

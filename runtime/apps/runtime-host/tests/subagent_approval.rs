@@ -352,23 +352,6 @@ async fn wait_for_consumed_approval_checkpoint(state_root: &Path, child_run_id: 
     panic!("timed out waiting for the consumed approval checkpoint");
 }
 
-async fn wait_for_failure(state_root: &Path, run_id: Uuid) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if matches!(
-            LocalRuntimeHost::read_run_record(state_root, run_id),
-            Ok(Some(LocalRunRecord {
-                state: LocalRunState::Finished { status },
-                ..
-            })) if status.starts_with("failed:")
-        ) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for the misdirected approval to fail closed");
-}
-
 #[tokio::test]
 async fn a_child_tool_approval_routes_through_the_parent_and_survives_a_daemon_restart() {
     let trusted_tool = trusted_tool_binary().expect("agent-trusted-workspace-tool must be built");
@@ -490,7 +473,7 @@ async fn a_child_tool_approval_routes_through_the_parent_and_survives_a_daemon_r
 }
 
 #[tokio::test]
-async fn a_child_approval_bound_to_another_run_never_executes_the_tool() {
+async fn a_child_approval_bound_to_another_run_is_rejected_without_terminalizing_the_parent() {
     let trusted_tool = trusted_tool_binary().expect("agent-trusted-workspace-tool must be built");
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
@@ -553,11 +536,35 @@ async fn a_child_approval_bound_to_another_run_never_executes_the_tool() {
     .expect("write misdirected approval fixture");
 
     let (replacement_socket, replacement) = start_daemon(local_config).await;
-    assert_eq!(
-        request(&replacement_socket, &LocalRequest::Approve { run_id }).await,
-        LocalResponse::Accepted { run_id }
+    assert!(
+        matches!(
+            request(&replacement_socket, &LocalRequest::Approve { run_id }).await,
+            LocalResponse::Error { .. }
+        ),
+        "a decision that disagrees with the Checkpoint must be rejected before acceptance"
     );
-    wait_for_failure(&state_root, run_id).await;
+    let after = LocalRuntimeHost::read_run_record(&state_root, run_id)
+        .expect("root record remains readable")
+        .expect("root record remains present");
+    assert!(
+        matches!(after.state, LocalRunState::AwaitingApproval { .. }),
+        "a rejected control command must not manufacture a terminal Run state"
+    );
+    let parent_events =
+        LocalRuntimeHost::replay_events(&state_root, run_id, 0).expect("parent events");
+    assert!(
+        !parent_events.iter().any(|event| matches!(
+            event.event_type.as_str(),
+            "run.failed" | "run.cancelled" | "run.timed_out" | "run.indeterminate"
+        )),
+        "a rejected control command must not manufacture a Kernel terminal event"
+    );
+    assert!(
+        std::fs::read_dir(state_root.join("control-receipts"))
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(true),
+        "a rejected control command must not leave an accepted receipt"
+    );
     let child_events =
         LocalRuntimeHost::replay_events(&state_root, child_run_id, 0).expect("child events");
     assert!(

@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：必需 MCP 启动失败终态
+## 当前阶段：控制命令接纳与 Kernel 终态权威
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 错误审批输入 | pending map 按 approval id 精确取出；不存在时 warn，不终结 Turn | resolver 在连接 Gateway 前校验 owner kind、id、decision；not-found/permission 向调用方返回 | Run 投影 + digest-valid Checkpoint 双校验；子代理还验证 root lineage | 与两者对齐“拒绝命令，不误杀工作”；多租户恢复绑定更强 |
+| 接纳提交点 | 进程内 oneshot，产品持久化由 rollout 承担 | Gateway approval service 是当前连接权威 | receipt、owner epoch 与 `*Decided` 仅在 Checkpoint binding 验证后提交 | 更适合无状态 Java/CLI/GUI 重试 |
+| 接纳后 Host 故障 | Turn/rollout 负责恢复，未知 approval 不合成失败 | Gateway 错误不改写 Session 为 terminal | 保留 Accepted receipt 和可恢复决定；适配器不得写 `Finished/failed` | 消除双状态机；故障如实保持未完成 |
+| waiting Run 取消 | interrupt 进入 Turn 状态机 | cancel 进入 active run/session 生命周期 | 恢复冻结 Checkpoint，在模型/Tool 出站前由 Kernel 提交唯一 `run.cancelled` | 已对齐；Event Cursor 不再看到 record/event 分裂 |
+| 终态权威 | Turn error/event | Session/Gateway lifecycle event | Kernel terminal event 是唯一 commit point，`run.json` 只投影 | 多租户审计边界更明确 |
+
+### 本阶段结论
+
+- 已验证：错绑子代理审批在 receipt 前拒绝；接纳后事件存储故障保持可恢复；parked cancellation 产生唯一
+  `run.cancelled`，Event Cursor 返回 typed cancelled；正常并发审批与跨 daemon 子代理恢复未回归。
+- 相比 Codex/OpenClaw，本轮没有扩展审批 UI 或决定种类，只消除了“控制适配器可以制造 Run 终态”的偏离。
+- **领先点仅限窄面**：Checkpoint digest、root→child lineage、owner epoch 和 durable receipt 的组合更适合
+  多租户无状态调用方；Codex 的客户端产品链和 OpenClaw 的 Gateway 运维仍明显更成熟。
+- **未外推**：真实 Embedded MCP 输入网络闭环、一般 Host 损坏的自动修复、跨节点 command ledger 仍未完成。
+  总体进度仍为 70–75%。
+
+## 上一阶段：必需 MCP 启动失败终态
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
