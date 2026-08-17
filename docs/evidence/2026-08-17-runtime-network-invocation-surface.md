@@ -213,9 +213,45 @@ Provider 故意只接收不回应，Run 因此保持存活——否则"取消成
 上一轮那条 EPERM 失败本次未复现（与「隔离 3/3 通过」一致，仍是负载相关，仍未被改动）。
 fmt `EXIT=0`；clippy `EXIT=0`；残留扫描：0 个遗留进程，磁盘 45Gi。
 
+## 第五段：审批（同日）
+
+`--test grpc_invocation_approval` **1 passed, 0 failed**，TEST_EXIT=0。**未改动任何产品代码。**
+
+链路：Run 停在审批门 → 调用方**只凭事件字节**取出 `approval_id` 与
+`approval.execution.binding_digest` → `DecideApproval(allow_once)` → 真实 Tool 执行（`tool.result`）
+→ 模型继续 → `Terminal { succeeded }`，转录含审批后的回答。
+
+测试**全程不读 Runtime 状态目录**。这是要点：`binding_digest` 把决定钉到那次具体的 Tool 调用上，
+若它在网络上取不到，这个面就只能观察到 Run 卡住而永远无法放行。
+
+### 过程中三次错误，都是我的，产品没错
+
+1. **provider 能力配错**：注册了 Tool 却只声明 `Capability::Text`，Run 因此选不出候选。
+   产品**正确地**过滤并 fail-closed。诊断方式是把 state root 固定下来直接读 `run.json`，
+   而不是猜——首个假设（并发写导致撕裂行）被"两次运行结果完全相同"推翻了。
+2. **在 payload 里找事件类型**：类型在 `event.r#type` 字段，不在载荷里。
+3. **clippy 抓到的循环**：`for` + `?` 会在第一个不可解析事件处**从整个函数返回 `None`**，
+   而不是继续下一个。改为 `find_map` 才是本意。这次 clippy 抓的不只是风格。
+
+### 一个单独记录的观察（未定性，未修）
+
+诊断第 1 项时看到：Run 在 Provider 选择阶段失败后，事件日志**只有 `run.started`**、
+无终态事件，而 `run.json` 写着 `finished/failed`。游标对此返回 `CorruptLog`，
+网络调用方拿到 `DataLoss`，**永远学不到该 Run 的结局**。
+
+游标判定"日志与记录不一致"本身可能是正确行为。但只有网络的消费者拿不到结局，
+是这个面的真实可观察缺口。**只在这一条路径上观察到一次，不外推，本轮不修。**
+
+### 全量门禁（第五段，fullgate23）——绿
+
+**130 二进制、802 passed、0 failed、6 ignored、`CARGO_EXIT=0`**
+
+对照 fullgate22（129 / 801 / 0）：+1 二进制、+1 通过 = 审批测试本身，精确闭合。
+fmt `EXIT=0`；clippy `EXIT=0`；残留扫描 0；磁盘 41Gi。
+
 ## 没证明什么——**阶段 1 未完成**
 
-- **取消已成功闭环；审批与 resume 的成功路径未验证**（审批需要真实 Tool 停在审批门上）。
+- **取消与审批已成功闭环；resume 的成功路径未验证。**
 - **跨进程崩溃恢复未在该面验证。**
 - 无流式订阅，调用方只能分页轮询。无 Java SDK。
 

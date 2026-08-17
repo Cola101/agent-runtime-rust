@@ -135,12 +135,25 @@ flowchart LR
 16. **`ControlCommandRebound` 独立成 typed 变体**，映射为 `failed_precondition`。
     调用方复用幂等键是它自己能改的错，以 `internal` 返回会把可行动的错误说成内部故障。
 
+## 第五段：审批——网络面必须自足
+
+17. **审批的参数必须能从事件里发现，否则这个面只能看不能放行。**
+    `DecideApproval` 需要 `approval_id` 和那次具体 Tool 调用的 `binding_digest`，两者调用方都不能编。
+    复核确认 `approval.required` 事件的载荷同时携带二者
+    （`approval.approval_id` 与 `approval.execution.binding_digest`），因此**只有网络的消费者
+    足以完成人在回路**。测试据此断言：全程不读 Runtime 状态目录。
+
+    这一段**未改任何产品代码**——审批路径本就正确，要证的是这个面是否自足。
+
 ## 风险与后续——本轮**未**完成的部分
 
 **仍未达到 `docs/roadmap.md` 阶段 1 的完整出口标准。**
 
-- **取消已证明成功端到端**（含幂等重放与改用途拒绝）；**审批与 resume 的成功路径、
-  以及跨进程崩溃恢复仍未在该面验证**。审批需要真实 Tool 停在审批门上，本轮未做。
+- **取消与审批已证明成功端到端**；**resume 的成功路径与跨进程崩溃恢复仍未在该面验证**。
+- **新观察（未定性，未修）**：Run 若在 Provider 选择阶段失败，事件日志只留 `run.started`、
+  没有终态事件，而 run 记录写着 `finished/failed`。游标据此返回 `CorruptLog`，网络调用方
+  因此**拿到 `DataLoss` 而非结局**。游标判定日志与记录不一致本身可能是对的，但一个只有网络的
+  消费者学不到结局，是这个面的真实可观察缺口。只在这一条路径上观察到一次，不外推。
 - 无流式订阅（`subscribe_events` 未暴露），调用方只能分页轮询。
 - 无 Java SDK。`option java_package` 只是让契约可被生成，不等于有 SDK。
 - **总体进度不因本 ADR 提高**，仍为 70–75%：这是边界层，不是内核能力，也不属于并发/真实厂商/
