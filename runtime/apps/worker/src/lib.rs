@@ -10299,6 +10299,12 @@ fn tool_execution_error_code(error: &ToolExecutionError) -> &'static str {
         // containment posture failure, not a Tool that misbehaved. An operator
         // seeing it needs to know the sandbox could not be established.
         ToolExecutionError::ContainmentUnavailable(_) => "tool_containment_unavailable",
+        // Also a containment posture failure, but a permanent one: this host
+        // has no backend that can enforce the boundary, so retrying or moving
+        // the Run to another attempt on the same host cannot help. Kept
+        // separate from `tool_containment_unavailable`, which means the
+        // backend exists and could not be established this time (ADR-0122).
+        ToolExecutionError::UnsupportedContainment(_) => "tool_containment_unsupported",
         ToolExecutionError::InvalidDefinition(_)
         | ToolExecutionError::InvalidContext(_)
         | ToolExecutionError::Engine(_)

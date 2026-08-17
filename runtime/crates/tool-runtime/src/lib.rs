@@ -50,6 +50,95 @@ pub enum WorkspaceAccess {
     ReadWrite,
 }
 
+/// Which containment mechanism, if any, this build can apply to a trusted
+/// native Tool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolContainmentBackendKind {
+    /// macOS Seatbelt, applied per launch through `sandbox-exec` (ADR-0037).
+    MacosSeatbelt,
+    /// No containment backend exists here. `TrustedNative` cannot be honoured.
+    Unsupported,
+}
+
+/// What the containment backend actually guarantees, stated per guarantee
+/// rather than per platform.
+///
+/// This exists for the same reason [`ProcessSessionResourceCapabilities`] does
+/// (ADR-0072): a boundary that is absent must be *typed and refused*, never
+/// silently skipped. Before this type existed, a non-macOS build ran a
+/// `TrustedNative` Tool with no containment at all while the descriptor, the
+/// implementation digest and the approval record all still said
+/// `TrustedNative`. Nothing reported the difference, so the only thing
+/// standing between that and an escape was a sentence in a document.
+///
+/// Every field is a guarantee the *operating system* enforces. A Tool
+/// promising not to do something is not a capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolContainmentCapabilities {
+    pub backend: ToolContainmentBackendKind,
+    /// Writes outside the canonical Workspace root are refused by the kernel.
+    pub workspace_write_confinement: bool,
+    /// Reads of the credential directories are refused by the kernel.
+    pub credential_read_denial: bool,
+    /// Outbound network access is refused by the kernel.
+    pub network_egress_denial: bool,
+}
+
+impl ToolContainmentCapabilities {
+    /// What this build can enforce.
+    ///
+    /// `const` and derived from `cfg!` so it cannot drift from what the
+    /// launch path is actually compiled to do.
+    #[must_use]
+    pub const fn current() -> Self {
+        let seatbelt = cfg!(target_os = "macos");
+        Self {
+            backend: if seatbelt {
+                ToolContainmentBackendKind::MacosSeatbelt
+            } else {
+                ToolContainmentBackendKind::Unsupported
+            },
+            workspace_write_confinement: seatbelt,
+            credential_read_denial: seatbelt,
+            network_egress_denial: seatbelt,
+        }
+    }
+}
+
+/// Refuses a launch whose containment guarantees are not all present.
+///
+/// Called before the Workspace is canonicalised and before any process is
+/// created, so an uncontained host fails at the contract rather than part-way
+/// into a launch. The error names the first missing guarantee; it does not
+/// name the platform, because what matters to the caller is which boundary
+/// they were promised and did not get.
+pub fn validate_containment(
+    capabilities: ToolContainmentCapabilities,
+) -> Result<(), ToolExecutionError> {
+    if capabilities.backend == ToolContainmentBackendKind::Unsupported {
+        return Err(ToolExecutionError::UnsupportedContainment(
+            "containment_backend",
+        ));
+    }
+    if !capabilities.workspace_write_confinement {
+        return Err(ToolExecutionError::UnsupportedContainment(
+            "workspace_write_confinement",
+        ));
+    }
+    if !capabilities.credential_read_denial {
+        return Err(ToolExecutionError::UnsupportedContainment(
+            "credential_read_denial",
+        ));
+    }
+    if !capabilities.network_egress_denial {
+        return Err(ToolExecutionError::UnsupportedContainment(
+            "network_egress_denial",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContainerToolDefinition {
     pub image: String,
@@ -164,6 +253,8 @@ pub enum ToolExecutionError {
     InvalidContext(String),
     #[error("tool containment cannot be established: {0}")]
     ContainmentUnavailable(String),
+    #[error("this host cannot enforce required tool containment: {0}")]
+    UnsupportedContainment(&'static str),
     #[error("container engine failed: {0}")]
     Engine(String),
     #[error("tool execution timed out")]
@@ -206,6 +297,27 @@ impl ToolExecutionError {
                         "code": "process_session_start_failed",
                         "message": "persistent process session could not be started",
                         "session_id": session_id,
+                    }
+                }),
+                is_error: true,
+                exit_code: 1,
+            }),
+            // The refusal happens before the Workspace is resolved and before
+            // any process is created (ADR-0122), so this provably never
+            // crossed the side-effect boundary. Without this arm a
+            // NonIdempotent Tool on an uncontained host would converge to
+            // `indeterminate` -- claiming "it might have run" about something
+            // that demonstrably did not, and sending an operator to reconcile
+            // an effect that never existed.
+            //
+            // The missing guarantee is deliberately NOT named here. It reaches
+            // the operator through the error's Display and the event code; the
+            // model only needs to know this Tool cannot run on this host.
+            Self::UnsupportedContainment(_) => Some(ToolExecutionResult {
+                content: json!({
+                    "error": {
+                        "code": "tool_containment_unsupported",
+                        "message": "this host cannot enforce the containment this Tool requires",
                     }
                 }),
                 is_error: true,
@@ -283,10 +395,17 @@ impl RestrictedContainerExecutor {
     ) -> Result<Self, ToolExecutionError> {
         let engine = engine.into();
         validate_definition(&engine, &definition)?;
+        // Same defect as the trusted native executor had: this said
+        // "read_only" unconditionally while `prepare` builds a writable bind
+        // mount from the real value, so read-only and read-write container
+        // Tools were indistinguishable by digest.
         let implementation_digest = digest_serializable(&json!({
             "image": definition.image,
             "entrypoint": definition.entrypoint,
-            "workspace_access": "read_only",
+            "workspace_access": match definition.workspace_access {
+                WorkspaceAccess::ReadOnly => "read_only",
+                WorkspaceAccess::ReadWrite => "read_write",
+            },
             "memory_bytes": definition.memory_bytes,
             "cpu_millis": definition.cpu_millis,
             "pids_limit": definition.pids_limit,
@@ -551,12 +670,22 @@ impl TrustedNativeExecutor {
         }
         let executable_digest = digest_file(&executable)
             .map_err(|error| ToolExecutionError::InvalidDefinition(error.to_string()))?;
+        // `workspace_access` was a hardcoded "read_only" here while the launch
+        // path honoured the real value, so a Tool that could write the
+        // Workspace and one that could not produced the *same* digest. The
+        // containment capabilities join it for the same reason: the digest is
+        // what proves two implementations are the same thing, and a boundary
+        // the host cannot enforce makes them different things.
         let implementation_digest = digest_serializable(&json!({
             "executable_digest": executable_digest,
             "fixed_args": definition.fixed_args,
-            "workspace_access": "read_only",
+            "workspace_access": match definition.workspace_access {
+                WorkspaceAccess::ReadOnly => "read_only",
+                WorkspaceAccess::ReadWrite => "read_write",
+            },
             "max_stdout_bytes": definition.max_stdout_bytes,
             "max_stderr_bytes": definition.max_stderr_bytes,
+            "containment": Self::containment_capabilities(),
         }));
         Ok(Self {
             definition,
@@ -569,6 +698,53 @@ impl TrustedNativeExecutor {
     #[must_use]
     pub fn implementation_digest(&self) -> &str {
         &self.implementation_digest
+    }
+
+    /// What this build can enforce when it launches a trusted native Tool.
+    #[must_use]
+    pub const fn containment_capabilities() -> ToolContainmentCapabilities {
+        ToolContainmentCapabilities::current()
+    }
+
+    /// Applies the platform containment backend to a launch.
+    ///
+    /// The unsupported arm returns an error rather than the bare executable.
+    /// That is the whole point: the previous shape returned
+    /// `(executable, fixed_args)` unchanged on any non-macOS host, so the Tool
+    /// ran with no containment while every record still said `TrustedNative`.
+    #[cfg(target_os = "macos")]
+    fn wrap_with_containment(
+        &self,
+        workspace: &Path,
+    ) -> Result<(PathBuf, Vec<String>), ToolExecutionError> {
+        // Fail closed: a launch with no credential denials would look
+        // contained and would not be (ADR-0037).
+        let home = seatbelt::containment_home();
+        let denied_reads = seatbelt::required_read_denials(home.as_deref()).map_err(|_| {
+            ToolExecutionError::ContainmentUnavailable(
+                "home directory could not be resolved, so credential read containment \
+                 cannot be established"
+                    .into(),
+            )
+        })?;
+        let (program, args) = seatbelt::wrap_launch(
+            &self.executable,
+            &self.definition.fixed_args,
+            workspace,
+            self.definition.workspace_access,
+            &denied_reads,
+        );
+        Ok((PathBuf::from(program), args))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn wrap_with_containment(
+        &self,
+        _workspace: &Path,
+    ) -> Result<(PathBuf, Vec<String>), ToolExecutionError> {
+        Err(ToolExecutionError::UnsupportedContainment(
+            "containment_backend",
+        ))
     }
 
     pub fn prepare(
@@ -584,6 +760,10 @@ impl TrustedNativeExecutor {
                 "timeout must be between 1ms and 3600 seconds".into(),
             ));
         }
+        // Refuse before the Workspace is resolved and before anything is
+        // spawned. A host that cannot contain this Tool must not get as far as
+        // looking like it is about to run it.
+        validate_containment(Self::containment_capabilities())?;
         self.revalidate_executable()?;
         let workspace = std::fs::canonicalize(&context.workspace_root)
             .map_err(|error| ToolExecutionError::InvalidContext(error.to_string()))?;
@@ -595,29 +775,7 @@ impl TrustedNativeExecutor {
         // A trusted Tool is trusted to be the binary we registered, not trusted
         // to be free of defects. Containment is what keeps a bug or a crafted
         // argument inside the Workspace.
-        #[cfg(target_os = "macos")]
-        let (program, args) = {
-            // Fail closed: a launch with no credential denials would look
-            // contained and would not be (ADR-0037).
-            let home = seatbelt::containment_home();
-            let denied_reads = seatbelt::required_read_denials(home.as_deref()).map_err(|_| {
-                ToolExecutionError::ContainmentUnavailable(
-                    "home directory could not be resolved, so credential read containment \
-                     cannot be established"
-                        .into(),
-                )
-            })?;
-            let (program, args) = seatbelt::wrap_launch(
-                &self.executable,
-                &self.definition.fixed_args,
-                &workspace,
-                self.definition.workspace_access,
-                &denied_reads,
-            );
-            (PathBuf::from(program), args)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let (program, args) = (self.executable.clone(), self.definition.fixed_args.clone());
+        let (program, args) = self.wrap_with_containment(&workspace)?;
         Ok(PreparedNativeLaunch {
             program,
             args,
