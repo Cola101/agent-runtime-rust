@@ -42,6 +42,7 @@ pub const EMBEDDED_EVENT_SUBSCRIPTION_MAX_CAPACITY: usize = 256;
 pub const EMBEDDED_EVENT_SUBSCRIPTION_MAX_ACTIVE: usize = 256;
 pub const EMBEDDED_EVENT_SUBSCRIPTION_MAX_BUFFERED_EVENTS: usize = 1_024;
 const EMBEDDED_EVENT_LOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const CONTROL_RECONCILIATION_SHARDS: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -479,6 +480,7 @@ pub struct EmbeddedRuntime {
     recovery_gate: AsyncMutex<()>,
     peak_active_execution_owners: AtomicUsize,
     event_subscriptions: Arc<EventSubscriptionCapacity>,
+    control_reconciliation_gates: [Mutex<()>; CONTROL_RECONCILIATION_SHARDS],
     retention_policy: RuntimeRetentionPolicy,
     retention_gates: HashMap<PathBuf, Arc<Mutex<()>>>,
     retired_runs: HashMap<PathBuf, Arc<Mutex<HashMap<Uuid, RuntimeTerminalTombstone>>>>,
@@ -617,6 +619,7 @@ impl EmbeddedRuntime {
             recovery_gate: AsyncMutex::new(()),
             peak_active_execution_owners: AtomicUsize::new(0),
             event_subscriptions: Arc::new(EventSubscriptionCapacity::default()),
+            control_reconciliation_gates: std::array::from_fn(|_| Mutex::new(())),
             retention_policy,
             retention_gates,
             retired_runs,
@@ -1505,16 +1508,8 @@ impl EmbeddedRuntime {
             {
                 continue;
             }
-            let Some(command_id) = entry
-                .path()
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .and_then(|value| Uuid::parse_str(value).ok())
-            else {
-                return Err(LocalRuntimeError::StateRoot(
-                    "Runtime control receipt filename is invalid".into(),
-                )
-                .into());
+            let Some(command_id) = Self::control_receipt_entry_command_id(&entry)? else {
+                continue;
             };
             let receipt = Self::load_control_receipt(&config.state_root, command_id)?
                 .ok_or_else(|| LocalRuntimeError::StateRoot("control receipt vanished".into()))?;
@@ -1607,33 +1602,16 @@ impl EmbeddedRuntime {
         {
             return Err(EmbeddedRuntimeError::ControlCommandRebound);
         }
-        if let Some(receipt) = existing {
-            if receipt.state == RuntimeControlReceiptState::Completed {
-                return Ok(receipt);
-            }
-            if let Some(terminal) =
-                Self::terminal_state_from_events(&config.state_root, command.run_id)?
+        if existing.is_some() {
+            // A Kernel terminal event is committed before its Run/receipt
+            // projections. If the client retries in that interval, serialize
+            // reconciliation with the execution finalizer. Both writers use
+            // durable replacement and therefore must not race on one staging
+            // pathname or let an older Accepted projection win afterward.
+            if let Some(receipt) =
+                self.reconcile_existing_control_receipt_serialized(config, &command, &digest)?
             {
-                let status = Self::terminal_status(&terminal).ok_or_else(|| {
-                    EmbeddedRuntimeError::Configuration(
-                        "terminal event did not map to a terminal Run status".into(),
-                    )
-                })?;
-                let mut record = self.owned_run_record(command.invocation, command.run_id)?;
-                record.state = terminal;
-                Self::write_run_record(&config.state_root, &record)?;
-                Self::complete_receipts_for_run(
-                    &config.state_root,
-                    command.invocation,
-                    command.run_id,
-                    status,
-                )?;
-                return Self::load_control_receipt(&config.state_root, command.command_id)?
-                    .ok_or_else(|| {
-                        EmbeddedRuntimeError::Configuration(
-                            "terminal control receipt vanished during reconciliation".into(),
-                        )
-                    });
+                return Ok(receipt);
             }
         }
         let invocation = command.invocation;
@@ -1663,6 +1641,92 @@ impl EmbeddedRuntime {
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
             }
+        }
+    }
+
+    fn reconcile_existing_control_receipt(
+        &self,
+        config: &LocalRuntimeConfig,
+        command: &RuntimeControlCommand,
+        command_digest: &str,
+    ) -> Result<Option<RuntimeControlReceipt>, EmbeddedRuntimeError> {
+        let receipt = Self::load_control_receipt(&config.state_root, command.command_id)?
+            .ok_or_else(|| {
+                EmbeddedRuntimeError::Configuration(
+                    "control receipt vanished during reconciliation".into(),
+                )
+            })?;
+        if receipt.command_digest != command_digest
+            || receipt.invocation != command.invocation
+            || receipt.run_id != command.run_id
+        {
+            return Err(EmbeddedRuntimeError::ControlCommandRebound);
+        }
+        if receipt.state == RuntimeControlReceiptState::Completed {
+            return Ok(Some(receipt));
+        }
+        let Some(terminal) = Self::terminal_state_from_events(&config.state_root, command.run_id)?
+        else {
+            return Ok(None);
+        };
+        let status = Self::terminal_status(&terminal).ok_or_else(|| {
+            EmbeddedRuntimeError::Configuration(
+                "terminal event did not map to a terminal Run status".into(),
+            )
+        })?;
+        let mut record = self.owned_run_record(command.invocation, command.run_id)?;
+        record.state = terminal;
+        Self::write_run_record(&config.state_root, &record)?;
+        Self::complete_receipts_for_run(
+            &config.state_root,
+            command.invocation,
+            command.run_id,
+            status,
+        )?;
+        let receipt = Self::load_control_receipt(&config.state_root, command.command_id)?
+            .ok_or_else(|| {
+                EmbeddedRuntimeError::Configuration(
+                    "terminal control receipt vanished during reconciliation".into(),
+                )
+            })?;
+        if receipt.state != RuntimeControlReceiptState::Completed
+            || receipt.run_status != Some(status)
+        {
+            return Err(EmbeddedRuntimeError::Configuration(
+                "terminal control receipt did not converge".into(),
+            ));
+        }
+        Ok(Some(receipt))
+    }
+
+    fn reconcile_existing_control_receipt_serialized(
+        &self,
+        config: &LocalRuntimeConfig,
+        command: &RuntimeControlCommand,
+        command_digest: &str,
+    ) -> Result<Option<RuntimeControlReceipt>, EmbeddedRuntimeError> {
+        let mut shard = 0usize;
+        for byte in command.run_id.as_bytes() {
+            shard = shard.wrapping_mul(31).wrapping_add(usize::from(*byte));
+        }
+        let _reconciliation = self.control_reconciliation_gates
+            [shard % CONTROL_RECONCILIATION_SHARDS]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(command.invocation, command.run_id))
+            .cloned();
+        if let Some(active) = active {
+            let _record = active
+                .record_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.reconcile_existing_control_receipt(config, command, command_digest)
+        } else {
+            self.reconcile_existing_control_receipt(config, command, command_digest)
         }
     }
 
@@ -1982,6 +2046,14 @@ impl EmbeddedRuntime {
             if receipt.state == RuntimeControlReceiptState::Completed {
                 return Ok(RuntimeControlResult {
                     receipt: receipt.clone(),
+                    outcome: None,
+                });
+            }
+            if let Some(receipt) =
+                self.reconcile_existing_control_receipt_serialized(&config, &command, &digest)?
+            {
+                return Ok(RuntimeControlResult {
+                    receipt,
                     outcome: None,
                 });
             }
@@ -2703,16 +2775,9 @@ impl EmbeddedRuntime {
             {
                 continue;
             }
-            let command_id = entry
-                .path()
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or_else(|| {
-                    LocalRuntimeError::StateRoot(
-                        "Runtime control receipt filename is invalid".into(),
-                    )
-                })?;
+            let Some(command_id) = Self::control_receipt_entry_command_id(&entry)? else {
+                continue;
+            };
             let Some(mut receipt) = Self::load_control_receipt(state_root, command_id)? else {
                 return Err(LocalRuntimeError::StateRoot(
                     "Runtime control receipt vanished".into(),
@@ -3100,6 +3165,33 @@ impl EmbeddedRuntime {
         state_root
             .join("control-receipts")
             .join(format!("{command_id}.json"))
+    }
+
+    fn control_receipt_entry_command_id(
+        entry: &std::fs::DirEntry,
+    ) -> Result<Option<Uuid>, LocalRuntimeError> {
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            LocalRuntimeError::StateRoot("Runtime control receipt filename is invalid".into())
+        })?;
+        if let Some(stem) = name.strip_suffix(".json.partial") {
+            Uuid::parse_str(stem).map_err(|_| {
+                LocalRuntimeError::StateRoot(
+                    "Runtime control receipt staging filename is invalid".into(),
+                )
+            })?;
+            // `durable_file::replace` commits only by renaming this sibling to
+            // `<command-id>.json`. A crash may leave it behind; it is never an
+            // authority record and must not make recovery reject the committed
+            // receipt beside it.
+            return Ok(None);
+        }
+        let stem = name.strip_suffix(".json").ok_or_else(|| {
+            LocalRuntimeError::StateRoot("Runtime control receipt filename is invalid".into())
+        })?;
+        Uuid::parse_str(stem).map(Some).map_err(|_| {
+            LocalRuntimeError::StateRoot("Runtime control receipt filename is invalid".into())
+        })
     }
 
     fn load_control_receipt(

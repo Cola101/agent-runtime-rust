@@ -27,7 +27,7 @@ Embedded control receipt 和 retention ledger 也已经使用“临时文件同�
    单 Run 已冻结的候选、尝试预算或副作用围栏。
 5. 模型路由 journal 是恢复权威，但本轮明确保留为未完成项。下一阶段应改成有界追加 WAL 或等价组提交，
    将“Provider 调用前的 inflight fence”和“响应 staging commit”变成少量 durable record；不得靠放宽容量
-   门禁，也不得继续给每次投影更新追加独立 fsync。
+   门禁，也不得继续给每次投影更新追加独立 fsync。该后续项已由 ADR-0132 完成。
 
 ## 对标
 
@@ -47,7 +47,8 @@ Embedded control receipt 和 retention ledger 也已经使用“临时文件同�
   等价为数据库事务。
 - 可预测 staging 文件假设每个 state root 只有一个进程 owner；EmbeddedRuntime 在 Unix 已持有 `flock`，
   普通 LocalRuntimeHost 的跨进程写者治理仍需继续收口。Windows rename/目录同步语义未验证。
-- 模型路由 journal 的掉电耐久、自动 quarantine/repair 和跨机器共享存储仍未完成。
+- 模型路由 journal 的有界 WAL 已由 ADR-0132 完成；自动 quarantine/repair、真实硬件掉电和跨机器共享存储
+  仍未完成。
 
 ## 备选方案
 

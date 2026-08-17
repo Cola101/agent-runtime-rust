@@ -13,7 +13,7 @@ use agent_runtime_host::{
     LocalProviderHealthPolicy, LocalRuntimeConfig, LocalRuntimeHost, LocalToolConsent,
 };
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,6 +23,27 @@ use tokio::net::{TcpListener, TcpStream};
 struct CapturedRequest {
     head: String,
     body: serde_json::Value,
+}
+
+fn committed_route_records(path: &Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read(path).expect("route WAL");
+    let committed_length = body
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    body[..committed_length]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).expect("route WAL record"))
+        .collect()
+}
+
+fn current_route_journal(path: &Path) -> serde_json::Value {
+    committed_route_records(path)
+        .last()
+        .and_then(|record| record.get("journal"))
+        .cloned()
+        .expect("current route journal snapshot")
 }
 
 async fn read_request(socket: &mut TcpStream) -> CapturedRequest {
@@ -1046,9 +1067,7 @@ async fn standalone_host_freezes_and_crosses_three_protocol_candidates_before_ou
         .collect::<Result<Vec<_>, _>>()
         .expect("route journal entries");
     assert_eq!(journals.len(), 1);
-    let journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(journals[0].path()).expect("route journal"))
-            .expect("route journal JSON");
+    let journal = current_route_journal(&journals[0].path());
     assert_eq!(
         journal["candidate_ids"],
         serde_json::json!(["responses", "anthropic", "compatible"])
@@ -1201,16 +1220,30 @@ async fn replacement_host_applies_a_staged_terminal_response_without_replaying_t
         .expect("journal entry")
         .expect("journal")
         .path();
-    let mut journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&journal_path).expect("completed journal"))
-            .expect("journal JSON");
-    journal["completed"] = serde_json::json!(false);
-    journal["selection_reported"] = serde_json::json!(false);
-    journal["staged_events"] = serde_json::json!([
-        {"type": "text_delta", "text": "staged answer"},
-        {"type": "completed", "reason": "stop"}
-    ]);
-    std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    let records = committed_route_records(&journal_path);
+    let staged_record_index = records
+        .iter()
+        .position(|record| {
+            record["journal"]["completed"] == false
+                && record["journal"]["selection_reported"] == false
+                && record["journal"]["staged_events"]
+                    .as_array()
+                    .is_some_and(|events| !events.is_empty())
+        })
+        .expect("committed staged-response boundary");
+    let mut committed_prefix = Vec::new();
+    for record in &records[..=staged_record_index] {
+        committed_prefix.extend(serde_json::to_vec(record).expect("route WAL record"));
+        committed_prefix.push(b'\n');
+    }
+    std::fs::write(&journal_path, committed_prefix).expect("restore staged WAL prefix");
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .unwrap()
+        .write_all(b"{\"record_version\":1")
+        .unwrap();
     std::fs::write(run_dir.join("checkpoint.json"), checkpoint_before_response).unwrap();
     std::fs::write(run_dir.join("events.jsonl"), events_before_response).unwrap();
     let mut replacement = LocalRuntimeHost::start(cfg).expect("replacement Host");
@@ -1230,9 +1263,7 @@ async fn replacement_host_applies_a_staged_terminal_response_without_replaying_t
             "run.succeeded",
         ]
     );
-    let recovered_journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(journal_path).expect("recovered journal"))
-            .expect("recovered journal JSON");
+    let recovered_journal = current_route_journal(&journal_path);
     assert_eq!(recovered_journal["completed"], true);
     assert_eq!(recovered_journal["staged_events"], serde_json::json!([]));
 }
@@ -1333,7 +1364,16 @@ async fn route_freeze_filters_health_region_capability_and_cost_before_network_e
         .unwrap()
         .unwrap()
         .path();
-    let journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(journal_path).unwrap()).unwrap();
+    let records = committed_route_records(&journal_path);
+    assert_eq!(
+        records.len(),
+        4,
+        "a normal successful invocation needs only fence, staged response, observation and completion commits"
+    );
+    let journal = records
+        .last()
+        .and_then(|record| record.get("journal"))
+        .cloned()
+        .expect("current route journal");
     assert_eq!(journal["candidate_ids"], serde_json::json!(["eligible"]));
 }

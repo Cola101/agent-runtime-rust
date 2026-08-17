@@ -6,7 +6,8 @@
 - 仅 crash-atomic、非强提交：Session record、模型路由 journal、Provider 健康、子代理结果、Tool
   reconciliation。
 - 本轮将 Session/Run/Checkpoint/control/retention/subagent/Tool reconciliation 收敛到一个实现；Event 保持
-  独立追加协议。模型路由 journal 和 Provider 健康没有被误报为完成。
+  独立追加协议。模型路由 journal 在本阶段没有被误报为完成，随后由 ADR-0132 的有界 WAL 补齐；Provider
+  健康仍是可重建缓存。
 
 ## RED / GREEN
 

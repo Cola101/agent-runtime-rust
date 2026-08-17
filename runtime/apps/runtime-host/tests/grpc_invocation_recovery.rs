@@ -14,7 +14,9 @@
 use agent_model_gateway::{Capability, DataClass, ProviderProtocol};
 use agent_protocol::{RunBudget, RuntimeExecutionPolicySnapshot, RuntimeInvocationContext};
 use agent_runtime_host::admission::RuntimeAdmissionLimits;
-use agent_runtime_host::embedded::{EmbeddedRuntime, RuntimeProfile};
+use agent_runtime_host::embedded::{
+    EmbeddedRuntime, RuntimeControlReceipt, RuntimeControlReceiptState, RuntimeProfile,
+};
 use agent_runtime_host::grpc::RuntimeInvocationGrpcService;
 use agent_runtime_host::{
     LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig,
@@ -687,11 +689,43 @@ async fn a_network_resume_recovers_an_inflight_run_over_a_replacement_runtime() 
     assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
 
     let replayed = client
-        .control(with_token(request, &token))
+        .control(with_token(request.clone(), &token))
         .await
         .expect("a lost Resume response must be safely replayable")
         .into_inner();
     assert_eq!(replayed.command_id, accepted.command_id);
     assert_eq!(replayed.command_digest, accepted.command_digest);
     assert_eq!(replayed.run_status, "succeeded");
+
+    // Reproduce the durable crash window without depending on scheduler timing:
+    // the Kernel terminal event committed, but the receipt projection remained
+    // Accepted and another interrupted replacement left its uncommitted staging
+    // file in the same authority directory. A restart must ignore that staging
+    // artifact, converge from the terminal event and never redispatch Resume.
+    let receipt_path = state
+        .path()
+        .join("control-receipts")
+        .join(format!("{command_id}.json"));
+    let mut stale_receipt: RuntimeControlReceipt =
+        serde_json::from_slice(&std::fs::read(&receipt_path).expect("completed Resume receipt"))
+            .expect("receipt JSON");
+    stale_receipt.state = RuntimeControlReceiptState::Accepted;
+    stale_receipt.run_status = None;
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_vec_pretty(&stale_receipt).expect("stale receipt JSON"),
+    )
+    .expect("restore the accepted crash-window receipt");
+    let staging_path = receipt_path.with_extension("json.partial");
+    std::fs::write(&staging_path, b"{\"incomplete\":").expect("uncommitted staging tail");
+
+    let reconciled = client
+        .control(with_token(request, &token))
+        .await
+        .expect("terminal evidence must reconcile an accepted receipt beside a staging file")
+        .into_inner();
+    assert_eq!(reconciled.command_id, accepted.command_id);
+    assert_eq!(reconciled.command_digest, accepted.command_digest);
+    assert_eq!(reconciled.run_status, "succeeded");
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
 }

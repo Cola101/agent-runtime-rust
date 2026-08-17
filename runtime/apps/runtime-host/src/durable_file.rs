@@ -74,6 +74,32 @@ pub(crate) fn replace(path: &Path, body: &[u8]) -> Result<(), LocalRuntimeError>
     replace_with_io(&StdDurableReplaceIo, path, body)
 }
 
+fn rename_with_io<I: DurableReplaceIo>(
+    io: &I,
+    from: &Path,
+    to: &Path,
+) -> Result<(), LocalRuntimeError> {
+    let from_parent = from.parent().ok_or_else(|| {
+        LocalRuntimeError::StateRoot("durable rename source has no parent".into())
+    })?;
+    let to_parent = to.parent().ok_or_else(|| {
+        LocalRuntimeError::StateRoot("durable rename target has no parent".into())
+    })?;
+    io.rename(from, to)
+        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+    io.sync_directory(to_parent)
+        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+    if from_parent != to_parent {
+        io.sync_directory(from_parent)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn rename(from: &Path, to: &Path) -> Result<(), LocalRuntimeError> {
+    rename_with_io(&StdDurableReplaceIo, from, to)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +211,37 @@ mod tests {
                 "rename",
                 "sync_directory",
             ]
+        );
+    }
+
+    #[test]
+    fn same_directory_rename_syncs_its_namespace_commit() {
+        let io = RecordingIo::default();
+
+        rename_with_io(
+            &io,
+            Path::new("state/active.json"),
+            Path::new("state/archive.json"),
+        )
+        .expect("rename");
+
+        assert_eq!(*io.operations.borrow(), ["rename", "sync_directory"]);
+    }
+
+    #[test]
+    fn cross_directory_rename_syncs_target_then_source_namespaces() {
+        let io = RecordingIo::default();
+
+        rename_with_io(
+            &io,
+            Path::new("active/item.json"),
+            Path::new("archive/item.json"),
+        )
+        .expect("rename");
+
+        assert_eq!(
+            *io.operations.borrow(),
+            ["rename", "sync_directory", "sync_directory"]
         );
     }
 }

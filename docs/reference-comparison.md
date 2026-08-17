@@ -14,7 +14,30 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：本地权威文件耐久替换
+## 当前阶段：有界模型路由 WAL 与终态控制收据收敛
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 高频恢复状态 | rollout 单 writer、pending queue、flush ack/retry | SQLite WAL、事务组提交、commit 后 publication | 每模型请求单写全状态 WAL；普通成功固定四次提交 | 无数据库嵌入边界成立；SQLite 并发事务仍领先 |
+| 出站与响应围栏 | rollout/history 支撑恢复，但不是 PaaS Provider attempt ledger | Session/Agent WAL 与 Provider retry/cooldown 产品链成熟 | Provider 前 inflight、响应 staging、观察、completion 分层提交 | 单 Run 副作用边界更明确，不代表生态更成熟 |
+| 损坏与回退 | loader I/O 错误传播，部分坏 item 可跳过 | SQLite schema/transaction/integrity | revision、身份与状态单调校验；只忽略 EOF 未提交尾部 | 多租户恢复权威更保守；无 quarantine/repair |
+| 终态重放 | Thread owner 串行 history/lifecycle | writer queue/transaction 避免 JSON staging | Kernel terminal event 经有界 shard + Run gate 收敛 receipt | 消除重复 Resume 窗口；仍只有单机 owner |
+
+### 本阶段结论
+
+- 已实现：V1/V2 snapshot 原子迁移；32 条 compaction、8 MiB 单条和读取前总大小上限；连续 revision、
+  immutable identity 与状态单调验证；普通成功路径精确四条记录。Provider 出站前必须先提交 inflight，完整
+  响应必须先 staging，替代 Host 可直接应用 staged response 而不重放 Provider。
+- 已修复：Event Cursor 已看见终态但 Resume receipt 仍为 Accepted 时，直接调用和 gRPC 重放都从 Kernel
+  event 收敛；合法 `.json.partial` 不是权威记录，不再让重放偶发 Internal。64 路固定 shard 不随历史增长。
+- 相比 Codex，本项目吸收单 writer/显式 ack 思想，但 Codex 的 rollout 生命周期、跨平台客户端和历史修复仍
+  领先。相比 OpenClaw，本项目保持无 SQLite/外部服务即可完成 Run；OpenClaw 在并发事务、迁移、quarantine
+  和长期运维上仍明显领先。
+- **未外推**：硬件断电、介质损坏、共享文件系统、跨机器 owner、跨文件事务和 Windows 未验证；总体仍为
+  70–75%。架构审查选择有界 full-state WAL，是为了同时满足本地嵌入、故障恢复和 16 GB Mac 容量门禁，
+  不是宣称文件 WAL 全面优于 SQLite。
+
+## 上一阶段：本地权威文件耐久替换
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
@@ -29,8 +52,8 @@
   顺序；同步失败不能被报告为成功。1000 Run 保留门禁恢复到 112–119 秒，阈值未放宽。
 - 相比 Codex，本项目没有复制“所有状态都进 rollout”；Event、Checkpoint 与投影仍按恢复职责分层。Codex 的
   writer 恢复、客户端生命周期和跨平台产品面仍领先。
-- 相比 OpenClaw，本项目无需 SQLite 即可独立运行，但 SQLite WAL 对高频状态和多记录原子性更合适。下一项
-  应吸收其组提交思想，为模型路由设计有界追加 journal，而不是继续堆整文件 fsync。
+- 相比 OpenClaw，本项目无需 SQLite 即可独立运行，但 SQLite WAL 对高频状态和多记录原子性更合适。本阶段
+  提出的有界追加 journal 已由当前 ADR-0132 完成，没有继续堆整文件 fsync。
 - **未外推**：模型路由掉电恢复、硬件断电、跨文件事务、Windows 和共享文件系统未完成；总体仍为 70–75%。
 
 ## 上一阶段：权威目录扫描失败关闭

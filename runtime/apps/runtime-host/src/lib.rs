@@ -2159,7 +2159,12 @@ fn shared_local_provider_health(
     Ok(shared)
 }
 
-const LOCAL_MODEL_ROUTE_STORE_VERSION: u32 = 2;
+const LOCAL_MODEL_ROUTE_STORE_VERSION: u32 = 3;
+const LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION: u32 = 1;
+const LOCAL_MODEL_ROUTE_WAL_MAX_RECORDS: usize = 32;
+const LOCAL_MODEL_ROUTE_WAL_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+const LOCAL_MODEL_ROUTE_WAL_MAX_FILE_BYTES: u64 =
+    ((LOCAL_MODEL_ROUTE_WAL_MAX_RECORDS + 1) * LOCAL_MODEL_ROUTE_WAL_MAX_LINE_BYTES) as u64;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct LocalModelRouteFailure {
@@ -2208,6 +2213,71 @@ struct LocalModelRouteJournal {
     terminal_failure_reported: bool,
     staged_events: Vec<ModelStreamEvent>,
     completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LocalModelRouteWalRecord {
+    record_version: u32,
+    revision: u64,
+    journal: LocalModelRouteJournal,
+}
+
+impl LocalModelRouteWalRecord {
+    fn is_well_formed(&self) -> bool {
+        self.record_version == LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION
+            && self.revision > 0
+            && self.journal.store_version == LOCAL_MODEL_ROUTE_STORE_VERSION
+            && self.journal.is_well_formed()
+    }
+
+    fn follows(&self, previous: &Self) -> bool {
+        self.journal.run_id == previous.journal.run_id
+            && self.journal.invocation_digest == previous.journal.invocation_digest
+            && self.journal.model_route_binding_digest
+                == previous.journal.model_route_binding_digest
+            && self.journal.candidate_ids == previous.journal.candidate_ids
+            && self.journal.next_candidate_index >= previous.journal.next_candidate_index
+            && self
+                .journal
+                .failed_attempts
+                .starts_with(&previous.journal.failed_attempts)
+            && self
+                .journal
+                .retry_attempts
+                .starts_with(&previous.journal.retry_attempts)
+            && self.journal.reported_failure_count >= previous.journal.reported_failure_count
+            && self.journal.reported_retry_count >= previous.journal.reported_retry_count
+            && (self.journal.next_candidate_index > previous.journal.next_candidate_index
+                || self.journal.same_provider_attempts >= previous.journal.same_provider_attempts)
+            && (previous.journal.inflight_provider_id.is_none()
+                || self.journal.inflight_provider_id.is_none())
+            && previous
+                .journal
+                .selected_provider_id
+                .as_ref()
+                .is_none_or(|selected| self.journal.selected_provider_id.as_ref() == Some(selected))
+            && (!previous.journal.selection_reported || self.journal.selection_reported)
+            && (!previous.journal.completed || self.journal.completed)
+            && (previous.journal.staged_events.is_empty()
+                || self.journal.staged_events == previous.journal.staged_events
+                || (self.journal.completed && self.journal.staged_events.is_empty()))
+            && match (
+                previous.journal.terminal_failure.as_ref(),
+                self.journal.terminal_failure.as_ref(),
+            ) {
+                (Some(previous_failure), Some(current_failure)) => {
+                    previous_failure == current_failure
+                        && (!previous.journal.terminal_failure_reported
+                            || self.journal.terminal_failure_reported)
+                }
+                (Some(_), None) => {
+                    previous.journal.terminal_failure_reported
+                        && !self.journal.terminal_failure_reported
+                        && self.journal.attempt_id != previous.journal.attempt_id
+                }
+                (None, _) => true,
+            }
+    }
 }
 
 impl LocalModelRouteJournal {
@@ -2282,6 +2352,196 @@ impl LocalModelRouteJournal {
                 || (self.staged_events.is_empty()
                     && ((self.selected_provider_id.is_some() && self.selection_reported)
                         || (self.terminal_failure.is_some() && self.terminal_failure_reported))))
+    }
+}
+
+#[cfg(test)]
+mod model_route_wal_tests {
+    use super::*;
+
+    fn journal() -> LocalModelRouteJournal {
+        LocalModelRouteJournal {
+            store_version: LOCAL_MODEL_ROUTE_STORE_VERSION,
+            run_id: Uuid::now_v7(),
+            attempt_id: Uuid::now_v7(),
+            invocation_digest: "11".repeat(32),
+            model_route_binding_digest: "22".repeat(32),
+            candidate_ids: vec!["primary".into()],
+            next_candidate_index: 0,
+            failed_attempts: Vec::new(),
+            reported_failure_count: 0,
+            retry_attempts: Vec::new(),
+            reported_retry_count: 0,
+            same_provider_attempts: 0,
+            inflight_provider_id: None,
+            retry_not_before_unix_ms: None,
+            selected_provider_id: None,
+            selection_reported: false,
+            terminal_failure: None,
+            terminal_failure_reported: false,
+            staged_events: Vec::new(),
+            completed: false,
+        }
+    }
+
+    #[test]
+    fn model_route_wal_repairs_only_an_uncommitted_tail_before_the_next_append() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let first = journal();
+        LocalRuntimeHost::persist_model_route_journal(&path, &first).expect("first commit");
+        let mut second = first.clone();
+        second.same_provider_attempts = 1;
+        second.inflight_provider_id = Some("primary".into());
+        LocalRuntimeHost::persist_model_route_journal(&path, &second).expect("second commit");
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("WAL")
+            .write_all(b"{\"record_version\":1")
+            .expect("torn tail");
+
+        assert_eq!(
+            LocalRuntimeHost::read_model_route_journal(&path).expect("committed prefix"),
+            second
+        );
+        LocalRuntimeHost::persist_model_route_journal(&path, &second).expect("repair then append");
+        let body = std::fs::read(&path).expect("repaired WAL");
+        assert!(body.ends_with(b"\n"));
+        assert_eq!(
+            LocalRuntimeHost::read_model_route_wal_records(&path)
+                .expect("records")
+                .len(),
+            2,
+            "an idempotent retry repairs the tail without adding a duplicate record"
+        );
+    }
+
+    #[test]
+    fn committed_model_route_wal_corruption_fails_closed() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        LocalRuntimeHost::persist_model_route_journal(&path, &journal()).expect("first commit");
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("WAL");
+        file.write_all(b"{}\n").expect("committed corruption");
+        file.sync_all().expect("sync corruption fixture");
+
+        assert!(LocalRuntimeHost::read_model_route_journal(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_model_route_snapshot_migrates_to_one_committed_wal_record() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let mut legacy = journal();
+        legacy.store_version = 2;
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let migrated = LocalRuntimeHost::read_model_route_journal(&path).expect("migration");
+
+        assert_eq!(migrated.store_version, LOCAL_MODEL_ROUTE_STORE_VERSION);
+        let records = LocalRuntimeHost::read_model_route_wal_records(&path).expect("WAL");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].revision, 1);
+        assert_eq!(records[0].journal, migrated);
+    }
+
+    #[test]
+    fn model_route_wal_rejects_a_revision_gap_and_identity_change() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let first = journal();
+        LocalRuntimeHost::persist_model_route_journal(&path, &first).expect("first commit");
+        let gap = LocalModelRouteWalRecord {
+            record_version: LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION,
+            revision: 3,
+            journal: first.clone(),
+        };
+        let line = LocalRuntimeHost::encode_model_route_wal_record(&gap).expect("gap fixture");
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("WAL");
+        file.write_all(&line).expect("append gap");
+        file.sync_all().expect("sync gap");
+        assert!(LocalRuntimeHost::read_model_route_journal(&path).is_err());
+
+        let other_path = root.path().join("other-route.json");
+        LocalRuntimeHost::persist_model_route_journal(&other_path, &first).expect("first commit");
+        let mut wrong_identity = first;
+        wrong_identity.run_id = Uuid::now_v7();
+        assert!(
+            LocalRuntimeHost::persist_model_route_journal(&other_path, &wrong_identity).is_err()
+        );
+        assert_eq!(
+            LocalRuntimeHost::read_model_route_wal_records(&other_path)
+                .expect("unchanged WAL")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_route_wal_rejects_a_well_formed_state_rollback() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let mut first = journal();
+        first.same_provider_attempts = 1;
+        first.inflight_provider_id = Some("primary".into());
+        LocalRuntimeHost::persist_model_route_journal(&path, &first).expect("first commit");
+        let mut rolled_back = first.clone();
+        rolled_back.same_provider_attempts = 0;
+        rolled_back.inflight_provider_id = None;
+        assert!(rolled_back.is_well_formed());
+        let record = LocalModelRouteWalRecord {
+            record_version: LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION,
+            revision: 2,
+            journal: rolled_back,
+        };
+        let line = LocalRuntimeHost::encode_model_route_wal_record(&record).expect("fixture");
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("WAL");
+        file.write_all(&line).expect("append rollback");
+        file.sync_all().expect("sync rollback fixture");
+
+        assert!(LocalRuntimeHost::read_model_route_journal(&path).is_err());
+    }
+
+    #[test]
+    fn model_route_wal_rejects_an_oversized_file_before_reading_it() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let file = std::fs::File::create(&path).expect("WAL");
+        file.set_len(LOCAL_MODEL_ROUTE_WAL_MAX_FILE_BYTES + 1)
+            .expect("oversized sparse WAL");
+
+        assert!(LocalRuntimeHost::read_model_route_journal(&path).is_err());
+    }
+
+    #[test]
+    fn model_route_wal_compacts_before_exceeding_its_record_bound() {
+        let root = tempfile::tempdir().expect("state");
+        let path = root.path().join("route.json");
+        let mut current = journal();
+        for revision in 1..=LOCAL_MODEL_ROUTE_WAL_MAX_RECORDS + 1 {
+            current.attempt_id = Uuid::now_v7();
+            LocalRuntimeHost::persist_model_route_journal(&path, &current)
+                .unwrap_or_else(|error| panic!("revision {revision}: {error}"));
+        }
+
+        let records = LocalRuntimeHost::read_model_route_wal_records(&path).expect("compacted WAL");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].revision, 1);
+        assert_eq!(records[0].journal, current);
     }
 }
 
@@ -3222,34 +3482,200 @@ impl LocalRuntimeHost {
                 "refusing to persist malformed local model route journal".into(),
             ));
         }
-        let parent = path
-            .parent()
-            .expect("model route journal path has a parent");
-        std::fs::create_dir_all(parent)
+        let records = if Self::model_route_journal_exists(path)? {
+            Self::read_model_route_wal_records(path)?
+        } else {
+            Vec::new()
+        };
+        if let Some(previous) = records.last() {
+            if previous.journal == *journal {
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+                Self::repair_uncommitted_event_tail(&mut file)?;
+                return Ok(());
+            }
+            if previous.journal.completed {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "refusing to append after a completed local model route WAL".into(),
+                ));
+            }
+            if journal.run_id != previous.journal.run_id
+                || journal.invocation_digest != previous.journal.invocation_digest
+                || journal.model_route_binding_digest != previous.journal.model_route_binding_digest
+                || journal.candidate_ids != previous.journal.candidate_ids
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "refusing to change local model route WAL immutable identity".into(),
+                ));
+            }
+            let candidate = LocalModelRouteWalRecord {
+                record_version: LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION,
+                revision: previous.revision.saturating_add(1),
+                journal: journal.clone(),
+            };
+            if !candidate.follows(previous) {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "refusing to roll back local model route WAL state".into(),
+                ));
+            }
+        }
+        let compact = records.len() >= LOCAL_MODEL_ROUTE_WAL_MAX_RECORDS;
+        let revision = if compact {
+            1
+        } else {
+            records
+                .last()
+                .map_or(1, |record| record.revision.saturating_add(1))
+        };
+        let record = LocalModelRouteWalRecord {
+            record_version: LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION,
+            revision,
+            journal: journal.clone(),
+        };
+        let line = Self::encode_model_route_wal_record(&record)?;
+        if records.is_empty() || compact {
+            return durable_file::replace(path, &line);
+        }
+
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
-        std::fs::write(
-            &staging,
-            serde_json::to_vec_pretty(journal)
-                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?,
-        )
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(staging, path)
+        Self::repair_uncommitted_event_tail(&mut file)?;
+        file.write_all(&line)
+            .and_then(|()| file.sync_data())
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
     }
 
     fn read_model_route_journal(path: &Path) -> Result<LocalModelRouteJournal, LocalRuntimeError> {
-        let body =
-            std::fs::read(path).map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let mut journal: LocalModelRouteJournal = serde_json::from_slice(&body)
-            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
-        if !journal.is_well_formed() {
+        Self::read_model_route_wal_records(path)?
+            .last()
+            .map(|record| record.journal.clone())
+            .ok_or_else(|| {
+                LocalRuntimeError::Checkpoint(
+                    "local model route journal has no committed record".into(),
+                )
+            })
+    }
+
+    fn encode_model_route_wal_record(
+        record: &LocalModelRouteWalRecord,
+    ) -> Result<Vec<u8>, LocalRuntimeError> {
+        if !record.is_well_formed() {
             return Err(LocalRuntimeError::Checkpoint(
-                "local model route journal is malformed".into(),
+                "refusing to encode malformed local model route WAL record".into(),
             ));
         }
-        journal.store_version = LOCAL_MODEL_ROUTE_STORE_VERSION;
-        Ok(journal)
+        let mut line = serde_json::to_vec(record)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        line.push(b'\n');
+        if line.len() > LOCAL_MODEL_ROUTE_WAL_MAX_LINE_BYTES {
+            return Err(LocalRuntimeError::Checkpoint(format!(
+                "local model route WAL record exceeds {LOCAL_MODEL_ROUTE_WAL_MAX_LINE_BYTES} bytes"
+            )));
+        }
+        Ok(line)
+    }
+
+    fn read_model_route_wal_records(
+        path: &Path,
+    ) -> Result<Vec<LocalModelRouteWalRecord>, LocalRuntimeError> {
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(LocalRuntimeError::StateRoot(
+                "local model route WAL is not a regular file".into(),
+            ));
+        }
+        if metadata.len() > LOCAL_MODEL_ROUTE_WAL_MAX_FILE_BYTES {
+            return Err(LocalRuntimeError::Checkpoint(format!(
+                "local model route WAL exceeds {LOCAL_MODEL_ROUTE_WAL_MAX_FILE_BYTES} bytes"
+            )));
+        }
+        let body =
+            std::fs::read(path).map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+
+        // V1/V2 used one pretty-printed JSON snapshot. Convert it in place to
+        // the first committed WAL record before any Provider can be invoked.
+        if let Ok(mut legacy) = serde_json::from_slice::<LocalModelRouteJournal>(&body) {
+            if !matches!(legacy.store_version, 1 | 2) || !legacy.is_well_formed() {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "legacy local model route journal is malformed".into(),
+                ));
+            }
+            legacy.store_version = LOCAL_MODEL_ROUTE_STORE_VERSION;
+            let record = LocalModelRouteWalRecord {
+                record_version: LOCAL_MODEL_ROUTE_WAL_RECORD_VERSION,
+                revision: 1,
+                journal: legacy,
+            };
+            let line = Self::encode_model_route_wal_record(&record)?;
+            durable_file::replace(path, &line)?;
+            return Ok(vec![record]);
+        }
+
+        let committed_length = body
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        if committed_length == 0 {
+            return Err(LocalRuntimeError::Checkpoint(
+                "local model route WAL has no committed record".into(),
+            ));
+        }
+        let mut records: Vec<LocalModelRouteWalRecord> = Vec::new();
+        for line in body[..committed_length - 1].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "local model route WAL contains a committed empty record".into(),
+                ));
+            }
+            if line.len() + 1 > LOCAL_MODEL_ROUTE_WAL_MAX_LINE_BYTES {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "local model route WAL contains an oversized record".into(),
+                ));
+            }
+            let record: LocalModelRouteWalRecord = serde_json::from_slice(line)
+                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+            let expected_revision = u64::try_from(records.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if !record.is_well_formed() || record.revision != expected_revision {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "local model route WAL record is malformed or out of sequence".into(),
+                ));
+            }
+            if let Some(previous) = records.last()
+                && !record.follows(previous)
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "local model route WAL changed immutable identity or rolled back state".into(),
+                ));
+            }
+            records.push(record);
+            if records.len() > LOCAL_MODEL_ROUTE_WAL_MAX_RECORDS {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "local model route WAL exceeds its bounded record count".into(),
+                ));
+            }
+        }
+        Ok(records)
+    }
+
+    fn model_route_journal_exists(path: &Path) -> Result<bool, LocalRuntimeError> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(LocalRuntimeError::StateRoot(
+                "local model route journal path is not a regular file".into(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(LocalRuntimeError::StateRoot(error.to_string())),
+        }
     }
 
     fn route_failure(provider_id: &str, error: &ProviderExecutionError) -> LocalModelRouteFailure {
@@ -3434,7 +3860,7 @@ impl LocalRuntimeHost {
     ) -> Result<(PathBuf, Vec<ModelStreamEvent>), LocalRuntimeError> {
         let invocation_digest = self.model_route_invocation_digest(request);
         let path = self.model_route_journal_path(run_id, &invocation_digest);
-        let (routes, mut journal) = if path.is_file() {
+        let (routes, mut journal) = if Self::model_route_journal_exists(&path)? {
             let mut journal = Self::read_model_route_journal(&path)?;
             if journal.run_id != run_id
                 || journal.invocation_digest != invocation_digest
@@ -3449,13 +3875,12 @@ impl LocalRuntimeHost {
                     "{}.{}.completed.json",
                     journal.invocation_digest, journal.attempt_id
                 ));
-                if archive.exists() {
+                if Self::model_route_journal_exists(&archive)? {
                     return Err(LocalRuntimeError::Checkpoint(
                         "completed local model route archive already exists".into(),
                     ));
                 }
-                std::fs::rename(&path, archive)
-                    .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+                durable_file::rename(&path, &archive)?;
                 let routes = self.frozen_model_routes(request, &invocation_digest)?;
                 let candidate_ids = routes
                     .iter()
@@ -3483,11 +3908,9 @@ impl LocalRuntimeHost {
                     staged_events: Vec::new(),
                     completed: false,
                 };
-                Self::persist_model_route_journal(&path, &journal)?;
                 (routes, journal)
             } else if journal.attempt_id != attempt_id {
                 journal.attempt_id = attempt_id;
-                Self::persist_model_route_journal(&path, &journal)?;
                 let routes = self.restored_model_routes(&journal.candidate_ids)?;
                 (routes, journal)
             } else {
@@ -3522,7 +3945,6 @@ impl LocalRuntimeHost {
                 staged_events: Vec::new(),
                 completed: false,
             };
-            Self::persist_model_route_journal(&path, &journal)?;
             (routes, journal)
         };
         if let Some(provider_id) = journal.inflight_provider_id.take() {
@@ -3607,14 +4029,12 @@ impl LocalRuntimeHost {
             }
             journal.terminal_failure = None;
             journal.terminal_failure_reported = false;
-            Self::persist_model_route_journal(&path, &journal)?;
         }
 
         loop {
             if let Some(retry_not_before) = journal.retry_not_before_unix_ms {
                 self.wait_for_model_retry(retry_not_before).await?;
                 journal.retry_not_before_unix_ms = None;
-                Self::persist_model_route_journal(&path, &journal)?;
             }
             let route = routes
                 .get(journal.next_candidate_index)
@@ -3641,7 +4061,6 @@ impl LocalRuntimeHost {
                     journal.next_candidate_index += 1;
                     journal.same_provider_attempts = 0;
                     journal.retry_not_before_unix_ms = None;
-                    Self::persist_model_route_journal(&path, &journal)?;
                     continue;
                 }
                 return Err(LocalRuntimeError::Provider(
@@ -3733,7 +4152,6 @@ impl LocalRuntimeHost {
                             retry_not_before_unix_ms,
                         });
                         journal.retry_not_before_unix_ms = Some(retry_not_before_unix_ms);
-                        Self::persist_model_route_journal(&path, &journal)?;
                         self.flush_model_route_observations(
                             run_id,
                             attempt_id,
@@ -3750,7 +4168,6 @@ impl LocalRuntimeHost {
                         journal.next_candidate_index += 1;
                         journal.same_provider_attempts = 0;
                         journal.retry_not_before_unix_ms = None;
-                        Self::persist_model_route_journal(&path, &journal)?;
                         self.flush_model_route_observations(
                             run_id,
                             attempt_id,
@@ -3762,7 +4179,6 @@ impl LocalRuntimeHost {
                     }
                     if self.can_fallback(&failure, committed_events) {
                         journal.terminal_failure = Some(failure.clone());
-                        Self::persist_model_route_journal(&path, &journal)?;
                         self.flush_model_route_observations(
                             run_id,
                             attempt_id,
