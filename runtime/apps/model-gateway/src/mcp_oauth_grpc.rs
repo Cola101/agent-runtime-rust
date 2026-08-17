@@ -19,7 +19,8 @@ use agent_model_gateway_protocol::v1::{
     McpOauthStatusRequest, McpOauthStatusResponse,
 };
 use agent_workload_identity::{
-    RequiredCapability, WorkloadIdentityBinding, WorkloadIdentityClaims, WorkloadTokenVerifier,
+    RequiredCapability, WorkloadIdentityBinding, WorkloadIdentityClaims, WorkloadTokenError,
+    WorkloadTokenVerifier,
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -79,20 +80,24 @@ impl McpOAuthAdminGrpcService {
             .verifier
             .verify(
                 bearer,
-                RequiredCapability::new("model-gateway", OAUTH_ADMIN_SCOPE, true),
+                // The shape is part of what this surface asks for rather than
+                // something it remembers to check afterwards. A Run-shaped token
+                // carrying the admin scope would still be a Run acting as an
+                // operator, and the contract refuses it without this service
+                // having to say so.
+                RequiredCapability::operator("model-gateway", OAUTH_ADMIN_SCOPE),
                 Utc::now().timestamp_millis(),
             )
-            .map_err(|_| Status::unauthenticated("invalid workload token"))?;
-        // Scope alone is not enough. A Run-shaped token carrying the admin scope
-        // would still be a Run acting as an operator, and no later policy could
-        // separate the two. Requiring the operator shape makes the distinction
-        // structural: a Run token names an execution, and an operator token
-        // cannot.
-        if !claims.is_operator() {
-            return Err(Status::permission_denied(
-                "the mcp oauth admin surface requires an operator identity",
-            ));
-        }
+            .map_err(|error| match error {
+                // A valid token of the wrong kind is not an authentication
+                // problem. Telling it to authenticate again would send it round
+                // a loop that cannot help, and no scope grant turns a Run into
+                // an operator.
+                WorkloadTokenError::WrongIdentityShape => Status::permission_denied(
+                    "the mcp oauth admin surface requires an operator identity",
+                ),
+                _ => Status::unauthenticated("invalid workload token"),
+            })?;
         let binding = WorkloadIdentityBinding {
             tenant_id: parse_uuid(&context.tenant_id, "tenant_id")?,
             application_id: parse_uuid(&context.application_id, "application_id")?,

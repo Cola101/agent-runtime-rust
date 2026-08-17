@@ -100,20 +100,52 @@ impl From<&WorkloadIdentityClaims> for WorkloadIdentityBinding {
     }
 }
 
+/// Which kind of caller a surface serves.
+///
+/// Asking for the shape rather than checking it afterwards is what keeps the
+/// separation from decaying. A surface that forgets to state its shape gets
+/// `Execution`, so an operator token is refused rather than quietly accepted on
+/// scope alone -- forgetting fails closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredIdentityShape {
+    /// A Run: an execution with an attempt and a worker.
+    Execution,
+    /// A tenant-scoped actor that names no execution.
+    Operator,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequiredCapability<'a> {
     audience: &'a str,
     scope: &'a str,
     require_incarnation: bool,
+    shape: RequiredIdentityShape,
 }
 
 impl<'a> RequiredCapability<'a> {
+    /// Requires an execution identity. This is the default because it is the
+    /// safe answer for a surface whose author did not think about shape.
     #[must_use]
     pub const fn new(audience: &'a str, scope: &'a str, require_incarnation: bool) -> Self {
         Self {
             audience,
             scope,
             require_incarnation,
+            shape: RequiredIdentityShape::Execution,
+        }
+    }
+
+    /// Requires an operator identity. Stating this is the only way a surface
+    /// accepts one.
+    #[must_use]
+    pub const fn operator(audience: &'a str, scope: &'a str) -> Self {
+        Self {
+            audience,
+            scope,
+            // An operator has no worker to pin, so demanding an incarnation
+            // would make the shape unusable.
+            require_incarnation: false,
+            shape: RequiredIdentityShape::Operator,
         }
     }
 }
@@ -130,6 +162,11 @@ pub enum WorkloadTokenError {
     MissingCapability,
     #[error("workload token is expired or has an invalid lifetime")]
     InvalidLifetime,
+    /// The token is valid and carries the capability, but it is the wrong kind
+    /// of caller for this surface. Distinct from `MissingCapability` because the
+    /// remedy is different: no scope grant can turn a Run into an operator.
+    #[error("workload token is not the identity shape this surface serves")]
+    WrongIdentityShape,
 }
 
 #[derive(Clone)]
@@ -264,6 +301,13 @@ impl WorkloadTokenVerifier {
         if !claims.audiences.contains(required.audience) || !claims.scopes.contains(required.scope)
         {
             return Err(WorkloadTokenError::MissingCapability);
+        }
+        let shape_matches = match required.shape {
+            RequiredIdentityShape::Execution => !operator,
+            RequiredIdentityShape::Operator => operator,
+        };
+        if !shape_matches {
+            return Err(WorkloadTokenError::WrongIdentityShape);
         }
         Ok(claims)
     }

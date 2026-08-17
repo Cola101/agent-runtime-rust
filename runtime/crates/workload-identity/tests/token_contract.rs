@@ -190,6 +190,51 @@ fn v4_authorization_rejects_a_different_application_identity() {
     assert!(!verified.authorizes(&WorkloadIdentityBinding::from(&different)));
 }
 
+/// Forgetting to state a shape must fail closed.
+///
+/// `RequiredCapability::new` means an execution, so a surface whose author never
+/// thought about shape refuses operator tokens rather than accepting them on
+/// scope alone. This is the property that keeps the separation from decaying as
+/// new surfaces are added.
+#[test]
+fn a_surface_that_does_not_ask_for_an_operator_refuses_one() {
+    let signing_key = SigningKey::from_bytes(&[94; 32]);
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
+    let claims = operator_claims();
+    let token = sign_v2(&signing_key, &claims);
+
+    assert_eq!(
+        verifier.verify(
+            &token,
+            // The default, as a surface that said nothing about shape would get.
+            RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+            claims.issued_at_unix_ms + 1_000,
+        ),
+        Err(WorkloadTokenError::WrongIdentityShape)
+    );
+}
+
+/// And the converse: asking for an operator refuses an execution, so the
+/// admin surface cannot be reached by a Run however it was scoped.
+#[test]
+fn asking_for_an_operator_refuses_an_execution() {
+    let signing_key = SigningKey::from_bytes(&[95; 32]);
+    let verifier = WorkloadTokenVerifier::new(signing_key.verifying_key());
+    let mut run_shaped = claims();
+    run_shaped.scopes = BTreeSet::from(["mcp.oauth.admin".to_string()]);
+    run_shaped.audiences = BTreeSet::from(["model-gateway".to_string()]);
+    let token = sign_v2(&signing_key, &run_shaped);
+
+    assert_eq!(
+        verifier.verify(
+            &token,
+            RequiredCapability::operator("model-gateway", "mcp.oauth.admin"),
+            run_shaped.issued_at_unix_ms + 1_000,
+        ),
+        Err(WorkloadTokenError::WrongIdentityShape)
+    );
+}
+
 /// An operator identity: it says who is acting and for which tenant, and says
 /// nothing about an execution.
 fn operator_claims() -> WorkloadIdentityClaims {
@@ -219,7 +264,7 @@ fn an_operator_token_is_accepted_and_names_no_execution() {
     let verified = verifier
         .verify(
             &token,
-            RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+            RequiredCapability::operator("model-gateway", "mcp.oauth.admin"),
             claims.issued_at_unix_ms + 1_000,
         )
         .expect("a well-formed operator token must verify");
@@ -253,7 +298,7 @@ fn an_operator_token_that_names_a_run_is_refused() {
         assert_eq!(
             verifier.verify(
                 &token,
-                RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+                RequiredCapability::operator("model-gateway", "mcp.oauth.admin"),
                 claims.issued_at_unix_ms + 1_000,
             ),
             Err(WorkloadTokenError::InvalidClaims),
@@ -279,7 +324,7 @@ fn an_operator_token_without_an_actor_is_refused() {
         assert_eq!(
             verifier.verify(
                 &token,
-                RequiredCapability::new("model-gateway", "mcp.oauth.admin", true),
+                RequiredCapability::operator("model-gateway", "mcp.oauth.admin"),
                 claims.issued_at_unix_ms + 1_000,
             ),
             Err(WorkloadTokenError::InvalidClaims),
