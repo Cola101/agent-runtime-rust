@@ -14,7 +14,26 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：权威目录扫描失败关闭
+## 当前阶段：本地权威文件耐久替换
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 写入模型 | rollout 单 writer + pending queue + flush ack/retry | SQLite WAL + immediate transaction + post-commit publish | 文件替换权威统一强提交；Event 独立 append commit | 静态文件边界收口，仍无跨文件事务 |
+| 掉电边界 | inspected 普通 rollout flush 未逐记录 `sync_all` | WAL `synchronous=NORMAL`，由 SQLite 组提交 | file sync→rename→parent sync，错误 fail-closed | 单文件更保守，不代表整体领先 |
+| 高频状态 | writer 批量写 pending items | 事务/WAL 合并多行变化 | 模型路由逐次 fsync 实测击穿容量门禁 | OpenClaw 的组提交结构明显领先 |
+| 可移植性 | 跨平台产品链成熟 | SQLite 与 Gateway 运维成熟 | 当前只在 macOS/Unix 目录同步验证 | Windows rename/目录同步仍落后 |
+
+### 本阶段结论
+
+- 已验证：Session、Run、Checkpoint、控制收据、保留账本、子代理结果和 Tool reconciliation 使用同一强替换
+  顺序；同步失败不能被报告为成功。1000 Run 保留门禁恢复到 112–119 秒，阈值未放宽。
+- 相比 Codex，本项目没有复制“所有状态都进 rollout”；Event、Checkpoint 与投影仍按恢复职责分层。Codex 的
+  writer 恢复、客户端生命周期和跨平台产品面仍领先。
+- 相比 OpenClaw，本项目无需 SQLite 即可独立运行，但 SQLite WAL 对高频状态和多记录原子性更合适。下一项
+  应吸收其组提交思想，为模型路由设计有界追加 journal，而不是继续堆整文件 fsync。
+- **未外推**：模型路由掉电恢复、硬件断电、跨文件事务、Windows 和共享文件系统未完成；总体仍为 70–75%。
+
+## 上一阶段：权威目录扫描失败关闭
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

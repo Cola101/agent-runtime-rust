@@ -6,6 +6,7 @@
 //! the provider adapters in-process because there is no boundary to cross.
 
 pub mod admission;
+mod durable_file;
 pub mod embedded;
 pub mod grpc;
 pub mod ipc;
@@ -3857,18 +3858,9 @@ impl LocalRuntimeHost {
             ));
         }
         let path = Self::session_record_path(state_root, record.session_id);
-        let parent = path.parent().expect("Session record path has a parent");
-        std::fs::create_dir_all(parent)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
-        std::fs::write(
-            &staging,
-            serde_json::to_vec_pretty(record)
-                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?,
-        )
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(staging, path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
+        let body = serde_json::to_vec_pretty(record)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        durable_file::replace(&path, &body)
     }
 
     fn history_prefix(
@@ -4094,18 +4086,9 @@ impl LocalRuntimeHost {
         result: &SubagentResultDelivery,
     ) -> Result<(), LocalRuntimeError> {
         let path = Self::subagent_result_path(state_root, parent_run_id, result.delegation_id);
-        let parent = path.parent().expect("subagent result path has a parent");
-        std::fs::create_dir_all(parent)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
-        std::fs::write(
-            &staging,
-            serde_json::to_vec_pretty(result)
-                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?,
-        )
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(staging, path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
+        let body = serde_json::to_vec_pretty(result)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        durable_file::replace(&path, &body)
     }
 
     fn completed_subagent_result(
@@ -4230,32 +4213,15 @@ impl LocalRuntimeHost {
             .processor
             .checkpoint(attempt_id)
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
-        let dir = self.run_dir(run_id);
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
         let path = Self::checkpoint_path(&self.config.state_root, run_id);
         let body = serde_json::json!({
             "store_version": LOCAL_STORE_VERSION,
             "run_id": run_id,
             "checkpoint": snapshot,
         });
-        // Write then rename so a crash mid-write cannot leave a torn checkpoint
-        // that later refuses to restore.
-        let staging = dir.join("checkpoint.json.partial");
         let encoded = serde_json::to_vec_pretty(&body)
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
-        let mut file = std::fs::File::create(&staging)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        use std::io::Write as _;
-        file.write_all(&encoded)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(&staging, &path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        #[cfg(unix)]
-        std::fs::File::open(&dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        durable_file::replace(&path, &encoded)?;
         Ok(path)
     }
 
@@ -5361,20 +5327,9 @@ impl LocalRuntimeHost {
     ) -> Result<(), LocalRuntimeError> {
         let path =
             Self::tool_reconciliation_path(state_root, source_run_id, record.reconciliation_id);
-        let parent = path
-            .parent()
-            .expect("Tool reconciliation path has a parent");
-        std::fs::create_dir_all(parent)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
-        std::fs::write(
-            &staging,
-            serde_json::to_vec_pretty(record)
-                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?,
-        )
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(staging, path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
+        let body = serde_json::to_vec_pretty(record)
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+        durable_file::replace(&path, &body)
     }
 
     fn validate_tool_reconciliation_source(
@@ -6034,27 +5989,9 @@ impl LocalRuntimeHost {
         record: &LocalRunRecord,
     ) -> Result<(), LocalRuntimeError> {
         let path = Self::record_path(state_root, record.run_id);
-        let parent = path.parent().ok_or_else(|| {
-            LocalRuntimeError::StateRoot("local Run record path has no parent".into())
-        })?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
         let body = serde_json::to_vec_pretty(record)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&staging)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        file.write_all(&body)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(&staging, &path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        Ok(())
+        durable_file::replace(&path, &body)
     }
 
     fn managed_run_state(outcome: &LocalRunOutcome) -> LocalRunState {

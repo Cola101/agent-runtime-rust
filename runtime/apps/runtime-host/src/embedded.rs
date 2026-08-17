@@ -3136,7 +3136,7 @@ impl EmbeddedRuntime {
         let path = Self::control_receipt_path(state_root, receipt.command_id);
         let body = serde_json::to_vec_pretty(receipt)
             .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        Self::durable_replace(&path, &body)
+        crate::durable_file::replace(&path, &body)
     }
 
     fn write_run_record(
@@ -3144,28 +3144,6 @@ impl EmbeddedRuntime {
         record: &LocalRunRecord,
     ) -> Result<(), LocalRuntimeError> {
         LocalRuntimeHost::write_run_record(state_root, record)
-    }
-
-    fn durable_replace(path: &Path, body: &[u8]) -> Result<(), LocalRuntimeError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| LocalRuntimeError::StateRoot("state path has no parent".into()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        let staging = path.with_extension("json.partial");
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&staging)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        file.write_all(body)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        std::fs::rename(&staging, path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-        Ok(())
     }
 
     fn profile(

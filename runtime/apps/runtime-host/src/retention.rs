@@ -275,24 +275,6 @@ fn active_segment_path(state_root: &Path, segment_id: u64) -> PathBuf {
     retention_root(state_root).join(format!("active-{segment_id:020}.json"))
 }
 
-fn durable_replace(path: &Path, body: &[u8]) -> Result<(), LocalRuntimeError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| LocalRuntimeError::StateRoot("retention path has no parent".into()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    let staging = path.with_extension("json.partial");
-    use std::io::Write as _;
-    let mut file = std::fs::File::create(&staging)
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    file.write_all(body)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    std::fs::rename(&staging, path)
-        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    sync_directory(parent)
-}
-
 fn sync_directory(path: &Path) -> Result<(), LocalRuntimeError> {
     #[cfg(unix)]
     std::fs::File::open(path)
@@ -407,7 +389,7 @@ fn write_manifest(
     manifest.validate()?;
     let body = serde_json::to_vec_pretty(manifest)
         .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    durable_replace(&ledger_manifest_path(state_root), &body)
+    crate::durable_file::replace(&ledger_manifest_path(state_root), &body)
 }
 
 fn write_segment(
@@ -423,7 +405,7 @@ fn write_segment(
     };
     let body = serde_json::to_vec_pretty(segment)
         .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    durable_replace(&path, &body)
+    crate::durable_file::replace(&path, &body)
 }
 
 fn merge_segment(
@@ -1282,7 +1264,7 @@ fn write_ledger(
     ledger.validate()?;
     let body = serde_json::to_vec_pretty(ledger)
         .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
-    durable_replace(&legacy_ledger_path(state_root), &body)?;
+    crate::durable_file::replace(&legacy_ledger_path(state_root), &body)?;
     let _ = load_ledger_store(state_root)?;
     Ok(())
 }
