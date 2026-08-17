@@ -14,7 +14,29 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：有界冷 Event 历史
+## 当前阶段：Codex MCP 2026 跨项目兼容门禁
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 外部权威 | `rmcp-client` 自带 strict 2026 stdio server，并用它验证自己的客户端 | inspected HTTP 路径主要由 MCP SDK 提供 2025-06-18 transport | 固定 Codex commit+fixture SHA+clean tree，直接编译原始 source | 首次不是客户端与自家 fixture 互证 |
+| 2026 用户输入 | server/discover metadata、input_required、requestState/inputResponses | 未找到等价的 2026 stdio strict fixture | 同一 Run 跨 Host replacement 保存并回送 opaque state/form response | 这一窄协议样本与 Codex 对齐，领先 inspected OpenClaw 表面 |
+| 网络防护 | stdio 本轮不涉及 HTTP | SSRF、TLS/client cert、proxy、redirect、same-origin header 完整 | 本轮只测 stdio；HTTP 安全契约虽有内部测试但无外部矩阵 | OpenClaw 真实 HTTP 防护仍领先 |
+| 防假绿 | Codex 自己编译 fixture | SDK/项目测试体系 | 无 source 构建退出 2 stub；ordinary test 仍 ignore；只有 pinned script 算证据 | 外部证据边界明确 |
+
+### 本阶段结论
+
+- 已确认：Codex `ff352fab6209` 的原始 strict fixture 在完整 Agent Loop 中通过 discover、Tool、input-required、
+  Host replacement、continuation 与唯一终态；第一次 exact run 即通过，没有发现生产协议缺陷。
+- 相比 Codex，本项目不再只是根据其源码手工对标，而是消费同一个 fixture；Codex 的客户端集成范围、长期
+  rollout 与跨平台产品链仍领先。
+- 相比 OpenClaw，本项目在这个 MCP 2026 stdio 样本上更完整；OpenClaw 的 SDK 生态、HTTP SSRF/TLS/proxy/
+  redirect 防护和真实 integrations 广度仍领先，不能用一个 stdio fixture 宣称整体反超。
+- 架构差异：不 vendor 上游源码，使用 commit+SHA+clean tree 固定并在 OUT_DIR 临时编译，保留跨项目独立性；
+  ordinary workspace 仍自包含。N=1 不提高 70–75% 总体进度。
+- **未外推**：Codex legacy/oversized modes、官方 Streamable HTTP、第二个独立 MCP、真实 OAuth、长稳分页与三类
+  Provider 外部矩阵。
+
+## 上一阶段：有界冷 Event 历史
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

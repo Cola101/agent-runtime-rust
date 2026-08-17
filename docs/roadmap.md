@@ -127,6 +127,10 @@ cgroup 限制对真实进程树生效；九处免责声明逐条删除并替换�
 
 **门槛。** 真实厂商 API Key、真实 OAuth provider、可长稳运行的第三方 MCP server。
 
+**当前部分证据。** ADR-0137 已在无凭据条件下，用 hash-pinned Codex strict MCP 2026 stdio fixture 完成一个
+跨项目样本；2026 input-required 与 Host replacement continuation 真实通过。它把 MCP 样本数从 0 变为 1，
+但没有满足本阶段 N>1、HTTP、OAuth 或真实 Provider 的出口标准。
+
 **做什么。**
 - 真实厂商三协议兼容矩阵：`openai_responses` / `anthropic_messages` / `openai_compatible`
   对真实限流、`Retry-After`、冷却与错误响应的行为。目前只有 `openai_compatible` 验证过一次。

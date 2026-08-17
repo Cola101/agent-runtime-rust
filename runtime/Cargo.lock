@@ -77,6 +77,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-codex-mcp-2026-compat-fixture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "agent-edge-node"
 version = "0.1.0"
 dependencies = [

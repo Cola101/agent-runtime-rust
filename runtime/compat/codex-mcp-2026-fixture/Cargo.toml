@@ -1,0 +1,10 @@
+[package]
+name = "agent-codex-mcp-2026-compat-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+serde_json.workspace = true

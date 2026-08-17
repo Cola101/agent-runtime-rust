@@ -17,6 +17,7 @@ members = [
   "apps/trusted-workspace-tool",
   "apps/edge-node",
   "apps/runtime-host",
+  "compat/codex-mcp-2026-fixture",
 ]
 
 [workspace.package]

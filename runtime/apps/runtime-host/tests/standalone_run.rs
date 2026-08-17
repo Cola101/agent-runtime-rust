@@ -3528,8 +3528,9 @@ async fn modern_stdio_mcp_input_round_trip_survives_host_replacement() {
 
 /// Cross-project compatibility gate against Codex's strict MCP 2026 stdio test
 /// server. It is ignored in ordinary CI because the reference checkout is not
-/// a dependency of this repository; release evidence runs it with an explicit
-/// `CODEX_MCP_2026_STDIO_SERVER` binary path.
+/// a dependency of this repository. Release evidence must use
+/// `runtime/scripts/test-codex-mcp-2026-compat.sh`, which pins the upstream
+/// commit and source digest before supplying `CODEX_MCP_2026_STDIO_SERVER`.
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires the external Codex MCP 2026 stdio reference server"]

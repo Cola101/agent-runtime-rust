@@ -401,6 +401,12 @@ ADR-0136 已补上 opt-in 的有界冷 Event 层：只有读回校验通过的�
 关闭。该层默认关闭，不给本地 1000 Run 路径施加持续 fsync/磁盘成本；压缩、自动 quarantine、外部对象存储、
 共享文件系统和 Windows 仍未实现。
 
+ADR-0137 已把 Codex strict MCP 2026 stdio server 从人工 binary path 变成哈希固定的跨项目 release gate：
+只接受精确 Codex commit、clean fixture 和已复核 SHA，不复制上游源码；真实 Agent Loop 跨 Host replacement
+完成 input-required continuation。普通 workspace 无参考 checkout 时只构建 fail-closed stub，不把 ignored
+冒充通过。它只增加 N=1 的外部 MCP 证据，不代表 Streamable HTTP、OAuth、多第三方 Server 或三类 Provider
+兼容矩阵完成。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault
