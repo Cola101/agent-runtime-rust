@@ -24,7 +24,17 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
-2026-08-17 首条哈希固定的跨项目 MCP 门禁完成（ADR-0137）：脚本验证 Codex checkout 精确为
+2026-08-17 官方 Streamable HTTP 外部门禁完成（ADR-0138）：完整 npm lock 固定
+`@modelcontextprotocol/server-everything@2026.7.4` 与 SDK `1.30.0`，临时安装使用空环境、临时 HOME/cache、
+`--ignore-scripts` 和随机 loopback 端口；退出按精确 PID identity 回收并删除完整临时目录。Model Gateway 对
+官方实现的 discovery 与 echo call **2/2 通过**，独立 Rust Host 的完整 Agent Loop **1/1 通过**，覆盖模型选择
+外部 Tool、Tool Result 回灌和唯一终态。每条 exact test 额外检查名称和 `1 passed`，测试改名不能以零测试成功
+冒充通过；该守卫也已回补 Codex 门禁。当前生产协议第一次外部重跑即通过，没有修改生产 MCP 代码。
+MCP 外部样本现为 Codex strict stdio 与官方 Streamable HTTP 两个；真实 OAuth、非官方 SDK Server、长期流和
+Provider 外部矩阵仍缺，因此总体仍为 70–75%。证据见
+`docs/evidence/2026-08-17-official-streamable-http-mcp-compatibility.md`。
+
+同日首条哈希固定的跨项目 MCP 门禁完成（ADR-0137）：脚本验证 Codex checkout 精确为
 `ff352fab6209dc0f9d13fc0036ed3f9404682b2c`、strict MCP 2026 fixture 无脏改且 SHA-256 为
 `02224a4a998359a1e35c15ab489bcb3463dbdd0a0cec23428e8d15f06ec6b3d8`，随后不复制源码地编译原文件。
 真实 Agent Loop 通过 `server/discover`、Tool Call、`input_required`、第一 Host 退出、replacement 回送 opaque
@@ -588,6 +598,7 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 | MCP OAuth 第二阶段：discovery 与拒绝反馈 | `WWW-Authenticate` challenge → RFC 9728 Protected Resource Metadata → RFC 8414 Authorization Server Metadata → S256 PKCE begin，全程真实回环 HTTP。challenge 命名的 metadata URL 必须与 MCP endpoint 同源且在发请求前校验；`resource` 必须精确等于 endpoint；issuer 必须自有 authorization/token endpoint；不跟随重定向；body ≤64KiB、字段 ≤4KiB、scope ≤32；缺 `S256` 不退化为 plain。discovery 结果冻结进 PendingAuthorization，callback 从记录读取 endpoint，替换攻击失败。`resolve_credential` 改为携带 token digest，401 + `invalid_token` 经 CAS 精确标记 `authorization_required`；403、`insufficient_scope`、网络与协议错误不改变凭证状态；认证失败零重放。管理 gRPC/CLI、callback 承载、远端 revoke、Dynamic Client Registration 与真实外部 Server 兼容矩阵仍未实现 | `ADR-0119`、`runtime/apps/model-gateway/src/mcp_oauth.rs`、`runtime/apps/model-gateway/src/mcp.rs`、`runtime/apps/model-gateway/tests/mcp_oauth_discovery.rs`、`docs/evidence/2026-08-16-mcp-oauth-discovery-and-rejection-feedback.md` |
 | MCP 2026 可恢复用户输入 | RunExecution v19 冻结 revision/capability/scope；Checkpoint v25 在询问、回答、续传三个边界持久化。HTTP form/url 与 stdio form 均跨 Host replacement 原样续传 opaque state；URL 不承载 secret content；Codex 严格外部 stdio fixture 已完成真实 Agent Loop。续传后的 Unknown 副作用模糊失败仍 indeterminate。无状态 gRPC 轮次桥已实跑真实 MCP→Gateway→Worker ToolExecutor；NATS recovery poll 自动续传仍未验证 | `ADR-0090`—`ADR-0092`、`contracts/events/run-execution-requested.v19.example.json`、`runtime/{crates/protocol,apps/model-gateway,apps/worker,apps/runtime-host}`、`standalone_run.rs`、`mcp_end_to_end.rs`、`docs/evidence/2026-08-11-{durable-mcp-mrtr,mcp-mrtr-grpc-bridge,mcp-2026-stdio-url-compatibility}.md` |
 | Codex MCP 2026 跨项目门禁 | release 脚本固定 Codex commit、fixture SHA 与 clean tree，直接编译上游 strict stdio server；Runtime 完成 discover→Tool→input-required→Host replacement→continuation→terminal。普通 workspace 无 source 时只构建退出 2 的 stub，ignored 不冒充 pass。仅 N=1；HTTP/OAuth/多实现矩阵仍缺 | `ADR-0137`、`runtime/{scripts/test-codex-mcp-2026-compat.sh,compat/codex-mcp-2026-fixture}`、`runtime/apps/runtime-host/tests/standalone_run.rs`、`docs/{runtime-compatibility-matrix.md,evidence/2026-08-17-codex-mcp-2026-cross-project-compatibility.md}` |
+| 官方 Streamable HTTP MCP 门禁 | npm lock 与摘要固定 Server `2026.7.4`、SDK `1.30.0` 和 106 个临时依赖；空环境启动官方实现，Model Gateway 完成 discovery/call/stale digest 拒绝，独立 Host 完成真实 Agent Loop。三条 exact test 均要求 `1 passed`，临时 Server/node_modules/cache 全部回收。尚缺真实 OAuth、非官方 SDK 实现和长稳公网链 | `ADR-0138`、`runtime/{scripts/test-mcp-streamable-http-compat.sh,compat/mcp-server-everything-http}`、`runtime/apps/{model-gateway,runtime-host}/tests/{mcp_real_server_compat,standalone_run}.rs`、`docs/evidence/2026-08-17-official-streamable-http-mcp-compatibility.md` |
 | Runtime IR | 供应商无关模型请求/流事件、错误分类、Tool 描述、assistant Tool Call / tool result、Reasoning、Refusal 与来源绑定 private state；跨 Provider omission 是无 opaque 数据且不提交输出的审计事件 | `ADR-0067`、`runtime/crates/protocol/tests/model_ir.rs`、`runtime/apps/model-gateway/tests/{openai_responses,anthropic_messages,failover}.rs` |
 | Runtime 执行策略 | RunExecution v18 在权威 root Session branch 之上冻结 runtime-policy schema 4、有界 Tool 并发和操作员 MCP effect；ModelInvocation v4 带策略摘要传至 Gateway。Worker Checkpoint schema 24 进一步绑定 source-order Tool commit queue、未完成请求和 staged results；恢复拒绝策略、目录、审批、历史、branch、预算、并行或 MCP effect 语义漂移。独立 Rust Host 使用同一策略且不依赖控制面 | `ADR-0041`、`ADR-0047`、`ADR-0052`—`ADR-0068`、`ADR-0086`、`contracts/events/run-execution-requested.v18.example.json`、`execution_contract.rs`、`history_repair_contract.rs`、`assignment.rs`、`standalone_run.rs`、`subagent_concurrency.rs`、`multi_provider.rs`、`docs/evidence/2026-08-11-run-frozen-mcp-tool-effects.md` |
 | 独立 Host 多 Provider 路由与健康 | 同一 IR 驱动三协议候选；按健康、地域、数据等级、能力和费用过滤并冻结链。仅零事件且策略允许的 retryable 错误可重试/切换；部分输出禁止重放。route journal schema 2 原子保存 cursor、attempt/inflight、退避、失败摘要、选择与 staged events；Provider 健康状态跨 Host 保存 cooldown、`Retry-After` 和 half-open lease。普通 Turn 与压缩摘要共用路径；认证/账单不 fallback、不污染 circuit。CLI JSON 只引用密钥环境变量 | `ADR-0065`、`ADR-0066`、`runtime/apps/{model-gateway,runtime-host}/src/{openai_compatible.rs,lib.rs,main.rs}`、`runtime/apps/runtime-host/tests/{multi_provider,daemon_recovery,standalone_run}.rs`、`docs/evidence/2026-08-10-{standalone-multi-provider-safe-failover,persistent-provider-health-retry-cooldown}.md` |

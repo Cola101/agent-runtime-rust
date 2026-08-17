@@ -55,11 +55,28 @@ cargo build \
   -p agent-codex-mcp-2026-compat-fixture
 verify_reference
 
-CODEX_MCP_2026_STDIO_SERVER="$CARGO_TARGET_DIR/debug/agent-codex-mcp-2026-compat-fixture" \
-  cargo test \
-    --manifest-path "$RUNTIME_ROOT/Cargo.toml" \
-    --locked \
-    -p agent-runtime-host \
-    --test standalone_run \
-    codex_mcp_2026_stdio_server_completes_a_recoverable_agent_loop \
-    -- --ignored --exact
+TEST_NAME="codex_mcp_2026_stdio_server_completes_a_recoverable_agent_loop"
+if ! TEST_OUTPUT=$(
+  CODEX_MCP_2026_STDIO_SERVER="$CARGO_TARGET_DIR/debug/agent-codex-mcp-2026-compat-fixture" \
+    CARGO_TERM_COLOR=never \
+    cargo test \
+      --manifest-path "$RUNTIME_ROOT/Cargo.toml" \
+      --locked \
+      -p agent-runtime-host \
+      --test standalone_run \
+      "$TEST_NAME" \
+      -- --ignored --exact 2>&1
+); then
+  printf '%s\n' "$TEST_OUTPUT" >&2
+  exit 1
+fi
+printf '%s\n' "$TEST_OUTPUT"
+if ! printf '%s\n' "$TEST_OUTPUT" | grep -F "test $TEST_NAME ... ok" >/dev/null; then
+  echo "exact compatibility test did not execute successfully: $TEST_NAME" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$TEST_OUTPUT" | grep -F \
+  "test result: ok. 1 passed; 0 failed; 0 ignored;" >/dev/null; then
+  echo "unexpected compatibility test summary: $TEST_NAME" >&2
+  exit 1
+fi

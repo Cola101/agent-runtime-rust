@@ -407,6 +407,12 @@ ADR-0137 已把 Codex strict MCP 2026 stdio server 从人工 binary path 变成�
 冒充通过。它只增加 N=1 的外部 MCP 证据，不代表 Streamable HTTP、OAuth、多第三方 Server 或三类 Provider
 兼容矩阵完成。
 
+ADR-0138 已把历史上人工启动的官方 Streamable HTTP 验证升级为锁定门禁：npm lock 固定
+`server-everything@2026.7.4`、SDK `1.30.0` 和完整传递依赖，空环境临时安装/启动，按精确 PID 回收且不留下
+`node_modules` 或 npm cache。Model Gateway 的 discovery/call/stale digest 拒绝与独立 Host 的完整 Agent Loop
+共 3/3 通过；每条还验证 test name 与 `1 passed`，不存在零测试假绿。当前 MCP 有两个外部样本，但真实 OAuth、
+非官方 SDK/手写 Server、长稳公网流和三类真实 Provider 兼容矩阵仍未完成。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault

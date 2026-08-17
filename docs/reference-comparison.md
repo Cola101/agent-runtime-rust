@@ -14,7 +14,30 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：Codex MCP 2026 跨项目兼容门禁
+## 当前阶段：官方 Streamable HTTP MCP 外部兼容门禁
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 外部实现 | inspected 主测试大量使用 Rust RMCP 本地 Server；另有真实产品生态 | MCP SDK 及大量 integrations，inspected 测试/运行路径广 | 锁定另一语言官方 `server-everything` 与完整 npm 依赖图 | 增加独立协议证据，不等于产品生态对齐 |
+| Streamable HTTP | Session、OAuth、重试、错误恢复与 app-server/CLI 生命周期成熟 | stdio/SSE/Streamable HTTP、OAuth/Auth Profile 与 Gateway 生命周期成熟 | 官方 discovery、SSE/JSON、Session ID、initialized、echo call 和 stale digest 拒绝 | 基础客户端协议已外部验证；长连接/OAuth 仍落后 |
+| Agent Loop | MCP Tool 进入成熟 Turn/rollout/客户端链 | MCP Tool 进入 Agent/Gateway/Session 与 channel integrations | 外部 echo 穿过 Runtime Tool 事件、模型第二轮和唯一终态 | 核心执行链成立；UI/Gateway 产品面不在本阶段 |
+| HTTP 安全 | shared HTTP client 与 OAuth/transport 策略成熟 | SSRF、TLS/client cert、代理、redirect、same-origin header、stream cleanup 完整 | DNS 全地址检查/固定、禁代理、禁重定向、TLS hostname 校验、有界 SSE | 当前 fail-closed 更窄；安全代理/client cert 广度落后 OpenClaw |
+| 门禁与垃圾 | 上游 workspace/CI 管理依赖 | pnpm workspace 与完整测试基建 | lock SHA、Server/SDK 精确版本、空环境临时安装、PID identity 清理、零测试守卫 | 适合本地无持久 Node 依赖的 Rust 仓库 |
+
+### 本阶段结论
+
+- 已确认：官方 `server-everything@2026.7.4` / SDK `1.30.0` 的 discovery、真实 echo call、stale catalog
+  digest 拒绝和完整 Runtime Agent Loop 3/3 通过；没有观察到生产协议缺陷。
+- 相比 Codex，本项目获得了另一语言官方实现的锁定外部门禁；Codex 的 Streamable HTTP OAuth、重试、CLI/
+  app-server 配置与长期客户端生命周期仍明显领先。
+- 相比 OpenClaw，本项目的 DNS pin、禁代理/redirect 是更窄的 fail-closed 选择，不是全面领先；OpenClaw 的
+  安全代理、TLS client cert、redirect/header policy、连接与 integrations 广度仍更完整。
+- 多租户偏离是有意的：外部 catalog digest 继续在调用前冻结，官方 Server 健康也不能绕过 Run 权威目录；
+  这比单用户客户端默认信任当前目录更严格。
+- **未外推**：非官方 SDK/手写第三方 Server、真实 OAuth、公网 TLS/proxy/redirect、长期 SSE、外部
+  Resources/Prompts 分页和三类 Provider 矩阵。总体仍为 70–75%。
+
+## 上一阶段：Codex MCP 2026 跨项目兼容门禁
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

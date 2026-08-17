@@ -5,14 +5,16 @@
 //! official reference implementation (`@modelcontextprotocol/server-everything`,
 //! Streamable HTTP transport) and found four ways the client was wrong.
 //!
-//! Ignored by default because it needs that server running. Bring it up and run:
+//! Ignored by default because it needs that server running. Release evidence
+//! must use the locked runner from the repository root:
 //!
 //! ```text
-//! npm pack @modelcontextprotocol/server-everything && tar xzf modelcontext*.tgz
-//! (cd package && npm install --omit=dev --ignore-scripts && node dist/index.js streamableHttp)
-//! AGENT_RUNTIME_MCP_COMPAT_ENDPOINT=http://127.0.0.1:3001/mcp \
-//!   cargo test -p agent-model-gateway --test mcp_real_server_compat -- --ignored
+//! runtime/scripts/test-mcp-streamable-http-compat.sh
 //! ```
+//!
+//! The runner pins the full npm dependency graph, installs it outside the
+//! repository, and verifies exact test counts so a renamed test cannot turn
+//! into a green zero-test run.
 //!
 //! Ignored rather than skipped-when-unset on purpose: a skip counts as a pass in
 //! the summary, and "the compatibility suite passed" would then be true on a

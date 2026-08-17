@@ -3609,6 +3609,77 @@ async fn codex_mcp_2026_stdio_server_completes_a_recoverable_agent_loop() {
     provider.await.expect("provider served both turns");
 }
 
+/// Cross-project compatibility gate against the official MCP reference
+/// implementation's Streamable HTTP transport. Release evidence must use
+/// `runtime/scripts/test-mcp-streamable-http-compat.sh`, which installs the
+/// fully locked server dependency graph into a temporary directory.
+#[tokio::test]
+#[ignore = "requires the locked external MCP Streamable HTTP reference server"]
+async fn official_streamable_http_server_completes_an_agent_loop() {
+    let endpoint = std::env::var("AGENT_RUNTIME_MCP_COMPAT_ENDPOINT")
+        .expect("AGENT_RUNTIME_MCP_COMPAT_ENDPOINT must name the official reference server");
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (provider_endpoint, provider) = spawn_provider(vec![
+        runtime_mcp_tool_turn(serde_json::json!([{
+            "index": 0,
+            "id": "call_official_http_echo",
+            "type": "function",
+            "function": {
+                "name": "mcp:everything/echo",
+                "arguments": serde_json::json!({"message": "agent runtime evidence"}).to_string()
+            }
+        }])),
+        text_turn("answer after official Streamable HTTP MCP compatibility"),
+    ])
+    .await;
+    let mut local_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("workspace"),
+        provider_endpoint,
+        BTreeSet::from(["tool:mcp:everything".to_owned()]),
+    );
+    local_config.mcp_servers = vec![LocalMcpServerConfig {
+        server_id: uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0094),
+        name: "everything".into(),
+        transport: LocalMcpTransportConfig::StreamableHttp { endpoint },
+        tool_names: BTreeSet::from(["echo".to_owned()]),
+        tool_effect_overrides: BTreeMap::new(),
+        required: true,
+    }];
+
+    let mut host = LocalRuntimeHost::start(local_config).expect("official HTTP MCP host starts");
+    let outcome = host
+        .execute("Use the official Streamable HTTP MCP echo Tool before answering.")
+        .await
+        .expect("official Streamable HTTP MCP Agent Loop succeeds");
+
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+    assert_eq!(
+        outcome.output,
+        "answer after official Streamable HTTP MCP compatibility"
+    );
+    assert!(outcome.pending_approval.is_none());
+    assert!(outcome.pending_mcp_input.is_none());
+    assert!(
+        outcome
+            .event_types
+            .iter()
+            .any(|event| event == "tool.result")
+    );
+    assert_eq!(
+        outcome
+            .event_types
+            .iter()
+            .filter(|event| event.as_str() == "run.succeeded")
+            .count(),
+        1
+    );
+
+    host.shutdown().await;
+    provider.await.expect("provider served both turns");
+}
+
 /// The production break this catches is binding a Checkpoint only to the Tool
 /// catalog digest. A different endpoint can advertise an identical catalog;
 /// recovery must still reject it because the approved remote authority moved.

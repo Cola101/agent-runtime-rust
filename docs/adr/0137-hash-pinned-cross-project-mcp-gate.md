@@ -27,6 +27,8 @@ Runtime 已有大量自写 HTTP/stdio 回环 MCP server，能证明内部协议�
 5. 构建复用本仓库 `runtime/target`，不创建 `node_modules`、常驻服务、凭据目录或第二套构建缓存。
    脚本同时支持普通 checkout 与 Git worktree、macOS `shasum` 与 Linux `sha256sum`，所有 Cargo 调用使用
    `--locked`，避免兼容门禁隐式改变依赖解析。
+6. ADR-0138 审查外部门禁时补充精确测试计数：Cargo 成功之外必须出现目标 test name 和
+   `1 passed / 0 failed / 0 ignored`，防止测试改名后零测试仍返回成功。
 
 ## 后果
 

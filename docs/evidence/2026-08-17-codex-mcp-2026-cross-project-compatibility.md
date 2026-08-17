@@ -42,6 +42,7 @@ stub，执行固定退出 2；它不能被误当成外部 server。
 - compat package `cargo clippy --all-targets -- -D warnings`：通过。
 - 无 fixture source 的普通构建：通过；生成的 stub 执行退出码精确为 2，错误消息精确指向固定脚本。
 - 固定脚本在普通 Codex checkout 上最终重跑：1 通过、0 失败；脚本同时支持 Git worktree。
+- ADR-0138 复审后加入 test name 与精确 `1 passed` 守卫并重跑 1/1；测试改名不能以零测试成功假绿。
 - `cargo fmt --check`、shell 语法检查与 `git diff --check`：通过。
 - 未启动外部服务、未使用凭据、未创建第二套 Cargo target 或项目临时目录。
 
