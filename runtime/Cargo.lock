@@ -217,6 +217,7 @@ dependencies = [
 name = "agent-runtime-host"
 version = "0.1.0"
 dependencies = [
+ "agent-grpc-security",
  "agent-kernel",
  "agent-model-gateway",
  "agent-model-gateway-protocol",

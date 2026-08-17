@@ -14,6 +14,7 @@ agent-protocol.workspace = true
 agent-runtime-worker = { path = "../worker" }
 agent-tool-runtime.workspace = true
 agent-workload-identity.workspace = true
+agent-grpc-security.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +26,7 @@ futures-util.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 tokio-util.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 prost.workspace = true
 tracing.workspace = true
@@ -34,4 +36,3 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23.0"
-tokio-stream.workspace = true

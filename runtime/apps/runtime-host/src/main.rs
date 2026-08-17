@@ -14,10 +14,12 @@ use agent_runtime_host::{
     LocalProcessSessionConfig, LocalProviderConfig, LocalProviderHealthPolicy, LocalRuntimeConfig,
     LocalRuntimeHost, LocalToolConsent, WORKSPACE_READ_SCOPE,
 };
+use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocationServer;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio_stream::wrappers::TcpListenerStream;
 use uuid::Uuid;
 
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -26,6 +28,48 @@ fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
 
 fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(PathBuf::from(required("AGENT_RUNTIME_LOCAL_STATE_ROOT")?))
+}
+
+/// Everything the network invocation surface needs, or nothing at all.
+struct InvocationSurface {
+    bind_address: std::net::SocketAddr,
+    tls: agent_grpc_security::ServerMtlsMaterials,
+    verifier: agent_workload_identity::WorkloadTokenVerifier,
+}
+
+/// Resolves the network surface configuration.
+///
+/// Two properties, both deliberate:
+///
+/// - **Off unless asked for.** No bind address means no surface. The local Unix
+///   socket stays the only way in, exactly as before, so an existing
+///   installation does not silently gain a network listener on upgrade.
+/// - **Cannot be turned on without mTLS and a verifying key.** Naming a bind
+///   address without the materials is a configuration error that refuses to
+///   start -- never a reason to serve in the clear. The Unix socket could treat
+///   "you can open this file" as the authorization; a TCP port has no such
+///   thing, and a surface that starts Runs must not be the place we discover
+///   that.
+fn load_invocation_surface() -> Result<Option<InvocationSurface>, Box<dyn std::error::Error>> {
+    let Ok(bind_address) = std::env::var("AGENT_RUNTIME_INVOCATION_BIND") else {
+        return Ok(None);
+    };
+    let bind_address = bind_address.parse::<std::net::SocketAddr>().map_err(|_| {
+        format!("AGENT_RUNTIME_INVOCATION_BIND is not a socket address: {bind_address}")
+    })?;
+    let tls = agent_grpc_security::ServerMtlsMaterials::from_files(
+        required("AGENT_RUNTIME_GRPC_SERVER_CERT")?,
+        required("AGENT_RUNTIME_GRPC_SERVER_KEY")?,
+        required("AGENT_RUNTIME_GRPC_CLIENT_CA_CERT")?,
+    )?;
+    let verifier = agent_workload_identity::WorkloadTokenVerifier::from_base64(&required(
+        "AGENT_RUNTIME_WORKLOAD_IDENTITY_PUBLIC_KEY",
+    )?)?;
+    Ok(Some(InvocationSurface {
+        bind_address,
+        tls,
+        verifier,
+    }))
 }
 
 fn load_mcp_servers_from_path(
@@ -272,6 +316,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         // The long-running Runtime. Runs outlive every client connection.
         "serve" => {
+            // Resolved first, before the rest of the configuration and before
+            // any recovery. It is cheap and independent, and it is the one
+            // security-relevant gate here: "you asked for a network surface
+            // without mTLS" must never be masked by an unrelated
+            // configuration error that an operator fixes and restarts past.
+            let surface = load_invocation_surface()?;
             let config = load_config()?;
             let socket = default_socket_path(&config.state_root);
             let listener = match LocalRuntimeDaemon::bind(&socket).await {
@@ -294,6 +344,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "runtime-host listening on {} (resumed {resumed} unfinished run(s))",
                 socket.display()
             );
+
+            // Both adapters drive the SAME EmbeddedRuntime. A second instance
+            // over one state root would give each its own admission ceilings,
+            // owner epochs and retention gates while both believed they owned
+            // the directory.
+            if let Some(surface) = surface {
+                let service = agent_runtime_host::grpc::RuntimeInvocationGrpcService::new(
+                    daemon.runtime(),
+                    surface.verifier,
+                );
+                let grpc_listener = tokio::net::TcpListener::bind(surface.bind_address).await?;
+                // Built before the spawn so a bad TLS configuration fails the
+                // process here, rather than inside a task nobody is awaiting.
+                let server = tonic::transport::Server::builder()
+                    .tls_config(surface.tls.into_tonic())?
+                    .add_service(RuntimeInvocationServer::new(service));
+                eprintln!(
+                    "runtime-host invocation surface listening on {} (mTLS required)",
+                    surface.bind_address
+                );
+                tokio::spawn(async move {
+                    if let Err(error) = server
+                        .serve_with_incoming(TcpListenerStream::new(grpc_listener))
+                        .await
+                    {
+                        eprintln!("runtime-host invocation surface stopped: {error}");
+                    }
+                });
+            }
+
             daemon.serve(listener).await;
             Ok(())
         }

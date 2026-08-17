@@ -135,6 +135,24 @@ impl LocalRuntimeDaemon {
         }))
     }
 
+    /// The Runtime this daemon drives, so a second adapter can be served from
+    /// the same process without a second `EmbeddedRuntime`.
+    ///
+    /// One Runtime per state root is not a convenience: two would each believe
+    /// they owned the same directory, and the admission ceilings, owner epochs
+    /// and retention gates that keep a state root consistent are per-instance.
+    #[must_use]
+    pub fn runtime(&self) -> Arc<EmbeddedRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// The invocation this daemon was registered for. A network adapter needs
+    /// it to state which Profile exists, and nothing else.
+    #[must_use]
+    pub const fn invocation(&self) -> RuntimeInvocationContext {
+        self.invocation
+    }
+
     fn record_is_owned(&self, record: &LocalRunRecord) -> bool {
         let legacy = [
             record.tenant_id,
