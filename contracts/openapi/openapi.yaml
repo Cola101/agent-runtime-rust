@@ -2,7 +2,17 @@ openapi: 3.1.0
 info:
   title: Agent Runtime Platform API
   version: 0.1.0
-  description: Multi-tenant resource API. Every operation is authorized against the tenant and application claims in the OIDC access token.
+  description: >-
+    Control-plane resource API. Every operation is authorized against the tenant and application
+    claims in the OIDC access token.
+
+    This is NOT the Rust Runtime's contract and no Rust crate implements it: it describes the
+    management surface a control plane exposes to consoles and business systems (Workspaces,
+    Agents, Skills, Model Providers, Console projections). The Runtime's own invocation contract
+    is `contracts/proto/runtime.proto` (`RuntimeInvocation`), which is served by
+    `agent-runtime-host`. Anything here that overlaps -- Runs, Sessions, Approvals -- is the
+    control plane's projection of Runtime state, reached over that gRPC surface, not a second
+    implementation of it.
   license:
     name: Apache License 2.0
     identifier: Apache-2.0
