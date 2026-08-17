@@ -388,6 +388,12 @@ metadata discovery、管理 API/CLI callback、MCP 401 rejected-token CAS 联动
 不把 Java/GUI/Edge 或外部数据库引入一次 Run。跨进程/跨节点 tenant authority、Windows ConPTY、真实 Linux
 cgroup、生产远端 command ledger 与冷归档继续保留为明确缺口。
 
+ADR-0132—0135 已把本地文件模式的模型路由与 Run 终态提交链收敛为统一语义：有界 route WAL 先保存 Provider
+出站/响应事实，Kernel terminal Event 先进入摘要有效的终态 Checkpoint，再发布原始 Event，随后封口路由 WAL
+并收敛 adapter 投影。Direct Host、Embedded 与网络入口对终态 Run 都只验证和观察，不再把 `resume` 当成新的
+模型回合；继续对话必须创建新 Run/Session Turn。该机制不依赖数据库，但也不冒充通用多文件事务；跨机器 owner、
+共享文件系统、硬件掉电与 Windows 仍是明确缺口。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault

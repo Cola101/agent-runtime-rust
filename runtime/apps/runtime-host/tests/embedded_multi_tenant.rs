@@ -226,7 +226,7 @@ async fn a_provider_selection_failure_is_a_durable_terminal_run() {
 }
 
 #[tokio::test]
-async fn a_session_directory_scan_failure_cannot_publish_a_fake_terminal_event() {
+async fn a_session_directory_scan_failure_does_not_block_a_checkpoint_bound_one_shot_terminal() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
     let identity = invocation(Uuid::now_v7());
@@ -256,27 +256,27 @@ async fn a_session_directory_scan_failure_cannot_publish_a_fake_terminal_event()
         .expect("break Session authority scan");
     let run_id = Uuid::now_v7();
 
-    let result = runtime
+    let outcome = runtime
         .execute(identity, run_id, "fail before Provider egress")
-        .await;
-    assert!(
-        result.is_err(),
-        "a terminal event cannot be published when Session ownership cannot be checked"
-    );
-    assert!(
-        agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0)
-            .expect("committed prefix")
+        .await
+        .expect("unrelated Session corruption must not block a one-shot Run");
+    assert_eq!(outcome.status, RunStatus::Failed);
+    let events = agent_runtime_host::LocalRuntimeHost::replay_events(state.path(), run_id, 0)
+        .expect("committed terminal history");
+    assert_eq!(
+        events
             .iter()
-            .all(|event| !matches!(
-                event.event_type.as_str(),
-                "run.succeeded"
-                    | "run.failed"
-                    | "run.cancelled"
-                    | "run.timed_out"
-                    | "run.indeterminate"
-            )),
-        "storage uncertainty must not be converted into a terminal Run"
+            .filter(|event| event.event_type == "run.failed")
+            .count(),
+        1,
+        "the one-shot terminal Event remains singular"
     );
+    let checkpoint = agent_runtime_host::LocalRuntimeHost::load_checkpoint(
+        &agent_runtime_host::LocalRuntimeHost::checkpoint_path(state.path(), run_id),
+    )
+    .expect("terminal Checkpoint receipt");
+    assert_eq!(checkpoint.status, RunStatus::Failed);
+    assert!(checkpoint.verify_digest());
 }
 
 #[tokio::test]

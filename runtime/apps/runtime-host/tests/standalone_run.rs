@@ -88,7 +88,7 @@ async fn spawn_history_import_provider() -> (String, tokio::task::JoinHandle<Vec
     let port = listener.local_addr().expect("provider addr").port();
     let handle = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for answer in ["imported answer", "resumed imported answer"] {
+        for answer in ["imported answer"] {
             let (mut socket, _) = listener.accept().await.expect("provider request");
             requests.push(read_json_request(&mut socket).await);
             let body = text_turn(answer);
@@ -1247,10 +1247,6 @@ async fn spawn_mcp_aware_provider() -> (String, tokio::task::JoinHandle<()>) {
         (
             text_turn("answer grounded by MCP"),
             vec!["call_mcp_1", "local mcp evidence"],
-        ),
-        (
-            text_turn("resumed with frozen MCP"),
-            vec!["mcp:local/search"],
         ),
     ];
     let handle = tokio::spawn(async move {
@@ -2642,7 +2638,7 @@ async fn terminal_checkpoint_republishes_a_missing_terminal_event_before_session
 /// promote imported System authority, and must remain identical after a Host
 /// replacement without turning historical Tool calls into executable work.
 #[tokio::test]
-async fn explicit_history_import_is_repaired_audited_and_restored_without_tool_replay() {
+async fn explicit_history_import_is_repaired_audited_and_terminal_resume_is_idempotent() {
     let state = tempfile::tempdir().expect("state root");
     let workspace = tempfile::tempdir().expect("workspace");
     let (endpoint, provider) = spawn_history_import_provider().await;
@@ -2681,14 +2677,17 @@ async fn explicit_history_import_is_repaired_audited_and_restored_without_tool_r
     let resumed = replacement
         .resume_with_imported_history(first_outcome.run_id, "Continue safely.", 2, import)
         .await
-        .expect("imported history resumes");
+        .expect("terminal imported-history Run converges");
     assert_eq!(resumed.status, RunStatus::Succeeded);
-    assert_eq!(resumed.output, "resumed imported answer");
+    assert_eq!(resumed.output, "imported answer");
     assert_eq!(resumed.history_repair, first_outcome.history_repair);
 
     let requests = provider.await.expect("provider observations");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["messages"], requests[1]["messages"]);
+    assert_eq!(
+        requests.len(),
+        1,
+        "a terminal Run is observed, never reissued to the Provider"
+    );
     let messages = requests[0]["messages"].as_array().expect("messages");
     let roles = messages
         .iter()
@@ -3137,15 +3136,14 @@ async fn standalone_checkpoint_contains_the_runtime_policy_accepted_before_execu
 }
 
 #[tokio::test]
-async fn a_restarted_local_host_resumes_the_run_from_its_filesystem_checkpoint() {
+async fn a_restarted_local_host_observes_a_terminal_run_from_its_checkpoint() {
     let state = tempfile::tempdir().expect("state root");
     let workspace = tempfile::tempdir().expect("workspace");
     let workspace_root = workspace
         .path()
         .canonicalize()
         .expect("canonical workspace");
-    let (endpoint, _provider) =
-        spawn_provider(vec![text_turn("first answer"), text_turn("resumed answer")]).await;
+    let (endpoint, provider) = spawn_provider(vec![text_turn("first answer")]).await;
 
     let mut first = LocalRuntimeHost::start(config(
         state.path().to_path_buf(),
@@ -3171,28 +3169,23 @@ async fn a_restarted_local_host_resumes_the_run_from_its_filesystem_checkpoint()
     let resumed = second
         .resume(first_outcome.run_id, "Summarize the workspace.", 2)
         .await
-        .expect("resume from the local checkpoint");
+        .expect("observe the terminal local checkpoint");
 
     assert_eq!(resumed.run_id, first_outcome.run_id);
-    assert_ne!(
+    assert_eq!(
         resumed.attempt_id, first_outcome.attempt_id,
-        "recovery must run on a new attempt"
+        "terminal observation must not manufacture another attempt"
     );
-    assert!(
-        resumed
-            .event_types
-            .first()
-            .is_some_and(|e| e == "run.restored"),
-        "resume must start from the restored event: {:?}",
-        resumed.event_types
-    );
+    assert_eq!(resumed.event_types, first_outcome.event_types);
+    assert_eq!(resumed.output, "first answer");
     assert_eq!(resumed.status, RunStatus::Succeeded);
+    provider.await.expect("one Provider request only");
 }
 
 /// The production break this catches is keeping standalone MCP behind the
 /// external gRPC Gateway, or restoring before the exact catalog is reattached.
-/// The first Run must execute a real MCP Tool; a fresh Host must then resume the
-/// same Checkpoint with the frozen Tool visible and without replaying the call.
+/// The first Run must execute a real MCP Tool; a fresh Host must then observe
+/// the terminal Checkpoint without rediscovery, model replay, or Tool replay.
 #[tokio::test]
 async fn standalone_mcp_executes_and_recovers_without_an_external_gateway() {
     let state = tempfile::tempdir().expect("state root");
@@ -3241,15 +3234,10 @@ async fn standalone_mcp_executes_and_recovers_without_an_external_gateway() {
             2,
         )
         .await
-        .expect("MCP checkpoint resumes");
+        .expect("terminal MCP checkpoint converges");
     assert_eq!(resumed.status, RunStatus::Succeeded);
-    assert_eq!(resumed.output, "resumed with frozen MCP");
-    assert!(
-        resumed
-            .event_types
-            .first()
-            .is_some_and(|event| event == "run.restored")
-    );
+    assert_eq!(resumed.output, "answer grounded by MCP");
+    assert_eq!(resumed.event_types, first_outcome.event_types);
     assert_eq!(
         mcp_calls.load(Ordering::SeqCst),
         1,
@@ -3668,7 +3656,7 @@ async fn standalone_mcp_recovery_rejects_another_server_with_the_same_catalog() 
         .resume(outcome.run_id, "Answer with the configured tools.", 2)
         .await
         .expect_err("a different MCP authority must not inherit the old Checkpoint");
-    assert!(matches!(error, LocalRuntimeError::Execution(_)));
+    assert!(matches!(error, LocalRuntimeError::Checkpoint(_)));
 
     provider.abort();
     first_mcp.abort();
@@ -4123,8 +4111,8 @@ async fn unavailable_optional_stdio_mcp_is_reported_while_the_run_continues() {
 
 /// The production break this catches is implementing stdio as a one-shot child
 /// per RPC, or restoring without the same transport authority. The same MCP
-/// process must serve discovery and Tool execution; a new Host may rediscover,
-/// but must not replay the completed call.
+/// process must serve discovery and Tool execution; a new Host observing the
+/// terminal Run must neither rediscover nor replay the completed call.
 #[cfg(unix)]
 #[tokio::test]
 async fn standalone_stdio_mcp_survives_recovery_without_replaying_a_tool() {
@@ -4169,16 +4157,15 @@ async fn standalone_stdio_mcp_survives_recovery_without_replaying_a_tool() {
             2,
         )
         .await
-        .expect("stdio MCP checkpoint resumes");
-    assert_eq!(resumed.output, "resumed with frozen MCP");
+        .expect("terminal stdio MCP checkpoint converges");
+    assert_eq!(resumed.output, "answer grounded by MCP");
+    assert_eq!(resumed.event_types, first_outcome.event_types);
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
         "called\n",
         "recovery must not replay a completed stdio Tool call"
     );
-    let replacement_grandchild = read_pid(&pid_file);
     drop(replacement);
-    assert!(wait_for_process_exit(replacement_grandchild).await);
     provider.await.expect("provider assertions");
 }
 
@@ -4373,7 +4360,7 @@ async fn a_local_run_that_changes_its_instructions_cannot_reuse_the_checkpoint()
         .await
         .expect_err("changed instructions must not restore");
     assert!(
-        matches!(error, LocalRuntimeError::Execution(_)),
+        matches!(error, LocalRuntimeError::Checkpoint(_)),
         "unexpected error: {error:?}"
     );
 }

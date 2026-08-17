@@ -24,6 +24,16 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-17 统一终态 Run 收敛完成（ADR-0135）：普通 one-shot Run 现在与 Root Session/子代理一样，在 terminal
+Event 可见前保存摘要绑定的原始 terminal envelope。Direct Host、Embedded 与网络入口遇到终态 Checkpoint 都只
+验证并观察原 Run，不再进入 Agent Loop；继续对话必须创建新 Run/Session Turn。真实故障窗口证明 Event 已提交
+但 route WAL completion 滞后时不会追加第二组 restored/output/terminal 事件，也不会重放 Provider；Event 缺失时
+补发完全相同的原始 envelope。唯一已结算 WAL 可幂等封口，第二个 unfinished 权威 WAL 与任何绑定漂移都在
+egress 前失败关闭，in-flight Provider WAL 则保留不确定证据而不伪装完成。Runtime Host **226 通过、0 失败、
+1 个外部 Codex MCP fixture 显式忽略**，Worker **163 通过、0 失败**；Clippy、fmt 与 diff 门禁通过。未证明真实
+厂商、硬件掉电、共享文件系统、跨机器 owner 与 Windows，因此总体进度仍为 70–75%。证据见
+`docs/evidence/2026-08-17-unified-terminal-run-convergence.md`。
+
 2026-08-15 MCP OAuth 凭证域第一阶段完成：RunExecution schema 21 与 Worker→Gateway Protobuf 只携带
 `oauth_credential_id`，该稳定句柄与 tenant、Server UUID、endpoint 一起进入授权摘要，静态 envelope 与 OAuth
 模式互斥且旧 schema fail-closed。Model Gateway 新增 PKCE S256 begin/complete、AES-256-GCM owner-only 文件账本、
@@ -584,6 +594,7 @@ Console 与完整 Console E2E 本次**未**重新执行，因此不在上表中�
 | 有界模型路由 WAL | 每个模型请求使用连续 revision 的全状态追加 WAL；换行提交、EOF 半行修复、32 条 compaction、8 MiB 单条和读取前总大小上限。Run/请求/路由/候选身份不可变，候选游标、失败/重试、尝试数、选择、观察和 completion 不可回退。V1/V2 snapshot 在 Provider 前原子迁移；普通成功只提交 inflight、staged response、选择观察、completion 四条。替代 Host 可应用 staged response 且不重放 Provider。Provider 健康仍是可重建缓存；硬件断电、跨文件事务、共享文件系统和 Windows 未验证 | `ADR-0132`、`runtime/apps/runtime-host/src/{lib.rs,durable_file.rs}`、`runtime/apps/runtime-host/tests/{multi_provider,embedded_retention}.rs`、`docs/evidence/2026-08-17-bounded-model-route-wal.md` |
 | Kernel 终态与控制收据收敛 | Event Cursor 已可见 terminal event 而 receipt 仍 Accepted 的窗口，由 64 路固定 Run shard 与 active finalizer `record_gate` 串行收敛；直接 `control` 与网络 `control_detached` 共用同一入口。严格 UUID `.json.partial` 视为未提交 staging，其他坏目录项继续 fail-closed；同命令重放返回 Completed/同终态，不再偶发 Internal 或重放 Provider。跨机器 command ledger 和共享 state root 未实现 | `ADR-0133`、`runtime/apps/runtime-host/src/embedded.rs`、`runtime/apps/runtime-host/tests/{grpc_invocation_recovery,embedded_control}.rs`、`docs/evidence/2026-08-17-terminal-event-control-receipt-convergence.md` |
 | Checkpoint 绑定终态事件发布 | Worker Checkpoint schema 27 在 Event 可见前保存原始 Kernel terminal envelope；Root Session/子代理恢复只在 active owner、完整多租户 invocation、替代 command 与连续 Event 前缀全部匹配时补发同一 event id。终态 child 直接收集而不进入普通 restore，Provider/Tool 不重放。旧 schema 已有 Event 可读，缺失 Event 无法证明身份时 fail-closed。任意跨文件事务、共享文件系统、跨机器 owner、硬件掉电和 Windows 未验证 | `ADR-0134`、`runtime/apps/{worker,runtime-host}/src/lib.rs`、`runtime/apps/{worker,runtime-host}/tests/{assignment,standalone_run,subagent_concurrency}.rs`、`docs/evidence/2026-08-17-checkpoint-bound-terminal-event-publication.md` |
+| 统一终态 Run 收敛 | 普通 one-shot、Root Session 与子代理统一为 terminal Checkpoint→Event→route WAL completion→adapter projection。Direct/Embedded/网络入口只观察已终态 Run；缺 Event 补发原 envelope，已结算 WAL 滞后可封口，冲突 WAL/身份漂移 fail-closed，in-flight Provider 证据不伪装完成。业务继续必须创建新 Run/Turn | `ADR-0135`、`runtime/apps/runtime-host/src/lib.rs`、`runtime/apps/runtime-host/tests/{multi_provider,standalone_run,daemon_recovery,embedded_multi_tenant,grpc_invocation_recovery}.rs`、`docs/evidence/2026-08-17-unified-terminal-run-convergence.md` |
 | Tool 容器边界 capability | 逐条声明 OS 强制的保证（workspace 写限制、凭证读拒绝、出网拒绝）与 backend（`MacosSeatbelt`/`Unsupported`），`const` + `cfg!` 推导不可漂移、不可由调用方放宽。缺任一保证在 Workspace 解析与进程创建之前具名 fail-closed；非 macOS 的 `wrap_with_containment` 返回错误而非裸可执行文件，静默降级分支已删除。一次性 Tool 与持久 Process Session 共用同一 `prepare()` 收口。该拒绝是确定性未执行，形成脱敏 Tool Result 而非 `indeterminate`。实现摘要修正：`workspace_access` 真实化（此前写死 `read_only`，读写与只读工具摘要相同）并纳入容器能力。**不新增任何非 macOS 隔离能力**，Linux landlock 仍未实现 | `ADR-0122`、`runtime/crates/tool-runtime/src/lib.rs`、`runtime/crates/tool-runtime/tests/containment_capability.rs`、`docs/evidence/2026-08-17-declared-tool-containment-capability.md` |
 | Linux cgroup v2 协议边界 | 显式 backend config；预校验后写五个限制文件，最终组件拒绝 symlink，membership 写 `0`，CPU parser 要求唯一 `usage_usec`。非 Linux 和尚未接完生命周期的 Linux 均在状态创建前拒绝；普通文件测试不等于真实 cgroup enforcement | `ADR-0073`、`runtime/crates/tool-runtime/src/process_resources.rs`、`runtime/crates/tool-runtime/tests/process_resource_capabilities.rs`、`docs/evidence/2026-08-10-linux-cgroup-v2-protocol-boundary.md` |
 | 持久资源身份与 pre-exec membership | schema 3 摘要绑定确定性 backend identity 和 aggregate CPU 观测位；schema 2 终态迁移为 Unix rlimit。父进程预开 controller fd，真实 child 在 exec 前写 membership；配置失败回滚空组、既有组拒绝接管。生产 cgroup 仍禁用 | `ADR-0075`、`runtime/crates/tool-runtime/src/{process_resources,process_session}.rs`、`runtime/crates/tool-runtime/tests/{persistent_process_session,process_session_governance}.rs`、`docs/evidence/2026-08-10-durable-resource-identity-and-pre-exec-membership.md` |

@@ -202,8 +202,7 @@ async fn spawn_repeated_compatible_responses(
     let server = tokio::spawn(async move {
         for status in statuses {
             let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
-                    .await
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
             else {
                 return;
             };
@@ -885,7 +884,11 @@ async fn expired_cooldown_allows_only_one_concurrent_half_open_probe() {
         .health_policy
         .consecutive_failure_threshold = 1;
     cfg.model_routing.health_policy.cooldown_ms = 50;
-    cfg.model_routing.health_policy.half_open_probe_lease_ms = 2_000;
+    // Keep the lease longer than this test's five-second observation window.
+    // Under the full package's concurrent fsync load, a two-second lease could
+    // legitimately expire before the second Run reached admission, changing
+    // the premise from "one active probe" to "a replacement probe is allowed".
+    cfg.model_routing.health_policy.half_open_probe_lease_ms = 30_000;
 
     let mut opener = LocalRuntimeHost::start(cfg.clone()).expect("opening Host");
     assert_eq!(
@@ -1266,6 +1269,203 @@ async fn replacement_host_applies_a_staged_terminal_response_without_replaying_t
     let recovered_journal = current_route_journal(&journal_path);
     assert_eq!(recovered_journal["completed"], true);
     assert_eq!(recovered_journal["staged_events"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn replacement_converges_a_committed_terminal_event_before_route_wal_completion() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"committed once\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base, request, server) = spawn_response(200, response).await;
+    let cfg = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        vec![candidate(
+            "primary",
+            ProviderProtocol::OpenAiCompatible,
+            format!("{base}/v1/chat/completions"),
+            1,
+        )],
+    );
+    let run_id = uuid::Uuid::now_v7();
+    let mut first = LocalRuntimeHost::start(cfg.clone()).expect("first Host");
+    let outcome = first
+        .execute_as(run_id, "commit the terminal response once")
+        .await
+        .expect("initial Run");
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+    assert_eq!(outcome.output, "committed once");
+    request.await.expect("Provider request");
+    server.await.unwrap();
+    drop(first);
+
+    let run_dir = state.path().join("runs").join(run_id.to_string());
+    let event_log_path = run_dir.join("events.jsonl");
+    let committed_events = std::fs::read(&event_log_path).expect("terminal event log");
+    let terminal_count = committed_events
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<serde_json::Value>(line).expect("event JSON"))
+        .filter(|event| event["type"] == "run.succeeded")
+        .count();
+    assert_eq!(terminal_count, 1);
+
+    let journal_path = std::fs::read_dir(run_dir.join("model-routes"))
+        .expect("route directory")
+        .next()
+        .expect("route entry")
+        .expect("route journal")
+        .path();
+    let records = committed_route_records(&journal_path);
+    assert_eq!(records.last().unwrap()["journal"]["completed"], true);
+    let staged_record_index = records
+        .iter()
+        .rposition(|record| {
+            record["journal"]["completed"] == false
+                && record["journal"]["selection_reported"] == true
+                && record["journal"]["staged_events"]
+                    .as_array()
+                    .is_some_and(|events| !events.is_empty())
+        })
+        .expect("staged response immediately before completion");
+    let mut crash_prefix = Vec::new();
+    for record in &records[..=staged_record_index] {
+        crash_prefix.extend(serde_json::to_vec(record).expect("route WAL record"));
+        crash_prefix.push(b'\n');
+    }
+    std::fs::write(&journal_path, crash_prefix).expect("restore crash prefix");
+    std::fs::write(
+        journal_path.with_extension("json.partial"),
+        b"{\"uncommitted\":",
+    )
+    .expect("leave an uncommitted durable-replace staging file");
+    assert_eq!(current_route_journal(&journal_path)["completed"], false);
+
+    let conflicting_journal = journal_path
+        .parent()
+        .expect("route directory")
+        .join(format!("{}.json", "ab".repeat(32)));
+    std::fs::copy(&journal_path, &conflicting_journal)
+        .expect("duplicate the unfinished authority record");
+    let mut ambiguous = LocalRuntimeHost::start(cfg.clone()).expect("ambiguous replacement Host");
+    let error = ambiguous
+        .resume(run_id, "commit the terminal response once", 2)
+        .await
+        .expect_err("multiple unfinished route WALs must fail closed");
+    assert!(error.to_string().contains("multiple unfinished"));
+    assert_eq!(
+        std::fs::read(&event_log_path).expect("unchanged event log"),
+        committed_events
+    );
+    std::fs::remove_file(conflicting_journal).expect("remove injected conflicting authority");
+
+    let terminal_row = committed_events
+        .split(|byte| *byte == b'\n')
+        .rfind(|row| !row.is_empty())
+        .expect("terminal event row");
+    let mut contradictory_events = committed_events.clone();
+    contradictory_events.extend_from_slice(terminal_row);
+    contradictory_events.push(b'\n');
+    std::fs::write(&event_log_path, contradictory_events)
+        .expect("inject an event after the terminal receipt");
+    let mut contradictory = LocalRuntimeHost::start(cfg.clone()).expect("replacement Host");
+    let error = contradictory
+        .resume(run_id, "commit the terminal response once", 2)
+        .await
+        .expect_err("a contradictory terminal log must fail before sealing route state");
+    assert!(error.to_string().contains("disagrees"));
+    assert_eq!(
+        current_route_journal(&journal_path)["completed"],
+        false,
+        "invalid terminal evidence must not mutate its route WAL"
+    );
+    std::fs::write(&event_log_path, &committed_events).expect("restore terminal event authority");
+
+    let mut replacement = LocalRuntimeHost::start(cfg).expect("replacement Host");
+    let recovered = replacement
+        .resume(run_id, "commit the terminal response once", 2)
+        .await
+        .expect("converge committed terminal response");
+
+    assert_eq!(recovered.status, RunStatus::Succeeded);
+    assert_eq!(recovered.output, "committed once");
+    assert_eq!(
+        std::fs::read(&event_log_path).expect("recovered event log"),
+        committed_events,
+        "recovery must not append run.restored, output, or a second terminal event"
+    );
+    let recovered_journal = current_route_journal(&journal_path);
+    assert_eq!(recovered_journal["completed"], true);
+    assert_eq!(recovered_journal["staged_events"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn one_shot_terminal_checkpoint_republishes_its_exact_missing_event() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let response = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"exact terminal\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base, request, server) = spawn_response(200, response).await;
+    let cfg = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        vec![candidate(
+            "primary",
+            ProviderProtocol::OpenAiCompatible,
+            format!("{base}/v1/chat/completions"),
+            1,
+        )],
+    );
+    let run_id = uuid::Uuid::now_v7();
+    let mut first = LocalRuntimeHost::start(cfg.clone()).expect("first Host");
+    first
+        .execute_as(run_id, "publish this terminal exactly once")
+        .await
+        .expect("initial Run");
+    request.await.expect("Provider request");
+    server.await.unwrap();
+    drop(first);
+
+    let event_log_path = state
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("events.jsonl");
+    let complete_log = std::fs::read(&event_log_path).expect("complete event log");
+    let mut rows = complete_log
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    let terminal: serde_json::Value =
+        serde_json::from_slice(rows.pop().expect("terminal row")).expect("terminal JSON");
+    assert_eq!(terminal["type"], "run.succeeded");
+    let mut crash_prefix = Vec::new();
+    for row in rows {
+        crash_prefix.extend_from_slice(row);
+        crash_prefix.push(b'\n');
+    }
+    std::fs::write(&event_log_path, crash_prefix).expect("remove terminal publication only");
+
+    let mut replacement = LocalRuntimeHost::start(cfg).expect("replacement Host");
+    let recovered = replacement
+        .resume(run_id, "publish this terminal exactly once", 2)
+        .await
+        .expect("republish terminal receipt");
+
+    assert_eq!(recovered.status, RunStatus::Succeeded);
+    assert_eq!(recovered.output, "exact terminal");
+    assert_eq!(
+        std::fs::read(event_log_path).expect("repaired event log"),
+        complete_log,
+        "recovery must append the original EventEnvelope, not manufacture another terminal"
+    );
 }
 
 #[tokio::test]

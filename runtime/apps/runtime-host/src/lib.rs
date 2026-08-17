@@ -4240,6 +4240,93 @@ impl LocalRuntimeHost {
         Self::persist_model_route_journal(path, &journal)
     }
 
+    /// Seals the one model-route WAL that can remain between a terminal
+    /// Checkpoint/Event commit and the ordinary post-event completion append.
+    ///
+    /// Model invocations are serial within one attempt, so more than one
+    /// unfinished journal for the terminal attempt is contradictory evidence.
+    /// A journal still carrying an inflight call or retry deadline is left
+    /// untouched: the terminal Checkpoint prevents replay, but the Runtime must
+    /// not rewrite an ambiguous Provider boundary as a completed response.
+    fn reconcile_terminal_model_route_wal(
+        &self,
+        run_id: Uuid,
+        checkpoint: &agent_protocol::CheckpointSnapshot,
+    ) -> Result<(), LocalRuntimeError> {
+        let directory = self.run_dir(run_id).join("model-routes");
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        };
+        let mut unfinished = None;
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            if !file_type.is_file() {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "model route directory contains an unexpected entry".into(),
+                ));
+            }
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                LocalRuntimeError::Checkpoint("model route filename is invalid".into())
+            })?;
+            if let Some(digest) = name.strip_suffix(".json.partial") {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(LocalRuntimeError::Checkpoint(
+                        "model route staging filename is invalid".into(),
+                    ));
+                }
+                // durable_file::replace commits only by renaming this sibling
+                // to `<digest>.json`. A crash may leave the staging write, but
+                // it is never authoritative beside the committed WAL.
+                continue;
+            }
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "model route filename is invalid".into(),
+                ));
+            }
+            let journal = Self::read_model_route_journal(&entry.path())?;
+            if journal.run_id != run_id
+                || journal.model_route_binding_digest != self.model_route_binding_digest
+            {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "terminal Run model route WAL is bound to another invocation".into(),
+                ));
+            }
+            if journal.completed {
+                continue;
+            }
+            if journal.attempt_id != checkpoint.attempt_id {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "terminal Checkpoint coexists with an unfinished model route from another attempt"
+                        .into(),
+                ));
+            }
+            if unfinished.replace((entry.path(), journal)).is_some() {
+                return Err(LocalRuntimeError::Checkpoint(
+                    "terminal attempt has multiple unfinished model route WALs".into(),
+                ));
+            }
+        }
+
+        let Some((path, journal)) = unfinished else {
+            return Ok(());
+        };
+        let response_is_settled = journal.inflight_provider_id.is_none()
+            && journal.retry_not_before_unix_ms.is_none()
+            && ((journal.selected_provider_id.is_some() && journal.selection_reported)
+                || (journal.terminal_failure.is_some() && journal.terminal_failure_reported));
+        if response_is_settled {
+            self.complete_model_route_journal(&path)?;
+        }
+        Ok(())
+    }
+
     fn session_record_path(state_root: &Path, session_id: Uuid) -> PathBuf {
         state_root
             .join("sessions")
@@ -5048,22 +5135,13 @@ impl LocalRuntimeHost {
                 | "run.timed_out"
                 | "run.indeterminate"
         );
-        let authoritative_session_turn =
-            terminal && Self::find_active_session_turn(&self.config.state_root, run_id)?.is_some();
-        if terminal
-            && (self
-                .processor
-                .is_subagent_attempt(envelope.attempt_id)
-                .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?
-                || authoritative_session_turn)
-        {
-            // The terminal transcript must exist before the terminal event can
-            // become observable. A replacement Host can then build the exact
-            // child result or commit an actual registered root Session Turn
-            // without replaying a completed model or Tool. An ordinary
-            // one-shot Run may carry an empty branch for execution-policy
-            // fencing, but it is not a Session head and must retain the older
-            // resumable pre-terminal Checkpoint behavior.
+        if terminal {
+            // Every terminal Event now has the same publication receipt. Before
+            // it becomes observable, the Checkpoint stores the exact envelope
+            // and complete transcript. This makes one-shot, Session and child
+            // Runs converge through one recovery rule instead of letting the
+            // one-shot path replay a staged model response over an already
+            // committed terminal Event.
             self.persist_checkpoint(run_id, envelope.attempt_id)?;
         }
         types.push(envelope.event_type.clone());
@@ -5201,7 +5279,7 @@ impl LocalRuntimeHost {
                     "durable terminal Event disagrees with its Checkpoint receipt".into(),
                 ));
             }
-            return Ok(());
+            return self.reconcile_terminal_model_route_wal(run_id, checkpoint);
         }
 
         let receipt = receipt.ok_or_else(|| {
@@ -5215,7 +5293,8 @@ impl LocalRuntimeHost {
                 "event prefix cannot accept the Checkpoint-bound terminal receipt".into(),
             ));
         }
-        self.append_event(run_id, &receipt)
+        self.append_event(run_id, &receipt)?;
+        self.reconcile_terminal_model_route_wal(run_id, checkpoint)
     }
 
     /// Replays a Run's durable event log from `after_sequence` (exclusive).
@@ -6342,6 +6421,12 @@ impl LocalRuntimeHost {
         let checkpoint =
             Self::load_checkpoint(&Self::checkpoint_path(&self.config.state_root, run_id))?;
         let command = self.local_command(run_id, input, owner_epoch);
+        if checkpoint.status.is_terminal() {
+            self.processor
+                .validate_terminal_checkpoint_binding(&command, &checkpoint)
+                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+            return self.terminal_local_outcome(run_id, &checkpoint);
+        }
         self.drive(command, Some(checkpoint), None).await
     }
 
@@ -6371,6 +6456,12 @@ impl LocalRuntimeHost {
             Vec::new(),
             Some(history_import),
         );
+        if checkpoint.status.is_terminal() {
+            self.processor
+                .validate_terminal_checkpoint_binding(&command, &checkpoint)
+                .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
+            return self.terminal_local_outcome(run_id, &checkpoint);
+        }
         self.drive(command, Some(checkpoint), None).await
     }
 

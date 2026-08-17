@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：Checkpoint 绑定的终态事件发布
+## 当前阶段：统一终态 Run 收敛
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 终态权威 | rollout 单 writer，已提交历史由 Thread 恢复读取 | Session writer queue + SQLite transaction/WAL | terminal Checkpoint 保存原 envelope，所有入口只观察终态 | 已消除 Direct/Embedded 双生命周期 |
+| 多阶段提交 | Flush/Shutdown ack 明确 writer 提交点 | `BEGIN IMMEDIATE` 内重验并提交多行状态 | Checkpoint→Event→route WAL completion→adapter projection，逐窗收敛 | 无数据库边界成立；不是通用事务 |
+| 身份漂移 | Thread/rollout 生命周期绑定 | Session row/revision 与事务快照 | tenant/application/workload/Workspace/Agent/model/input/history/Tool/MCP 全绑定 | 多租户嵌入身份更显式 |
+| 不确定请求 | rollout 保留已观察历史 | Gateway/Session 产品链与 SQLite 账本 | in-flight Provider WAL 不伪装完成，终态 Checkpoint 阻止重放 | 副作用边界保守；长期运维仍落后 |
+
+### 本阶段结论
+
+- 已验证 one-shot Run 的两个真实文件级故障窗口：terminal Event 缺失时补发 Checkpoint 内同一 envelope；Event
+  已提交但 route WAL completion 滞后时只封口已结算 WAL，不追加第二组事件、不重放 Provider。
+- 相比 Codex，本项目吸收“单一提交权威、终态历史只观察不重做”，并增加完整多租户 execution binding；Codex
+  的 rollout/Thread 迁移、跨平台执行和客户端产品链仍领先。
+- 相比 OpenClaw，本项目无需 SQLite 或 Gateway 即可独立完成 Run；OpenClaw 的多记录事务、并发 writer、schema
+  migration、quarantine 与长期 Session 运维仍明显领先。
+- **未外推**：in-flight Provider WAL 只保留证据而不伪装 completion；真实厂商、硬件掉电、共享文件系统、
+  跨机器 owner、Windows 和任意多文件事务未验证。总体仍为 70–75%。
+
+## 上一阶段：Checkpoint 绑定的终态事件发布
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |
