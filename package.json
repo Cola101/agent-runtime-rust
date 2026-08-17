@@ -12,5 +12,11 @@
   },
   "devDependencies": {
     "@redocly/cli": "1.27.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
   }
 }

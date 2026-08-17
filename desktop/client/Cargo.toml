@@ -1,0 +1,11 @@
+[package]
+name = "runtime-desk-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-runtime-invocation-protocol.workspace = true
+tonic.workspace = true
+tokio.workspace = true

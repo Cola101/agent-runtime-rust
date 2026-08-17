@@ -10,6 +10,8 @@ control-plane/target/
 
 # Rust
 runtime/target/
+desktop/target/
+desktop/shell/node_modules/
 
 # Node
 node_modules/

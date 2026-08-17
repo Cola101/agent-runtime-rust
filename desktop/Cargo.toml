@@ -1,0 +1,23 @@
+# Deliberately its own workspace.
+#
+# There is no root Cargo.toml in this repository, so `runtime/` is a workspace
+# unto itself and cannot see this directory. Keeping that true is the whole
+# isolation story: `cargo test --workspace` under runtime/ never builds the
+# desktop client, and a broken client can never turn the runtime gate red.
+[workspace]
+resolver = "2"
+members = ["client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+# The one thing shared with the runtime: its generated invocation contract.
+# That crate depends on prost/tonic and nothing else from the runtime, which
+# is why it was split out in ADR-0123.
+agent-runtime-invocation-protocol = { path = "../runtime/crates/runtime-invocation-protocol" }
+tonic = { version = "0.14.3", features = ["transport", "tls-ring"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros"] }
