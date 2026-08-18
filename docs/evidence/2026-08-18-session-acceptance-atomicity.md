@@ -46,7 +46,7 @@ RuntimeSessionHead { generation: 1, turn_count: 0,
 | 门禁 | 结果 |
 | --- | --- |
 | `--lib client::tests` | 3/3 |
-| `--test runtime_client_contract` | 5/5（连跑 7 次） |
+| `--test runtime_client_contract` | 7/7 |
 | `--test grpc_session_contract` | 1/1 |
 | `--test embedded_recovery_all` | 3/3 |
 | `--test standalone_run root_session_` | 2/2 |
@@ -75,20 +75,39 @@ Fork 重试等价 → ListSessions → 超限拒绝 → 半截游标拒绝 → R
 测试因此拿到 `trusted_workspace_tool: None`，模型的 tool call 无工具可执行，审批永不记录。构建该二进制后
 9/9 通过、耗时 3.58s。**不是回归**；`--workspace --all-targets` 本身会构建它。
 
-## 未验证与下一门禁
+## 覆盖清单
 
-计划列出的 12 项测试中，以下尚无独立覆盖：
+计划列出的 12 项已全部覆盖。最后两项及其构造方式：
 
-- 终态崩溃窗口恢复且 Provider 请求次数不增加
-- schema v1→v2 安全迁移
+- **终态崩溃窗口恢复且 Provider 请求次数不增加**。窗口按持久格式在磁盘上重建，而不是去抢一个真实崩溃：
+  Turn 完成后把 `active_turn` 写回记录、清空 `history`，这正是崩溃留下的状态，且完全确定。随后由替换
+  Runtime 启动恢复，断言 head 被补完、**历史摘要与原先逐字相同**、分支恢复可继续，而计数 Provider 的
+  请求数**一次未增**。该实现原本就是对的——这一项是补缺失的覆盖，不是驱动修复。
+- **schema v1→v2 安全迁移**。两个真实 Session 各自跑完一个 Turn 后被降级为 v1 形状（`store_version`
+  降为 1、删掉 `invocation` 字段）。本地默认身份能读回自己的 v1 记录；任何其他身份都不能——记录没有
+  owner **不等于**同意被任意认领。跨身份按 id 直接读同样是 `NotFound`。
 
 `generation` 溢出的显式拒绝已在 Rollback 重试判据上改为 `checked_add`，但**尚无独立测试**——构造
-u64::MAX 分支需要直接写 Session 记录，属白盒，留待下一轮。
+u64::MAX 分支需要直接写 Session 记录，留待下一轮。
 
-## 一处已定位但不属本轮的间歇失败
+## 两处负载敏感的间歇失败，均不属本轮
 
-`subagent_concurrency::close_cancels_only_the_targeted_asynchronous_child_and_reaps_its_stream`
-在三次全量中失败一次（854/854 绿 → 1 失败 → 856/856 绿），隔离重跑 5/5 通过。
+四次全量的实况：**854/854 绿 → 1 失败 → 856/856 绿 → 1 失败（另一个测试）**。两个失败都在
+`agent-runtime-host` 的 Session 路径之外，隔离重跑均全绿，且都是时间界断言。本轮**一处都没有放宽**。
+
+### 其二：`process_wait_multi_session_capacity::sixty_four_sessions_...`
+
+```
+64 sessions / 1024 waits: p50=1.130572709s, p95=1.131459375s, p100=1.140962417s
+wake latency gate failed（门槛 p50 < 1s）
+```
+
+隔离重跑 3/3 通过。这条本来就在"待决定"清单上，属 `crates/tool-runtime`，与 Session 无关。
+延迟门在满载机器上是否仍是正确门槛，是产品决定，不是可以顺手调大的数字。
+
+### 其一：`subagent_concurrency::close_cancels_only_the_targeted_asynchronous_child_and_reaps_its_stream`
+
+隔离重跑 5/5 通过。
 
 机制在测试的假 provider，不在产品：
 

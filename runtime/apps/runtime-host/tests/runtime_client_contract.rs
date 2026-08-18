@@ -33,6 +33,7 @@ use agent_runtime_host::{
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -931,4 +932,317 @@ async fn a_rollback_is_replayable_until_the_branch_moves_past_it() {
         })
         .expect("head");
     assert_eq!(head.turn_count, 2, "the refused replay kept the later Turn");
+}
+
+/// A Provider that counts what it was actually asked, so "recovery did not
+/// re-request the model" can be asserted rather than assumed.
+async fn spawn_counting_provider(response_delay: Duration) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("addr")
+    );
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(response_delay).await;
+            let body = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{MODEL_REPLY}\"}}}}]}}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (endpoint, requests)
+}
+
+fn session_record_path(state_root: &std::path::Path, session_id: Uuid) -> std::path::PathBuf {
+    state_root
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("session.json")
+}
+
+/// The crash window, reconstructed on disk rather than raced for.
+///
+/// A Turn's Checkpoint is durable before its Turn is committed onto the branch
+/// head. A process that dies in between leaves a branch holding an active Turn
+/// whose Run is already finished -- and the only honest way to finish it is
+/// from the Checkpoint, because asking the model again would bill a second time
+/// for an answer already given, and replaying its Tools would repeat effects
+/// that already landed.
+///
+/// The window is produced by putting the active Turn back into the durable
+/// record after the Turn completed, which is exactly the state a crash leaves
+/// behind, and is deterministic in a way that racing a real crash is not.
+#[tokio::test]
+async fn a_terminal_turn_lost_before_its_head_is_finished_from_the_checkpoint() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let (provider_endpoint, requests) = spawn_counting_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let first = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&first), &capabilities);
+    client
+        .start_session(RuntimeSessionTurnRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+            generation: 1,
+            run_id,
+            input: "a Turn whose head never got committed".into(),
+        })
+        .await
+        .expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, run_id).await,
+        RunStatus::Succeeded
+    );
+    let committed = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("committed head");
+    assert_eq!(committed.turn_count, 1);
+    drop(client);
+    wait_released(&first).await;
+    drop(first);
+
+    let asked_before_recovery = requests.load(Ordering::SeqCst);
+    assert!(asked_before_recovery >= 1, "the Turn really ran");
+
+    // Rewind the durable record to the instant before the head was committed:
+    // the Turn is gone from history and active again, while its Checkpoint and
+    // terminal events stay exactly where the completed Run left them.
+    let path = session_record_path(state.path(), session_id);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("session record")).expect("json");
+    let branch = &mut record["branches"][branch_id.to_string()];
+    assert_eq!(branch["history"].as_array().expect("history").len(), 1);
+    branch["active_turn"] = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "generation": 1,
+        // The digest of the history this Turn was accepted against, which for a
+        // first Turn is the empty one. Taken from the protocol rather than
+        // rebuilt here: a hand-rolled hash would test the test.
+        "history_digest": agent_protocol::session_conversation_history_digest(&[]),
+        "input": "a Turn whose head never got committed",
+    });
+    branch["history"] = serde_json::json!([]);
+    std::fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("write");
+
+    // A replacement Runtime over the same state root, as after a restart.
+    let replacement = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&replacement), &capabilities);
+    let report = client.recover_on_startup().await;
+    assert!(
+        report.failures.is_empty(),
+        "startup recovery reported failures: {:?}",
+        report.failures
+    );
+
+    let restored = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("restored head");
+    assert_eq!(
+        restored.turn_count, 1,
+        "the lost Turn is finished from its Checkpoint, not dropped"
+    );
+    assert_eq!(restored.active_run_id, None);
+    assert_eq!(
+        restored.history_digest, committed.history_digest,
+        "recovery reconstructs the same history, not a different one"
+    );
+
+    // The whole point: nothing was asked of the model to get there.
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        asked_before_recovery,
+        "recovery re-requested the model instead of reading its Checkpoint"
+    );
+
+    // And the branch is continuable again rather than stuck on a finished Turn.
+    let next_run_id = Uuid::now_v7();
+    client
+        .continue_session(RuntimeSessionTurnRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+            generation: 1,
+            run_id: next_run_id,
+            input: "the branch still works".into(),
+        })
+        .await
+        .expect("continue after recovery");
+    assert_eq!(
+        wait_terminal(&client, invocation, next_run_id).await,
+        RunStatus::Succeeded
+    );
+}
+
+/// A v1 Session record is adopted only by the local default identity.
+///
+/// v1 predates per-invocation binding, so a record at that version carries no
+/// trustworthy owner. Reading it as though it belonged to whoever happened to
+/// ask would hand one caller another's conversation on the strength of a
+/// version number. The only identity a v1 record may be read as is the
+/// built-in local one, which is the identity it was actually written by.
+#[tokio::test]
+async fn a_legacy_session_record_is_adopted_only_by_the_local_default_identity() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let local = agent_runtime_host::local_invocation_context();
+    // Derived from the local identity rather than generated: one state root
+    // belongs to one Workspace identity, so a wholly unrelated invocation
+    // cannot be hosted beside it. Everything else differs, which is all the
+    // rule under test needs -- this is simply not the local default.
+    let other = RuntimeInvocationContext {
+        agent_version_id: Uuid::now_v7(),
+        model_policy_id: Uuid::now_v7(),
+        ..local
+    };
+    let provider_endpoint = spawn_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    let runtime = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[local, other],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    // Two real Sessions, one per identity, so the records under test are
+    // genuine rather than hand-built.
+    let sow = |invocation: RuntimeInvocationContext| {
+        let session_id = Uuid::now_v7();
+        let branch_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        (
+            session_id,
+            branch_id,
+            run_id,
+            RuntimeSessionTurnRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id,
+                branch_id,
+                generation: 1,
+                run_id,
+                input: "a Turn written before per-invocation binding".into(),
+            },
+        )
+    };
+
+    let (local_session, local_branch, local_run, local_start) = sow(local);
+    client
+        .start_session(local_start)
+        .await
+        .expect("local start");
+    assert_eq!(
+        wait_terminal(&client, local, local_run).await,
+        RunStatus::Succeeded
+    );
+    let (other_session, other_branch, other_run, other_start) = sow(other);
+    client
+        .start_session(other_start)
+        .await
+        .expect("other start");
+    assert_eq!(
+        wait_terminal(&client, other, other_run).await,
+        RunStatus::Succeeded
+    );
+
+    // Rewind both records to the v1 shape: the version drops, and with it the
+    // field that says who owns the Session.
+    let downgrade = |session_id: Uuid| {
+        let path = session_record_path(state.path(), session_id);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("json");
+        record["store_version"] = serde_json::json!(1);
+        record.as_object_mut().expect("object").remove("invocation");
+        std::fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("write");
+    };
+    downgrade(local_session);
+    downgrade(other_session);
+
+    // The local default reads its own v1 record.
+    let migrated = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation: local,
+            session_id: local_session,
+            branch_id: local_branch,
+        })
+        .expect("a v1 record is readable as the local default identity");
+    assert_eq!(migrated.turn_count, 1);
+
+    // A tenant does not, even though the record is now version 1 and silent
+    // about its owner. Absence of an owner is not consent to be adopted.
+    assert_eq!(
+        client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation: other,
+                session_id: other_session,
+                branch_id: other_branch,
+            })
+            .expect_err("a v1 record must not be adopted by any other identity")
+            .code,
+        RuntimeClientErrorCode::NotFound
+    );
+
+    // Nor may one identity reach the other's Session by claiming its id.
+    assert_eq!(
+        client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation: other,
+                session_id: local_session,
+                branch_id: local_branch,
+            })
+            .expect_err("another identity must not read the local default's Session")
+            .code,
+        RuntimeClientErrorCode::NotFound
+    );
 }
