@@ -525,6 +525,10 @@ async function openRuntime({ mustOwn = false } = {}) {
     return;
   }
   if (!runtimeBinary) {
+    // A packaged app without its runtime is a broken download, and nothing in
+    // this window can fix it. Worth saying, because the alternative is a
+    // person editing settings that were never the problem.
+    local.declined("no-binary", null);
     console.log(`runtime-desk: no local runtime at ${first.socketPath} — ${first.error}`);
     return;
   }

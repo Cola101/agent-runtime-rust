@@ -28,6 +28,14 @@ export function LinkBanner({ link }: { link: Link }) {
       </div>
     );
   }
+  if (link.state === "no-binary") {
+    return (
+      <div className="offline">
+        <b>这个应用里没有 Runtime，所以没什么可启动的。</b>
+        {" 这是打包或下载缺了东西 —— 设置里改什么都不会有用。"}
+      </div>
+    );
+  }
   if (link.state === "start-failed") {
     return (
       <div className="offline">

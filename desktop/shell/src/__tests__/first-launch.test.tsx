@@ -78,6 +78,29 @@ describe("the first launch", () => {
       expect(screen.getByText(/AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT/)).toBeTruthy());
   });
 
+  /// A bundle without its runtime binary is a broken download, not a
+  /// misconfiguration, and there is nothing the person can do in this window
+  /// about it. Saying which of the two it is is the whole value of the
+  /// message: one sends them to the settings page and the other to the
+  /// download.
+  it("says the app is missing its runtime, rather than blaming a socket", async () => {
+    const bridge = installFakeRuntime();
+    const absent = {
+      transport: "local",
+      stateRoot: "/tmp/state",
+      socketPath: "/tmp/state/runtime-host.sock",
+      connected: false,
+      error: "no runtime is listening",
+      reason: "no-binary",
+      said: null,
+    };
+    bridge.desk.runtime.status = async () => ({ ok: true as const, value: absent });
+    bridge.desk.runtime.probe = async () => ({ ok: true as const, value: absent });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/这个应用里没有 Runtime/)).toBeTruthy());
+    expect(screen.queryByText(/runtime-host\.sock/)).toBeNull();
+  });
+
   /// A runtime that is genuinely unreachable is a different fact and keeps its
   /// own words: something was there and is not answering.
   it("still names the socket when a runtime should have been there", async () => {
