@@ -1560,7 +1560,8 @@ async fn multi_tenant_multi_workspace_churn_keeps_every_root_bounded_and_recover
             6
         );
     }
-    assert!(started.elapsed() < Duration::from_secs(90));
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(90), "the churn took {elapsed:?}");
     drop(replacement);
     drop(workspace_roots);
     drop(state_roots);
@@ -1626,7 +1627,10 @@ async fn one_thousand_runs_keep_hot_state_recovery_and_process_resources_bounded
     assert_eq!(report.total_control_tombstones, 0);
     assert_eq!(report.unmanaged_run_directories, 0);
     assert!(report.terminal_ledger_bytes < 2 * 1024 * 1024);
-    assert!(scan_elapsed < Duration::from_secs(2));
+    assert!(
+        scan_elapsed < Duration::from_secs(2),
+        "the recovery scan took {scan_elapsed:?}"
+    );
 
     let (files, state_bytes) = directory_metrics(state.path());
     assert!(
@@ -1657,7 +1661,11 @@ async fn one_thousand_runs_keep_hot_state_recovery_and_process_resources_bounded
         .expect("replacement maintenance");
     assert_eq!(replacement_report.run_directories_after, 16);
     assert_eq!(replacement_report.total_run_tombstones, RUNS - 16);
-    assert!(replacement_scan.elapsed() < Duration::from_secs(2));
+    let replacement_elapsed = replacement_scan.elapsed();
+    assert!(
+        replacement_elapsed < Duration::from_secs(2),
+        "the replacement's recovery scan took {replacement_elapsed:?}"
+    );
     replacement
         .execute(identity, first_run, &first_input)
         .await
@@ -1665,16 +1673,11 @@ async fn one_thousand_runs_keep_hot_state_recovery_and_process_resources_bounded
     assert_eq!(requests.load(Ordering::SeqCst), RUNS);
 
     let final_fds = open_fd_count();
-    if let (Some(baseline), Some(peak)) = (baseline_rss, peak_rss) {
-        assert!(peak.saturating_sub(baseline) <= 512 * 1024 * 1024);
-    }
-    if let (Some(baseline), Some(peak)) = (baseline_fds, peak_fds) {
-        assert!(peak.saturating_sub(baseline) <= 32);
-    }
-    if let (Some(baseline), Some(final_count)) = (baseline_fds, final_fds) {
-        assert!(final_count <= baseline + 8);
-    }
-    assert!(started.elapsed() < Duration::from_secs(180));
+    // Printed before the bounds are checked, not after. Every number this test
+    // is about is in this line, and an `assert!` that fires first takes the
+    // whole line with it -- which left "elapsed exceeded 180s" with no way to
+    // know whether it was 181 seconds or six hundred, and the same for the two
+    // resource bounds above it.
     println!(
         "retention_churn_metrics runs={RUNS} hot_run_directories={} tombstones={} ledger_bytes={} state_files={files} state_bytes={state_bytes} recovery_scan_ms={} rss_baseline_bytes={} rss_peak_bytes={} fd_baseline={} fd_peak={} fd_final={} elapsed_ms={}",
         report.run_directories_after,
@@ -1687,6 +1690,33 @@ async fn one_thousand_runs_keep_hot_state_recovery_and_process_resources_bounded
         peak_fds.unwrap_or(0),
         final_fds.unwrap_or(0),
         started.elapsed().as_millis(),
+    );
+
+    // And each bound says what it measured, because a captured stdout is not
+    // shown for a test that passes and is easy to miss for one that fails.
+    if let (Some(baseline), Some(peak)) = (baseline_rss, peak_rss) {
+        let grew = peak.saturating_sub(baseline);
+        assert!(
+            grew <= 512 * 1024 * 1024,
+            "resident memory grew by {grew} bytes over a baseline of {baseline}"
+        );
+    }
+    if let (Some(baseline), Some(peak)) = (baseline_fds, peak_fds) {
+        let grew = peak.saturating_sub(baseline);
+        assert!(grew <= 32, "open descriptors peaked {grew} above a baseline of {baseline}");
+    }
+    if let (Some(baseline), Some(final_count)) = (baseline_fds, final_fds) {
+        assert!(
+            final_count <= baseline + 8,
+            "{final_count} descriptors remain open against a baseline of {baseline}"
+        );
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(180),
+        "{RUNS} runs took {:?}, which is the wall clock this bound is about -- \
+         the metrics line above says where it went",
+        elapsed,
     );
 
     let _ = shutdown.send(());
