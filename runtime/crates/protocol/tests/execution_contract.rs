@@ -990,6 +990,26 @@ fn v19_freezes_the_mcp_protocol_revision_and_client_capabilities() {
 }
 
 #[test]
+fn v22_can_freeze_the_explicit_2025_03_26_legacy_revision() {
+    let mut command: RunExecutionCommand = serde_json::from_str(EXECUTION_V20_EXAMPLE).unwrap();
+    command.schema_version = agent_protocol::RUN_EXECUTION_SCHEMA_VERSION;
+    command.mcp_servers[0].protocol_revision = agent_protocol::McpProtocolRevision::V2025_03_26;
+    command.mcp_servers[0].client_capabilities.clear();
+
+    assert_eq!(command.validate(), Ok(()));
+    assert_eq!(
+        serde_json::to_value(&command).unwrap()["mcp_servers"][0]["protocol_revision"],
+        "2025-03-26"
+    );
+
+    command.schema_version = 21;
+    assert_eq!(
+        command.validate(),
+        Err(agent_protocol::RunExecutionValidationError::InvalidMcpProtocolPolicy)
+    );
+}
+
+#[test]
 fn legacy_mcp_servers_decode_to_the_explicit_default_deny_policy() {
     let command: RunExecutionCommand = serde_json::from_str(EXECUTION_V18_EXAMPLE).unwrap();
     let server = &command.mcp_servers[0];

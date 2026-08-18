@@ -3609,6 +3609,97 @@ async fn codex_mcp_2026_stdio_server_completes_a_recoverable_agent_loop() {
     provider.await.expect("provider served both turns");
 }
 
+/// Cross-implementation compatibility gate against the independently
+/// maintained `mark3labs/mcp-go` protocol stack. The release script pins the
+/// filesystem Server source and its Go module graph before supplying the
+/// binary. The Agent may call only the read-only directory-authority Tool.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires the locked mark3labs/mcp-go filesystem server"]
+async fn mcp_go_filesystem_server_completes_an_agent_loop() {
+    let binary = std::env::var_os("MCP_GO_FILESYSTEM_SERVER")
+        .map(PathBuf::from)
+        .expect("MCP_GO_FILESYSTEM_SERVER must name the external Go server");
+    let binary = binary.canonicalize().expect("mcp-go Server binary");
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let allowed_root = tempfile::tempdir().expect("read-only MCP authority root");
+    let allowed_root = allowed_root
+        .path()
+        .canonicalize()
+        .expect("canonical MCP authority root");
+    let (provider_endpoint, provider) = spawn_provider(vec![
+        runtime_mcp_tool_turn(serde_json::json!([{
+            "index": 0,
+            "id": "call_mcp_go_allowed_directories",
+            "type": "function",
+            "function": {
+                "name": "mcp:mcp_go/list_allowed_directories",
+                "arguments": "{}"
+            }
+        }])),
+        text_turn("answer after independent mcp-go compatibility"),
+    ])
+    .await;
+    let mut local_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().expect("workspace"),
+        provider_endpoint,
+        BTreeSet::from(["tool:mcp:mcp_go".to_owned()]),
+    );
+    local_config.mcp_servers = vec![LocalMcpServerConfig {
+        server_id: uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0095),
+        name: "mcp_go".into(),
+        transport: LocalMcpTransportConfig::StdioV20250326 {
+            command: binary,
+            args: vec![allowed_root.to_string_lossy().into_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+        },
+        tool_names: BTreeSet::from(["list_allowed_directories".to_owned()]),
+        tool_effect_overrides: BTreeMap::from([(
+            "list_allowed_directories".to_owned(),
+            ToolEffect::Pure,
+        )]),
+        required: true,
+    }];
+
+    let mut host = LocalRuntimeHost::start(local_config).expect("mcp-go host starts");
+    let outcome = host
+        .execute("Use the mcp-go directory-authority Tool before answering.")
+        .await
+        .expect("independent mcp-go Agent Loop succeeds");
+
+    assert_eq!(
+        outcome.status,
+        RunStatus::Succeeded,
+        "independent mcp-go outcome: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.output,
+        "answer after independent mcp-go compatibility"
+    );
+    assert!(outcome.pending_approval.is_none());
+    assert!(outcome.pending_mcp_input.is_none());
+    assert!(
+        outcome
+            .event_types
+            .iter()
+            .any(|event| event == "tool.result")
+    );
+    assert_eq!(
+        outcome
+            .event_types
+            .iter()
+            .filter(|event| event.as_str() == "run.succeeded")
+            .count(),
+        1
+    );
+
+    host.shutdown().await;
+    provider.await.expect("provider served both turns");
+}
+
 /// Cross-project compatibility gate against the official MCP reference
 /// implementation's Streamable HTTP transport. Release evidence must use
 /// `runtime/scripts/test-mcp-streamable-http-compat.sh`, which installs the

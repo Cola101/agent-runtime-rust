@@ -24,6 +24,15 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-17 独立 Go MCP 实现门禁完成（ADR-0140）：`mark3labs/mcp-filesystem-server v0.11.1` 固定 commit
+`5646396f50ba144b9dd1ca9d088db0ac08cab3f8`，依赖非官方实现 `mcp-go v0.32.0`。首次真实 Agent Loop 得到
+RED：Server 选择 `2025-03-26`，Runtime 只接受 `2025-06-18`。修复后 RunExecution schema 22 显式冻结新修订，
+本地 `stdio_2025_03_26`、Gateway 与 stdio initialize 发送并验证同一版本；schema 21 downgrade 和 Server
+选择漂移均拒绝。最终模型调用唯一 `list_allowed_directories`、Tool Result 回灌、第二轮模型和唯一终态
+**1/1 通过**。无凭据/文件读取写入，Go 源码与 154 MiB 构建缓存只在临时目录并已删除。该阶段关闭“已知独立
+实现栈样本为零”，但真实 OAuth、长稳外部 Server 与 Provider 矩阵仍缺，总体保持 70–75%。证据见
+`docs/evidence/2026-08-17-independent-mcp-go-compatibility.md`。
+
 2026-08-17 公开第三方 MCP 只读发现门禁完成（ADR-0139）：固定 Context7
 `https://mcp.context7.com/mcp` 与 Microsoft Learn `https://learn.microsoft.com/api/mcp` 两个无需凭据的
 公开生产端点，显式清除本地认证环境变量后，只执行 initialize、initialized 与 `tools/list`。两端分别返回

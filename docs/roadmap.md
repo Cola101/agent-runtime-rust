@@ -131,8 +131,8 @@ cgroup 限制对真实进程树生效；九处免责声明逐条删除并替换�
 Host replacement continuation。ADR-0138 又用完整 npm lock 固定官方 `server-everything@2026.7.4` 与 SDK
 `1.30.0`，完成 Streamable HTTP discovery、真实 Tool call、目录冻结拒绝和完整 Agent Loop。ADR-0139 再以
 Context7 与 Microsoft Learn 两个无需凭据的公开生产端点完成只读 discovery，证明真实 TLS/DNS/CDN 后的运营方
-部署多样性。当前仍没有**已知实现栈独立**的非官方 SDK/手写第三方实现、真实 OAuth、长稳公网流或真实
-Provider 矩阵，因此阶段未完成。
+部署多样性。ADR-0140 已用 `mcp-go v0.32.0` 的固定 Go Server 完成 `2025-03-26` 真实 Tool Agent Loop，补上
+首个已知独立实现栈。当前仍没有真实 OAuth、长稳公网流或真实 Provider 矩阵，因此阶段未完成。
 
 **做什么。**
 - 真实厂商三协议兼容矩阵：`openai_responses` / `anthropic_messages` / `openai_compatible`

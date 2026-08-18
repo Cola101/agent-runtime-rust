@@ -26,7 +26,6 @@ use uuid::Uuid;
 
 use crate::{LocalMcpLifecycleConfig, LocalMcpLifecycleSnapshot, LocalStdioMcpConfig};
 
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_STDIO_MESSAGE_BYTES: usize = 256 * 1024;
 const SESSION_QUEUE_CAPACITY: usize = 32;
@@ -1045,7 +1044,7 @@ impl StdioProcess {
             self.rpc(
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "protocolVersion": self.protocol_revision.as_str(),
                     "capabilities": {},
                     "clientInfo": {"name": "agent-runtime-platform", "version": "1"}
                 }),
@@ -1053,7 +1052,8 @@ impl StdioProcess {
         )
         .await
         .map_err(|_| McpFederationError::Unreachable("stdio MCP initialize timed out".into()))??;
-        self.server_capabilities = validate_initialize_result(&initialize_result)?;
+        self.server_capabilities =
+            validate_initialize_result(&initialize_result, self.protocol_revision)?;
         self.write_message(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
@@ -1304,12 +1304,11 @@ impl StdioProcess {
                 {
                     return Err(McpFederationError::ToolNotInFrozenCatalog(qualified_name));
                 }
-                if self.protocol_revision == McpProtocolRevision::V2025_06_18
-                    && continuation.is_some()
-                {
-                    return Err(McpFederationError::Protocol(
-                        "MCP 2025-06-18 does not support stateless MRTR continuation".into(),
-                    ));
+                if self.protocol_revision.is_legacy() && continuation.is_some() {
+                    return Err(McpFederationError::Protocol(format!(
+                        "MCP {} does not support stateless MRTR continuation",
+                        self.protocol_revision.as_str()
+                    )));
                 }
                 let list_params = self.request_params(serde_json::json!({}))?;
                 let listed = self.rpc("tools/list", list_params).await?;
@@ -1656,13 +1655,20 @@ impl StdioProcess {
 
 fn validate_initialize_result(
     result: &Value,
+    expected_revision: McpProtocolRevision,
 ) -> Result<std::collections::BTreeSet<McpServerCapability>, McpFederationError> {
+    if !expected_revision.is_legacy() {
+        return Err(McpFederationError::Protocol(
+            "stdio initialize requires an explicitly frozen legacy revision".into(),
+        ));
+    }
     let selected = result["protocolVersion"].as_str().ok_or_else(|| {
         McpFederationError::Protocol("stdio MCP initialize result has no protocolVersion".into())
     })?;
-    if selected != MCP_PROTOCOL_VERSION {
+    if selected != expected_revision.as_str() {
         return Err(McpFederationError::Protocol(format!(
-            "stdio MCP server selected unsupported protocol version {selected}"
+            "stdio MCP server selected protocol version {selected}, expected {}",
+            expected_revision.as_str()
         )));
     }
     let capabilities = parse_server_capabilities(&result["capabilities"])?;
@@ -1847,6 +1853,79 @@ mod tests {
         assert!(
             !lists.exists(),
             "a server without Tool capability received tools/list"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_2025_03_26_stdio_revision_completes_discovery() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio_mcp_server.sh")
+            .canonicalize()
+            .expect("fixture script");
+        let server_id = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00c7);
+        let client = StdioMcpClient::new(
+            HashMap::from([(
+                server_id,
+                LocalStdioMcpConfig {
+                    command: Path::new("/bin/sh").to_path_buf(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    env: BTreeMap::from([(
+                        "MCP_SERVER_PROTOCOL_VERSION".into(),
+                        "2025-03-26".into(),
+                    )]),
+                    cwd: None,
+                    protocol_revision: McpProtocolRevision::V2025_03_26,
+                    client_capabilities: Default::default(),
+                },
+            )]),
+            Duration::from_secs(2),
+            LocalMcpLifecycleConfig::default(),
+        );
+
+        let catalog = client
+            .list_tools(server_id, "legacy")
+            .await
+            .expect("explicit legacy revision discovers tools");
+        client.shutdown().await;
+
+        assert_eq!(catalog.tools.len(), 1);
+        assert_eq!(catalog.tools[0].qualified_name, "mcp:legacy/search");
+    }
+
+    #[tokio::test]
+    async fn a_stdio_server_cannot_silently_select_another_legacy_revision() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/stdio_mcp_server.sh")
+            .canonicalize()
+            .expect("fixture script");
+        let server_id = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_00c8);
+        let client = StdioMcpClient::new(
+            HashMap::from([(
+                server_id,
+                LocalStdioMcpConfig {
+                    command: Path::new("/bin/sh").to_path_buf(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    env: BTreeMap::new(),
+                    cwd: None,
+                    protocol_revision: McpProtocolRevision::V2025_03_26,
+                    client_capabilities: Default::default(),
+                },
+            )]),
+            Duration::from_secs(2),
+            LocalMcpLifecycleConfig::default(),
+        );
+
+        let error = client
+            .list_tools(server_id, "legacy")
+            .await
+            .expect_err("server-selected revision drift must fail closed");
+        client.shutdown().await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("selected protocol version 2025-06-18, expected 2025-03-26"),
+            "unexpected revision drift error: {error}"
         );
     }
 

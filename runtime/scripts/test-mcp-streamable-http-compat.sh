@@ -47,11 +47,10 @@ cleanup() {
 
   case "$TEMP_ROOT" in
     "$TMP_BASE"/agent-runtime-mcp-http.*)
-      if [ -x /usr/bin/trash ]; then
-        /usr/bin/trash "$TEMP_ROOT"
-      else
-        /bin/rm -rf "$TEMP_ROOT"
-      fi
+      # This is a guarded mktemp tree containing only reproducible npm output.
+      # Moving it to the macOS Trash retains tens of MiB after every gate run.
+      chmod -R u+w "$TEMP_ROOT" 2>/dev/null || cleanup_status=1
+      find "$TEMP_ROOT" -depth -delete 2>/dev/null || cleanup_status=1
       ;;
     *)
       echo "refusing to remove unexpected temporary path: $TEMP_ROOT" >&2
@@ -77,7 +76,7 @@ sha256_file() {
   fi
 }
 
-for command_name in cargo curl node npm; do
+for command_name in cargo chmod curl find node npm; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "required command is unavailable: $command_name" >&2
     exit 2

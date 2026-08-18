@@ -8,7 +8,7 @@ use std::fmt;
 use uuid::Uuid;
 
 pub const RUN_QUEUED_SCHEMA_VERSION: u32 = 1;
-pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 21;
+pub const RUN_EXECUTION_SCHEMA_VERSION: u32 = 22;
 pub const RUN_EXECUTION_COMPLETE_IDENTITY_SCHEMA_VERSION: u32 = 20;
 pub const RUN_EXECUTION_MCP_OAUTH_SCHEMA_VERSION: u32 = 21;
 pub const RUN_CANCELLATION_SCHEMA_VERSION: u32 = 2;
@@ -546,6 +546,10 @@ pub struct RunExecutionCommand {
 /// One federated MCP server as the Worker sees it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum McpProtocolRevision {
+    /// Stateful initialize/session protocol retained for compatibility with
+    /// independently deployed servers that have not adopted 2025-06-18.
+    #[serde(rename = "2025-03-26")]
+    V2025_03_26,
     /// Stateful initialize/session protocol retained for compatibility.  It has
     /// no client-side reverse capabilities unless a future schema explicitly
     /// adds a separately recoverable legacy policy.
@@ -561,9 +565,15 @@ impl McpProtocolRevision {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::V2025_03_26 => "2025-03-26",
             Self::V2025_06_18 => "2025-06-18",
             Self::V2026_07_28 => "2026-07-28",
         }
+    }
+
+    #[must_use]
+    pub const fn is_legacy(self) -> bool {
+        matches!(self, Self::V2025_03_26 | Self::V2025_06_18)
     }
 }
 
@@ -1621,6 +1631,11 @@ impl RunExecutionCommand {
                 server.protocol_revision != McpProtocolRevision::V2025_06_18
                     || !server.client_capabilities.is_empty()
             }))
+            || (self.schema_version < 22
+                && self
+                    .mcp_servers
+                    .iter()
+                    .any(|server| server.protocol_revision == McpProtocolRevision::V2025_03_26))
             || (self.schema_version >= 19 && !self.valid_mcp_protocol_policy())
         {
             return Err(RunExecutionValidationError::InvalidMcpProtocolPolicy);
@@ -1740,7 +1755,7 @@ impl RunExecutionCommand {
 
     fn valid_mcp_protocol_policy(&self) -> bool {
         self.mcp_servers.iter().all(|server| {
-            if server.protocol_revision == McpProtocolRevision::V2025_06_18 {
+            if server.protocol_revision.is_legacy() {
                 return server.client_capabilities.is_empty();
             }
             !server.client_capabilities.is_empty()

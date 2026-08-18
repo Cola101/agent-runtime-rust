@@ -419,6 +419,12 @@ namespace 和稳定格式摘要。两端首轮共同运行 1/1 通过，分别�
 生产协议修改。该阶段证明运营方与真实部署多样性，不证明实现栈独立；已知非官方 SDK/手写 Server、真实 OAuth、
 长稳公网流和三类真实 Provider 兼容矩阵仍未完成。
 
+ADR-0140 用 `mark3labs/mcp-filesystem-server v0.11.1` / `mcp-go v0.32.0` 补上首个实现栈已知独立的外部
+Server。真实 RED 暴露 `2025-03-26` 被旧客户端拒绝；RunExecution schema 22、Gateway 与 stdio 现可显式冻结
+并验证该修订，绝不把 Server 选择漂移当成兼容。只允许 `list_allowed_directories` 的完整 Agent Loop 1/1
+通过，Go 源码/依赖/构建缓存全在受控临时目录并原地删除。真实 OAuth、长稳公网流和三类真实 Provider
+兼容矩阵仍未完成。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault

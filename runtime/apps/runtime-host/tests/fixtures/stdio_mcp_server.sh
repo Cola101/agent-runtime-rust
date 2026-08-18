@@ -39,7 +39,8 @@ while IFS= read -r request; do
       fi
       id=$(printf '%s' "$request" | sed -E 's/.*"id":([0-9]+).*/\1/')
       capabilities_json=${MCP_SERVER_CAPABILITIES_JSON:-'{"tools":{}}'}
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":${capabilities_json},\"serverInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}"
+      protocol_version=${MCP_SERVER_PROTOCOL_VERSION:-2025-06-18}
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id},\"result\":{\"protocolVersion\":\"${protocol_version}\",\"capabilities\":${capabilities_json},\"serverInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}"
       ;;
     *'"method":"notifications/initialized"'*)
       ;;

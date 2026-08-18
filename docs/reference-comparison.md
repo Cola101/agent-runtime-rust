@@ -14,7 +14,28 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：公开第三方 MCP 只读发现门禁
+## 当前阶段：显式旧版 MCP 修订与独立 Go 实现门禁
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 旧版修订 | modern discovery 可接受已知 Server-selected legacy，并保存 initialized 实际版本 | loopback MCP 支持 2025-03-26/2024-11-05，bundle 测试覆盖 2025-03-26 | schema 22 与 `stdio_2025_03_26` 在接纳前显式冻结 | 兼容面补齐；多租户恢复选择比自动降级更严格 |
+| 独立实现 | Codex 客户端使用 Rust RMCP，并有严格自有 fixture | 主要依赖 SDK/integrations 的广泛产品生态 | 固定 `mcp-go v0.32.0` + filesystem Server commit/tree/go.sum | 首个已知非官方实现完整 Agent Loop |
+| Tool 权限 | Tool/审批/rollout 产品链成熟 | Tool normalization、Auth Profile 与 Gateway 生命周期成熟 | 只将 `list_allowed_directories` 作为 Pure Tool 暴露 | 无副作用证据成立，不代表工具生态广度 |
+| 恢复身份 | initialized version 留在连接/session 状态 | Session/Gateway 管理连接代际 | wire revision 进入 Run/Checkpoint binding；漂移在 Tool 前拒绝 | 更适合替代 Host 恢复，自动协商便利性较低 |
+
+### 本阶段结论
+
+- 已确认：真实 RED 为 Server 选择 `2025-03-26` 而 Runtime 拒绝；修复后固定 mcp-go Server 完成模型→Tool→
+  Tool Result→模型第二轮→唯一终态 1/1。
+- 相比 Codex，本项目吸收其“只接受已知 legacy 修订并保存实际版本”的原则，但不采用运行中自动降级；多租户
+  Run 在接纳前显式冻结修订，牺牲配置便利以保持替代 Host 的身份稳定。
+- 相比 OpenClaw，本项目补齐其已覆盖的 `2025-03-26` 基础兼容；OpenClaw 的 Gateway、Auth Profile、连接
+  生命周期和 integrations 广度仍领先。
+- 独立 Go 实现关闭了“官方 SDK 与自家 fixture 互证”的证据缺口；一个 Server/Tool 不足以声明生态等量。
+- **未外推**：真实 OAuth、长期 session、Resources/Prompts、取消/progress、远端 HTTP 独立实现和三类
+  Provider 外部矩阵。总体仍为 70–75%。
+
+## 上一阶段：公开第三方 MCP 只读发现门禁
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

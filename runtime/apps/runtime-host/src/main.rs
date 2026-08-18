@@ -485,12 +485,23 @@ mod tests {
                     "cwd":null
                 },
                 "tool_names":["search"]
+            },{
+                "server_id":"00000000-0000-4000-8000-000000000045",
+                "name":"legacy",
+                "transport":{
+                    "type":"stdio_2025_03_26",
+                    "command":"/bin/sh",
+                    "args":["legacy-server.sh"],
+                    "env":{},
+                    "cwd":null
+                },
+                "tool_names":["list_allowed_directories"]
             }]"#,
         )
         .unwrap();
 
         let servers = load_mcp_servers_from_path(&path).expect("valid MCP config");
-        assert_eq!(servers.len(), 1);
+        assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].name, "local");
         assert!(matches!(
             &servers[0].transport,
@@ -498,6 +509,15 @@ mod tests {
                 if command.as_path() == std::path::Path::new("/bin/sh")
                     && args == &["server.sh"]
                     && env.get("EXPLICIT_VALUE").map(String::as_str) == Some("present")
+                    && cwd.is_none()
+        ));
+        assert_eq!(servers[1].name, "legacy");
+        assert!(matches!(
+            &servers[1].transport,
+            LocalMcpTransportConfig::StdioV20250326 { command, args, env, cwd }
+                if command.as_path() == std::path::Path::new("/bin/sh")
+                    && args == &["legacy-server.sh"]
+                    && env.is_empty()
                     && cwd.is_none()
         ));
     }

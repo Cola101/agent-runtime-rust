@@ -39,7 +39,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const ENVELOPE_ALGORITHM: &str = "RSA-OAEP-256+A256GCM";
-const LEGACY_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 
 /// A federated result is untrusted third-party content headed for the model's
@@ -1100,9 +1099,10 @@ impl McpFederationClient {
             };
         }
         if continuation.is_some() {
-            return Err(McpFederationError::Protocol(
-                "MCP 2025-06-18 does not support stateless MRTR continuation".into(),
-            ));
+            return Err(McpFederationError::Protocol(format!(
+                "MCP {} does not support stateless MRTR continuation",
+                server.protocol_revision.as_str()
+            )));
         }
         // A fresh session per call. Reusing one across calls would mean holding
         // server-side state whose lifetime we do not control, and a call that
@@ -1229,13 +1229,14 @@ impl McpFederationClient {
                 None,
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": LEGACY_MCP_PROTOCOL_VERSION,
+                    "protocolVersion": server.protocol_revision.as_str(),
                     "capabilities": {},
                     "clientInfo": { "name": "agent-runtime-platform", "version": "1" }
                 }),
             )
             .await?;
-        let capabilities = validate_initialize_result(&initialize_result)?;
+        let capabilities =
+            validate_initialize_result(&initialize_result, server.protocol_revision)?;
         // The spec has the client confirm initialization. It is a notification,
         // so there is no result to wait for and a server that ignores it is
         // still conformant; failing the whole discovery over it would be worse
@@ -2176,13 +2177,20 @@ pub fn mrtr_responses_value(
 
 fn validate_initialize_result(
     result: &serde_json::Value,
+    expected_revision: McpProtocolRevision,
 ) -> Result<BTreeSet<McpServerCapability>, McpFederationError> {
+    if !expected_revision.is_legacy() {
+        return Err(McpFederationError::Protocol(
+            "MCP initialize requires an explicitly frozen legacy revision".into(),
+        ));
+    }
     let selected = result["protocolVersion"].as_str().ok_or_else(|| {
         McpFederationError::Protocol("MCP initialize result has no protocolVersion".into())
     })?;
-    if selected != LEGACY_MCP_PROTOCOL_VERSION {
+    if selected != expected_revision.as_str() {
         return Err(McpFederationError::Protocol(format!(
-            "MCP server selected unsupported protocol version {selected}"
+            "MCP server selected protocol version {selected}, expected {}",
+            expected_revision.as_str()
         )));
     }
     let capabilities = parse_server_capabilities(&result["capabilities"])?;
@@ -2506,6 +2514,27 @@ fn catalog_digest(capabilities: &BTreeSet<McpServerCapability>, tools: &[McpTool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_initialize_accepts_only_the_frozen_wire_revision() {
+        let result = serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}}
+        });
+        assert_eq!(
+            validate_initialize_result(&result, McpProtocolRevision::V2025_03_26)
+                .expect("explicit legacy revision"),
+            BTreeSet::from([McpServerCapability::Tools])
+        );
+        let error = validate_initialize_result(&result, McpProtocolRevision::V2025_06_18)
+            .expect_err("wire revision drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("selected protocol version 2025-03-26, expected 2025-06-18"),
+            "unexpected revision drift error: {error}"
+        );
+    }
 
     /// The policy lookup and the connector lookup must be the same lookup.
     ///

@@ -817,6 +817,19 @@ pub enum LocalMcpTransportConfig {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
+    /// Stateful MCP 2025-03-26 over a persistent local process. This remains
+    /// explicit rather than silently accepting a peer-selected downgrade, so
+    /// the exact wire revision is frozen into Run and Checkpoint identity.
+    #[serde(rename = "stdio_2025_03_26")]
+    StdioV20250326 {
+        command: PathBuf,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+    },
     /// Stateless MCP 2026-07-28 over a persistent local process. Elicitation
     /// remains an explicit authority grant, identical to the HTTP transport.
     Stdio2026 {
@@ -838,7 +851,7 @@ impl LocalMcpTransportConfig {
             Self::StreamableHttp { endpoint } | Self::StreamableHttp2026 { endpoint, .. } => {
                 endpoint.clone()
             }
-            Self::Stdio { .. } | Self::Stdio2026 { .. } => {
+            Self::Stdio { .. } | Self::StdioV20250326 { .. } | Self::Stdio2026 { .. } => {
                 let canonical =
                     serde_json::to_vec(self).expect("local MCP transport config is serializable");
                 format!("stdio+sha256://{}", hex::encode(Sha256::digest(canonical)))
@@ -851,6 +864,7 @@ impl LocalMcpTransportConfig {
             Self::StreamableHttp2026 { .. } | Self::Stdio2026 { .. } => {
                 McpProtocolRevision::V2026_07_28
             }
+            Self::StdioV20250326 { .. } => McpProtocolRevision::V2025_03_26,
             Self::StreamableHttp { .. } | Self::Stdio { .. } => McpProtocolRevision::V2025_06_18,
         }
     }
@@ -971,6 +985,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)?
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .list_tools(server.server_id, &server.name)
@@ -1020,6 +1035,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .list_resources(
@@ -1055,6 +1071,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .read_resource(server.server_id, &server.name, frozen_catalog_digest, uri)
@@ -1092,6 +1109,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .list_resource_templates(
@@ -1126,6 +1144,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .list_prompts(
@@ -1167,6 +1186,7 @@ impl McpFederationBackend for LocalMcpBackend {
                         .map_err(local_mcp_error)
                 }
                 LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. }
                 | LocalMcpTransportConfig::Stdio2026 { .. } => self
                     .stdio
                     .get_prompt(
@@ -1269,7 +1289,8 @@ impl McpFederationBackend for LocalMcpBackend {
                         }
                     }
                 }
-                LocalMcpTransportConfig::Stdio { .. } => self
+                LocalMcpTransportConfig::Stdio { .. }
+                | LocalMcpTransportConfig::StdioV20250326 { .. } => self
                     .stdio
                     .call_tool_with_lifecycle(
                         server.server_id,
@@ -2764,6 +2785,12 @@ impl LocalRuntimeHost {
                 }
                 let stdio_process = match &server.transport {
                     LocalMcpTransportConfig::Stdio {
+                        command,
+                        args,
+                        env,
+                        cwd,
+                    }
+                    | LocalMcpTransportConfig::StdioV20250326 {
                         command,
                         args,
                         env,

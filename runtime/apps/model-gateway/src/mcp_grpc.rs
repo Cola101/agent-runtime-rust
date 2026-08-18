@@ -584,6 +584,7 @@ fn server_ref(
 ) -> Result<McpServerRef, Status> {
     let protocol_revision = match server.protocol_revision.as_str() {
         "" | "2025-06-18" => McpProtocolRevision::V2025_06_18,
+        "2025-03-26" => McpProtocolRevision::V2025_03_26,
         "2026-07-28" => McpProtocolRevision::V2026_07_28,
         revision => {
             return Err(Status::invalid_argument(format!(
@@ -601,7 +602,7 @@ fn server_ref(
             )),
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    if protocol_revision == McpProtocolRevision::V2025_06_18 && !client_capabilities.is_empty() {
+    if protocol_revision.is_legacy() && !client_capabilities.is_empty() {
         return Err(Status::invalid_argument(
             "legacy MCP servers cannot carry modern client capabilities",
         ));
@@ -656,5 +657,24 @@ fn to_status(error: McpFederationError) -> Status {
         McpFederationError::Protocol(_) => Status::invalid_argument(error.to_string()),
         McpFederationError::Unreachable(_) => Status::unavailable(error.to_string()),
         McpFederationError::Cancelled => Status::cancelled(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_preserves_the_explicit_2025_03_26_revision() {
+        let wire = agent_model_gateway_protocol::v1::McpServerRef {
+            server_id: Uuid::now_v7().to_string(),
+            name: "legacy".into(),
+            endpoint: "https://mcp.example.test/mcp".into(),
+            protocol_revision: "2025-03-26".into(),
+            ..Default::default()
+        };
+        let server = server_ref(wire).expect("explicit legacy wire revision");
+        assert_eq!(server.protocol_revision, McpProtocolRevision::V2025_03_26);
+        assert!(server.client_capabilities.is_empty());
     }
 }
