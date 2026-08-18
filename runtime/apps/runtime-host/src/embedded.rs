@@ -607,22 +607,31 @@ pub struct EmbeddedRuntime {
 /// then drops it.
 ///
 /// For a success that is right: the Run's own terminal is the record. For an
-/// error it is not: the Run is left at whatever state was last persisted, with
-/// no terminal event, and nothing anywhere says why. A subagent whose child
-/// fails reaches exactly that -- the parent stays `suspended` and the host is
-/// silent.
+/// error it is not, and what it costs depends on who was watching.
 ///
-/// This does not fix that. It makes it diagnosable, which is a different and
-/// smaller claim: the fix is for the error to *become* the Run's durable
-/// terminal, the way `terminate_provider_failure` already does for a Provider
-/// failure after `run.started`, and that is a change to the Run lifecycle
-/// rather than a line here.
+/// Measured, not assumed: a top-level Run that exhausts its budget writes
+/// `run.failed` correctly and *then* takes one more step, which is refused
+/// with `execution attempt is already terminal`. Nothing is lost there -- the
+/// terminal is on disk -- and the error was simply dropped. The same error
+/// under a delegation destroys the parent, because `execute_subagent` raises
+/// it as the failure of the whole delegation and the parent is left with
+/// neither a result nor a terminal of its own.
+///
+/// So the defect is a drive loop that continues past its own terminal, and it
+/// is universal; delegation is only where it does damage. This line does not
+/// fix it. It makes it visible, which is how the two cases above were told
+/// apart at all.
 fn note_detached_failure(operation: &str, run_id: Uuid, error: &dyn std::fmt::Display) {
     tracing::error!(
         error = %error,
         operation,
         %run_id,
-        "a detached execution failed after durable acceptance and left no terminal",
+        // Deliberately does not say whether a terminal was left. The first
+        // wording did, and it was wrong for the commonest case: a Run that
+        // exhausts its budget writes `run.failed` correctly and *then* takes
+        // one step past it, so the error is real and the terminal is there.
+        // Read this line beside the Run's own log rather than instead of it.
+        "a detached execution failed after durable acceptance",
     );
 }
 
