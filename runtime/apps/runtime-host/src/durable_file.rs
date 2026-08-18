@@ -50,11 +50,52 @@ impl DurableReplaceIo for StdDurableReplaceIo {
     }
 }
 
+/// One writer at a time per record, within this process.
+///
+/// The staging file is named from the target path, so two `replace` calls on
+/// one record share a `.json.partial`: one renames it away while the other
+/// still expects it, and the loser's `rename` fails with ENOENT. A caller sees
+/// "storage is unavailable" about a state root that is perfectly fine.
+///
+/// Serialised rather than renamed. The `.json.partial` suffix is load-bearing:
+/// recovery and retention find a half-written record by that exact name
+/// (`embedded.rs`, `event_archive.rs`, `retention.rs`, and `lib.rs`), so making
+/// it unique per writer would have to change every one of those, and would
+/// leave a stale file per crashed write instead of the one that is currently
+/// overwritten in place.
+///
+/// Sharded by path rather than one global lock, because two records have no
+/// reason to wait for each other; and by hash rather than by a map keyed on the
+/// path, because a map would grow with every record this process ever wrote.
+/// Contention within a shard is between writers of the same file, which is
+/// exactly what has to be serialised anyway.
+///
+/// This is process-local. Two *processes* writing one state root is already
+/// refused elsewhere -- the state root carries a single-owner lock -- so this
+/// is the scope the problem actually has.
+const REPLACE_SHARDS: usize = 64;
+
+fn replace_gates() -> &'static [std::sync::Mutex<()>; REPLACE_SHARDS] {
+    static GATES: std::sync::OnceLock<[std::sync::Mutex<()>; REPLACE_SHARDS]> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(())))
+}
+
+fn replace_shard(path: &Path) -> usize {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    usize::try_from(hasher.finish() % REPLACE_SHARDS as u64).unwrap_or(0)
+}
+
 fn replace_with_io<I: DurableReplaceIo>(
     io: &I,
     path: &Path,
     body: &[u8],
 ) -> Result<(), LocalRuntimeError> {
+    let _writing = replace_gates()[replace_shard(path)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let parent = path
         .parent()
         .ok_or_else(|| LocalRuntimeError::StateRoot("durable state path has no parent".into()))?;
@@ -126,6 +167,60 @@ fn remove_with_io<I: DurableReplaceIo>(io: &I, path: &Path) -> Result<(), LocalR
 /// Removes a durable file and commits that removal to its directory.
 pub(crate) fn remove(path: &Path) -> Result<(), LocalRuntimeError> {
     remove_with_io(&StdDurableReplaceIo, path)
+}
+
+/// Two writers, one path, at the same time.
+///
+/// The staging file is named from the target path, so two `replace` calls on
+/// one record use the same `.json.partial`: one renames it away while the
+/// other still expects it, and the second `rename` fails with ENOENT. That
+/// reaches a caller as "Session storage is unavailable" -- the state root is
+/// fine, and the answer names the wrong thing entirely.
+///
+/// This is not hypothetical concurrency. Nine call sites persist a Session
+/// record and only the projection path takes a gate, so a Run committing its
+/// own Turn and a reader projecting the same branch race by construction. The
+/// `grpc_session_contract` test failed this way in 4 of 25 runs.
+#[test]
+fn two_writers_on_one_path_do_not_lose_each_other_s_staging_file() {
+    let home = tempfile::tempdir().expect("temp dir");
+    let path = home.path().join("record.json");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    std::thread::scope(|scope| {
+        for writer in 0..8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let failures = failures.clone();
+            scope.spawn(move || {
+                let body = format!("{{\"writer\":{writer}}}").into_bytes();
+                barrier.wait();
+                for _ in 0..40 {
+                    if let Err(error) = replace(&path, &body) {
+                        failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(error.to_string());
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        failures.is_empty(),
+        "concurrent writers to one record must not fail: {failures:?}",
+    );
+    // And what is on disk is one of the bodies, whole -- not a mixture.
+    let held = std::fs::read_to_string(&path).expect("the record is readable");
+    assert!(
+        (0..8).any(|writer| held == format!("{{\"writer\":{writer}}}")),
+        "a torn or empty record was left behind: {held:?}",
+    );
 }
 
 #[cfg(test)]

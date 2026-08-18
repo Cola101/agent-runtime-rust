@@ -107,9 +107,70 @@ fn with_token<T>(message: T, token: &str) -> tonic::Request<T> {
     request
 }
 
+/// What the host logged while this test ran.
+///
+/// The reply a network caller gets is deliberately sanitised -- a host path
+/// must not cross the client contract -- so a failure here said only "Session
+/// storage is unavailable". The host does log the real error
+/// (`note_state_root` in `client.rs`), but a test binary installs no
+/// subscriber, so that line went nowhere and the cause of a flake this test's
+/// own comment says has been seen "for weeks, under load" stayed unknown.
+#[derive(Clone, Default)]
+struct HostLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl HostLog {
+    /// Process-wide rather than per-thread: the host work happens on Tokio's
+    /// threads and `set_default` would only cover this one.
+    fn install() -> Self {
+        let held = Self::default();
+        let _ = tracing_subscriber::fmt()
+            .with_writer(held.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .try_init();
+        held
+    }
+
+    fn said(&self) -> String {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let text = String::from_utf8_lossy(&held).into_owned();
+        if text.trim().is_empty() {
+            "(nothing at WARN or above)".into()
+        } else {
+            text
+        }
+    }
+}
+
+impl std::io::Write for HostLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for HostLog {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// One caller, one token, the whole Session surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_network_caller_starts_continues_forks_and_reads_a_real_session() {
+    let host_log = HostLog::install();
     let signing_key = SigningKey::from_bytes(&[73; 32]);
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
@@ -289,7 +350,7 @@ async fn a_network_caller_starts_continues_forks_and_reads_a_real_session() {
         // root looked like at the moment it was refused.
         .unwrap_or_else(|status| {
             panic!(
-                "continue session: {status:?}\nstate root {} held {:?}",
+                "continue session: {status:?}\nstate root {} held {:?}\nhost said: {}",
                 state.path().display(),
                 std::fs::read_dir(state.path())
                     .map(|entries| entries
@@ -297,6 +358,7 @@ async fn a_network_caller_starts_continues_forks_and_reads_a_real_session() {
                         .map(|entry| entry.file_name())
                         .collect::<Vec<_>>())
                     .unwrap_or_default(),
+                host_log.said(),
             )
         })
         .into_inner();
