@@ -116,8 +116,46 @@ fixture **已经有了**：`tests/embedded_control.rs::spawn_cancellable_provide
 - **被 steer 过的 Run 仍然取消得掉**（第一条发现直接对应的回归）
 - 被 steer 打断的调用**不留下一次模型超时**
 
+## 第四步不是接线，是控制面够不到 host
+
+动手写到第四步才看清：**没有任何外部路径能到达正在跑的 host**。
+
+`ActiveExecution` 持有的是一个 cancellation token，不是 host 的句柄；host 本身活在
+`drive_recorded` spawn 出去的那个 task 里，`processor` 是它的 `&mut self`。
+Cancel 之所以能工作，是因为它只需要取消一个 token；steering 需要**调用 processor 的方法**。
+
+写完 `steer()` 之后编译器直接说了：`method \`steer\` is never used`。这条警告就是结论。
+
+### 但同时看清了一件让它变简单的事
+
+`apply_steering` 的安全门要求：没有未决审批、没有未决子代理、没有任何在途工具调用。
+
+**循环正在等模型返回的那一刻，这三条按构造全部成立** —— 工具调用是在模型返回之后才发起的。
+
+所以不需要把安全判断搬到控制面（那需要把 processor 的内部状态暴露出去）。正确的形状是：
+
+- `ActiveExecution` 增加一个 steering 信箱（`mpsc` 或 `Mutex<Option<..>>`）
+- 模型调用外面套一个 `select!`，**同时**等模型返回和等信箱
+- 信箱先到 ⇒ 此刻必然安全 ⇒ 取消这次调用、由循环在 `&mut self` 处调 `apply_steering`
+- 循环带着更新后的 transcript 再问一次
+
+安全门仍然由 `apply_steering` 判定（它还要管幂等、冲突、终止态），
+`select!` 只是保证调用它的时机是安全的那个时机。
+
+### 本轮落地了什么，没落地什么
+
+**落地**：取消拓扑。host 现在持有 per-attempt token，绑一份进 processor，
+模型调用从同一个 token 派生。69 个测试无回归。
+
+这一步独立成立——它让 processor 侧的取消真的能够到在途模型调用，而此前够不到。
+但要说准：**现在还没有任何东西依赖它**，所以它是被回归测试保护的，不是被证明有效的。
+证明要等 steering 真的用上它。
+
+**没落地**：`steer()`、`Steered` 信号、以及把它接到控制面。写过又撤了——
+够不到的代码不提交。
+
 ## 结论
 
 这是一次对 Run 循环取消语义的改动——本地 host 最容易出错的地方。
-**本轮不落地。** 定位、设计与验证清单在此，下一批按这四步做，
-每一步都要能先看到它红。
+第一步已落地并回归验证；第四步的形状现在是确定的（信箱 + `select!` + 安全时机由构造保证）。
+剩下三步一起做，因为它们分开都够不到、也测不了。

@@ -1976,6 +1976,14 @@ pub struct LocalRuntimeHost {
     /// Root of this Run's cancellation tree. A child receives a child token,
     /// so cancellation propagates downward without letting it cancel a parent.
     cancellation: CancellationToken,
+    /// The token this attempt's work hangs from, and the one bound into the
+    /// Processor.
+    ///
+    /// A child of `cancellation`, so a Run-level cancel still reaches every
+    /// model call. It exists as a field because the Processor's own paths
+    /// cancel what is bound to them, and those have to reach the model call in
+    /// flight rather than a sibling nobody is awaiting.
+    attempt_cancellation: Option<CancellationToken>,
     /// Set only by this Host's duration watchdog. Ancestor/user cancellation
     /// therefore remains distinguishable from a local duration terminal.
     duration_expired: Arc<AtomicBool>,
@@ -3281,6 +3289,7 @@ impl LocalRuntimeHost {
             process_session_manager,
             worker_id,
             cancellation,
+            attempt_cancellation: None,
             duration_expired: Arc::new(AtomicBool::new(false)),
             subagent_tasks: HashMap::new(),
             pending_mcp_input: None,
@@ -4215,7 +4224,11 @@ impl LocalRuntimeHost {
             journal.inflight_provider_id = Some(route.candidate.id.clone());
             Self::persist_model_route_journal(&path, &journal)?;
             let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-            let cancellation = self.cancellation.child_token();
+            // From the attempt's token, not from the Run's directly. Both stop
+            // this call when a person cancels -- the attempt token is a child
+            // of the Run's -- but only this way does cancelling what the
+            // Processor holds reach the call that is actually in flight.
+            let cancellation = self.attempt_cancellation_token().child_token();
             let call = route.adapter.execute(
                 &route.candidate.id,
                 request,
@@ -7320,6 +7333,14 @@ impl LocalRuntimeHost {
         Ok(DurationDeadlineGuard { stop })
     }
 
+    /// The attempt's token, or the Run's when no attempt is bound yet.
+    ///
+    /// The fallback is not a convenience: work that happens before an attempt
+    /// exists still has to stop when the Run is cancelled.
+    fn attempt_cancellation_token(&self) -> &CancellationToken {
+        self.attempt_cancellation.as_ref().unwrap_or(&self.cancellation)
+    }
+
     fn terminate_interrupted(
         &mut self,
         run_id: Uuid,
@@ -7781,9 +7802,11 @@ impl LocalRuntimeHost {
                 None
             }
         };
+        let attempt_cancellation = self.cancellation.child_token();
         self.processor
-            .bind_cancellation_token(attempt_id, self.cancellation.child_token())
+            .bind_cancellation_token(attempt_id, attempt_cancellation.clone())
             .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?;
+        self.attempt_cancellation = Some(attempt_cancellation);
         let _duration_deadline = self.arm_duration_deadline(attempt_id)?;
 
         // Cancellation intent is allowed to outlive the daemon that accepted
