@@ -125,6 +125,64 @@ export function since(iso: string | null): string {
   return `${Math.round(hours / 24)} 天前`;
 }
 
+/// How long a Run has been going, counted rather than described.
+///
+/// "35 分钟前" answers a different question from "it has been running for 35
+/// minutes", and while something is in flight the second is the one being
+/// asked. A finished Run is measured end to end; a live one is measured to
+/// now, which is why this takes both ends.
+export function elapsed(startedAt: string | null, until: string | null): string {
+  if (!startedAt) return "";
+  const start = Date.parse(startedAt);
+  if (Number.isNaN(start)) return "";
+  const end = until ? Date.parse(until) : Date.now();
+  const seconds = Math.max(0, Math.round(((Number.isNaN(end) ? Date.now() : end) - start) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/// What the Run is doing, from the last event it wrote.
+///
+/// Every phrase here is something an event says. Nothing estimates progress:
+/// "almost done thinking" is a sentence no event supports, and a screen that
+/// says it is guessing at a model's interior. When the last event is one this
+/// version does not know, that is said too -- with the type, so it can be
+/// looked up rather than wondered about.
+export function doing(lastEventType: string | null): string | null {
+  switch (lastEventType) {
+    case null:
+      return null;
+    case "run.started":
+    case "model.provider.selected":
+    case "run.resumed":
+    case "run.restored":
+      return "在想";
+    case "model.output.delta":
+    case "model.reasoning":
+      return "在回答";
+    case "model.tool_call":
+    case "tool.execution.requested":
+    case "tool.execution.started":
+    case "tool.execution.progress":
+      return "在用工具";
+    case "approval.required":
+    case "mcp.input.required":
+      return "等你决定";
+    case "run.steer.applied":
+      return "刚改了向";
+    case "subagent.spawned":
+    case "subagent.spawn.requested":
+      return "在派子代理";
+    case "model.usage":
+    case "model.turn.completed":
+      return "在收尾";
+    default:
+      return null;
+  }
+}
+
 /// Cost in micro-dollars, as the runtime reports it. Rendered at the precision
 /// the number actually has: a run that cost nothing says so.
 export function costLabel(micros: number): string {

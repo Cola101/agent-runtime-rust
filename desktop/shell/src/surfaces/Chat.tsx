@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
 import {
-  costLabel, effectLabel, eventNote, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
+  costLabel, doing, effectLabel, elapsed, eventNote, lifecycleLabel, lifecycleTone,
+  sandboxLabel, shortId, since,
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
@@ -231,23 +232,39 @@ function Turns({ session }: { session: SessionView }) {
   );
 }
 
+/// Which Run this surface is about.
+///
+/// One rule, used by the transcript and by the status line, because they were
+/// two answers to one question: the transcript respected the selection and the
+/// open conversation while the status line took whichever Run was touched last.
+/// A window that describes one Run above a transcript of another is worse than
+/// either alone.
+///
+/// Two cursors meet here and the explicit one wins. Picking a Run out of a list
+/// and coming here has to show that Run; inside a conversation the only Run
+/// worth drawing is the Turn still running, since "the newest Run anywhere"
+/// would be a different conversation's.
+function shownRun(desk: Desk): RunView | null {
+  const chosen = desk.selected
+    ? desk.runs.find((candidate) => candidate.id === desk.selected) ?? null
+    : null;
+  if (chosen) return chosen;
+  const session = desk.current;
+  if (session) {
+    return session.activeRunId
+      ? desk.runs.find((candidate) => candidate.id === session.activeRunId) ?? null
+      : null;
+  }
+  return currentRun(desk);
+}
+
 function ChatView() {
   const desk = useDesk();
-  // Two cursors meet on this surface, and the explicit one wins. Picking a Run
-  // out of a list and coming here has to show that Run -- if the open
-  // conversation could displace it, the list would be pointing at something
-  // the transcript is not showing.
   const chosen = desk.selected
     ? desk.runs.find((candidate) => candidate.id === desk.selected) ?? null
     : null;
   const session = chosen ? null : desk.current;
-  // Inside a conversation the only Run worth drawing under it is the Turn
-  // still running. Falling back to "the newest Run anywhere" would append a
-  // different conversation's transcript to this one.
-  const live = session?.activeRunId
-    ? desk.runs.find((candidate) => candidate.id === session.activeRunId) ?? null
-    : null;
-  const run = chosen ?? (session ? live : currentRun(desk));
+  const run = shownRun(desk);
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
 
@@ -437,18 +454,46 @@ export function Composer() {
 /// about the app. An app that spends that row on its own name has wasted it.
 export function ChatStatus() {
   const desk = useDesk();
-  const run = currentRun(desk);
+  const run = shownRun(desk);
+  const moving = run !== null
+    && (run.lifecycle.kind === "running" || run.lifecycle.kind === "cancelling");
+  // No timer here. The store re-reads every 1.2 seconds and re-renders, so the
+  // clock already advances without one. A `setInterval` was written first and
+  // taken out: stopping it changed nothing a test could see, which is the
+  // definition of a part that is not doing anything.
   if (!run) return <span className="now">—</span>;
-  const moving = run.lifecycle.kind === "running" || run.lifecycle.kind === "cancelling";
+
+  const lastEvent = run.events[run.events.length - 1]?.type ?? null;
+  const activity = moving ? doing(lastEvent) : null;
   return (
     <>
       <span className={`now t-${lifecycleTone(run.lifecycle)}`}>
         {lifecycleLabel(run.lifecycle)}
       </span>
+      {moving && (
+        <>
+          <i>・</i>
+          {activity
+            ? <span>{activity}</span>
+            // Named rather than smoothed over: an event this build does not
+            // recognise is worth seeing, and the type is what makes it
+            // lookupable instead of mysterious.
+            : <span className="dim mono" title="这个版本不认识这个事件类型">{lastEvent}</span>}
+          <i>・</i>
+          {/* Counted from the Run's first event to now. A finished Run is
+              measured end to end instead. */}
+          <span title={run.startedAt ?? ""}>{elapsed(run.startedAt, null)}</span>
+        </>
+      )}
       <i>・</i><span className="mono">{shortId(run.id)}</span>
       <i>・</i><span>{run.tokens.toLocaleString()} token</span>
       <i>・</i><span>{costLabel(run.costMicros)}</span>
-      <i>・</i><span title={run.updatedAt ?? ""}>{since(run.updatedAt)}</span>
+      <i>・</i>
+      {moving
+        ? <span title={run.updatedAt ?? ""}>{since(run.updatedAt)}</span>
+        : <span title={`${run.startedAt ?? ""} → ${run.updatedAt ?? ""}`}>
+          用了 {elapsed(run.startedAt, run.updatedAt)}
+        </span>}
       {moving && (
         <button type="button" className="flat stop" onClick={() => void desk.decide(run.id, "cancel")}>
           停止
