@@ -129,6 +129,41 @@ function processScript(messages) {
 
 /// Picks a reply from the prompt, so a developer can drive the client into a
 /// specific lifecycle state on purpose instead of waiting for one to happen.
+/// One delegation, start to finish.
+///
+/// Exists because delegation was the one capability nobody had watched work:
+/// the parent reached `model.turn.completed{reason: tool_calls}` and no child
+/// Run directory was ever written. Whether that was the app not granting
+/// `agent:spawn`, the roles file, or the kernel could not be told apart
+/// without a provider that actually asks for one.
+///
+/// `inline` on purpose: it waits for the terminal result, so one turn is
+/// enough to say whether a child ran. An async spawn would return an id and
+/// leave the question open in a different place.
+function delegationScript(messages, starve = false) {
+  const answered = messages.some((message) => message?.role === "tool");
+  if (!answered) {
+    return [
+      ...textChunks("Handing this to a reader."),
+      callChunk("agent.spawn", {
+        role: "reader",
+        input: "Read what is in the workspace and say what you found.",
+        max_tokens: starve ? 1 : 2000,
+        max_cost_cents: 5,
+        max_duration_seconds: 60,
+        mode: "inline",
+      }),
+      usage(120, 30),
+      done("tool_calls"),
+    ];
+  }
+  return [
+    ...textChunks("The reader answered; everything above is what it returned."),
+    usage(200, 40),
+    done("stop"),
+  ];
+}
+
 function script(prompt, tools, messages) {
   const asked = prompt.toLowerCase();
   const has = (name) => tools.some((tool) => tool?.function?.name === name);
@@ -136,6 +171,14 @@ function script(prompt, tools, messages) {
   if ((asked.includes("process") || asked.includes("进程") || asked.includes("会话"))
       && has("process.start")) {
     return processScript(messages);
+  }
+
+  if ((asked.includes("delegate") || asked.includes("子代理") || asked.includes("委托"))
+      && has("agent.spawn")) {
+    // A budget of one token makes the child end on `budget_exhausted` on its
+    // first turn, which is the arm that says whether a parent hears about a
+    // child that failed as reliably as one that did not.
+    return delegationScript(messages, asked.includes("预算") || asked.includes("starve"));
   }
 
   if ((asked.includes("shell") || asked.includes("命令")) && has("shell.exec")) {
@@ -159,6 +202,18 @@ function script(prompt, tools, messages) {
   }
 
   if ((asked.includes("read") || asked.includes("读")) && has("workspace.read_text")) {
+    // Once. This branch used to ignore what it had already been told, so the
+    // same prompt produced the same call forever -- which is not a model and
+    // is not a useful stand-in for one: a subagent driven by it could only
+    // ever end on `budget_exhausted`, which is the wrong arm of the very
+    // question a delegation test is asking.
+    if (messages.some((message) => message?.role === "tool")) {
+      return [
+        ...textChunks("That is what the file says."),
+        usage(200, 24),
+        done("stop"),
+      ];
+    }
     return [
       ...textChunks("Let me look at that file."),
       {

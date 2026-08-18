@@ -60,7 +60,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | --- | --- | --- | --- |
 | 22 | 子代理树（角色 / 深度 / 并发 / 预算子集） | 未做 | 内核做得最深的一块，UI 一个像素都没有 |
 | 23 | Session fork / rollback | 已接入 | 转录里每个 Turn 上分叉/回滚，generation 与 ordinal 都来自 head 与 history；回滚要按两次，且不在任何裸键上；分叉出的分支在会话列表里是单独一行，只标分支 id——head 不带来源，"分叉自谁"无从说起 |
-| 23.5 | 子代理树 | 已接入 | 角色、状态、排队输入、代数、用量、分叉血缘，各字段都来自事件；每行可跳到子 Run |
+| 23.5 | 子代理树 | 已接入 | 角色、状态、排队输入、代数、用量、分叉血缘，各字段都来自事件；每行可跳到子 Run。端到端**已验证**：子 Run 真的建出来并跑完，父收到 `subagent.result.received` 后结束。**但子代理失败时父收不到结果**，停在 `suspended` —— 见 `docs/evidence/2026-08-19-delegation-end-to-end.md` |
 | 24 | 持久进程会话 / PTY | **已接入（不是终端）** | 进程会话面。渲染 `tool.result` 里 `ProcessSessionOutput` 真正带回来的字节，每段标出字节区间、缺口与重读。应用现在会设 `AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE`（登录 shell，取不到就 `/bin/sh`）并授 `tool:process.session`——在此之前八个 `process.*` 工具**一个都没装**，这个面只可能是空的。**仍不是终端**：客户端读不到实时输出也无法输入 |
 | 25 | MCP resources / prompts 浏览 | 未做 | ADR-0116/0117 已实现读取契约 |
 | 25.1 | MCP 服务配置（stdio） | 已接入 | 设置里可增删；应用写 `AGENT_RUNTIME_LOCAL_MCP_CONFIG` 并补 `tool:mcp:<name>` 授权 |
