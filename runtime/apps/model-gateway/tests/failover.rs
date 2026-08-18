@@ -85,7 +85,8 @@ async fn rate_limit_before_output_falls_back_to_the_next_provider() {
         events,
         vec![
             ModelStreamEvent::TextDelta {
-                text: "fallback".into()
+                text: "fallback".into(),
+                block: None
             },
             ModelStreamEvent::Usage {
                 input_tokens: 1,
@@ -304,7 +305,8 @@ async fn partial_output_then_timeout_never_falls_back() {
     assert_eq!(
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
-            text: "committed".into()
+            text: "committed".into(),
+            block: None
         })
     );
     assert!(

@@ -5138,7 +5138,7 @@ impl LocalRuntimeHost {
         let mut completed = false;
         for event in events {
             match event {
-                ModelStreamEvent::TextDelta { text } => summary.push_str(&text),
+                ModelStreamEvent::TextDelta { text, .. } => summary.push_str(&text),
                 ModelStreamEvent::Usage {
                     input_tokens: input,
                     output_tokens: output,
@@ -8471,9 +8471,8 @@ impl LocalRuntimeHost {
 
             for event in events {
                 match &event {
-                    ModelStreamEvent::TextDelta { text } | ModelStreamEvent::Refusal { text } => {
-                        output.push_str(text)
-                    }
+                    ModelStreamEvent::TextDelta { text, .. }
+                    | ModelStreamEvent::Refusal { text } => output.push_str(text),
                     _ => {}
                 }
                 let envelope = self

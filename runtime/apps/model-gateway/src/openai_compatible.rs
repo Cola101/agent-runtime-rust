@@ -384,7 +384,20 @@ async fn consume_chunk(
     for choice in chunk["choices"].as_array().into_iter().flatten() {
         let delta = &choice["delta"];
         if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
-            emit(events, ModelStreamEvent::TextDelta { text: text.into() }).await?;
+            // The choice's own index. This protocol has one content stream per
+            // choice, so the choice *is* the block, and a provider asked for
+            // more than one completion produces more than one.
+            let block = choice["index"]
+                .as_u64()
+                .map(|index| u32::try_from(index).unwrap_or(u32::MAX));
+            emit(
+                events,
+                ModelStreamEvent::TextDelta {
+                    text: text.into(),
+                    block,
+                },
+            )
+            .await?;
         }
         for fragment in delta["tool_calls"].as_array().into_iter().flatten() {
             let index = fragment["index"].as_u64().ok_or_else(|| {

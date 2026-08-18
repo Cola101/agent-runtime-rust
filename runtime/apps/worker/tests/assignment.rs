@@ -3125,6 +3125,7 @@ fn terminal_model_turn_can_be_checkpointed_before_its_event_is_published() {
             command.attempt_id,
             ModelStreamEvent::TextDelta {
                 text: "terminal transcript evidence".into(),
+                block: None,
             },
         )
         .unwrap();
@@ -3891,6 +3892,7 @@ fn tool_turn_preserves_assistant_text_call_and_bound_result() {
             command.attempt_id,
             ModelStreamEvent::TextDelta {
                 text: "I will inspect the file first. ".into(),
+                block: None,
             },
         )
         .unwrap();
@@ -3899,6 +3901,7 @@ fn tool_turn_preserves_assistant_text_call_and_bound_result() {
             command.attempt_id,
             ModelStreamEvent::TextDelta {
                 text: "The result will support the answer.".into(),
+                block: None,
             },
         )
         .unwrap();
@@ -4545,6 +4548,7 @@ fn compaction_summarizes_an_old_prefix_keeps_a_complete_tool_tail_and_restores_e
                 command.attempt_id,
                 ModelStreamEvent::TextDelta {
                     text: narrative.into(),
+                    block: None,
                 },
             )
             .unwrap();

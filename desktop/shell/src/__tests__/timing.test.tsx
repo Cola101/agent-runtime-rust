@@ -49,7 +49,13 @@ describe("the clock", () => {
       await waitFor(() => expect(screen.getByText("运行中")).toBeTruthy());
       const clock = () => screen.getByText(/^\d+[smh]/).textContent;
       const first = clock();
-      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      // Two minutes, not an hour. The store polls every 1.2s and each tick
+      // drives a full read, so an hour of fake time is three thousand of them
+      // and the test outran its deadline whenever the machine was busy. Two
+      // minutes is enough to be certain: the fixture's Run started long enough
+      // ago that the label is at minute resolution, and crossing two of them
+      // cannot leave a live clock reading what it read before.
+      await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
       expect(clock()).not.toBe(first);
     } finally {
       vi.useRealTimers();

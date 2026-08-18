@@ -129,11 +129,22 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
     acts = [];
   };
 
+  // Which block the text being accumulated came from. The runtime now says so
+  // (`model.output.delta` carries `block`), and two blocks are two things the
+  // model said rather than one cut in half -- a distinction adjacency cannot
+  // make. Undefined means the provider supplied none, which is also every
+  // record written before the field existed; those still group by adjacency,
+  // which is the best a log without the answer allows.
+  let block: number | undefined;
+
   for (const event of run.events) {
     if (event.type === "model.output.delta") {
       // Text ends a run of calls: what the model says after using a tool is a
       // new part of the conversation, not more of the same fold.
       flushActs(String(event.sequence));
+      const at = typeof event.payload.block === "number" ? event.payload.block : undefined;
+      if (text && at !== block) flushText(String(event.sequence));
+      block = at;
       text += String(event.payload.text ?? "");
       continue;
     }

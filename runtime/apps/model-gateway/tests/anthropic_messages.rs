@@ -121,6 +121,11 @@ async fn maps_messages_tool_history_and_streamed_tool_input() {
         vec![
             ModelStreamEvent::TextDelta {
                 text: "Hello".into(),
+                // The block this adapter's own `content_block_start` named. It
+                // reads that index to track partial tools and reasoning and
+                // used to drop it for text, which is what left a log unable to
+                // tell two answers from one cut in half.
+                block: Some(0),
             },
             ModelStreamEvent::ToolCall {
                 id: "toolu_99".into(),
@@ -241,12 +246,16 @@ async fn thinking_is_private_continuation_state_and_never_visible_text() {
     assert_eq!(
         events[1],
         ModelStreamEvent::TextDelta {
-            text: "Visible answer".into()
+            text: "Visible answer".into(),
+            // Block 1, not 0: block 0 of this answer is the thinking. That the
+            // two are different blocks is precisely what the log could not say
+            // before, and it is the distinction a reader needs most.
+            block: Some(1)
         }
     );
     assert!(!events.iter().any(|event| matches!(
         event,
-        ModelStreamEvent::TextDelta { text } if text.contains("private thought")
+        ModelStreamEvent::TextDelta { text, .. } if text.contains("private thought")
     )));
 
     let replay_request = ModelRequest {

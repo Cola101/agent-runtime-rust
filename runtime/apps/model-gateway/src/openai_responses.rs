@@ -156,7 +156,20 @@ impl OpenAiResponsesAdapter {
             match event_type {
                 "response.output_text.delta" => {
                     if let Some(text) = value["delta"].as_str().filter(|text| !text.is_empty()) {
-                        emit(&events, ModelStreamEvent::TextDelta { text: text.into() }).await?;
+                        // `output_index` is this API's name for which output
+                        // item the delta belongs to, which is the same question
+                        // the other adapters answer with a block index.
+                        let block = value["output_index"]
+                            .as_u64()
+                            .map(|index| u32::try_from(index).unwrap_or(u32::MAX));
+                        emit(
+                            &events,
+                            ModelStreamEvent::TextDelta {
+                                text: text.into(),
+                                block,
+                            },
+                        )
+                        .await?;
                     }
                 }
                 "response.refusal.done" => {

@@ -51,8 +51,19 @@
 
 `thread/search` `thread/searchOccurrences`
 
-**在服务端搜索历史**。我此刻正让一个子代理做客户端 ⌘F ——那只能搜当前 Run 已加载的事件。
-Codex 搜的是整个 thread 存储。这是设计层面的差别，不是实现进度差别。
+**在服务端搜索历史**。我们的 ⌘F 是客户端的：搜这个客户端已经读进来的东西——正在跑那个 Run
+的事件，**以及已提交的 Turn**（`Turns` 里的 user/assistant 文本一样过 `<Mark>`，
+`finds what was said in a Turn that has already committed` 守着这条）。
+
+已提交的 Turn 这一半值得单独说：Run 的事件日志会被回收，冻结的 transcript 不会，
+所以那是日志没了之后**唯一还找得到的东西**。
+
+但仍然不是 `thread/search`：Codex 搜的是整个 thread 存储，包括这个客户端从未读过的会话。
+这是设计层面的差别，不是实现进度差别。
+
+（这一条我原先写成"只能搜当前 Run 已加载的事件"，写窄了。做这个功能的 agent 指出来了，
+并且**没有顺手改这份文档**——它说这是热点文件，别的 worktree 正在往上 rebase，
+顺手改会制造它刚刚避开的冲突。这个判断是对的。）
 
 ### 四、模型与配置枚举（6 个方法）
 

@@ -118,6 +118,9 @@ async fn maps_typed_items_and_requires_response_completed() {
         vec![
             ModelStreamEvent::TextDelta {
                 text: "Hello".into(),
+                // This fixture sends no `output_index`, so the event does not
+                // claim one. Absent is the honest answer, not zero.
+                block: None,
             },
             ModelStreamEvent::ToolCall {
                 id: "call_99".into(),

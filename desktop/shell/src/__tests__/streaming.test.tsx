@@ -84,3 +84,34 @@ describe("a run being followed", () => {
       .toBe("still going重复一次就错");
   });
 });
+
+describe("what the runtime says about where text came from", () => {
+  /// Two blocks are two things the model said. Before the runtime carried the
+  /// block, these three deltas were indistinguishable from one answer arriving
+  /// in three pieces, and this client joined them into a single paragraph
+  /// because adjacency was the only signal it had.
+  it("keeps two blocks apart instead of joining them", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(30, "model.output.delta", { text: "第一块。", block: 0 }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(31, "model.output.delta", { text: "第二块。", block: 1 }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(32, "model.output.delta", { text: "还是第二块。", block: 1 }, 30));
+
+    await waitFor(() => expect(screen.getByText("第一块。")).toBeTruthy());
+    // The second block's two deltas join, because they are one thing; the first
+    // stays its own paragraph, because it is another.
+    expect(screen.getByText("第二块。还是第二块。")).toBeTruthy();
+  });
+
+  it("falls back to adjacency when the log does not say", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    // A provider that supplies no block, and every record written before the
+    // field existed. Joining is all a log without the answer permits.
+    bridge.emit(RUN_LIVE, bridge.event(30, "model.output.delta", { text: "前半" }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(31, "model.output.delta", { text: "后半" }, 30));
+    await waitFor(() => expect(screen.getByText(/前半后半/)).toBeTruthy());
+  });
+});

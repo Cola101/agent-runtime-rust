@@ -2146,6 +2146,7 @@ impl ModelExecution for SuccessfulModelGateway {
                 sequence: 1,
                 body: Some(model_event::Body::TextDelta(TextDelta {
                     text: "hello".into(),
+                    block: None,
                 })),
             }),
             Ok(ModelEvent {
@@ -2197,6 +2198,7 @@ impl ModelExecution for SteeringModelGateway {
                     sequence: 1,
                     body: Some(model_event::Body::TextDelta(TextDelta {
                         text: "stale".into(),
+                        block: None,
                     })),
                 }),
                 Ok(ModelEvent {
@@ -2267,6 +2269,7 @@ impl ModelExecution for ToolLoopModelGateway {
                     sequence: 1,
                     body: Some(model_event::Body::TextDelta(TextDelta {
                         text: "done".into(),
+                        block: None,
                     })),
                 }),
                 Ok(ModelEvent {

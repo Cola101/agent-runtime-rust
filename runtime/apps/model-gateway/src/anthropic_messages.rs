@@ -460,7 +460,14 @@ async fn consume_block_start(
                 .as_str()
                 .filter(|text| !text.is_empty())
             {
-                emit(events, ModelStreamEvent::TextDelta { text: text.into() }).await?;
+                emit(
+                    events,
+                    ModelStreamEvent::TextDelta {
+                        text: text.into(),
+                        block: block_index(index),
+                    },
+                )
+                .await?;
             }
         }
         Some("tool_use") => {
@@ -535,7 +542,18 @@ async fn consume_block_delta(
                 .as_str()
                 .filter(|text| !text.is_empty())
             {
-                emit(events, ModelStreamEvent::TextDelta { text: text.into() }).await?;
+                // The same index the tool and reasoning branches below already
+                // key their partial state on. A text delta carries it for the
+                // same reason they do: it says which block this belongs to.
+                let index = required_index(value)?;
+                emit(
+                    events,
+                    ModelStreamEvent::TextDelta {
+                        text: text.into(),
+                        block: block_index(index),
+                    },
+                )
+                .await?;
             }
         }
         Some("input_json_delta") => {
@@ -691,6 +709,15 @@ fn map_stop_reason(reason: &str) -> Result<ModelFinishReason, ProviderExecutionE
             format!("unsupported Anthropic stop_reason {value}"),
         )),
     }
+}
+
+/// The provider's block index, narrowed to what the event carries.
+///
+/// A stream with more than `u32::MAX` blocks is not a stream; clamping rather
+/// than failing keeps a pathological provider from ending a Run over a number
+/// nobody reads.
+fn block_index(index: u64) -> Option<u32> {
+    Some(u32::try_from(index).unwrap_or(u32::MAX))
 }
 
 fn required_index(value: &Value) -> Result<u64, ProviderExecutionError> {

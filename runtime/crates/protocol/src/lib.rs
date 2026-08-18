@@ -2943,6 +2943,21 @@ pub enum ModelFinishReason {
 pub enum ModelStreamEvent {
     TextDelta {
         text: String,
+        /// Which block of the model's answer this text belongs to.
+        ///
+        /// Providers stream an answer as indexed content blocks, and two blocks
+        /// are two things the model said -- not one thing cut in half. Without
+        /// this a client can only group text by adjacency, which cannot tell
+        /// those apart, and every client has to invent the same guess.
+        ///
+        /// The adapters had it and dropped it: `anthropic_messages` reads
+        /// `content_block_start`'s index and uses it to track partial tools and
+        /// reasoning, then emitted text without it.
+        ///
+        /// Optional because a provider need not supply one and because durable
+        /// records written before this field exist and must still parse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block: Option<u32>,
     },
     ToolCall {
         id: String,

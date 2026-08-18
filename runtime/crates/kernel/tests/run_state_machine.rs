@@ -171,6 +171,7 @@ fn model_stream_events_are_ordered_and_completion_is_the_only_terminal_event() {
     let delta = run
         .apply_model_event(ModelStreamEvent::TextDelta {
             text: "hello".into(),
+            block: None,
         })
         .expect("running model stream accepts deltas");
     let usage = run
@@ -235,4 +236,45 @@ fn timeout_failure_preserves_classification_and_uses_timed_out_terminal_state() 
     assert_eq!(failed.payload["kind"], "timeout");
     assert_eq!(failed.payload["retryable"], true);
     assert_eq!(run.status(), RunStatus::TimedOut);
+}
+
+/// Which block text came from reaches the durable event, and its absence is a
+/// different fact from block zero.
+///
+/// Without this the log cannot tell two things the model said from one thing
+/// cut in half, and every client has to guess by adjacency. A provider that
+/// supplies no block index still produces a usable event -- the payload simply
+/// does not claim one, which is also what every record written before this
+/// field existed looks like.
+#[test]
+fn a_text_delta_carries_the_block_it_came_from() {
+    let mut run = machine();
+    run.apply(RunCommand::Start).unwrap();
+
+    let first = run
+        .apply_model_event(ModelStreamEvent::TextDelta {
+            text: "one".into(),
+            block: Some(0),
+        })
+        .expect("a running stream accepts deltas");
+    assert_eq!(first.payload["block"], 0);
+    assert_eq!(first.payload["text"], "one");
+
+    let second = run
+        .apply_model_event(ModelStreamEvent::TextDelta {
+            text: "two".into(),
+            block: Some(1),
+        })
+        .expect("a running stream accepts deltas");
+    assert_eq!(second.payload["block"], 1);
+
+    let unblocked = run
+        .apply_model_event(ModelStreamEvent::TextDelta {
+            text: "three".into(),
+            block: None,
+        })
+        .expect("a running stream accepts deltas");
+    // Absent, not zero. Zero is a block; nothing is the absence of one, and a
+    // client that read a default here would group unrelated text together.
+    assert!(unblocked.payload.get("block").is_none());
 }

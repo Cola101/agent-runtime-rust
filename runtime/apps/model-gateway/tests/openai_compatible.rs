@@ -100,8 +100,14 @@ async fn real_http_sse_maps_request_and_emits_text_usage_then_completion() {
     assert_eq!(
         events,
         vec![
-            ModelStreamEvent::TextDelta { text: "Hel".into() },
-            ModelStreamEvent::TextDelta { text: "lo".into() },
+            ModelStreamEvent::TextDelta {
+                text: "Hel".into(),
+                block: Some(0),
+            },
+            ModelStreamEvent::TextDelta {
+                text: "lo".into(),
+                block: Some(0),
+            },
             ModelStreamEvent::Usage {
                 input_tokens: 12,
                 output_tokens: 3,
@@ -137,7 +143,8 @@ async fn cancellation_stops_a_live_provider_http_stream_without_waiting_for_time
     assert_eq!(
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
-            text: "started".into()
+            text: "started".into(),
+            block: Some(0),
         })
     );
     cancellation.cancel();
@@ -173,7 +180,8 @@ async fn idle_provider_stream_is_classified_as_a_retryable_timeout() {
     assert_eq!(
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
-            text: "started".into()
+            text: "started".into(),
+            block: Some(0),
         })
     );
     let result = tokio::time::timeout(Duration::from_millis(500), task)
@@ -219,7 +227,8 @@ async fn done_without_finish_reason_is_not_reported_as_success() {
     assert_eq!(
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
-            text: "partial".into()
+            text: "partial".into(),
+            block: Some(0),
         })
     );
     assert_eq!(events_rx.recv().await, None);

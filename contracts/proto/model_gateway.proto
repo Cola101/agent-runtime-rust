@@ -126,6 +126,10 @@ message ModelEvent {
 
 message TextDelta {
   string text = 1;
+  // Which block of the answer this text belongs to. Optional because a
+  // provider need not supply one; absent means the same as it has always
+  // meant, which is that the receiver can only group by adjacency.
+  optional uint32 block = 2;
 }
 
 message ToolCall {

@@ -109,7 +109,10 @@ fn decode_event(event: ModelEvent) -> Result<ModelStreamEvent, ModelGatewayClien
         ));
     }
     match event.body {
-        Some(Body::TextDelta(delta)) => Ok(ModelStreamEvent::TextDelta { text: delta.text }),
+        Some(Body::TextDelta(delta)) => Ok(ModelStreamEvent::TextDelta {
+            text: delta.text,
+            block: delta.block,
+        }),
         Some(Body::Usage(usage)) => Ok(ModelStreamEvent::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,

@@ -91,6 +91,11 @@ async fn authenticated_worker_streams_real_provider_events_without_receiving_pro
         vec![
             ModelStreamEvent::TextDelta {
                 text: "hello".into(),
+                // The choice index this fixture does send, carried the whole way
+                // across gRPC. I assumed it sent none; the gate said otherwise,
+                // which is the argument for asserting the value rather than the
+                // presence of a field.
+                block: Some(0),
             },
             ModelStreamEvent::Usage {
                 input_tokens: 4,
@@ -148,7 +153,7 @@ async fn supervisor_forwards_one_dispatch_model_stream_in_order_and_only_once() 
         supervisor.recv(Duration::from_secs(1)).await,
         Some(ModelExecutionUpdate::Event {
             attempt_id,
-            event: ModelStreamEvent::TextDelta { ref text },
+            event: ModelStreamEvent::TextDelta { ref text, .. },
         }) if attempt_id == command.attempt_id && text == "hello"
     ));
     assert!(matches!(
@@ -262,7 +267,7 @@ async fn supervisor_cancellation_stops_inflight_provider_without_emitting_failur
     assert!(matches!(
         supervisor.recv(Duration::from_secs(1)).await,
         Some(ModelExecutionUpdate::Event {
-            event: ModelStreamEvent::TextDelta { ref text },
+            event: ModelStreamEvent::TextDelta { ref text, .. },
             ..
         }) if text == "started"
     ));
@@ -387,6 +392,7 @@ async fn worker_cancellation_crosses_grpc_and_closes_the_provider_http_stream() 
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
             text: "started".into(),
+            block: Some(0),
         })
     );
     processor.cancel(command.attempt_id).unwrap();
@@ -492,6 +498,7 @@ async fn grpc_stream_that_ends_without_a_terminal_event_is_rejected() {
         events_rx.recv().await,
         Some(ModelStreamEvent::TextDelta {
             text: "partial".into(),
+            block: None,
         })
     );
     assert!(matches!(
@@ -728,7 +735,7 @@ async fn supervisor_turns_premature_gateway_close_into_non_retryable_protocol_fa
     assert!(matches!(
         supervisor.recv(Duration::from_secs(1)).await,
         Some(ModelExecutionUpdate::Event {
-            event: ModelStreamEvent::TextDelta { ref text },
+            event: ModelStreamEvent::TextDelta { ref text, .. },
             ..
         }) if text == "partial"
     ));
@@ -794,6 +801,7 @@ impl agent_model_gateway_protocol::v1::model_execution_server::ModelExecution
             sequence: 1,
             body: Some(model_event::Body::TextDelta(TextDelta {
                 text: "partial".into(),
+                block: None,
             })),
         })]);
         Ok(Response::new(Box::pin(stream)))

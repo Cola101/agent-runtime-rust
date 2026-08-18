@@ -290,7 +290,9 @@ fn decode_invocation(invocation: &ModelInvocation) -> Result<ModelRequest, Statu
 
 fn encode_event(sequence: u64, event: ModelStreamEvent) -> Result<ModelEvent, Status> {
     let body = match event {
-        ModelStreamEvent::TextDelta { text } => EventBody::TextDelta(TextDelta { text }),
+        ModelStreamEvent::TextDelta { text, block } => {
+            EventBody::TextDelta(TextDelta { text, block })
+        }
         ModelStreamEvent::Usage {
             input_tokens,
             output_tokens,

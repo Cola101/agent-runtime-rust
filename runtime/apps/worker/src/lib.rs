@@ -6169,7 +6169,14 @@ impl WorkerProcessor {
             .apply_model_event(model_event)
             .map_err(|error| WorkerAssignmentError::KernelTransition(error.to_string()))?;
         match retained_model_event {
-            ModelStreamEvent::TextDelta { text } => {
+            // The block is deliberately not used here, and that is a limit
+            // rather than an oversight: this buffer becomes the assistant text
+            // of one committed Turn, and the Session transcript has no place to
+            // put two separate blocks. So the durable *event log* now says which
+            // block text came from, and the committed transcript still flattens
+            // it. Splitting the transcript is a change to a durable format and
+            // belongs to its own decision.
+            ModelStreamEvent::TextDelta { text, block: _ } => {
                 execution.assistant_text_buffer.push_str(&text);
             }
             ModelStreamEvent::Reasoning {

@@ -459,10 +459,17 @@ impl RunMachine {
         }
 
         let envelope = match event {
-            ModelStreamEvent::TextDelta { text } => self.emit(
+            ModelStreamEvent::TextDelta { text, block } => self.emit(
                 RunStatus::Running,
                 "model.output.delta",
-                json!({ "text": text }),
+                // The block travels into the durable log, because that is where
+                // a client reads a Run it did not watch happen. Omitted when the
+                // provider gave none, so a record written before this existed
+                // and a stream that genuinely has no blocks read the same.
+                match block {
+                    Some(block) => json!({ "text": text, "block": block }),
+                    None => json!({ "text": text }),
+                },
             ),
             ModelStreamEvent::ToolCall {
                 id,
