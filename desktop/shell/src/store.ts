@@ -3,13 +3,13 @@
 ///
 /// Two facts about the local adapter shape everything here:
 ///
-///  * `List` returns run ids and nothing else, and the daemon keeps that order
-///    in memory. A restarted host reports no runs even though the runs are
-///    still on disk. That is shown as "this host has started none since it came
-///    up", never as "there are none".
-///  * The durable log does not contain the run's input. `run.started` carries
-///    only its status. So a run's prompt is known only to whoever submitted it;
-///    this client remembers its own and says plainly when it does not know.
+/// It reads the runtime's owner surface, which answers both questions a run
+/// list has to answer: what a Run was asked to do, and where it got to. An
+/// earlier version of this file read a list of bare ids and kept its own note
+/// of what it had submitted, because the durable *event log* does not carry the
+/// input -- but the durable *record* always did, and the owner surface hands it
+/// back. The client no longer keeps a note, and no longer has to say "not this
+/// client's Run" about work it can read perfectly well.
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   bridge, lifecycleFromCursor, probe,
@@ -17,7 +17,6 @@ import {
 } from "./runtime";
 import type { Lifecycle } from "./surfaces/model";
 
-const ASKED_KEY = "runtime-desk.asked.v1";
 /// `RUNTIME_EVENT_CURSOR_MAX_EVENTS`. Larger is not a bigger page — the daemon
 /// rejects it as an invalid request, which is how a transcript becomes empty
 /// rather than truncated.
@@ -26,25 +25,6 @@ const PAGE_LIMIT = 256;
 /// twenty thousand events should not silently become a spinner.
 const MAX_PAGES = 12;
 const POLL_MS = 1_200;
-
-/// What this client asked for, kept because the runtime does not keep it.
-/// Deliberately local and deliberately labelled as such wherever it is shown.
-function loadAsked(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem(ASKED_KEY) ?? "{}");
-  } catch {
-    return {};
-  }
-}
-
-function saveAsked(asked: Record<string, string>) {
-  try {
-    localStorage.setItem(ASKED_KEY, JSON.stringify(asked));
-  } catch {
-    // A client that cannot persist its own note about a run still works; it
-    // just stops being able to say what that run was asked. Not worth failing.
-  }
-}
 
 export type Approval = {
   approvalId: string;
@@ -76,9 +56,9 @@ export type ObservedPolicy = {
 
 export type RunView = {
   id: string;
-  /// What was asked, if this client is the one that asked. Null otherwise —
-  /// never a guess reconstructed from the model's reply.
-  asked: string | null;
+  /// What this Run was asked to do, from its durable record. Filled for
+  /// every Run the state root holds, not only the ones this client started.
+  asked: string;
   lifecycle: Lifecycle;
   events: RunEvent[];
   text: string;
@@ -154,7 +134,7 @@ async function readWholeLog(
 }
 
 function project(
-  id: string, asked: string | null, page: CursorPage, events: RunEvent[], truncated: boolean,
+  id: string, asked: string, page: CursorPage, events: RunEvent[], truncated: boolean,
 ): RunView {
   let tokens = 0;
   let costMicros = 0;
@@ -214,7 +194,7 @@ function project(
   };
 }
 
-function failed(id: string, asked: string | null, error: CursorError): RunView {
+function failed(id: string, asked: string, error: CursorError): RunView {
   return {
     id, asked, lifecycle: { kind: "unrecognised" }, events: [], text: "",
     toolCalls: [], approval: null, tokens: 0, costMicros: 0,
@@ -272,7 +252,6 @@ export function useRuntime(): Store {
   const [runs, setRuns] = useState<RunView[]>([]);
   const [loading, setLoading] = useState(true);
   const [listedAt, setListedAt] = useState<number | null>(null);
-  const asked = useRef<Record<string, string>>(loadAsked());
   const busy = useRef(false);
 
   const load = useCallback(async () => {
@@ -291,12 +270,11 @@ export function useRuntime(): Store {
       const listed = await api.list();
       if (!listed.ok) return;
       const views = await Promise.all(
-        listed.value.map(async (id) => {
-          const note = asked.current[id] ?? null;
-          const read = await readWholeLog(api, id);
+        listed.value.runs.map(async (summary) => {
+          const read = await readWholeLog(api, summary.run_id);
           return "code" in read
-            ? failed(id, note, read)
-            : project(id, note, read.page, read.events, read.truncated);
+            ? failed(summary.run_id, summary.input, read)
+            : project(summary.run_id, summary.input, read.page, read.events, read.truncated);
         }),
       );
       setRuns(views);
@@ -321,8 +299,6 @@ export function useRuntime(): Store {
     if (!api) return "not running in the desktop host";
     const reply = await api.submit(input);
     if (!reply.ok) return reply.error;
-    asked.current = { ...asked.current, [reply.value]: input };
-    saveAsked(asked.current);
     void load();
     return null;
   }, [load]);

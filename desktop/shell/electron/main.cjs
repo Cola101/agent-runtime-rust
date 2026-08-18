@@ -108,7 +108,10 @@ function guarded(handler) {
 
 ipcMain.handle("runtime:status", guarded(() => local.status()));
 ipcMain.handle("runtime:probe", guarded(() => local.probe()));
-ipcMain.handle("runtime:list", guarded(() => local.list()));
+ipcMain.handle("runtime:list", guarded(() => local.listRuns()));
+ipcMain.handle("runtime:lifecycle", guarded(() => local.lifecycle()));
+ipcMain.handle("runtime:startRuntime", guarded(() => local.start()));
+ipcMain.handle("runtime:shutdown", guarded(() => local.shutdown()));
 ipcMain.handle("runtime:events", guarded((request) => local.eventCursor(request)));
 ipcMain.handle("runtime:submit", guarded((input) => local.submit(input)));
 ipcMain.handle("runtime:control", guarded((request) => local.control(request)));

@@ -8,6 +8,7 @@
 use crate::admission::RuntimeAdmissionLimits;
 use crate::embedded::{
     EmbeddedRuntime, EmbeddedRuntimeError, RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+    RUNTIME_EVENT_CURSOR_MAX_EVENTS, RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
     RuntimeControlAction, RuntimeControlCommand, RuntimeControlReceipt, RuntimeEventCursorError,
     RuntimeEventCursorErrorCode, RuntimeEventCursorPage, RuntimeEventCursorRequest,
     RuntimeEventCursorState, RuntimeEventStreamItem, RuntimeProfile,
@@ -170,6 +171,19 @@ pub enum OwnerRequest {
         #[serde(default = "default_owner_page")]
         limit: usize,
     },
+    /// One bounded page of a Run's durable event log.
+    ///
+    /// The workload surface has this too, but it takes an invocation, which is
+    /// the last thing that would force a client to mirror the daemon's identity
+    /// constants. Here the daemon supplies its own, and a client needs to
+    /// mirror nothing at all.
+    RunEvents {
+        run_id: Uuid,
+        #[serde(default)]
+        after_sequence: u64,
+        #[serde(default = "default_owner_event_page")]
+        limit: usize,
+    },
     /// Recover every Profile and open for work. Safe to ask twice.
     Start,
     /// Lifecycle, recovery progress, what is in flight, and -- once -- what the
@@ -242,6 +256,7 @@ impl OwnerRequest {
             | Self::SessionFork { .. }
             | Self::SessionRollback { .. } => true,
             Self::ListRuns { .. }
+            | Self::RunEvents { .. }
             | Self::SessionRead { .. }
             | Self::SessionList { .. }
             | Self::SessionHistory { .. }
@@ -261,6 +276,10 @@ fn default_owner_page() -> usize {
 
 fn default_owner_history_page() -> usize {
     OWNER_MAX_HISTORY_PAGE
+}
+
+fn default_owner_event_page() -> usize {
+    RUNTIME_EVENT_CURSOR_MAX_EVENTS
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -283,6 +302,12 @@ pub enum OwnerResponse {
         page: Box<crate::embedded::EmbeddedSessionHistoryPage>,
     },
     Started,
+    RunEvents {
+        page: Box<RuntimeEventCursorPage>,
+    },
+    RunEventsError {
+        error: RuntimeEventCursorError,
+    },
     /// Same fact as `LocalResponse::NotReady`, for the owner surface.
     NotReady {
         lifecycle: crate::controller::RuntimeLifecycle,
@@ -726,6 +751,27 @@ impl LocalRuntimeDaemon {
                                 runs,
                                 next_after_run_id,
                             },
+                            Err(error) => OwnerResponse::Error {
+                                message: error.to_string(),
+                            },
+                        },
+                        OwnerRequest::RunEvents {
+                            run_id,
+                            after_sequence,
+                            limit,
+                        } => match self.runtime.event_cursor(RuntimeEventCursorRequest {
+                            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                            invocation: self.invocation,
+                            run_id,
+                            after_sequence,
+                            limit,
+                        }) {
+                            Ok(page) => OwnerResponse::RunEvents {
+                                page: Box::new(page),
+                            },
+                            Err(EmbeddedRuntimeError::EventCursor(error)) => {
+                                OwnerResponse::RunEventsError { error }
+                            }
                             Err(error) => OwnerResponse::Error {
                                 message: error.to_string(),
                             },

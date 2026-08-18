@@ -93,6 +93,46 @@ describe("approvals", () => {
   });
 });
 
+describe("ending a run", () => {
+  it("arms before it acts, because it cannot be undone", async () => {
+    const { user, bridge } = await open("待决定");
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    const end = screen.getAllByRole("button", { name: /结束这个 Run/ })[0];
+
+    await user.click(end);
+    expect(bridge.control).not.toHaveBeenCalled();
+    expect(screen.getByText(/再按一次确认/)).toBeTruthy();
+
+    await user.click(end);
+    await waitFor(() =>
+      expect(bridge.control).toHaveBeenCalledWith({ action: "cancel", runId: RUN_WAITING }));
+  });
+
+  it("is not on a bare key at all", () => {
+    for (const surface of all()) {
+      for (const key of surface.keys ?? []) {
+        expect(
+          key.hint,
+          `${surface.id} put an irreversible action on the bare key ${key.key}`,
+        ).not.toMatch(/结束这个 Run/);
+      }
+    }
+  });
+
+  it("disarms when another decision is chosen", async () => {
+    const { user, bridge } = await open("待决定");
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    await user.click(screen.getAllByRole("button", { name: /结束这个 Run/ })[0]);
+    expect(screen.getByText(/再按一次确认/)).toBeTruthy();
+
+    // Choosing something else must not leave a destructive key armed behind it.
+    await user.click(screen.getAllByRole("button", { name: /不执行/ })[0]);
+    await waitFor(() =>
+      expect(bridge.control).toHaveBeenCalledWith({ action: "deny", runId: RUN_WAITING }));
+    expect(screen.queryByText(/再按一次确认/)).toBeNull();
+  });
+});
+
 describe("the run list is operable from the keyboard", () => {
   it("moves the cursor with j and opens with Enter", async () => {
     const { user } = await open("Run");

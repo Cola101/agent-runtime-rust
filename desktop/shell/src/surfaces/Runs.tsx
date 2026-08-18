@@ -41,10 +41,8 @@ function RunsView() {
 
       {desk.link.state === "live" && rows.length === 0 && desk.listedAt !== null && (
         <div className="empty">
-          这个 runtime-host 自启动以来还没有跑过 Run。
-          <span className="sub">
-            磁盘上可能仍有更早的 Run —— List 走的是内存里的顺序，重启后就空了。
-          </span>
+          这个状态目录里还没有 Run。
+          <span className="sub">在对话里写一句话就开始。</span>
         </div>
       )}
 
@@ -82,9 +80,9 @@ function RunsView() {
                   {run.truncated && <span className="flag">只读到前一段</span>}
                   {run.error && <span className="flag">读不出来・{run.error.code}</span>}
                 </td>
-                {/* The runtime does not store the prompt, so this column is
-                    only ever filled for runs this client submitted itself. */}
-                <td className="ask">{run.asked ?? <span className="dim">不是这台客户端发起的</span>}</td>
+                {/* From the durable record, so it is filled for every Run this
+                    state root holds -- not only the ones this client started. */}
+                <td className="ask" title={run.asked}>{run.asked}</td>
                 <td className="num">{run.tokens.toLocaleString()}</td>
                 <td className="num">{costLabel(run.costMicros)}</td>
                 <td className="num" title={run.updatedAt ?? ""}>{since(run.updatedAt)}</td>

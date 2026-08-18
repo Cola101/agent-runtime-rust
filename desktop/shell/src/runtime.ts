@@ -59,10 +59,30 @@ export type CursorError = {
   message?: string;
 };
 
+/// A Run as the owner surface reports it: what it was asked to do, and where it
+/// got to. A list of ids cannot answer either, which is why this replaced one.
+export type RunSummary = {
+  run_id: string;
+  input: string;
+  state: Record<string, unknown>;
+};
+
+export type RuntimeLifecycle = {
+  lifecycle: string;
+  recovery: { completed_profiles: number; total_profiles: number };
+  active_runs: number;
+  queued_runs: number;
+  recovery_failures: number;
+  previous_shutdown: Record<string, unknown> | null;
+};
+
 type Bridge = {
   status(): Promise<Reply<RuntimeStatus>>;
   probe(): Promise<Reply<RuntimeStatus>>;
-  list(): Promise<Reply<string[]>>;
+  list(): Promise<Reply<{ runs: RunSummary[]; nextAfterRunId: string | null }>>;
+  lifecycle(): Promise<Reply<RuntimeLifecycle>>;
+  startRuntime(): Promise<Reply<boolean>>;
+  shutdown(): Promise<Reply<Record<string, unknown>>>;
   events(request: { runId: string; afterSequence?: number; limit?: number }): Promise<
     Reply<{ ok: true; page: CursorPage } | { ok: false; error: CursorError }>
   >;

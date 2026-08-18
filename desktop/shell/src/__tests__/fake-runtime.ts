@@ -69,7 +69,33 @@ export function installFakeRuntime() {
   const runtime = {
     status: async () => ({ ok: true as const, value: status() }),
     probe: async () => ({ ok: true as const, value: status() }),
-    list: async () => ({ ok: true as const, value: [RUN_WAITING, RUN_LIVE, RUN_DONE] }),
+    // The owner surface's shape: what each Run was asked to do and where it
+    // got to, not a list of ids. A fake that still answered ids would let the
+    // renderer pass against a contract the runtime no longer has.
+    list: async () => ({
+      ok: true as const,
+      value: {
+        runs: [
+          { run_id: RUN_WAITING, input: "run a shell command", state: { state: "waiting_approval" } },
+          { run_id: RUN_LIVE, input: "something still going", state: { state: "running" } },
+          { run_id: RUN_DONE, input: "something finished", state: { state: "finished", status: "succeeded" } },
+        ],
+        nextAfterRunId: null,
+      },
+    }),
+    lifecycle: async () => ({
+      ok: true as const,
+      value: {
+        lifecycle: "ready",
+        recovery: { completed_profiles: 1, total_profiles: 1 },
+        active_runs: 1,
+        queued_runs: 0,
+        recovery_failures: 0,
+        previous_shutdown: null,
+      },
+    }),
+    startRuntime: async () => ({ ok: true as const, value: true }),
+    shutdown: async () => ({ ok: true as const, value: {} }),
     events: async ({ runId, limit = 256 }: { runId: string; limit?: number }) => {
       // The daemon rejects an oversized page rather than clamping it. A test
       // that clamped here would hide exactly the bug this caught in practice.

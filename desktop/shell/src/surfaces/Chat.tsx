@@ -128,11 +128,7 @@ function ChatView() {
               更早的事件已被回收，这段转录不完整 —— 最早还能读到第 {run.earliestSequence} 条
             </Note>
           )}
-          {run.asked !== null ? (
-            <div className="ask">{run.asked}</div>
-          ) : (
-            <Note>这个 Run 不是这台客户端发起的，问的是什么只有发起方知道</Note>
-          )}
+          <div className="ask">{run.asked}</div>
           {run.error ? (
             <div className="offline">
               这个 Run 的日志读不出来：<span className="mono">{run.error.code}</span>
@@ -289,7 +285,8 @@ register({
   drawerLabel: "原始事件",
   composer: Composer,
   status: ChatStatus,
-  keys: DECISIONS.map((decision) => ({
+  // Same rule as the queue: the irreversible one is not a bare key.
+  keys: DECISIONS.filter((decision) => !decision.destructive).map((decision) => ({
     key: decision.key,
     hint: decision.label,
     when: asking,

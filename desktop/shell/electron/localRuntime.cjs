@@ -16,23 +16,6 @@ const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
 
-/// The daemon's built-in local identity, mirrored from
-/// `runtime-host::local_invocation_context()`.
-///
-/// EventCursor takes the invocation context as an argument and checks it, so a
-/// local client has to know these. They are constants in the runtime rather
-/// than anything served over the socket, which means this copy can drift.
-/// `desktop/scripts/check-local-invocation.sh` fails if it ever does.
-const LOCAL_INVOCATION = Object.freeze({
-  schema_version: 1,
-  tenant_id: "00000000-0000-4000-8000-000000000010",
-  application_id: "00000000-0000-4000-8000-000000000013",
-  workload_identity_id: "00000000-0000-4000-8000-000000000015",
-  workspace_id: "00000000-0000-4000-8000-000000000011",
-  agent_version_id: "00000000-0000-4000-8000-000000000012",
-  model_policy_id: "00000000-0000-4000-8000-000000000001",
-});
-
 const EVENT_CURSOR_SCHEMA_VERSION = 1;
 /// `RUNTIME_EVENT_CURSOR_MAX_EVENTS`. The daemon rejects a larger limit as an
 /// invalid request rather than clamping it, so asking for more is not a bigger
@@ -162,6 +145,19 @@ class LocalRuntime {
     return this.status();
   }
 
+  /// One line on the owner surface.
+  ///
+  /// Owner requests carry no invocation. The daemon owns exactly one state root
+  /// and one identity, so supplying one would only be an opportunity to supply
+  /// the wrong one -- and it is why this client no longer mirrors the runtime's
+  /// identity constants at all.
+  async #owner(body) {
+    if (!this.socketPath) throw new Error("no runtime configured");
+    const reply = await call(this.socketPath, { scope: "owner", ...body });
+    if (reply && reply.type === "error") throw new Error(reply.message);
+    return reply;
+  }
+
   async #request(body, options) {
     if (!this.socketPath) throw new Error("no runtime configured");
     const reply = await call(this.socketPath, body, options);
@@ -184,24 +180,64 @@ class LocalRuntime {
 
   /// One bounded page of a run's durable log, with its typed lifecycle.
   ///
-  /// Errors here are returned, not thrown: `history_gap`, `corrupt_log` and
+  /// On the owner surface, so it carries no invocation. That is the last thing
+  /// that required this client to mirror the runtime's identity constants, and
+  /// with it gone the mirror and its drift guard are gone too -- one fewer
+  /// thing that can silently disagree with the runtime.
+  ///
+  /// Errors are returned, not thrown: `history_gap`, `corrupt_log` and
   /// `cursor_ahead` are things the person needs to see on the run, and turning
   /// them into a rejected promise is how they become a blank panel instead.
   async eventCursor({ runId, afterSequence = 0, limit = EVENT_CURSOR_MAX_EVENTS }) {
     const bounded = Math.min(Math.max(1, limit), EVENT_CURSOR_MAX_EVENTS);
-    const reply = await this.#request({
-      type: "event_cursor",
-      request: {
-        schema_version: EVENT_CURSOR_SCHEMA_VERSION,
-        invocation: LOCAL_INVOCATION,
-        run_id: runId,
-        after_sequence: afterSequence,
-        limit: bounded,
-      },
+    const reply = await this.#owner({
+      type: "run_events",
+      run_id: runId,
+      after_sequence: afterSequence,
+      limit: bounded,
     });
-    if (reply.type === "event_cursor") return { ok: true, page: reply.page };
-    if (reply.type === "event_cursor_error") return { ok: false, error: reply.error };
+    if (reply.type === "run_events") return { ok: true, page: reply.page };
+    if (reply.type === "run_events_error") return { ok: false, error: reply.error };
     throw new Error(`unexpected reply: ${reply.type}`);
+  }
+
+  /// Recover every Profile and open for work. Safe to ask twice.
+  async start() {
+    const reply = await this.#owner({ type: "start" });
+    if (reply.type === "started") return true;
+    if (reply.type === "not_ready") return false;
+    throw new Error(`unexpected reply: ${reply.type}`);
+  }
+
+  /// Lifecycle, recovery progress, what is in flight, and -- once -- what the
+  /// previous shutdown left behind.
+  async lifecycle() {
+    const reply = await this.#owner({ type: "snapshot" });
+    if (reply.type !== "snapshot") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply;
+  }
+
+  /// Stop taking work, drain within the deadline, and report.
+  async shutdown() {
+    const reply = await this.#owner({ type: "shutdown" });
+    if (reply.type !== "shutdown") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.report;
+  }
+
+  /// Every Run this state root holds, newest first, with what it was asked to
+  /// do and where it got to.
+  ///
+  /// Distinct from `list()`, which returns bare ids for this daemon's own
+  /// order. That difference is the reason this exists: a list of ids cannot say
+  /// what a Run was asked to do, and that is the column a person reads.
+  async listRuns({ afterRunId = null, limit = 256 } = {}) {
+    const reply = await this.#owner({
+      type: "list_runs",
+      ...(afterRunId ? { after_run_id: afterRunId } : {}),
+      limit,
+    });
+    if (reply.type !== "runs") throw new Error(`unexpected reply: ${reply.type}`);
+    return { runs: reply.runs, nextAfterRunId: reply.next_after_run_id ?? null };
   }
 
   async submit(input) {
@@ -222,6 +258,4 @@ class LocalRuntime {
   }
 }
 
-module.exports = {
-  LocalRuntime, socketPathFor, LOCAL_INVOCATION, EVENT_CURSOR_MAX_EVENTS,
-};
+module.exports = { LocalRuntime, socketPathFor, EVENT_CURSOR_MAX_EVENTS };
