@@ -40,6 +40,68 @@ export type Approval = {
   policyDigest: string;
 };
 
+/// One field of an MCP form request, as `requested_schema` declares it.
+///
+/// `type` is the JSON Schema type the server asked for, kept verbatim because
+/// it is the whole rule for what may be sent back: the runtime compares the
+/// value's JSON type against it and refuses the entire resolution when they
+/// disagree. A type this client has no widget for is carried here anyway and
+/// said on screen — dropping the field would hide half of what was asked.
+export type McpField = {
+  name: string;
+  type: string;
+  title: string | null;
+  description: string | null;
+  /// The closed set of values the schema allows, or null when it declares none.
+  choices: string[] | null;
+  required: boolean;
+};
+
+/// One interaction an MCP server asked a person for.
+///
+/// `mode` is the runtime's own word for the kind of request. It is not mapped
+/// onto a boolean: a mode this build does not know stays unknown on screen and
+/// unanswerable, because rendering a form for it would be inventing what the
+/// server asked.
+export type McpRequest = {
+  key: string;
+  mode: string;
+  message: string;
+  /// Form mode. Empty in every other mode.
+  fields: McpField[];
+  /// URL mode. Null in every other mode.
+  url: string | null;
+  elicitationId: string | null;
+  /// What the server attached to the request. The runtime does not interpret
+  /// it and neither does this — it is shown as it arrived.
+  meta: unknown;
+};
+
+/// The MCP input request a suspended Run is parked on.
+///
+/// The three the answer is bound to — `inputId`, `inputVersion`,
+/// `bindingDigest` — are echoed back verbatim, and the runtime checks each of
+/// them against the exact pending request. A client that reconstructed any of
+/// them would be answering a different question than the one on screen. The
+/// rest is what a person needs in order to answer: which server is asking,
+/// which tool call it belongs to, and which round this is.
+export type McpInput = {
+  inputId: string;
+  inputVersion: number;
+  bindingDigest: string;
+  serverName: string;
+  toolCallId: string;
+  round: number;
+  requests: McpRequest[];
+};
+
+/// One answer to one request. `content` belongs only to an accepted form: the
+/// runtime rejects content on a declined, cancelled or URL-mode response.
+export type McpResponse = {
+  action: "accept" | "decline" | "cancel";
+  content?: Record<string, unknown>;
+};
+
 /// A tool's policy exactly as the runtime froze it into one execution.
 ///
 /// Observed, not configured: the local adapter has no call for reading the
@@ -67,6 +129,10 @@ export type RunView = {
   text: string;
   toolCalls: { name: string; arguments: unknown }[];
   approval: Approval | null;
+  /// The MCP input request this run is suspended on, or null. Like `approval`,
+  /// it is only ever set while the runtime's own boundary says the run is
+  /// parked — never inferred from having seen the event go past.
+  mcpInput: McpInput | null;
   tokens: number;
   costMicros: number;
   startedAt: string | null;
@@ -103,6 +169,49 @@ function readApproval(payload: Record<string, unknown>): Approval | null {
     bindingDigest: String(execution?.binding_digest ?? ""),
     requiredScopes: (policy?.required_scopes as string[]) ?? [],
     policyDigest: String(approval.policy_digest ?? ""),
+  };
+}
+
+function readMcpRequest(key: string, request: Record<string, unknown>): McpRequest {
+  const schema = request.requested_schema as Record<string, unknown> | undefined;
+  const properties = (schema?.properties ?? {}) as Record<string, Record<string, unknown>>;
+  const required = new Set((schema?.required as string[] | undefined) ?? []);
+  return {
+    key,
+    mode: String(request.mode ?? ""),
+    message: String(request.message ?? ""),
+    fields: Object.entries(properties).map(([name, property]) => ({
+      name,
+      type: String(property.type ?? ""),
+      title: typeof property.title === "string" ? property.title : null,
+      description: typeof property.description === "string" ? property.description : null,
+      choices: Array.isArray(property.enum) ? property.enum.map(String) : null,
+      required: required.has(name),
+    })),
+    url: typeof request.url === "string" ? request.url : null,
+    elicitationId: typeof request.elicitation_id === "string" ? request.elicitation_id : null,
+    meta: request.meta ?? null,
+  };
+}
+
+/// Reads `mcp.input.required`.
+///
+/// Note where `input_version` comes from: the event, beside the request rather
+/// than inside it. It is the version of the *response binding*, and the runtime
+/// refuses a resolution that carries the wrong one — so a client that hard-coded
+/// today's number would be answering a contract it never read.
+function readMcpInput(payload: Record<string, unknown>): McpInput | null {
+  const input = payload.input as Record<string, unknown> | undefined;
+  if (!input) return null;
+  const requests = (input.requests ?? {}) as Record<string, Record<string, unknown>>;
+  return {
+    inputId: String(input.input_id ?? ""),
+    inputVersion: Number(payload.input_version ?? 0),
+    bindingDigest: String(input.binding_digest ?? ""),
+    serverName: String(input.server_name ?? ""),
+    toolCallId: String(input.tool_call_id ?? ""),
+    round: Number(input.round ?? 0),
+    requests: Object.entries(requests).map(([key, request]) => readMcpRequest(key, request)),
   };
 }
 
@@ -144,6 +253,7 @@ function project(
   let text = "";
   const toolCalls: { name: string; arguments: unknown }[] = [];
   let approval: Approval | null = null;
+  let mcpInput: McpInput | null = null;
 
   for (const event of events) {
     switch (event.type) {
@@ -165,6 +275,14 @@ function project(
       case "approval.required":
         approval = readApproval(event.payload);
         break;
+      case "mcp.input.required":
+        mcpInput = readMcpInput(event.payload);
+        break;
+      // The answer the runtime recorded, which is the only thing that clears
+      // the question. A later round arrives as its own `mcp.input.required`.
+      case "mcp.input.resolved":
+        mcpInput = null;
+        break;
       // An answered approval clears the one on screen. Without this a decided
       // run keeps showing the question it already answered.
       case "run.resumed":
@@ -185,6 +303,11 @@ function project(
     text,
     toolCalls,
     approval: lifecycle.kind === "waiting_approval" ? approval : null,
+    // `suspended` is the boundary the local adapter reports for a run parked
+    // on an MCP input request. Requiring both it and the unanswered event
+    // keeps a build that meets some future suspension from drawing a form for
+    // a question nobody asked.
+    mcpInput: lifecycle.kind === "suspended" ? mcpInput : null,
     tokens,
     costMicros,
     startedAt: events[0]?.timestamp ?? null,
@@ -232,13 +355,23 @@ function withStreamed(run: RunView, streamed: RunEvent[]): RunView {
     state: {},
     events,
   }, events, run.truncated);
-  return { ...projected, lifecycle: run.lifecycle, approval: run.approval, error: run.error };
+  return {
+    ...projected,
+    lifecycle: run.lifecycle,
+    approval: run.approval,
+    // Same rule as the lifecycle above, for the same reason. A streamed
+    // `mcp.input.required` is re-projected against a page with no state, so
+    // `projected.mcpInput` is null however loudly the stream said otherwise;
+    // whether this Run is parked on a person is the cursor's to say.
+    mcpInput: run.mcpInput,
+    error: run.error,
+  };
 }
 
 function failed(id: string, asked: string, error: CursorError): RunView {
   return {
     id, asked, lifecycle: { kind: "unrecognised" }, events: [], text: "",
-    toolCalls: [], approval: null, tokens: 0, costMicros: 0,
+    toolCalls: [], approval: null, mcpInput: null, tokens: 0, costMicros: 0,
     startedAt: null, updatedAt: null, historyGap: false, truncated: false,
     earliestSequence: null, highestSequence: 0, error,
   };
@@ -361,6 +494,13 @@ export type Store = {
   steer(input: string): Promise<string | null>;
   submit(input: string): Promise<string | null>;
   decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
+  /// Answer the MCP input request a suspended run is parked on.
+  ///
+  /// `responses` must answer every pending key and no others — the runtime
+  /// rejects a resolution that answers a different set. The identity it is
+  /// bound to is not a parameter: it is read from the pending request this
+  /// client is showing, so what is answered is always what is on screen.
+  answerMcpInput(runId: string, responses: Record<string, McpResponse>): Promise<string | null>;
   refresh(): void;
 };
 
@@ -661,6 +801,31 @@ export function useRuntime(): Store {
     [load],
   );
 
+  const answerMcpInput = useCallback(
+    async (runId: string, responses: Record<string, McpResponse>) => {
+      const api = bridge();
+      // A host too old to carry this call has no path to the runtime's
+      // `ResolveMcpInput`. Saying so beats a button that silently does nothing.
+      if (!api?.resolveMcpInput) return "这个宿主还没有回答 MCP 输入的通道";
+      // Read from `runs` rather than the merged view on purpose: the pending
+      // request is a boundary fact the cursor reported, and `withStreamed`
+      // carries it through untouched for the same reason it carries the
+      // lifecycle and the approval through untouched.
+      const input = runs.find((run) => run.id === runId)?.mcpInput;
+      if (!input) return "这个 Run 现在没有在等输入";
+      const reply = await api.resolveMcpInput({
+        runId,
+        inputId: input.inputId,
+        inputVersion: input.inputVersion,
+        bindingDigest: input.bindingDigest,
+        responses,
+      });
+      void load();
+      return reply.ok ? null : reply.error;
+    },
+    [runs, load],
+  );
+
   // Streamed events are folded in here rather than into `runs`, so the poll's
   // reading of the durable log stays the thing this client holds, and the
   // stream stays an accelerator on top of it.
@@ -672,6 +837,6 @@ export function useRuntime(): Store {
     current: sessions.find((session) => session.sessionId === current) ?? null,
     selectSession, newConversation, send, steer,
     providers, saveProvider, forgetProvider,
-    submit, decide, refresh: () => void load(),
+    submit, decide, answerMcpInput, refresh: () => void load(),
   };
 }

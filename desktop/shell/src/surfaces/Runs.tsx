@@ -7,12 +7,17 @@ import { byRecency, moveCursor, useDesk } from "../desk";
 function RunsToolbar() {
   const desk = useDesk();
   const waiting = desk.runs.filter((run) => run.approval).length;
+  // Counted apart from `waiting` rather than added to it. Both stop a Run on a
+  // person, but one is a decision about a tool call and the other is an MCP
+  // server asking for content; one number covering both would name neither.
+  const asking = desk.runs.filter((run) => run.mcpInput).length;
   return (
     <>
       <b>Run</b>
       <span className="tb-r">
         {desk.link.state === "live" ? `共 ${desk.runs.length} 个` : "未连接"}
         {waiting > 0 && ` ・ ${waiting} 个等你决定`}
+        {asking > 0 && ` ・ ${asking} 个等你回答`}
       </span>
     </>
   );

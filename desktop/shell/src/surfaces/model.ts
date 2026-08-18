@@ -85,6 +85,28 @@ export function sandboxLabel(sandbox: string): string {
   return SANDBOX[sandbox] ?? sandbox;
 }
 
+/// The three answers MCP defines for one input request, in the order they are
+/// offered. The wire word travels with the label because it is what lands in
+/// `mcp.input.resolved` — the log will say `decline`, and the person who
+/// pressed 拒绝 should be able to recognise their own answer there.
+export const MCP_ACTIONS = [
+  { action: "accept" as const, label: "接受" },
+  { action: "decline" as const, label: "拒绝" },
+  { action: "cancel" as const, label: "取消" },
+];
+
+/// What a request mode asks of a person. Null for a mode this build does not
+/// know: the surfaces say so and offer no way to accept it, because a form
+/// drawn for an unknown mode would be a guess about what the server wanted.
+const MCP_MODE: Record<string, string> = {
+  form: "填一张表",
+  url: "去链接上完成",
+};
+
+export function mcpModeLabel(mode: string): string | null {
+  return MCP_MODE[mode] ?? null;
+}
+
 /// Event type names are kept verbatim. They are the runtime's own vocabulary
 /// and they appear in the durable log, in evidence files and in ADRs; a
 /// translated copy on screen would be a second name for the same thing.
@@ -104,6 +126,9 @@ const EVENT_NOTE: Record<string, string> = {
   "approval.required": "需要你决定",
   "tool.denied": "已拒绝",
   "tool.result": "工具返回",
+  "mcp.input.required": "MCP 服务要你回答",
+  "mcp.input.resolved": "已回答",
+  "mcp.input.continuation.started": "带着你的回答继续调用",
 };
 
 export function eventNote(type: string): string | null {
@@ -201,8 +226,15 @@ export function doing(lastEventType: string | null): string | null {
     case "tool.execution.progress":
       return "在用工具";
     case "approval.required":
-    case "mcp.input.required":
       return "等你决定";
+    // Its own phrase rather than sharing the one above. Both stop the Run on a
+    // person, but the gate that appears a moment later says 等你回答, and a
+    // status line that said 等你决定 first would be two words for one stop.
+    // The window is real: with streaming the event arrives before the cursor
+    // moves the boundary, so this line is what a person reads while the client
+    // still believes the Run is running.
+    case "mcp.input.required":
+      return "等你回答";
     case "run.steer.applied":
       return "刚改了向";
     case "subagent.spawned":

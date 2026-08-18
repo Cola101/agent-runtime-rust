@@ -6,6 +6,7 @@ import {
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
+import { McpInputForm } from "./McpInput";
 import { currentRun, useDesk, type Desk } from "../desk";
 import type { RunEvent } from "../runtime";
 import type { RunView } from "../store";
@@ -97,6 +98,33 @@ function Acts({ events }: { events: RunEvent[] }) {
   );
 }
 
+/// The other thing that stops a run on a person.
+///
+/// Beside the approval gate and drawn the same way, because it is the same
+/// situation: the Run is parked and nothing moves until someone answers. What
+/// differs is who is asking — an MCP server, by name — and that the answer is
+/// content rather than a yes.
+function InputGate({ run }: { run: RunView }) {
+  const input = run.mcpInput;
+  if (!input) return null;
+  return (
+    <div className="gate">
+      <div className="h">
+        等你回答<span className="of"> ・ MCP {input.serverName}</span>
+      </div>
+      <McpInputForm run={run} />
+    </div>
+  );
+}
+
+/// The events a gate below draws in full, so the transcript does not also
+/// draw a hairline for them. Both park the Run on a person -- one asks for a
+/// decision about a tool call, the other for content an MCP server wants.
+const PARKS_THE_RUN: ReadonlySet<string> = new Set([
+  "approval.required",
+  "mcp.input.required",
+]);
+
 /// The transcript, rendered from the durable log.
 ///
 /// Text deltas are joined into one block rather than drawn per event: the
@@ -144,11 +172,15 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
     }
     flushText(String(event.sequence));
     const note = eventNote(event.type);
-    // Routine bookkeeping stays out of the column. It is state, and the status
+    // Two reasons an event that has a note still does not get a hairline here.
+    // Routine bookkeeping stays out of the column: it is state, and the status
     // line and the raw-event drawer are where state belongs -- leaving it here
     // made a running Turn read as a machine log and a committed one as a
-    // conversation, which is the same exchange rendered two ways.
-    if (note && event.type !== "approval.required" && belongsInConversation(event.type)) {
+    // conversation, which is the same exchange rendered two ways. And the
+    // events that park the Run on a person are drawn as their own gate below,
+    // with what they are asking for; a hairline saying it happened as well
+    // would be the same fact twice.
+    if (note && !PARKS_THE_RUN.has(event.type) && belongsInConversation(event.type)) {
       flushActs(String(event.sequence));
       blocks.push(
         <Note key={event.event_id || event.sequence}>
@@ -337,6 +369,7 @@ function ChatView() {
           )}
           <Delegations run={run} />
           <Gate run={run} />
+          <InputGate run={run} />
         </>
       )}
     </div>
