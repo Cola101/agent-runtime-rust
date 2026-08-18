@@ -9,7 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
-import { installFakeRuntime } from "./fake-runtime";
+import { installFakeRuntime, RUN_LIVE } from "./fake-runtime";
 
 async function openWorkspace() {
   const user = userEvent.setup();
@@ -59,6 +59,31 @@ describe("the workspace surface", () => {
     // Said as a request rather than as a change: a call parked on an approval
     // was asked and never ran, and both look identical in this list.
     expect(screen.getByText(/被要求过，但没有执行/)).toBeTruthy();
+  });
+
+  /// A cut list that does not say it was cut reads as a complete one.
+  ///
+  /// This table stopped at twenty rows in silence, in a surface that says so
+  /// about everything else -- the directory listing right above it has always
+  /// said 目录太大，只列了前面一部分.
+  it("says how many touched paths it is not showing", async () => {
+    const { bridge } = await openWorkspace();
+    await waitFor(() => expect(screen.getByText("代理动过的路径")).toBeTruthy());
+    // Twenty-five distinct paths, from the log, the way real ones arrive.
+    for (let index = 0; index < 25; index += 1) {
+      bridge.emit(RUN_LIVE, bridge.event(200 + index, "model.tool_call", {
+        call: { name: "workspace.write_text", arguments: { path: `file-${index}.txt` } },
+      }, 40, RUN_LIVE));
+    }
+    await waitFor(() => expect(screen.getByText(/还有 \d+ 条没列出来/)).toBeTruthy());
+    // The number is what is missing, not what there is.
+    expect(screen.getByText(/还有 6 条没列出来/)).toBeTruthy();
+  });
+
+  it("says nothing about a cut when the whole list fits", async () => {
+    await openWorkspace();
+    await waitFor(() => expect(screen.getByText("代理动过的路径")).toBeTruthy());
+    expect(screen.queryByText(/没列出来/)).toBeNull();
   });
 
   it("invents nothing from a tool call that names no path", async () => {

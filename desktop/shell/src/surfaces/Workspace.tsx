@@ -81,6 +81,13 @@ function Folder({ status }: { status: WorkspaceStatus | null }) {
   );
 }
 
+/// How many touched paths the table draws.
+///
+/// A cut list that does not say it was cut is a list that reads as complete,
+/// and this surface says so everywhere else -- the directory listing above it
+/// has said "目录太大，只列了前面一部分" all along.
+const SHOWN_CHANGES = 20;
+
 function WorkspaceView() {
   const desk = useDesk();
   const [status, setStatus] = useState<WorkspaceStatus | null>(null);
@@ -212,7 +219,7 @@ function WorkspaceView() {
                 <tr><th>路径</th><th>工具</th><th className="num">什么时候</th></tr>
               </thead>
               <tbody>
-                {changed.slice(0, 20).map((entry) => (
+                {changed.slice(0, SHOWN_CHANGES).map((entry) => (
                   <tr key={`${entry.runId}-${entry.path}`}>
                     <td className="p mono">{entry.path}</td>
                     <td>{entry.tool}</td>
@@ -221,6 +228,14 @@ function WorkspaceView() {
                 ))}
               </tbody>
             </table>
+            {changed.length > SHOWN_CHANGES && (
+              <div className="note">
+                <span>
+                  还有 {changed.length - SHOWN_CHANGES} 条没列出来 —— 这张表只画最近的
+                  {" "}{SHOWN_CHANGES} 条
+                </span>
+              </div>
+            )}
             <p className="note">
               <span>
                 这是 Runtime 记录的「某个工具被要求做什么」，不是文件系统的改动记录 ——
