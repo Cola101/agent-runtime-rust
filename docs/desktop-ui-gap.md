@@ -71,7 +71,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 
 | 能力 | 阻塞原因 |
 | --- | --- |
-| 中途改向（#8） | `runtime-host` 的 `RuntimeControlAction` 只有 Resume / DecideApproval / Cancel / ResolveMcpInput。**没有 steer**，本地适配器也没有。这不是 UI 问题 |
+| 中途改向（#8） | steering 在 `crates/protocol`、`crates/kernel`、`apps/worker` 里**已经完整**，本地 host 持有的正是实现它的 `WorkerProcessor`。缺 `RuntimeControlAction::Steer` 与本地调用；真正的工作是取消拓扑——绑进 processor 的 token 与模型调用用的 token 是**兄弟**，取消前者打不断后者。定位与设计见 `docs/evidence/2026-08-18-local-steer-blocker.md` |
 | 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
 
 ## 五、推进顺序
