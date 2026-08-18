@@ -553,6 +553,14 @@ pub struct EmbeddedRuntime {
     retired_runs: HashMap<PathBuf, Arc<Mutex<HashMap<Uuid, RuntimeTerminalTombstone>>>>,
     tenant_retention_gates: HashMap<Uuid, Arc<Mutex<()>>>,
     session_storage: SessionStoragePolicy,
+    /// Every detached execution this Runtime started, and how to stop it.
+    ///
+    /// One registry rather than a handle kept privately by each caller: a
+    /// handle shutdown cannot find is a task shutdown cannot stop. Aborting
+    /// through these never touches a `CancellationToken`, which is the whole
+    /// point -- the Runtime stopping and a person cancelling are different
+    /// events and must stay two paths.
+    background_tasks: Arc<Mutex<HashMap<Uuid, tokio::task::AbortHandle>>>,
     _state_root_leases: Vec<StateRootLease>,
 }
 
@@ -710,6 +718,7 @@ impl EmbeddedRuntime {
             session_projection_gates: std::array::from_fn(|_| Mutex::new(())),
             retention_policy,
             session_storage,
+            background_tasks: Arc::new(Mutex::new(HashMap::new())),
             retention_gates,
             retired_runs,
             tenant_retention_gates,
@@ -1811,7 +1820,7 @@ impl EmbeddedRuntime {
         self.profile(invocation)?;
         let runtime = Arc::clone(self);
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let result = runtime.execute(invocation, run_id, &input).await;
             let _ = finished_tx.send(result);
         });
@@ -1851,6 +1860,61 @@ impl EmbeddedRuntime {
                 () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
             }
         }
+    }
+
+    /// Spawns detached work and remembers how to stop it.
+    ///
+    /// The single registration point the shutdown path relies on. The entry is
+    /// inserted before the task can remove it, and removed by the task itself
+    /// when it finishes, so the registry holds exactly what is still running.
+    fn spawn_background<F>(&self, future: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = Uuid::now_v7();
+        let registry = Arc::clone(&self.background_tasks);
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = tokio::spawn(async move {
+            future.await;
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+        });
+        tasks.insert(id, handle.abort_handle());
+        handle
+    }
+
+    /// Stops detached execution without cancelling anything.
+    ///
+    /// A Run stopped this way was not cancelled: no `run.cancelled` is
+    /// published and no operator Cancel receipt is written, because nobody
+    /// decided to cancel it. What it leaves behind is decided by what it had
+    /// already made durable -- a Run with a valid Checkpoint stays recoverable,
+    /// and one without is recorded as interrupted and never replayed on its
+    /// own. Returns how many were still running.
+    pub fn stop_background_executions(&self) -> usize {
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stopped = tasks.len();
+        for (_, handle) in tasks.drain() {
+            handle.abort();
+        }
+        stopped
+    }
+
+    /// How much detached work is still running.
+    #[must_use]
+    pub fn background_task_count(&self) -> usize {
+        self.background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn session_mutation_shard(invocation: RuntimeInvocationContext, session_id: Uuid) -> usize {
@@ -2065,7 +2129,7 @@ impl EmbeddedRuntime {
         }
         let runtime = Arc::clone(self);
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let result = runtime
                 .drive_recorded(
                     config,
@@ -2321,7 +2385,7 @@ impl EmbeddedRuntime {
         let command_id = command.command_id;
         let runtime = Arc::clone(self);
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        self.spawn_background(async move {
             let result = runtime.control(command).await;
             let _ = finished_tx.send(result);
         });

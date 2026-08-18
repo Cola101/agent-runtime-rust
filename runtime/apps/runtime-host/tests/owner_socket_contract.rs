@@ -488,3 +488,91 @@ async fn the_owner_socket_carries_the_whole_session_chain() {
 
     host.stop().await;
 }
+
+/// The lifecycle is drivable from another process.
+///
+/// A Controller held in-process is reachable from Tauri and from nothing that
+/// runs separately, which is most of what will drive this. Without this the
+/// whole lifecycle stage would be the third thing finished onto a surface the
+/// desktop client cannot speak.
+#[tokio::test]
+async fn the_owner_socket_drives_the_lifecycle() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = Daemon::start(config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        spawn_provider().await,
+    ))
+    .await;
+    let socket = host.socket.clone();
+
+    let started = owner(&socket, serde_json::json!({"scope":"owner","type":"start"})).await;
+    assert!(
+        matches!(started, OwnerResponse::Started),
+        "expected the Runtime to open, got {started:?}"
+    );
+    // Asking twice is a caller that does not know it was beaten to it, not an
+    // error.
+    assert!(matches!(
+        owner(&socket, serde_json::json!({"scope":"owner","type":"start"})).await,
+        OwnerResponse::Started
+    ));
+
+    let snapshot = owner(
+        &socket,
+        serde_json::json!({"scope":"owner","type":"snapshot"}),
+    )
+    .await;
+    let OwnerResponse::Snapshot {
+        lifecycle,
+        recovery,
+        previous_shutdown,
+        ..
+    } = snapshot
+    else {
+        panic!("expected a snapshot");
+    };
+    assert_eq!(
+        lifecycle,
+        agent_runtime_host::controller::RuntimeLifecycle::Ready
+    );
+    assert_eq!(recovery.completed_profiles, recovery.total_profiles);
+    assert!(
+        previous_shutdown.is_none(),
+        "a Runtime that has not shut down has nothing to hand over"
+    );
+
+    let stopped = owner(
+        &socket,
+        serde_json::json!({"scope":"owner","type":"shutdown"}),
+    )
+    .await;
+    let OwnerResponse::Shutdown { report } = stopped else {
+        panic!("expected a shutdown report");
+    };
+    assert!(!report.deadline_reached, "an idle Runtime drains at once");
+
+    // The counts survive the call that produced them: for a desktop client the
+    // caller of shutdown is a process on its way out.
+    let snapshot = owner(
+        &socket,
+        serde_json::json!({"scope":"owner","type":"snapshot"}),
+    )
+    .await;
+    let OwnerResponse::Snapshot {
+        lifecycle,
+        previous_shutdown,
+        ..
+    } = snapshot
+    else {
+        panic!("expected a snapshot");
+    };
+    assert_eq!(
+        lifecycle,
+        agent_runtime_host::controller::RuntimeLifecycle::Stopped
+    );
+    assert_eq!(previous_shutdown.as_ref(), Some(&*report));
+
+    host.stop().await;
+}

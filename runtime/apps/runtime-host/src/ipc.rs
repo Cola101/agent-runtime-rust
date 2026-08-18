@@ -168,6 +168,13 @@ pub enum OwnerRequest {
         #[serde(default = "default_owner_page")]
         limit: usize,
     },
+    /// Recover every Profile and open for work. Safe to ask twice.
+    Start,
+    /// Lifecycle, recovery progress, what is in flight, and -- once -- what the
+    /// previous shutdown left behind.
+    Snapshot,
+    /// Stop taking work, wait a bounded time for what was admitted, and report.
+    Shutdown,
     // Session operations carry no invocation. This daemon owns exactly one
     // state root and one built-in local identity, so asking a caller to supply
     // it would only invite it to supply the wrong one -- and would force every
@@ -251,6 +258,18 @@ pub enum OwnerResponse {
     SessionHistory {
         page: Box<crate::embedded::EmbeddedSessionHistoryPage>,
     },
+    Started,
+    Snapshot {
+        lifecycle: crate::controller::RuntimeLifecycle,
+        recovery: crate::controller::RuntimeRecoveryProgress,
+        active_runs: usize,
+        queued_runs: usize,
+        recovery_failures: usize,
+        previous_shutdown: Option<crate::controller::RuntimeShutdownReport>,
+    },
+    Shutdown {
+        report: Box<crate::controller::RuntimeShutdownReport>,
+    },
     Error {
         message: String,
     },
@@ -301,6 +320,11 @@ pub struct LocalRuntimeDaemon {
     config: LocalRuntimeConfig,
     invocation: RuntimeInvocationContext,
     runtime: Arc<EmbeddedRuntime>,
+    /// The owner-side lifecycle. Held here so that stopping the Runtime is
+    /// something a separate-process client can ask for over this socket -- an
+    /// in-process Controller is reachable from Tauri and from nothing that runs
+    /// in another process, which is most of what will drive this.
+    controller: Arc<crate::controller::RuntimeController>,
     order: Arc<Mutex<Vec<Uuid>>>,
 }
 
@@ -333,10 +357,12 @@ impl LocalRuntimeDaemon {
             }],
         )
         .map_err(|error| LocalRuntimeError::Configuration(error.to_string()))?;
+        let runtime = Arc::new(runtime);
         Ok(Arc::new(Self {
             config,
             invocation,
-            runtime: Arc::new(runtime),
+            controller: crate::controller::RuntimeController::new(Arc::clone(&runtime)),
+            runtime,
             order: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -564,6 +590,30 @@ impl LocalRuntimeDaemon {
                             Err(error) => OwnerResponse::Error {
                                 message: error.to_string(),
                             },
+                        },
+                        OwnerRequest::Start => match self.controller.start().await {
+                            Ok(()) => OwnerResponse::Started,
+                            Err(error) => OwnerResponse::Error {
+                                message: error.to_string(),
+                            },
+                        },
+                        OwnerRequest::Snapshot => {
+                            let snapshot = self.controller.snapshot().await;
+                            OwnerResponse::Snapshot {
+                                lifecycle: snapshot.lifecycle,
+                                recovery: snapshot.recovery,
+                                active_runs: snapshot.active_runs,
+                                queued_runs: snapshot.queued_runs,
+                                // A count, not the failures themselves: a
+                                // client that needs to act on one asks the
+                                // Profile, and a socket reply is not the place
+                                // to fan out per-tenant diagnostics.
+                                recovery_failures: snapshot.recovery_failures.len(),
+                                previous_shutdown: snapshot.previous_shutdown,
+                            }
+                        }
+                        OwnerRequest::Shutdown => OwnerResponse::Shutdown {
+                            report: Box::new(self.controller.shutdown().await),
                         },
                         OwnerRequest::SessionStart {
                             session_id,

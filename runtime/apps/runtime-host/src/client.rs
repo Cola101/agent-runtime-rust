@@ -361,7 +361,7 @@ impl RuntimeClientError {
         }
     }
 
-    fn from_embedded(error: EmbeddedRuntimeError) -> Self {
+    pub(crate) fn from_embedded(error: EmbeddedRuntimeError) -> Self {
         match error {
             EmbeddedRuntimeError::UnregisteredInvocation => Self::new(
                 RuntimeClientErrorCode::Forbidden,

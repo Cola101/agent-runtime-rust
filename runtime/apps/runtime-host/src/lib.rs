@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod client;
+pub mod controller;
 mod durable_file;
 pub mod embedded;
 mod event_archive;
