@@ -18,6 +18,10 @@ export type Link =
   /// The host was not told where a runtime is. Not an error: the client
   /// deliberately has no default path to go looking in.
   | { state: "unconfigured" }
+  /// Nothing is listening because this app declined to start one, and it knows
+  /// why. A fresh install has no provider; naming the socket there would report
+  /// a step nobody has taken as a fault in the app.
+  | { state: "no-provider" }
   | { state: "unreachable"; socketPath: string; reason: string }
   | { state: "live"; socketPath: string };
 
@@ -27,6 +31,10 @@ export type RuntimeStatus = {
   socketPath: string | null;
   connected: boolean;
   error: string | null;
+  /// What the app knows beyond the connection error, when it knows something:
+  /// `no-provider` means it declined to start a runtime rather than failed to
+  /// reach one. Absent from an older preload, which is why it is optional.
+  reason?: string | null;
 };
 
 export type RunEvent = {
@@ -348,6 +356,9 @@ export function bridge(): Bridge | null {
 function linkFrom(status: RuntimeStatus): Link {
   if (!status.socketPath) return { state: "unconfigured" };
   if (status.connected) return { state: "live", socketPath: status.socketPath };
+  // Before the socket, because "nothing is listening" is what both look like
+  // and only one of them is something the person can act on.
+  if (status.reason === "no-provider") return { state: "no-provider" };
   return {
     state: "unreachable",
     socketPath: status.socketPath,

@@ -186,6 +186,19 @@ class LocalRuntime {
     this.lastError = null;
   }
 
+  /// Why there is no runtime, when the app knows a reason better than the
+  /// socket's silence.
+  ///
+  /// A fresh install has no provider, so the app declines to start a runtime
+  /// and nothing is listening -- which the window used to report as a socket
+  /// that did not answer, naming a path and reading as a fault. The one thing
+  /// the person has to do is add a provider, and this is how the window gets
+  /// to say that instead. Null when the app has no better account than the
+  /// connection error itself.
+  declined(reason) {
+    this.reason = reason ?? null;
+  }
+
   status() {
     return {
       transport: "local",
@@ -193,6 +206,7 @@ class LocalRuntime {
       socketPath: this.socketPath,
       connected: this.reachable,
       error: this.lastError,
+      reason: this.reachable ? null : (this.reason ?? null),
     };
   }
 

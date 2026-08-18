@@ -19,6 +19,15 @@ export function LinkBanner({ link }: { link: Link }) {
       </div>
     );
   }
+  if (link.state === "no-provider") {
+    return (
+      <div className="offline">
+        <b>还没配 Provider，所以没有启动 Runtime。</b>
+        {" 去"}<b>设置</b>
+        {" 里加一个，保存之后它会自己起来。这不是故障，是还差一步。"}
+      </div>
+    );
+  }
   return (
     <div className="offline">
       <b>连不上 Runtime。</b> {link.socketPath} 没有回应 —— {link.reason}

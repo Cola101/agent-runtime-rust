@@ -5,7 +5,7 @@
 /// one. Run ids and payload shapes are copied from a real dev-runtime session.
 import { vi } from "vitest";
 import { uuidv7 } from "../ids";
-import type { Reply, WorkspaceStatus } from "../runtime";
+import type { Reply, RuntimeStatus, WorkspaceStatus } from "../runtime";
 
 export const RUN_WAITING = "01a0122b-217e-7e72-bec8-ad3273f16cd1";
 export const RUN_DONE = "01a0122a-18c8-7012-972a-d422fe9abde8";
@@ -879,9 +879,12 @@ export function installFakeRuntime(
     sessionFork,
     sessionRollback,
   };
-  const status = () => ({
+  // Typed by the contract rather than by this literal, so a test can answer
+  // with a host that declined to start for want of a provider without casting
+  // its way past the shape.
+  const status = (): RuntimeStatus => ({
     transport: "local", stateRoot: "/tmp/state", socketPath: "/tmp/state/runtime-host.sock",
-    connected: true, error: null,
+    connected: true, error: null, reason: null,
   });
   // The host side of the notification: what the window reports, and the way
   // back in when someone clicks one. `attend` stands in for that click.

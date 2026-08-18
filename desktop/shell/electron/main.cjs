@@ -540,9 +540,13 @@ async function openRuntime({ mustOwn = false } = {}) {
 
   const routing = await credentials.routing();
   if (!routing) {
+    // Told to the window as well as to the console. This is the state a fresh
+    // install is in, and the only screen every new person is guaranteed to see.
+    local.declined("no-provider");
     console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
     return;
   }
+  local.declined(null);
   // Written beside the routing file, and read by the runtime at startup only.
   // Null when no server is configured, so the variable stays unset rather than
   // naming an empty list.
