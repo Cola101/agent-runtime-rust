@@ -622,6 +622,58 @@ mod process_start_failure_agent_loop_tests {
     }
 }
 
+/// Where a steer waits for the Run it is meant for.
+///
+/// A slot rather than a queue, and that is the semantic: two steers arriving
+/// before either is applied means the person changed their mind twice, and the
+/// second is what they meant. Queueing them would apply an instruction that had
+/// already been superseded.
+#[derive(Debug, Default)]
+pub struct SteeringMailbox {
+    pending: StdMutex<Option<crate::embedded::PendingSteer>>,
+    arrived: tokio::sync::Notify,
+}
+
+impl SteeringMailbox {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn post(&self, steer: crate::embedded::PendingSteer) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(steer);
+        self.arrived.notify_waiters();
+    }
+
+    pub fn take(&self) -> Option<crate::embedded::PendingSteer> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Resolves when something is waiting.
+    ///
+    /// Checks before awaiting: a steer posted before the Host started, or
+    /// between two model calls, must not wait for a second one to wake it.
+    pub async fn arrival(&self) {
+        loop {
+            if self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            {
+                return;
+            }
+            self.arrived.notified().await;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LocalRuntimeError {
     #[error("local runtime configuration is invalid: {0}")]
@@ -632,6 +684,13 @@ pub enum LocalRuntimeError {
     /// connect to the running host, not report a broken installation.
     #[error("another runtime host is already serving this state root at {0}")]
     AlreadyRunning(String),
+    /// Not a failure. The model call was aborted so a steer could be applied,
+    /// and the turn is meant to be asked again with what the person added. It
+    /// carries the steer because the loop -- which holds `&mut self` -- is what
+    /// applies it. Every caller has to turn this back into a continue rather
+    /// than let it reach a person as a failed Run.
+    #[error("the model call was aborted to apply steering")]
+    Steered(Option<crate::embedded::PendingSteer>),
     #[error("local execution was refused: {0}")]
     Execution(String),
     #[error("no model provider can serve this Run: {0}")]
@@ -1984,6 +2043,13 @@ pub struct LocalRuntimeHost {
     /// cancel what is bound to them, and those have to reach the model call in
     /// flight rather than a sibling nobody is awaiting.
     attempt_cancellation: Option<CancellationToken>,
+    /// Where steers arrive from outside this task. Absent for a Host nobody can
+    /// steer -- a subagent's, or one a test drove directly.
+    steering: Option<Arc<SteeringMailbox>>,
+    /// How many steers this Host has applied. A model call that returns
+    /// cancelled cannot say which of two things happened, and comparing this
+    /// across the call answers it without inferring intent from a token.
+    steerings: u64,
     /// Set only by this Host's duration watchdog. Ancestor/user cancellation
     /// therefore remains distinguishable from a local duration terminal.
     duration_expired: Arc<AtomicBool>,
@@ -3290,6 +3356,8 @@ impl LocalRuntimeHost {
             worker_id,
             cancellation,
             attempt_cancellation: None,
+            steering: None,
+            steerings: 0,
             duration_expired: Arc::new(AtomicBool::new(false)),
             subagent_tasks: HashMap::new(),
             pending_mcp_input: None,
@@ -4229,6 +4297,8 @@ impl LocalRuntimeHost {
             // of the Run's -- but only this way does cancelling what the
             // Processor holds reach the call that is actually in flight.
             let cancellation = self.attempt_cancellation_token().child_token();
+            let call_cancellation = cancellation.clone();
+            let steer_taken: Option<crate::embedded::PendingSteer>;
             let call = route.adapter.execute(
                 &route.candidate.id,
                 request,
@@ -4243,7 +4313,49 @@ impl LocalRuntimeHost {
                 }
                 events
             };
-            let (result, mut events) = tokio::join!(call, collector);
+            // The one place a steer can be taken safely, and it is safe by
+            // construction rather than by checking: while this await is
+            // running, no tool call is in flight and no approval is pending,
+            // because tool calls are issued after a model returns. A steer
+            // arriving now aborts this call so the turn can be asked again
+            // with what the person added.
+            let steering = self.steering.clone();
+            let arrived = async {
+                match steering.as_deref() {
+                    Some(mailbox) => {
+                        mailbox.arrival().await;
+                        true
+                    }
+                    // Nothing can steer this Host, so this branch must never
+                    // win the select. Pending forever is how a `select!` arm
+                    // says "not applicable".
+                    None => std::future::pending().await,
+                }
+            };
+            let joined = async { tokio::join!(call, collector) };
+            let steered = tokio::select! {
+                (result, events) = joined => {
+                    steer_taken = None;
+                    Some((result, events))
+                }
+                true = arrived => {
+                    // Cancelling here, before applying, is what makes the abort
+                    // and the steer one event rather than two: the call stops,
+                    // and the loop below applies what stopped it.
+                    steer_taken = self.steering.as_ref().and_then(|mailbox| mailbox.take());
+                    call_cancellation.cancel();
+                    None
+                }
+            };
+            let (result, mut events) = match steered {
+                Some(finished) => finished,
+                None => {
+                    journal.inflight_provider_id = None;
+                    journal.staged_events = Vec::new();
+                    Self::persist_model_route_journal(&path, &journal)?;
+                    return Err(LocalRuntimeError::Steered(steer_taken));
+                }
+            };
             match result {
                 Ok(()) => {
                     journal.inflight_provider_id = None;
@@ -5004,6 +5116,15 @@ impl LocalRuntimeHost {
         let routed = self
             .execute_model_with_frozen_routing(run_id, attempt_id, &request, emitted)
             .await;
+        // Compaction is not a turn a person steers into. The steer is left in
+        // the mailbox rather than applied here: the loop re-enters, asks for a
+        // model call again, and takes it there where it belongs.
+        if let Err(LocalRuntimeError::Steered(steer)) = &routed {
+            if let (Some(mailbox), Some(steer)) = (self.steering.as_ref(), steer.clone()) {
+                mailbox.post(steer);
+            }
+            return Ok(true);
+        }
         if self.cancellation.is_cancelled() {
             self.terminate_interrupted(run_id, attempt_id, emitted)?;
             return Ok(true);
@@ -7333,12 +7454,71 @@ impl LocalRuntimeHost {
         Ok(DurationDeadlineGuard { stop })
     }
 
+    /// Accepts steers posted from outside the task driving this Run.
+    pub fn attach_steering(&mut self, mailbox: Arc<SteeringMailbox>) {
+        self.steering = Some(mailbox);
+    }
+
+    /// Redirects a Run, and says so durably.
+    ///
+    /// Everything deciding whether this is allowed already exists in
+    /// `WorkerProcessor::apply_steering`: it refuses while an approval, a
+    /// subagent or any tool call is unresolved, answers a repeated
+    /// `steering_id` from what it recorded, and rejects that id carrying
+    /// different input. None of it is reimplemented here -- a second set of
+    /// rules about when steering is safe is how the two stop agreeing.
+    ///
+    /// The rebinding is local and load-bearing. `apply_steering` installs a
+    /// fresh token with no parent, and this Host cancels a Run by cancelling
+    /// the root of a tree. An attempt left holding an unparented token has
+    /// quietly left that tree, and Cancel would stop working for it --
+    /// discovered only by someone cancelling a Run they had steered.
+    fn apply_steer(
+        &mut self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        steer: crate::embedded::PendingSteer,
+    ) -> Result<EventEnvelope, LocalRuntimeError> {
+        let now = Utc::now();
+        let command = agent_protocol::RunSteeringCommand::new(
+            Uuid::now_v7(),
+            steer.steering_id,
+            agent_protocol::RunSteeringTarget {
+                tenant_id: self.invocation.tenant_id,
+                run_id,
+                attempt_id,
+                worker_id: self.worker_id,
+                worker_incarnation_id: self.worker_id,
+            },
+            agent_protocol::RunSteeringRequest {
+                input: steer.input,
+                issued_at: now,
+                // The window exists for a command that crosses a queue. This one
+                // crosses a function call, so it is short on purpose.
+                expires_at: now + chrono::Duration::seconds(30),
+            },
+        );
+        let event = self
+            .processor
+            .apply_steering(command, now)
+            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?;
+        let replacement = self.cancellation.child_token();
+        self.processor
+            .bind_cancellation_token(attempt_id, replacement.clone())
+            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?;
+        self.attempt_cancellation = Some(replacement);
+        self.steerings = self.steerings.saturating_add(1);
+        Ok(event)
+    }
+
     /// The attempt's token, or the Run's when no attempt is bound yet.
     ///
     /// The fallback is not a convenience: work that happens before an attempt
     /// exists still has to stop when the Run is cancelled.
     fn attempt_cancellation_token(&self) -> &CancellationToken {
-        self.attempt_cancellation.as_ref().unwrap_or(&self.cancellation)
+        self.attempt_cancellation
+            .as_ref()
+            .unwrap_or(&self.cancellation)
     }
 
     fn terminate_interrupted(
@@ -8269,6 +8449,22 @@ impl LocalRuntimeHost {
                 Err(LocalRuntimeError::ProviderSelection(message)) => {
                     self.terminate_provider_failure(run_id, attempt_id, message, &mut event_types)?;
                     break;
+                }
+                // The call was aborted so this could be applied. Applying it
+                // here is the point: `&mut self` is held, and
+                // `apply_steering` decides whether it is allowed. A refusal is
+                // not a failed Run -- the person asked at a moment the Runtime
+                // will not redirect, and the turn is simply asked again.
+                Err(LocalRuntimeError::Steered(steer)) => {
+                    if let Some(steer) = steer {
+                        match self.apply_steer(run_id, attempt_id, steer) {
+                            Ok(event) => self.emit(run_id, &event, &mut event_types)?,
+                            Err(error) => {
+                                tracing::warn!(%error, "steering was refused");
+                            }
+                        }
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error),
             };

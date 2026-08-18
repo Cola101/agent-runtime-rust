@@ -805,6 +805,11 @@ async fn a_restarted_daemon_never_re_executes_a_run_that_already_finished() {
         endpoint.clone(),
     ));
     let serving = tokio::spawn(Arc::clone(&daemon).serve(listener));
+    // Its two siblings in this file wait; this one did not, and passed on
+    // timing. `serve` recovers concurrently with accepting, so a submit sent
+    // before recovery finishes is answered `NotReady` -- correct behaviour, and
+    // not what this test is about.
+    daemon.wait_until_ready().await;
     let run_id = submit(&socket, "Summarize the workspace.").await;
 
     let probe = state_root.clone();

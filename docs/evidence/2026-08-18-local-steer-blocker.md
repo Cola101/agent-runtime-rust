@@ -142,7 +142,50 @@ Cancel 之所以能工作，是因为它只需要取消一个 token；steering �
 安全门仍然由 `apply_steering` 判定（它还要管幂等、冲突、终止态），
 `select!` 只是保证调用它的时机是安全的那个时机。
 
-### 本轮落地了什么，没落地什么
+### 落地了（下一轮补记）
+
+四步全部落地，形状和上面写的一致：
+
+- `SteeringMailbox` 是**一个槽而不是队列**。两条 steer 在任一条被应用前先后到达，
+  意味着人改了两次主意，**第二条才是他要的**；排队会去执行一条已经被推翻的指令。
+- 模型调用外的 `select!` 同时等调用返回和信箱到达。信箱先到 ⇒ 取消这次调用 ⇒
+  循环在 `&mut self` 处调 `apply_steering` ⇒ 带着新 transcript 再问一次。
+- `apply_steering` 拒绝时**不是失败的 Run**：人在 Runtime 不会改向的时刻问了，
+  这一轮照常再问一次。
+- `NotSteerable` 映射到 client 契约既有的 `Conflict`，**没有为它新增错误码**——
+  那个契约是专门稳定下来的，而「你的请求与这个 Run 正在做的事冲突」正是该码已有的意思。
+
+### 三条守卫，各自都先看到过红
+
+| 守卫 | 打破方式 | 结果 |
+| --- | --- | --- |
+| 在途调用真的被打断，且带着人加的那句话 | 信箱不投递 | 20.15s 超时后红 |
+| 被 steer 过的 Run 仍然取消得掉 | 去掉重绑 | 红（正是设计预言的那条） |
+| 不在跑的 Run 被拒绝而不是接受后丢弃 | —— | 覆盖 |
+
+通过时整条链路是 **0.32 秒**；打破后是 20 秒超时。这个差值本身就是「立刻生效」的证据。
+
+### 全量门禁：一条修好的、一条仍开着的
+
+`cargo test --workspace --all-targets --all-features`：**449 passed，1 failed**。
+
+**修好的**：`daemon_recovery::a_restarted_daemon_never_re_executes_a_run_that_already_finished`
+报 `NotReady { Recovering }`。这条测试**从来没等就绪**——同文件另外两条都调了
+`wait_until_ready()`，早先修那两条时漏了它，它一直靠时序侥幸通过。
+修法是让它像生产那样启动守护进程，不是放宽断言。连跑三次全绿。
+
+**仍开着的**：`grpc_session_contract::a_network_caller_starts_continues_forks_and_reads_a_real_session`
+在满载并行下报 `Unavailable: Session storage is unavailable`。隔离重跑 3/3 通过。
+
+这句话来自 `LocalRuntimeError::StateRoot`——状态根上的文件系统错误——在客户端契约边界
+被**有意脱敏**（宿主路径不得越过该边界，这是对的）。代价是测试拿不到真实原因：
+是 fd 耗尽、瞬时 ENOENT，还是别的，从这条消息里看不出来。
+
+**没有证据把它归到 steering 这次改动**：改动落在模型调用路径，不碰 Session 存储。
+但也不声称无关——只记录：隔离通过、满载偶发、原因被边界挡住。
+要查清需要在 host 侧留下未脱敏的诊断，而不是放宽边界。
+
+### 旧结论（保留，因为它记的是当时的判断）
 
 **落地**：取消拓扑。host 现在持有 per-attempt token，绑一份进 processor，
 模型调用从同一个 token 派生。69 个测试无回归。

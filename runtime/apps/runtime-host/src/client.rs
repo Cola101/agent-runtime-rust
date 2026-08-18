@@ -375,6 +375,15 @@ impl RuntimeClientError {
                 RuntimeClientErrorCode::Conflict,
                 "this Run id is already bound to a different Session Turn",
             ),
+            // Not an error in the Runtime and not a malformed request: the Run
+            // is simply not moving, so there is nothing for a steer to redirect.
+            // `Conflict` rather than a new code -- this contract was stabilised
+            // deliberately, and "your request conflicts with what this Run is
+            // doing" is exactly what that code already means.
+            EmbeddedRuntimeError::NotSteerable => Self::new(
+                RuntimeClientErrorCode::Conflict,
+                "this Run is not executing here, so there is nothing to steer",
+            ),
             EmbeddedRuntimeError::InvalidControlCommand(_) => Self::new(
                 RuntimeClientErrorCode::InvalidRequest,
                 "invalid Runtime control command",

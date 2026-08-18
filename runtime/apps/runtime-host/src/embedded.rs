@@ -192,6 +192,15 @@ pub enum RuntimeControlAction {
     Cancel {
         reason: String,
     },
+    /// Redirect a Run that is already moving.
+    ///
+    /// `steering_id` is the caller's idempotency key: the same id resent is
+    /// answered from what was recorded, and the same id carrying different
+    /// input is a conflict rather than a second redirect.
+    Steer {
+        steering_id: Uuid,
+        input: String,
+    },
     ResolveMcpInput {
         input_id: Uuid,
         input_version: u32,
@@ -404,11 +413,28 @@ impl Drop for EmbeddedEventSubscription {
     }
 }
 
+/// A steer waiting to be applied to a Run in flight.
+///
+/// It waits rather than being applied where it arrives, because applying it
+/// means calling the Processor and the Processor is `&mut` inside the task
+/// driving the Run. The Host picks it up at the one moment that is safe by
+/// construction: while it is awaiting a model call, no tool call is in flight
+/// and no approval is pending, because tool calls are issued after a model
+/// returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSteer {
+    pub steering_id: Uuid,
+    pub input: String,
+}
+
 struct ActiveExecution {
     cancellation: CancellationToken,
     finalizing: AtomicBool,
     record_gate: Mutex<()>,
     cancellation_commands: Mutex<Vec<Uuid>>,
+    /// Handed to the Host when it starts. Steers posted before it does are held
+    /// here, so a steer that races the first model call is not lost.
+    steering: Arc<crate::SteeringMailbox>,
 }
 
 type ActiveExecutionKey = (RuntimeInvocationContext, Uuid);
@@ -521,6 +547,14 @@ pub enum EmbeddedRuntimeError {
     /// caller the Runtime broke when in fact its own request was refused.
     #[error("Session Turn Run id was already used for another Turn")]
     SessionTurnRebound,
+    /// A steer arrived for a Run that is not executing here.
+    ///
+    /// Its own variant because it is not a broken request: the Run finished, is
+    /// parked on a person, or is running somewhere else. A steer only means
+    /// something to work in flight, and accepting one with nothing to redirect
+    /// would be accepting a command that is silently dropped.
+    #[error("the Run is not executing here, so there is nothing to steer")]
+    NotSteerable,
     #[error(transparent)]
     Admission(#[from] RuntimeAdmissionError),
     #[error(transparent)]
@@ -2978,6 +3012,22 @@ impl EmbeddedRuntime {
                 self.apply_cancellation(command, digest, existing, reason)
                     .await
             }
+            RuntimeControlAction::Steer { steering_id, input } => {
+                let config = self.profile(command.invocation)?.clone();
+                let receipt = existing.unwrap_or(RuntimeControlReceipt {
+                    schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+                    command_id: command.command_id,
+                    invocation: command.invocation,
+                    run_id: command.run_id,
+                    command_digest: digest,
+                    expected_owner_epoch: command.expected_owner_epoch,
+                    action: command.action.clone(),
+                    state: RuntimeControlReceiptState::Accepted,
+                    applied_owner_epoch: command.expected_owner_epoch,
+                    run_status: None,
+                });
+                self.post_steering(&config, &command, receipt, steering_id, input)
+            }
             RuntimeControlAction::Resume => {
                 self.apply_resume(command, digest, existing, None).await
             }
@@ -3329,6 +3379,43 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Hands a steer to the Run it is meant for, if that Run is moving.
+    ///
+    /// A steer only means something to work in flight. With no active execution
+    /// there is nothing to redirect -- the Run is finished, parked on a person,
+    /// or was never started here -- and saying so is better than accepting a
+    /// command that would be silently dropped.
+    ///
+    /// Whether the steer is *allowed* is not decided here. That is
+    /// `apply_steering`'s, evaluated inside the Run's own task at the moment it
+    /// is safe by construction.
+    fn post_steering(
+        &self,
+        config: &LocalRuntimeConfig,
+        command: &RuntimeControlCommand,
+        mut receipt: RuntimeControlReceipt,
+        steering_id: Uuid,
+        input: String,
+    ) -> Result<RuntimeControlResult, EmbeddedRuntimeError> {
+        let key = (command.invocation, command.run_id);
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let Some(active) = active else {
+            return Err(EmbeddedRuntimeError::NotSteerable);
+        };
+        active.steering.post(PendingSteer { steering_id, input });
+        receipt.state = RuntimeControlReceiptState::Accepted;
+        Self::write_control_receipt(&config.state_root, &receipt)?;
+        Ok(RuntimeControlResult {
+            receipt,
+            outcome: None,
+        })
+    }
+
     fn cancel_active_execution(
         &self,
         config: &LocalRuntimeConfig,
@@ -3414,6 +3501,7 @@ impl EmbeddedRuntime {
             invocation,
             cancellation.clone(),
         )?;
+        host.attach_steering(Arc::clone(&execution.steering));
         let result = match operation {
             RecordedOperation::Execute => {
                 host.execute_as_at_epoch(record.run_id, &record.input, record.owner_epoch)
@@ -3564,6 +3652,7 @@ impl EmbeddedRuntime {
             finalizing: AtomicBool::new(false),
             record_gate: Mutex::new(()),
             cancellation_commands: Mutex::new(Vec::new()),
+            steering: Arc::new(crate::SteeringMailbox::new()),
         });
         let mut active = self
             .active
@@ -3766,6 +3855,16 @@ impl EmbeddedRuntime {
         }
         match &command.action {
             RuntimeControlAction::Resume => {}
+            RuntimeControlAction::Steer { steering_id, input } => {
+                // The same bounds `RunSteeringCommand::validate` applies, checked
+                // here so a malformed steer is refused at the boundary rather
+                // than after it has been posted to a Run in flight.
+                if steering_id.is_nil() || input.trim().is_empty() || input.len() > 32 * 1024 {
+                    return Err(EmbeddedRuntimeError::InvalidControlCommand(
+                        "steering needs an id and 1 to 32768 bytes of input".into(),
+                    ));
+                }
+            }
             RuntimeControlAction::Cancel { reason } => {
                 if reason.trim().is_empty() || reason.len() > 512 {
                     return Err(EmbeddedRuntimeError::InvalidControlCommand(

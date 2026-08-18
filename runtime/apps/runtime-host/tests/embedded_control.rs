@@ -151,6 +151,44 @@ async fn spawn_cancellable_provider() -> (String, tokio::sync::oneshot::Receiver
     (endpoint, seen_rx)
 }
 
+/// Holds the first call open, then answers the second and reports what it was
+/// asked.
+///
+/// The held call is the whole point: a steer that arrives while nothing is in
+/// flight proves nothing about interrupting one. The second request body is
+/// returned because the claim being tested is not "the Run continued" but
+/// "the Run continued *with what the person added*".
+async fn spawn_steerable_provider() -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<String>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("address")
+    );
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut held, _) = listener.accept().await.expect("first request");
+        let mut request = vec![0_u8; 64 * 1024];
+        let read = held.read(&mut request).await.unwrap_or(0);
+        let _ = read;
+        let _ = seen_tx.send(());
+
+        let (mut socket, _) = listener.accept().await.expect("second request");
+        let mut body = vec![0_u8; 256 * 1024];
+        let read = socket.read(&mut body).await.unwrap_or(0);
+        let _ = second_tx.send(String::from_utf8_lossy(&body[..read]).into_owned());
+        write_response(&mut socket, &text_turn("redirected and finished")).await;
+        // Held until the run is over, so the first call never completes.
+        let mut sink = [0_u8; 1];
+        let _ = held.read(&mut sink).await;
+    });
+    (endpoint, seen_rx, second_rx)
+}
+
 async fn spawn_recoverable_provider() -> (
     String,
     tokio::sync::oneshot::Receiver<()>,
@@ -892,4 +930,197 @@ async fn an_accepted_resume_command_survives_a_second_owner_crash() {
     assert_eq!(replayed.receipt, recovered.receipt);
     assert!(replayed.outcome.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+/// The claim: a steer sent while the model is mid-call interrupts that call and
+/// the Run continues with what the person added.
+///
+/// Everything about this test is chosen so it cannot pass for another reason.
+/// The provider holds the first call open forever, so nothing but an
+/// interruption can end it. The second request body is inspected, so
+/// "continued" is not mistaken for "continued with the steering". And the Run
+/// is asserted to succeed, because a steer that ends a Run has cancelled it
+/// under another name.
+#[tokio::test]
+async fn steering_an_active_run_interrupts_the_model_call_and_redirects_it() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation();
+    let (endpoint, request_seen, second_request) = spawn_steerable_provider().await;
+    let runtime = runtime(RuntimeProfile {
+        invocation: identity,
+        config: config(
+            state.path().to_path_buf(),
+            workspace.path().canonicalize().unwrap(),
+            endpoint,
+            None,
+        ),
+    });
+    let run_id = Uuid::now_v7();
+    let executing_runtime = Arc::clone(&runtime);
+    let execution = tokio::spawn(async move {
+        executing_runtime
+            .execute(identity, run_id, "start something long")
+            .await
+    });
+    request_seen.await.expect("provider request");
+    let record = wait_for_record(&runtime, identity, run_id, |state| {
+        *state == LocalRunState::Running
+    })
+    .await;
+
+    let accepted = runtime
+        .control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id: Uuid::now_v7(),
+            invocation: identity,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Steer {
+                steering_id: Uuid::now_v7(),
+                input: "actually look at the retention sweep instead".into(),
+            },
+        })
+        .await
+        .expect("steer");
+    assert_eq!(accepted.receipt.state, RuntimeControlReceiptState::Accepted);
+
+    let asked = tokio::time::timeout(Duration::from_secs(20), second_request)
+        .await
+        .expect("the steer did not interrupt the model call within twenty seconds")
+        .expect("second request");
+    assert!(
+        asked.contains("actually look at the retention sweep instead"),
+        "the turn was asked again without what the person added: {asked}"
+    );
+
+    let outcome = execution.await.unwrap().expect("steered outcome");
+    // A steer redirects a Run. One that ends it has cancelled it under another
+    // name.
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+    assert!(
+        outcome
+            .event_types
+            .iter()
+            .any(|event| event == "run.steer.applied"),
+        "steering left no durable evidence: {:?}",
+        outcome.event_types
+    );
+}
+
+/// A steer for a Run that is not moving is refused rather than accepted and
+/// dropped.
+#[tokio::test]
+async fn steering_a_run_that_is_not_executing_here_is_refused() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation();
+    let (endpoint, _calls) = spawn_approval_provider().await;
+    let runtime = runtime(RuntimeProfile {
+        invocation: identity,
+        config: config(
+            state.path().to_path_buf(),
+            workspace.path().canonicalize().unwrap(),
+            endpoint,
+            None,
+        ),
+    });
+    let refused = runtime
+        .control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id: Uuid::now_v7(),
+            invocation: identity,
+            run_id: Uuid::now_v7(),
+            expected_owner_epoch: 1,
+            action: RuntimeControlAction::Steer {
+                steering_id: Uuid::now_v7(),
+                input: "nobody is listening".into(),
+            },
+        })
+        .await;
+    assert!(matches!(
+        refused,
+        Err(agent_runtime_host::embedded::EmbeddedRuntimeError::NotSteerable)
+    ));
+}
+
+/// The regression the design predicted before it was written.
+///
+/// `apply_steering` installs a token with no parent. This Host cancels a Run by
+/// cancelling the root of a tree, so an attempt left holding an unparented
+/// token has quietly left that tree -- and Cancel would stop working for it,
+/// discoverable only by someone cancelling a Run they had steered.
+#[tokio::test]
+async fn a_steered_run_can_still_be_cancelled() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation();
+    let (endpoint, request_seen, second_request) = spawn_steerable_provider().await;
+    let runtime = runtime(RuntimeProfile {
+        invocation: identity,
+        config: config(
+            state.path().to_path_buf(),
+            workspace.path().canonicalize().unwrap(),
+            endpoint,
+            None,
+        ),
+    });
+    let run_id = Uuid::now_v7();
+    let executing_runtime = Arc::clone(&runtime);
+    let execution = tokio::spawn(async move {
+        executing_runtime
+            .execute(identity, run_id, "start something long")
+            .await
+    });
+    request_seen.await.expect("provider request");
+    let record = wait_for_record(&runtime, identity, run_id, |state| {
+        *state == LocalRunState::Running
+    })
+    .await;
+    runtime
+        .control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id: Uuid::now_v7(),
+            invocation: identity,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Steer {
+                steering_id: Uuid::now_v7(),
+                input: "go the other way".into(),
+            },
+        })
+        .await
+        .expect("steer");
+    // The steer has landed once the redirected turn has been asked.
+    let _asked = tokio::time::timeout(Duration::from_secs(20), second_request)
+        .await
+        .expect("the steer did not interrupt the model call")
+        .expect("second request");
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(20),
+        runtime.control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id: Uuid::now_v7(),
+            invocation: identity,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Cancel {
+                reason: "cancelled after steering".into(),
+            },
+        }),
+    )
+    .await
+    .expect("cancelling a steered Run hung -- the attempt left the cancellation tree")
+    .expect("cancel");
+    assert!(matches!(
+        cancelled.receipt.state,
+        RuntimeControlReceiptState::Accepted | RuntimeControlReceiptState::Completed
+    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(20), execution)
+        .await
+        .expect("the steered Run never stopped after being cancelled")
+        .unwrap()
+        .expect("outcome");
+    assert_eq!(outcome.status, RunStatus::Cancelled);
 }
