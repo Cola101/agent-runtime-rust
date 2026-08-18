@@ -169,13 +169,13 @@ Codex 的通知围绕 **item** 组织：`item/started`、`item/completed`，以�
 | --- | --- |
 | `turn/diff/updated` | **结构化 diff，逐步推送**。我们只能从工具调用参数推路径 |
 | `turn/plan/updated` `item/plan/delta` | **计划 / 待办清单**，流式更新。Codex 右栏那块 |
-| `item/reasoning/textDelta` `summaryTextDelta` `summaryPartAdded` | **思考过程流**。我们的内核有 `model.reasoning` 事件，但没有摘要分段 |
+| `item/reasoning/textDelta` `summaryTextDelta` `summaryPartAdded` | **思考过程流**。这一行原来写错了：内核的 `ModelStreamEvent::Reasoning` 带的就是 `summary: Vec<String>`，**分段是有的**，缺的是流式——他们逐段推送，我们一次一个事件带全部段。客户端原来按字符串读这个数组，正文一直被丢掉；已修 |
 | `thread/tokenUsage/updated` | 用量作为独立通知，而不是埋在事件里 |
 | `command/exec/outputDelta` `process/outputDelta` `process/exited` | 终端输出流 |
 | `item/fileChange/patchUpdated` | 文件改动的补丁 |
 | `fs/changed` | 文件系统变化 |
 | `item/autoApprovalReview/started|completed` | 自动批准的**复核**过程可见 |
-| `thread/compacted` | 压缩发生了（我们有 `context.compacted` 事件，但客户端丢掉了） |
+| ~~`thread/compacted`~~ | 已对齐。`context.compacted` 客户端现在画得出来（「上文压成了摘要」）；把内核每个 `json!` 发的类型和客户端认得的类型对过一遍，**没有缺口** |
 | `model/rerouted` `model/verification` `model/safetyBuffering/updated` | 模型被改路由、验证、安全缓冲 |
 | `warning` `guardianWarning` `deprecationNotice` `configWarning` | **分级的警告通道**。我们只有错误或没有 |
 
