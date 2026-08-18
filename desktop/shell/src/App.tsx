@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { all, byId } from "./surfaces/registry";
 import { DeskContext, useDesk, type Desk } from "./desk";
+import { DRAWER_KEY, PALETTE_KEY, SHELL_KEYS, printedKey, type Shell } from "./shell-keys";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
 import "./surfaces/Chat";
@@ -9,6 +10,7 @@ import "./surfaces/Workspace";
 import "./surfaces/Runs";
 import "./surfaces/Approvals";
 import "./surfaces/Settings";
+import "./surfaces/Keys";
 
 const GROUPS = [
   { key: "work", title: "工作" },
@@ -93,7 +95,7 @@ function KeyHints({ desk, surfaceId }: { desk: Desk; surfaceId: string }) {
     <span className="keys">
       {keys.map((key) => (
         <span key={key.key}>
-          <kbd>{key.key === " " ? "空格" : key.key}</kbd> {key.hint}
+          <kbd>{printedKey(key.key)}</kbd> {key.hint}
         </span>
       ))}
     </span>
@@ -110,10 +112,19 @@ export function App() {
   const [palette, setPalette] = useState(false);
   const [drawer, setDrawer] = useState(false);
   const restore = useRef<HTMLElement | null>(null);
+  // One step, not a history stack: where ⌘/ puts you back to after a look at
+  // the reference. A stack would be a browser, and this window has no back.
+  const before = useRef(active);
+
+  const go = useCallback((id: string) => {
+    const was = latest.current.active;
+    if (was !== id) before.current = was;
+    setActive(id);
+  }, []);
 
   const desk = useMemo<Desk>(
-    () => ({ ...store, selected, select: setSelected, go: setActive }),
-    [store, selected],
+    () => ({ ...store, selected, select: setSelected, go }),
+    [store, selected, go],
   );
   // Read through a ref inside the key handler so the listener is installed
   // once rather than re-bound on every poll tick.
@@ -153,20 +164,32 @@ export function App() {
     restore.current?.focus();
   }, []);
 
+  // The handle the shell's own keys act through. Everything on it is window
+  // state; a surface key gets the Desk instead, and neither can reach the
+  // other's half.
+  const shell = useMemo<Shell>(
+    () => ({
+      togglePalette: () => (palette ? closePalette() : openPalette()),
+      toggleDrawer: () => setDrawer((open) => !open),
+      peek: (id) => go(latest.current.active === id ? before.current : id),
+    }),
+    [palette, openPalette, closePalette, go],
+  );
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const meta = event.metaKey || event.ctrlKey;
-      if (meta && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        if (palette) closePalette(); else openPalette();
-        return;
+      if (meta) {
+        const claimed = SHELL_KEYS.find((key) => key.key === event.key.toLowerCase());
+        // While the palette has the keyboard only the key that closes it still
+        // answers. The rest act on a surface the person cannot currently see.
+        if (claimed && (!palette || claimed === PALETTE_KEY)) {
+          event.preventDefault();
+          claimed.run(shell);
+          return;
+        }
       }
       if (palette) return;
-      if (meta && event.key.toLowerCase() === "i") {
-        event.preventDefault();
-        setDrawer((open) => !open);
-        return;
-      }
       if (typing(event.target) || meta || event.altKey) return;
 
       const surface = byId(latest.current.active);
@@ -178,7 +201,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [palette, openPalette, closePalette]);
+  }, [palette, shell]);
 
   const surface = byId(active);
   const View = surface?.view;
@@ -194,7 +217,7 @@ export function App() {
         <div className="chrome">
           <span>Runtime Desk</span>
           <button type="button" className="chrome-r" onClick={openPalette}>
-            <kbd>⌘K</kbd> 命令
+            <kbd>{PALETTE_KEY.chord}</kbd> {PALETTE_KEY.hint}
           </button>
         </div>
 
@@ -214,7 +237,7 @@ export function App() {
                         type="button"
                         aria-current={s.id === active}
                         className={s.id === active ? "r on" : "r"}
-                        onClick={() => setActive(s.id)}
+                        onClick={() => go(s.id)}
                       >
                         {s.label}
                         {count !== undefined && <span className="n">{count}</span>}
@@ -236,8 +259,8 @@ export function App() {
               <span className="end">
                 <KeyHints desk={desk} surfaceId={active} />
                 {Drawer ? (
-                  <button type="button" className="flat" onClick={() => setDrawer((o) => !o)}>
-                    <kbd>⌘I</kbd> {surface?.drawerLabel ?? "详情"}
+                  <button type="button" className="flat" onClick={() => DRAWER_KEY.run(shell)}>
+                    <kbd>{DRAWER_KEY.chord}</kbd> {surface?.drawerLabel ?? "详情"}
                   </button>
                 ) : (
                   // Said rather than shown as an inert key. A hint for a key
