@@ -39,8 +39,13 @@
   Create/Send/List/Fork/Rewind 重试与 revision 语义已对齐；本项目的多租户 invocation 绑定更严格——
   分支绑定完整 `RuntimeInvocationContext`，跨租户/应用/工作区/Agent/模型策略不得互读——但缺少其
   Gateway 运维与 Archive/Delete/Switch 等产品能力。
+- **可靠性与容量对标（2026-08-18，ADR-0143 加固轮）**：本轮只补可靠性与容量边界，**不增加任何产品功能**。
+  Codex Thread 与 OpenClaw Sessions 的产品面差距一项未变——仍缺 Codex 的完整客户端、SQLite Thread 产品链与
+  归档，仍缺 OpenClaw 的 Gateway 运维与 Archive/Delete/Switch。本项目在此新增的是两家都未公开明示的东西：
+  存储上限在 `Initialize` 就公布、容量拒绝发生在请求模型之前、以及不可恢复的终态 Turn 报 `DataLoss` 而不是
+  伪装成"仍在运行"。
 - **下一内核目标**：~~Session/Thread client contract~~（已完成）→应用关闭/恢复生命周期→Profile 与
-  credential resolver→可分发 artifact；不进入 GUI。总体仍为 70–75%：本轮收口的是既有接口的语义，
+  credential resolver→可分发 artifact；不进入 GUI。总体仍为 70–75%：本轮收口的是既有接口的语义与边界，
   不是新增能力。
 
 ## 上一阶段：可执行 Runtime 控制边界

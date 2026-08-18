@@ -75,6 +75,45 @@ Fork 重试等价 → ListSessions → 超限拒绝 → 半截游标拒绝 → R
 测试因此拿到 `trusted_workspace_tool: None`，模型的 tool call 无工具可执行，审批永不记录。构建该二进制后
 9/9 通过、耗时 3.58s。**不是回归**；`--workspace --all-targets` 本身会构建它。
 
+## 第二轮加固（同日）
+
+第一轮收口了语义，这一轮收口的是**可靠性与容量边界**，不增加任何产品功能。
+
+| 边界 | 修改前 | 风险 |
+| --- | --- | --- |
+| 投影失败 | 每种投影不了的理由都静默返回 | Checkpoint 已落盘却验不过的 Turn 被报成"还在跑"，分支永远卡住而无人有理由去查 |
+| 文件删除 | 直接 `std::fs::remove_file` | 未同步的目录仍会列出已删除的文件 |
+| Fork 重试 | generation 检查排在查找 target 之前 | 源分支继续或回滚过之后，重试被拒，调用方以为 Fork 失败而它就在那儿 |
+| 存储容量 | 无上限 | Session 数、分支数、归档 generation、记录字节全部无界；单文件 Store 每个 Turn 重写整份记录 |
+| 容量拒绝 | 无 | 无 |
+| `u64::MAX` generation | 走到"陈旧 generation"冲突 | 范围错误被报成与无辜分支的冲突 |
+
+### 实现结果
+
+- `durable_file::remove` —— 删除并同步父目录；4 个失败注入单测覆盖正常路径、已不存在、删除失败、目录同步失败。
+- 投影只豁免三件事：Session 尚不存在、本 invocation 看不见它、**没有 Checkpoint**（Turn 确实还欠着工作）。
+  其余一律上报；提交失败只吞 generation 围栏。
+- Fork 按请求自己命名的 generation 取历史（当前或已归档）；target 内容一致即返回，哪怕源已继续或回滚。
+  target 不存在且源已移动时仍拒绝。
+- `SessionStoragePolicy`：Workspace 1,000 / 租户 10,000 / 每 Session 32 分支 / 每分支 16 归档 generation /
+  单记录 8 MiB / 单 Turn 预留 2 MiB。全部在 `Initialize` 公布。
+- `LocalRuntimeError::SessionCapacity` → `ResourceExhausted`。它既不是调用方的错也不是存储坏了：请求合法、
+  状态完好，只是没地方了。告诉 `Conflict` 它会换内容重试，告诉 `Unavailable` 它会原样重试，两者都没用。
+- 上限是 `EmbeddedRuntime::new_with_policies` 的构造参数而非常量。**没人能触发的上限就是没人验过的上限**；
+  现有 30 处构造点一处未改。
+
+### 新增门禁
+
+| 门禁 | 结果 |
+| --- | --- |
+| `durable_file` 失败注入 | 9/9 |
+| Checkpoint 验不过 → `DataLoss`（read 与 continue 皆是） | 1/1，且**验证过它会失败**：改回安静版即转红 |
+| Fork 重试跨源分支 continue 与 rollback | 1/1 |
+| 三道上限各 N 成功 / N+1 拒绝，拒绝前后 Provider 调用数不变 | 1/1 |
+| 记录字节上限走到边界，拒绝后无残留 active Turn | 1/1 |
+| `u64::MAX` generation → `InvalidRequest` | 1/1 |
+| `--test runtime_client_contract` | 11/11 |
+
 ## 覆盖清单
 
 计划列出的 12 项已全部覆盖。最后两项及其构造方式：

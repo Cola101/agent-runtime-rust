@@ -24,6 +24,18 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-18 Session 可靠性与容量加固（ADR-0143 修订）：只补边界，不增加产品功能。投影由"刻意安静"改为
+fail-closed——初版让每一种投影不了的理由都原样返回，但那个理由只对**还没做完**的工作成立：Checkpoint 已落盘
+却验不过的 Turn，其结果已经发生且不可恢复，报成"还在跑"会让分支永远卡着而每次读都说它只是忙。现在只豁免
+Session 尚不存在、本 invocation 看不见、以及没有 Checkpoint 三种；其余 `DataLoss`。新增 `durable_file::remove`
+（删除并同步父目录，4 个失败注入单测），补偿不再直接 `remove_file`。Fork 按请求自己命名的 generation 取历史，
+target 内容一致即返回，**哪怕源分支之后继续或回滚过**——丢了响应的调用方重发的就是原来那个请求。新增
+`SessionStoragePolicy`（Workspace 1,000 / 租户 10,000 / 32 分支 / 16 归档 generation / 8 MiB 记录 / 2 MiB
+单 Turn 预留），全部在 `Initialize` 公布，检查一律在写入之前，`continue` 更在请求模型之前预留——准入了却记
+不下的 Turn 会跑完、成功、花掉钱然后提交失败。上限做成构造参数而非常量，因为没人能触发的上限就是没人验过的
+上限。Session 契约测试 **11/11**，全工作区 **866/866**，clippy `-D warnings` 与 fmt 均为 0。总体仍为
+**70–75%**。证据见 `docs/evidence/2026-08-18-session-acceptance-atomicity.md`。
+
 2026-08-18 Session 契约语义收口（ADR-0143）：`RuntimeClient v1` 的七个 Session capability 从"形状可用"
 推进到"语义可依赖"。三处缺陷以确定性 RED 先复现再修改，不是从代码阅读推断的：接受顺序把 active Turn 写在
 admission 之前，被拒绝的 Turn 会留下指向不存在 Run 的分支，永久不可继续；终态落地分三级（Kernel 事件 →

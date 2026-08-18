@@ -217,6 +217,12 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
             max_event_stream_capacity: descriptor.max_event_stream_capacity,
             max_session_list_size: descriptor.max_session_list_size,
             max_session_history_turns: descriptor.max_session_history_turns,
+            max_sessions_per_workspace: descriptor.max_sessions_per_workspace,
+            max_sessions_per_tenant: descriptor.max_sessions_per_tenant,
+            max_branches_per_session: descriptor.max_branches_per_session,
+            max_archived_generations_per_branch: descriptor.max_archived_generations_per_branch,
+            max_session_record_bytes: descriptor.max_session_record_bytes,
+            max_turn_reserve_bytes: descriptor.max_turn_reserve_bytes,
         }))
     }
 

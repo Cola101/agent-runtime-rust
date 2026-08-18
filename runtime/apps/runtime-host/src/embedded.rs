@@ -23,7 +23,7 @@ use crate::{
     LOCAL_EVENT_LOG_LINE_MAX_BYTES, LocalApprovalDecision, LocalApprovalResolution, LocalEvent,
     LocalMcpInputResolution, LocalResumeResolution, LocalRunOutcome, LocalRunRecord, LocalRunState,
     LocalRuntimeConfig, LocalRuntimeError, LocalRuntimeHost, LocalSessionHead,
-    LocalSessionTurnDecision, LocalSessionTurnPreparation,
+    LocalSessionTurnDecision, LocalSessionTurnPreparation, SessionStoragePolicy,
 };
 use agent_protocol::{
     McpInputResponse, RunStatus, RuntimeInvocationContext, SessionConversationTurn,
@@ -552,6 +552,7 @@ pub struct EmbeddedRuntime {
     retention_gates: HashMap<PathBuf, Arc<Mutex<()>>>,
     retired_runs: HashMap<PathBuf, Arc<Mutex<HashMap<Uuid, RuntimeTerminalTombstone>>>>,
     tenant_retention_gates: HashMap<Uuid, Arc<Mutex<()>>>,
+    session_storage: SessionStoragePolicy,
     _state_root_leases: Vec<StateRootLease>,
 }
 
@@ -567,6 +568,24 @@ impl EmbeddedRuntime {
         limits: RuntimeAdmissionLimits,
         profiles: Vec<RuntimeProfile>,
         retention_policy: RuntimeRetentionPolicy,
+    ) -> Result<Self, EmbeddedRuntimeError> {
+        Self::new_with_policies(
+            limits,
+            profiles,
+            retention_policy,
+            SessionStoragePolicy::default(),
+        )
+    }
+
+    /// The ceilings are constructor arguments rather than constants so that a
+    /// test can reach `N` and `N + 1` without manufacturing a thousand Sessions
+    /// or eight megabytes of transcript. A limit nobody can exercise is a limit
+    /// nobody has checked.
+    pub fn new_with_policies(
+        limits: RuntimeAdmissionLimits,
+        profiles: Vec<RuntimeProfile>,
+        retention_policy: RuntimeRetentionPolicy,
+        session_storage: SessionStoragePolicy,
     ) -> Result<Self, EmbeddedRuntimeError> {
         if profiles.is_empty() {
             return Err(EmbeddedRuntimeError::Configuration(
@@ -690,6 +709,7 @@ impl EmbeddedRuntime {
             session_mutation_gates: std::array::from_fn(|_| AsyncMutex::new(())),
             session_projection_gates: std::array::from_fn(|_| Mutex::new(())),
             retention_policy,
+            session_storage,
             retention_gates,
             retired_runs,
             tenant_retention_gates,
@@ -1976,6 +1996,7 @@ impl EmbeddedRuntime {
                 generation,
                 run_id,
                 &input,
+                self.session_storage,
             )?
         };
         if matches!(decision, LocalSessionTurnDecision::Existing) {
@@ -1996,6 +2017,7 @@ impl EmbeddedRuntime {
                 branch_id,
                 run_id,
                 &input,
+                self.session_storage,
             )?
         } else {
             LocalRuntimeHost::prepare_session_continue(
@@ -2145,6 +2167,7 @@ impl EmbeddedRuntime {
             source_generation,
             through_turn_ordinal,
             target_branch_id,
+            self.session_storage,
         )
         .map_err(Into::into)
     }
@@ -2167,6 +2190,7 @@ impl EmbeddedRuntime {
             branch_id,
             generation,
             through_turn_ordinal,
+            self.session_storage,
         )
         .map_err(Into::into)
     }

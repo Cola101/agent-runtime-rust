@@ -29,7 +29,7 @@ use agent_runtime_host::embedded::{
 };
 use agent_runtime_host::{
     LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalProviderConfig, LocalRuntimeConfig,
-    LocalToolConsent,
+    LocalToolConsent, SessionStoragePolicy,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -77,13 +77,12 @@ fn invocation() -> RuntimeInvocationContext {
     }
 }
 
-fn runtime_with_limits(
+fn session_profiles(
     state_root: &std::path::Path,
     workspace_root: &std::path::Path,
     invocations: &[RuntimeInvocationContext],
     provider_endpoint: &str,
-    limits: RuntimeAdmissionLimits,
-) -> EmbeddedRuntime {
+) -> Vec<RuntimeProfile> {
     let config = LocalRuntimeConfig {
         state_root: state_root.to_path_buf(),
         workspace_root: workspace_root.to_path_buf(),
@@ -123,16 +122,26 @@ fn runtime_with_limits(
         },
         runtime_policy: RuntimeExecutionPolicySnapshot::default(),
     };
+    invocations
+        .iter()
+        .copied()
+        .map(|invocation| RuntimeProfile {
+            invocation,
+            config: config.clone(),
+        })
+        .collect()
+}
+
+fn runtime_with_limits(
+    state_root: &std::path::Path,
+    workspace_root: &std::path::Path,
+    invocations: &[RuntimeInvocationContext],
+    provider_endpoint: &str,
+    limits: RuntimeAdmissionLimits,
+) -> EmbeddedRuntime {
     EmbeddedRuntime::new(
         limits,
-        invocations
-            .iter()
-            .copied()
-            .map(|invocation| RuntimeProfile {
-                invocation,
-                config: config.clone(),
-            })
-            .collect(),
+        session_profiles(state_root, workspace_root, invocations, provider_endpoint),
     )
     .expect("Runtime")
 }
@@ -146,6 +155,23 @@ fn roomy_limits() -> RuntimeAdmissionLimits {
         max_queued_runs: 8,
         max_queued_runs_per_tenant: 8,
     }
+}
+
+/// A Runtime whose Session ceilings are small enough to walk up to.
+fn runtime_with_storage(
+    state_root: &std::path::Path,
+    workspace_root: &std::path::Path,
+    invocations: &[RuntimeInvocationContext],
+    provider_endpoint: &str,
+    storage: SessionStoragePolicy,
+) -> EmbeddedRuntime {
+    EmbeddedRuntime::new_with_policies(
+        roomy_limits(),
+        session_profiles(state_root, workspace_root, invocations, provider_endpoint),
+        Default::default(),
+        storage,
+    )
+    .expect("Runtime")
 }
 
 fn runtime(
@@ -1245,4 +1271,603 @@ async fn a_legacy_session_record_is_adopted_only_by_the_local_default_identity()
             .code,
         RuntimeClientErrorCode::NotFound
     );
+}
+
+/// A Turn that finished and cannot be recovered is reported, not hidden.
+///
+/// The head projection deliberately stays quiet about a Turn it cannot finish
+/// *yet* -- no Checkpoint means the Turn is still owed work, and a read must
+/// not fail over that. But a Turn whose Checkpoint exists and does not verify
+/// is a different fact: its result happened and is unreadable. Answering that
+/// with "still running" leaves the branch stuck forever while every read says
+/// it is merely busy, and the person watching has no reason to look.
+#[tokio::test]
+async fn a_terminal_turn_with_an_unreadable_checkpoint_is_reported_not_hidden() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let provider_endpoint = spawn_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+
+    let first = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&first), &capabilities);
+    client
+        .start_session(RuntimeSessionTurnRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+            generation: 1,
+            run_id,
+            input: "a Turn whose Checkpoint will not survive".into(),
+        })
+        .await
+        .expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, run_id).await,
+        RunStatus::Succeeded
+    );
+    drop(client);
+    wait_released(&first).await;
+    drop(first);
+
+    // The crash state again -- head not committed, Turn active -- and this time
+    // the Checkpoint it would be finished from is damaged.
+    let path = session_record_path(state.path(), session_id);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("json");
+    let branch = &mut record["branches"][branch_id.to_string()];
+    branch["active_turn"] = serde_json::json!({
+        "run_id": run_id.to_string(),
+        "generation": 1,
+        "history_digest": agent_protocol::session_conversation_history_digest(&[]),
+        "input": "a Turn whose Checkpoint will not survive",
+    });
+    branch["history"] = serde_json::json!([]);
+    std::fs::write(&path, serde_json::to_vec(&record).expect("encode")).expect("write");
+
+    let checkpoint = state
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("checkpoint.json");
+    let mut damaged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint).expect("checkpoint")).expect("json");
+    // Content changed, digest left as it was: exactly what a torn or tampered
+    // Checkpoint looks like, and precisely what the digest exists to catch.
+    damaged["checkpoint"]["status"] = serde_json::json!("failed");
+    std::fs::write(&checkpoint, serde_json::to_vec(&damaged).expect("encode")).expect("write");
+
+    let replacement = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&replacement), &capabilities);
+
+    assert_eq!(
+        client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id,
+                branch_id,
+            })
+            .expect_err("an unverifiable terminal Checkpoint must not read as still running")
+            .code,
+        RuntimeClientErrorCode::DataLoss
+    );
+
+    // And the same fact reaches a caller trying to continue, rather than being
+    // reported as an ordinary active-Turn conflict it could wait out.
+    assert_eq!(
+        client
+            .continue_session(RuntimeSessionTurnRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id,
+                branch_id,
+                generation: 1,
+                run_id: Uuid::now_v7(),
+                input: "this cannot proceed".into(),
+            })
+            .await
+            .expect_err("continuing past an unrecoverable Turn must not look like a wait")
+            .code,
+        RuntimeClientErrorCode::DataLoss
+    );
+}
+
+/// A Fork that already happened is still that Fork after the source moves on.
+///
+/// Fork is identified by what it produced -- a target branch holding an exact
+/// prefix -- not by what the source happens to look like now. A caller whose
+/// response was lost retries the request it sent; between the two attempts the
+/// source may well have taken another Turn or been rolled back, and refusing
+/// the retry for that would make the caller believe its Fork failed when the
+/// Fork is sitting right there.
+///
+/// The other direction still holds: if the target does not exist and the source
+/// has moved, there is nothing to return and nothing may be created, because a
+/// branch built now from a generation that is no longer current is a branch
+/// nobody asked for.
+#[tokio::test]
+async fn a_fork_retry_survives_the_source_moving_on() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let provider_endpoint = spawn_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_FORK,
+        RUNTIME_CAPABILITY_SESSION_ROLLBACK,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    let runtime = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let turn = |generation: u64, text: &str| RuntimeSessionTurnRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation,
+        run_id: Uuid::now_v7(),
+        input: text.to_owned(),
+    };
+
+    let first = turn(1, "first turn");
+    let first_run_id = first.run_id;
+    client.start_session(first).await.expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, first_run_id).await,
+        RunStatus::Succeeded
+    );
+    let second = turn(1, "second turn");
+    let second_run_id = second.run_id;
+    client.continue_session(second).await.expect("continue");
+    assert_eq!(
+        wait_terminal(&client, invocation, second_run_id).await,
+        RunStatus::Succeeded
+    );
+
+    let fork_request = RuntimeSessionForkRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        source_branch_id: branch_id,
+        source_generation: 1,
+        through_turn_ordinal: 1,
+        target_branch_id: Uuid::now_v7(),
+    };
+    let forked = client
+        .fork_session(fork_request.clone())
+        .await
+        .expect("fork");
+    assert_eq!(forked.turn_count, 1);
+
+    // The source takes another Turn. The Fork is untouched by that.
+    let third = turn(1, "a turn after the fork");
+    let third_run_id = third.run_id;
+    client.continue_session(third).await.expect("continue");
+    assert_eq!(
+        wait_terminal(&client, invocation, third_run_id).await,
+        RunStatus::Succeeded
+    );
+    let replayed = client
+        .fork_session(fork_request.clone())
+        .await
+        .expect("a Fork retry after the source continued is still that Fork");
+    assert_eq!(replayed, forked);
+
+    // And after the source is rolled back, which moves its generation.
+    client
+        .rollback_session(RuntimeSessionRollbackRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+            generation: 1,
+            through_turn_ordinal: 1,
+        })
+        .await
+        .expect("rollback");
+    let replayed_after_rollback = client
+        .fork_session(fork_request.clone())
+        .await
+        .expect("a Fork retry after the source was rolled back is still that Fork");
+    assert_eq!(replayed_after_rollback, forked);
+
+    // A different target from the same moved-on source is not a retry of
+    // anything, and must not be built from a generation that is no longer
+    // current.
+    assert_eq!(
+        client
+            .fork_session(RuntimeSessionForkRequest {
+                target_branch_id: Uuid::now_v7(),
+                ..fork_request.clone()
+            })
+            .await
+            .expect_err("a new Fork from a stale generation must be refused")
+            .code,
+        RuntimeClientErrorCode::Conflict
+    );
+
+    // Same target, different prefix: a different Fork wearing an accepted
+    // Fork's name.
+    assert_eq!(
+        client
+            .fork_session(RuntimeSessionForkRequest {
+                through_turn_ordinal: 2,
+                ..fork_request
+            })
+            .await
+            .expect_err("a Fork target may not be rebound to a different prefix")
+            .code,
+        RuntimeClientErrorCode::Conflict
+    );
+}
+
+/// Ceilings refuse the next one, and refuse it before anything runs.
+///
+/// A store bound that is discovered after the model has answered is not a
+/// bound, it is a bill. Every ceiling here is checked before admission, so a
+/// refusal costs nothing and leaves nothing: no Turn, no Run, no branch, and
+/// no Provider request.
+#[tokio::test]
+async fn session_ceilings_refuse_the_next_one_before_anything_runs() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let (provider_endpoint, requests) = spawn_counting_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_FORK,
+        RUNTIME_CAPABILITY_SESSION_ROLLBACK,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    // Small enough to walk up to, same shape as the shipped defaults.
+    let policy = SessionStoragePolicy {
+        max_sessions_per_workspace: 2,
+        max_sessions_per_tenant: 8,
+        max_branches_per_session: 3,
+        max_archived_generations_per_branch: 2,
+        ..SessionStoragePolicy::default()
+    };
+    let runtime = Arc::new(runtime_with_storage(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+        policy,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    let start = |session_id: Uuid, branch_id: Uuid, text: &str| RuntimeSessionTurnRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation: 1,
+        run_id: Uuid::now_v7(),
+        input: text.to_owned(),
+    };
+
+    // --- Sessions per workspace: 2 fit, the third does not ----------------
+    let mut sessions = Vec::new();
+    for index in 0..policy.max_sessions_per_workspace {
+        let session_id = Uuid::now_v7();
+        let branch_id = Uuid::now_v7();
+        let request = start(session_id, branch_id, &format!("session {index}"));
+        let run_id = request.run_id;
+        client.start_session(request).await.expect("within ceiling");
+        assert_eq!(
+            wait_terminal(&client, invocation, run_id).await,
+            RunStatus::Succeeded
+        );
+        sessions.push((session_id, branch_id));
+    }
+
+    let asked = requests.load(Ordering::SeqCst);
+    let refused_session = Uuid::now_v7();
+    let refused_branch = Uuid::now_v7();
+    assert_eq!(
+        client
+            .start_session(start(refused_session, refused_branch, "one too many"))
+            .await
+            .expect_err("a Session past the workspace ceiling must be refused")
+            .code,
+        RuntimeClientErrorCode::ResourceExhausted
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        asked,
+        "a refused Session asked the model anyway"
+    );
+    assert_eq!(
+        client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id: refused_session,
+                branch_id: refused_branch,
+            })
+            .expect_err("a refused Session must not exist")
+            .code,
+        RuntimeClientErrorCode::NotFound
+    );
+
+    // --- Branches per Session: the original plus 2 forks, then no more ----
+    let (session_id, branch_id) = sessions[0];
+    let head = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("head");
+    let fork = |target: Uuid| RuntimeSessionForkRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        source_branch_id: branch_id,
+        source_generation: head.generation,
+        through_turn_ordinal: 1,
+        target_branch_id: target,
+    };
+    for _ in 1..policy.max_branches_per_session {
+        client
+            .fork_session(fork(Uuid::now_v7()))
+            .await
+            .expect("within the branch ceiling");
+    }
+    let refused_fork = Uuid::now_v7();
+    assert_eq!(
+        client
+            .fork_session(fork(refused_fork))
+            .await
+            .expect_err("a branch past the ceiling must be refused")
+            .code,
+        RuntimeClientErrorCode::ResourceExhausted
+    );
+    assert_eq!(
+        client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id,
+                branch_id: refused_fork,
+            })
+            .expect_err("a refused Fork must not have created its branch")
+            .code,
+        RuntimeClientErrorCode::NotFound
+    );
+
+    // --- Archived generations per branch ----------------------------------
+    let (rollback_session, rollback_branch) = sessions[1];
+    let mut generation = 1;
+    for round in 0..policy.max_archived_generations_per_branch {
+        let request = RuntimeSessionTurnRequest {
+            session_id: rollback_session,
+            branch_id: rollback_branch,
+            generation,
+            run_id: Uuid::now_v7(),
+            input: format!("turn for round {round}"),
+            ..start(rollback_session, rollback_branch, "")
+        };
+        let run_id = request.run_id;
+        client.continue_session(request).await.expect("continue");
+        assert_eq!(
+            wait_terminal(&client, invocation, run_id).await,
+            RunStatus::Succeeded
+        );
+        let rolled = client
+            .rollback_session(RuntimeSessionRollbackRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id: rollback_session,
+                branch_id: rollback_branch,
+                generation,
+                through_turn_ordinal: 1,
+            })
+            .await
+            .expect("within the archive ceiling");
+        generation = rolled.generation;
+    }
+
+    let asked = requests.load(Ordering::SeqCst);
+    let request = RuntimeSessionTurnRequest {
+        session_id: rollback_session,
+        branch_id: rollback_branch,
+        generation,
+        run_id: Uuid::now_v7(),
+        input: "the turn before the refused rollback".into(),
+        ..start(rollback_session, rollback_branch, "")
+    };
+    let run_id = request.run_id;
+    client.continue_session(request).await.expect("continue");
+    assert_eq!(
+        wait_terminal(&client, invocation, run_id).await,
+        RunStatus::Succeeded
+    );
+    let asked_after_turn = requests.load(Ordering::SeqCst);
+    assert!(asked_after_turn > asked, "that Turn really ran");
+    assert_eq!(
+        client
+            .rollback_session(RuntimeSessionRollbackRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id: rollback_session,
+                branch_id: rollback_branch,
+                generation,
+                through_turn_ordinal: 1,
+            })
+            .await
+            .expect_err("a rollback past the archive ceiling must be refused")
+            .code,
+        RuntimeClientErrorCode::ResourceExhausted
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        asked_after_turn,
+        "a refused rollback is not work and must ask nothing"
+    );
+
+    // --- A generation with no successor -----------------------------------
+    assert_eq!(
+        client
+            .rollback_session(RuntimeSessionRollbackRequest {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                session_id: rollback_session,
+                branch_id: rollback_branch,
+                generation: u64::MAX,
+                through_turn_ordinal: 1,
+            })
+            .await
+            .expect_err("u64::MAX has no successor to number")
+            .code,
+        RuntimeClientErrorCode::InvalidRequest
+    );
+
+    // The branch survived every refusal intact and is still continuable.
+    let head = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id: rollback_session,
+            branch_id: rollback_branch,
+        })
+        .expect("head");
+    assert_eq!(head.active_run_id, None, "a refusal left an active Turn");
+    assert_eq!(head.generation, generation);
+}
+
+/// The record ceiling is enforced against the record, not against a guess.
+///
+/// This store rewrites the whole Session file on every Turn, so the record's
+/// size is the cost of every future Turn as well as this one. The ceiling is
+/// checked by encoding exactly what would be written, and `continue` holds back
+/// room for the Turn it is about to run -- a Turn admitted without space to
+/// record it would run, succeed, and then have nowhere to go.
+#[tokio::test]
+async fn a_session_record_ceiling_is_reached_before_a_turn_is_run() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let (provider_endpoint, requests) = spawn_counting_provider(Duration::from_millis(20)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    // Same shape as the shipped 8 MiB / 2 MiB pair, small enough to reach.
+    let policy = SessionStoragePolicy {
+        max_session_record_bytes: 8 * 1024,
+        max_turn_reserve_bytes: 2 * 1024,
+        ..SessionStoragePolicy::default()
+    };
+    let runtime = Arc::new(runtime_with_storage(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+        policy,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let turn = |text: String| RuntimeSessionTurnRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation: 1,
+        run_id: Uuid::now_v7(),
+        input: text,
+    };
+
+    let first = turn("the first turn".into());
+    let first_run_id = first.run_id;
+    client.start_session(first).await.expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, first_run_id).await,
+        RunStatus::Succeeded
+    );
+
+    // Continue until the record has no room for another Turn. The refusal is
+    // the point; how many Turns it takes is an implementation detail.
+    let mut committed = 1_u64;
+    let mut refusal = None;
+    for round in 0..64 {
+        let request = turn(format!("padding turn {round} {}", "x".repeat(400)));
+        let run_id = request.run_id;
+        let asked = requests.load(Ordering::SeqCst);
+        match client.continue_session(request).await {
+            Ok(_) => {
+                assert_eq!(
+                    wait_terminal(&client, invocation, run_id).await,
+                    RunStatus::Succeeded
+                );
+                committed += 1;
+            }
+            Err(error) => {
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    asked,
+                    "a refused Turn asked the model anyway"
+                );
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+
+    let refusal = refusal.expect("the record ceiling was never reached");
+    assert_eq!(refusal.code, RuntimeClientErrorCode::ResourceExhausted);
+    assert!(
+        committed > 1,
+        "the ceiling refused work that should have fit"
+    );
+
+    // Everything that was accepted is still there, and the branch is not left
+    // holding a Turn that will never finish.
+    let head = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("head");
+    assert_eq!(head.turn_count, committed);
+    assert_eq!(head.active_run_id, None);
 }

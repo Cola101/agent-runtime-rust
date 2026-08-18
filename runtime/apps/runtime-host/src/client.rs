@@ -14,7 +14,7 @@ use crate::embedded::{
     RuntimeEventCursorPage, RuntimeEventCursorRequest, RuntimeEventCursorState,
     RuntimeEventStreamItem,
 };
-use crate::{LocalRuntimeError, LocalSessionHead};
+use crate::{LocalRuntimeError, LocalSessionHead, SessionStoragePolicy};
 use agent_protocol::{RuntimeInvocationContext, SessionConversationTurn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -68,11 +68,20 @@ pub struct RuntimeClientDescriptor {
     pub max_event_stream_capacity: u32,
     pub max_session_list_size: u32,
     pub max_session_history_turns: u32,
+    /// Session storage ceilings, published here so a caller can plan against
+    /// them instead of meeting them halfway through a conversation.
+    pub max_sessions_per_workspace: u32,
+    pub max_sessions_per_tenant: u32,
+    pub max_branches_per_session: u32,
+    pub max_archived_generations_per_branch: u32,
+    pub max_session_record_bytes: u64,
+    pub max_turn_reserve_bytes: u64,
 }
 
 impl RuntimeClientDescriptor {
     #[must_use]
     pub fn current() -> Self {
+        let storage = SessionStoragePolicy::default();
         Self {
             schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
             contract_version: RUNTIME_CLIENT_CONTRACT_VERSION,
@@ -97,6 +106,12 @@ impl RuntimeClientDescriptor {
             max_event_stream_capacity: EMBEDDED_EVENT_SUBSCRIPTION_MAX_CAPACITY as u32,
             max_session_list_size: RUNTIME_CLIENT_MAX_SESSION_LIST_SIZE as u32,
             max_session_history_turns: RUNTIME_CLIENT_MAX_SESSION_HISTORY_TURNS as u32,
+            max_sessions_per_workspace: storage.max_sessions_per_workspace as u32,
+            max_sessions_per_tenant: storage.max_sessions_per_tenant as u32,
+            max_branches_per_session: storage.max_branches_per_session as u32,
+            max_archived_generations_per_branch: storage.max_archived_generations_per_branch as u32,
+            max_session_record_bytes: storage.max_session_record_bytes as u64,
+            max_turn_reserve_bytes: storage.max_turn_reserve_bytes as u64,
         }
     }
 
@@ -409,6 +424,10 @@ impl RuntimeClientError {
 
     fn from_session_mutation(error: EmbeddedRuntimeError) -> Self {
         match error {
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::SessionCapacity(_)) => Self::new(
+                RuntimeClientErrorCode::ResourceExhausted,
+                "this Session store is at a ceiling",
+            ),
             EmbeddedRuntimeError::Runtime(LocalRuntimeError::Execution(_)) => Self::new(
                 RuntimeClientErrorCode::Conflict,
                 "Session head changed or is already active",
@@ -427,6 +446,10 @@ impl RuntimeClientError {
 
     fn from_session_read(error: EmbeddedRuntimeError) -> Self {
         match error {
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::SessionCapacity(_)) => Self::new(
+                RuntimeClientErrorCode::ResourceExhausted,
+                "this Session store is at a ceiling",
+            ),
             EmbeddedRuntimeError::Runtime(LocalRuntimeError::Execution(_)) => {
                 Self::new(RuntimeClientErrorCode::NotFound, "no such Session branch")
             }
@@ -650,7 +673,11 @@ impl InitializedRuntimeClient {
             request.session_id,
             request.branch_id,
         )?;
-        if request.generation == 0 {
+        // Both ends of the range. A rollback numbers the generation after the
+        // one it names, so `u64::MAX` names a generation with no successor --
+        // out of range in the same way zero is, and reported the same way
+        // rather than as a conflict with a branch that did nothing wrong.
+        if request.generation == 0 || request.generation == u64::MAX {
             return Err(RuntimeClientError::new(
                 RuntimeClientErrorCode::InvalidRequest,
                 "invalid Runtime Session Rollback",

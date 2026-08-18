@@ -70,6 +70,14 @@ message InitializeRuntimeResponse {
   uint32 max_event_stream_capacity = 8;
   uint32 max_session_list_size = 9;
   uint32 max_session_history_turns = 10;
+  // Session storage ceilings, published so a caller can plan against them
+  // rather than discover them by being refused mid-conversation.
+  uint32 max_sessions_per_workspace = 11;
+  uint32 max_sessions_per_tenant = 12;
+  uint32 max_branches_per_session = 13;
+  uint32 max_archived_generations_per_branch = 14;
+  uint64 max_session_record_bytes = 15;
+  uint64 max_turn_reserve_bytes = 16;
 }
 
 // Selects a pre-registered invocation Profile.

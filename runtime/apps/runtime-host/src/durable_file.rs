@@ -10,6 +10,7 @@ trait DurableReplaceIo {
     fn write_all(&self, file: &mut Self::File, body: &[u8]) -> std::io::Result<()>;
     fn sync_file(&self, file: &Self::File) -> std::io::Result<()>;
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
     fn sync_directory(&self, path: &Path) -> std::io::Result<()>;
 }
 
@@ -36,6 +37,10 @@ impl DurableReplaceIo for StdDurableReplaceIo {
 
     fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
     }
 
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
@@ -100,6 +105,29 @@ pub(crate) fn rename(from: &Path, to: &Path) -> Result<(), LocalRuntimeError> {
     rename_with_io(&StdDurableReplaceIo, from, to)
 }
 
+fn remove_with_io<I: DurableReplaceIo>(io: &I, path: &Path) -> Result<(), LocalRuntimeError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LocalRuntimeError::StateRoot("durable removal path has no parent".into()))?;
+    match io.remove_file(path) {
+        Ok(()) => {}
+        // Already gone is the state the caller asked for. Every other failure
+        // is uncertainty about whether it is gone, and must reach the caller.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+    }
+    // Unlinking is a change to the directory, and an unsynced directory can
+    // still list a file that is gone. A removal that has not been committed to
+    // its namespace is not a removal.
+    io.sync_directory(parent)
+        .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))
+}
+
+/// Removes a durable file and commits that removal to its directory.
+pub(crate) fn remove(path: &Path) -> Result<(), LocalRuntimeError> {
+    remove_with_io(&StdDurableReplaceIo, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +137,7 @@ mod tests {
     struct RecordingIo {
         operations: RefCell<Vec<&'static str>>,
         fail_on: Option<&'static str>,
+        missing: bool,
     }
 
     impl RecordingIo {
@@ -145,6 +174,14 @@ mod tests {
 
         fn rename(&self, _from: &Path, _to: &Path) -> std::io::Result<()> {
             self.record("rename")
+        }
+
+        fn remove_file(&self, _path: &Path) -> std::io::Result<()> {
+            if self.missing {
+                self.operations.borrow_mut().push("remove_file");
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            self.record("remove_file")
         }
 
         fn sync_directory(&self, _path: &Path) -> std::io::Result<()> {
@@ -226,6 +263,63 @@ mod tests {
         .expect("rename");
 
         assert_eq!(*io.operations.borrow(), ["rename", "sync_directory"]);
+    }
+
+    #[test]
+    fn removal_commits_the_unlink_to_its_directory() {
+        let io = RecordingIo::default();
+
+        remove_with_io(&io, Path::new("state/session.json")).expect("removal");
+
+        assert_eq!(
+            *io.operations.borrow(),
+            ["remove_file", "sync_directory"],
+            "an unsynced directory can still list a file that is gone"
+        );
+    }
+
+    #[test]
+    fn removing_what_is_already_gone_is_the_state_the_caller_asked_for() {
+        let io = RecordingIo {
+            missing: true,
+            ..RecordingIo::default()
+        };
+
+        remove_with_io(&io, Path::new("state/session.json")).expect("absent is removed");
+
+        assert_eq!(
+            *io.operations.borrow(),
+            ["remove_file"],
+            "there is no namespace change to commit"
+        );
+    }
+
+    #[test]
+    fn removal_failure_is_returned_rather_than_reported_as_removed() {
+        let io = RecordingIo {
+            fail_on: Some("remove_file"),
+            ..RecordingIo::default()
+        };
+
+        let error = remove_with_io(&io, Path::new("state/session.json"))
+            .expect_err("an unremoved file must not be reported as removed");
+
+        assert!(matches!(error, LocalRuntimeError::StateRoot(_)));
+        assert_eq!(*io.operations.borrow(), ["remove_file"]);
+    }
+
+    #[test]
+    fn removal_directory_sync_failure_reaches_the_caller() {
+        let io = RecordingIo {
+            fail_on: Some("sync_directory"),
+            ..RecordingIo::default()
+        };
+
+        let error = remove_with_io(&io, Path::new("state/session.json"))
+            .expect_err("uncommitted removal is uncertainty, not success");
+
+        assert!(matches!(error, LocalRuntimeError::StateRoot(_)));
+        assert_eq!(*io.operations.borrow(), ["remove_file", "sync_directory"]);
     }
 
     #[test]

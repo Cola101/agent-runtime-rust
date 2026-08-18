@@ -126,8 +126,8 @@ gRPC 与进程内嵌入调用同一门面；无 UI 真实 Run 1/1、受影响 gR
 
 **剩余出口标准。**
 
-1. ~~Session/Thread 契约~~：已完成（ADR-0143）。仍缺独立覆盖：同一 `run_id` 携带不同输入、Rollback 重试
-   与回滚后重放旧请求、终态崩溃窗口且 Provider 请求次数不增、schema v1→v2 迁移、generation 溢出拒绝。
+1. ~~Session/Thread 契约~~：已完成（ADR-0143），含语义收口与可靠性/容量加固。计划要求的 12 项覆盖全部到位，
+   另有投影 fail-closed、Fork 重试跨源分支移动、五道存储上限的 N/N+1 边界与 `u64::MAX` generation 拒绝。
 2. 应用生命周期：停止接纳、有界 drain、安全关闭/下次启动恢复，不把“退出应用”伪造成“用户取消 Run”。
 3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令或持久配置。
 4. 可分发验收：一个无 UI artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、

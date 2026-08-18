@@ -641,6 +641,56 @@ pub enum LocalRuntimeError {
     ToolExecution(String),
     #[error("local checkpoint is unusable: {0}")]
     Checkpoint(String),
+    /// A Session storage ceiling was reached.
+    ///
+    /// Its own variant because it is neither a caller mistake nor a broken
+    /// store: the request was well formed and the state is intact, there is
+    /// simply no room. A caller told `Conflict` would retry with different
+    /// content and a caller told `Unavailable` would retry the same request;
+    /// neither helps, and only this one says why.
+    #[error("Session storage ceiling reached: {0}")]
+    SessionCapacity(String),
+}
+
+/// The ceilings a single-file Session store can hold without becoming
+/// something it is not.
+///
+/// Every one of these is a bound on a thing that would otherwise grow without
+/// limit: Sessions per owner, branches per Session, retained rolled-back
+/// generations, and the size of the one record that holds them all. The record
+/// bound is the load-bearing one -- the store rewrites the whole file on every
+/// Turn, so an unbounded record is an unbounded write on the hot path.
+///
+/// Not configurable yet, deliberately. Numbers that no caller can change are
+/// still worth naming in one place and publishing at Initialize, and a policy
+/// object is the shape a per-profile setting plugs into when there is a reason
+/// for one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionStoragePolicy {
+    pub max_sessions_per_workspace: usize,
+    pub max_sessions_per_tenant: usize,
+    pub max_branches_per_session: usize,
+    pub max_archived_generations_per_branch: usize,
+    pub max_session_record_bytes: usize,
+    /// Room held back for the Turn a `start` or `continue` is about to run.
+    ///
+    /// A quantity of the same kind as the ceiling it is subtracted from, so it
+    /// belongs beside it -- and a test that cannot shrink both cannot reach the
+    /// boundary either ceiling describes.
+    pub max_turn_reserve_bytes: usize,
+}
+
+impl Default for SessionStoragePolicy {
+    fn default() -> Self {
+        Self {
+            max_sessions_per_workspace: 1_000,
+            max_sessions_per_tenant: 10_000,
+            max_branches_per_session: 32,
+            max_archived_generations_per_branch: 16,
+            max_session_record_bytes: 8 * 1024 * 1024,
+            max_turn_reserve_bytes: agent_protocol::SESSION_HISTORY_MAX_BYTES,
+        }
+    }
 }
 
 /// The operator's answer to a parked approval.
@@ -5518,6 +5568,7 @@ impl LocalRuntimeHost {
             branch_id,
             run_id,
             input,
+            SessionStoragePolicy::default(),
         )? {
             LocalSessionTurnPreparation::Execute(_) => {
                 self.drive_prepared_session_turn(session_id, branch_id, 1, run_id, input, 1)
@@ -5618,6 +5669,7 @@ impl LocalRuntimeHost {
     }
 
     /// The same decision for a continuation.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decide_session_continue(
         state_root: &Path,
         invocation: RuntimeInvocationContext,
@@ -5626,6 +5678,7 @@ impl LocalRuntimeHost {
         generation: u64,
         run_id: Uuid,
         input: &str,
+        policy: SessionStoragePolicy,
     ) -> Result<LocalSessionTurnDecision, LocalRuntimeError> {
         if session_id.is_nil()
             || branch_id.is_nil()
@@ -5670,6 +5723,10 @@ impl LocalRuntimeHost {
                 "root Session branch already has an active Turn".into(),
             ));
         }
+        // Reserved here, before the model is asked. A Turn admitted without
+        // room to record it would run, succeed, cost money, and then fail to
+        // commit -- the one outcome worth refusing work to avoid.
+        Self::check_session_record_fits(policy, &record, policy.max_turn_reserve_bytes)?;
         Ok(LocalSessionTurnDecision::New)
     }
 
@@ -5706,12 +5763,9 @@ impl LocalRuntimeHost {
         if !untouched {
             return Ok(());
         }
-        let path = Self::session_record_path(state_root, session_id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(LocalRuntimeError::StateRoot(error.to_string())),
-        }
+        // Removal is a durable change like any other: an unsynced directory can
+        // still list a Session this call was compensating away.
+        durable_file::remove(&Self::session_record_path(state_root, session_id))
     }
 
     /// Undoes a `prepare_session_continue` whose Run never came into existence.
@@ -5751,6 +5805,7 @@ impl LocalRuntimeHost {
         branch_id: Uuid,
         run_id: Uuid,
         input: &str,
+        policy: SessionStoragePolicy,
     ) -> Result<LocalSessionTurnPreparation, LocalRuntimeError> {
         if session_id.is_nil()
             || branch_id.is_nil()
@@ -5786,6 +5841,9 @@ impl LocalRuntimeHost {
                 "root Session start identity is already bound to another mutation".into(),
             ));
         }
+        // Counted before anything is written, so a refusal leaves the store
+        // exactly as it was found.
+        Self::check_session_headroom(state_root, invocation, policy)?;
         let branch = LocalSessionBranchRecord {
             branch_id,
             generation: 1,
@@ -5799,15 +5857,16 @@ impl LocalRuntimeHost {
             }),
         };
         let head = branch.head(session_id);
-        Self::persist_session_record(
-            state_root,
-            &LocalSessionRecord {
-                store_version: LOCAL_SESSION_STORE_VERSION,
-                invocation,
-                session_id,
-                branches: BTreeMap::from([(branch_id, branch)]),
-            },
-        )?;
+        let record = LocalSessionRecord {
+            store_version: LOCAL_SESSION_STORE_VERSION,
+            invocation,
+            session_id,
+            branches: BTreeMap::from([(branch_id, branch)]),
+        };
+        // Room for the Turn this start is about to run, not merely for the
+        // empty Session it creates.
+        Self::check_session_record_fits(policy, &record, policy.max_turn_reserve_bytes)?;
+        Self::persist_session_record(state_root, &record)?;
         Ok(LocalSessionTurnPreparation::Execute(head))
     }
 
@@ -5943,9 +6002,11 @@ impl LocalRuntimeHost {
             source_generation,
             through_turn_ordinal,
             Uuid::now_v7(),
+            SessionStoragePolicy::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fork_session_as(
         state_root: &Path,
         invocation: RuntimeInvocationContext,
@@ -5954,6 +6015,7 @@ impl LocalRuntimeHost {
         source_generation: u64,
         through_turn_ordinal: u64,
         target_branch_id: Uuid,
+        policy: SessionStoragePolicy,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
         if session_id.is_nil()
             || source_branch_id.is_nil()
@@ -5969,18 +6031,30 @@ impl LocalRuntimeHost {
         let source = record.branches.get(&source_branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session source branch does not exist".into())
         })?;
-        if source.generation != source_generation {
+
+        // Resolve the history the request named, from the generation it named.
+        // A branch keeps its rolled-back generations, so a Fork request stays
+        // answerable after the source moves -- and it has to, because the
+        // request that produced an existing Fork is the same request a caller
+        // retries when it loses the response.
+        let source_is_current = source.generation == source_generation;
+        let named_history = if source_is_current {
+            Some(&source.history)
+        } else {
+            source.archived_generations.get(&source_generation)
+        };
+        let Some(named_history) = named_history else {
             return Err(LocalRuntimeError::Execution(format!(
-                "stale root Session generation {source_generation}; current generation is {}",
+                "unknown root Session generation {source_generation}; current generation is {}",
                 source.generation
             )));
-        }
-        if source.active_turn.is_some() {
-            return Err(LocalRuntimeError::Execution(
-                "cannot Fork a root Session branch with an active Turn".into(),
-            ));
-        }
-        let history = Self::history_prefix(&source.history, through_turn_ordinal)?;
+        };
+        let history = Self::history_prefix(named_history, through_turn_ordinal)?;
+        let source_has_active_turn = source.active_turn.is_some();
+
+        // A Fork is identified by what it produced, not by how the source looks
+        // now. If the target is already exactly this Fork, that is the answer,
+        // whether or not the source has since continued or been rolled back.
         if let Some(existing) = record.branches.get(&target_branch_id) {
             if existing.generation == 1
                 && existing.history == history
@@ -5992,6 +6066,29 @@ impl LocalRuntimeHost {
                 "root Session Fork target is already bound to another mutation".into(),
             ));
         }
+
+        // Nothing to return, so this would be a new branch -- and a new branch
+        // may only be cut from where the source actually is. Building one now
+        // from a generation that has been superseded produces a branch nobody
+        // asked for, off a history the caller has not seen since.
+        if !source_is_current {
+            return Err(LocalRuntimeError::Execution(format!(
+                "stale root Session generation {source_generation}; current generation is {}",
+                record.branches[&source_branch_id].generation
+            )));
+        }
+        if source_has_active_turn {
+            return Err(LocalRuntimeError::Execution(
+                "cannot Fork a root Session branch with an active Turn".into(),
+            ));
+        }
+        if record.branches.len() >= policy.max_branches_per_session {
+            return Err(LocalRuntimeError::SessionCapacity(format!(
+                "Session already holds {} branches against a ceiling of {}",
+                record.branches.len(),
+                policy.max_branches_per_session
+            )));
+        }
         let branch = LocalSessionBranchRecord {
             branch_id: target_branch_id,
             generation: 1,
@@ -6001,6 +6098,7 @@ impl LocalRuntimeHost {
         };
         let head = branch.head(session_id);
         record.branches.insert(target_branch_id, branch);
+        Self::check_session_record_fits(policy, &record, 0)?;
         Self::persist_session_record(state_root, &record)?;
         Ok(head)
     }
@@ -6019,6 +6117,7 @@ impl LocalRuntimeHost {
             branch_id,
             generation,
             through_turn_ordinal,
+            SessionStoragePolicy::default(),
         )
     }
 
@@ -6029,8 +6128,13 @@ impl LocalRuntimeHost {
         branch_id: Uuid,
         generation: u64,
         through_turn_ordinal: u64,
+        policy: SessionStoragePolicy,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
-        if session_id.is_nil() || branch_id.is_nil() || generation == 0 {
+        // A generation with no successor cannot be rolled back from: the very
+        // next thing this would have to do is number the generation after it.
+        // Refused here, explicitly, rather than saturated into a number that
+        // silently means something else.
+        if session_id.is_nil() || branch_id.is_nil() || generation == 0 || generation == u64::MAX {
             return Err(LocalRuntimeError::Execution(
                 "root Session Rollback identity is invalid".into(),
             ));
@@ -6075,6 +6179,13 @@ impl LocalRuntimeHost {
             return Err(LocalRuntimeError::Execution(
                 "root Session Rollback must move to an earlier completed Turn".into(),
             ));
+        }
+        if branch.archived_generations.len() >= policy.max_archived_generations_per_branch {
+            return Err(LocalRuntimeError::SessionCapacity(format!(
+                "branch already retains {} archived generations against a ceiling of {}",
+                branch.archived_generations.len(),
+                policy.max_archived_generations_per_branch
+            )));
         }
         let next_generation = generation.checked_add(1).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session generation overflow".into())
@@ -6175,12 +6286,16 @@ impl LocalRuntimeHost {
         session_id: Uuid,
         branch_id: Uuid,
     ) -> Result<(), LocalRuntimeError> {
-        // A Session that does not exist yet, or that this invocation may not
-        // read, has nothing to project. Both are ordinary on the accept path --
-        // `start` runs this before the Session is created -- so neither may
-        // become a failure to start.
-        let Ok(record) = Self::read_owned_session_record(state_root, invocation, session_id) else {
-            return Ok(());
+        // Two things are genuinely "nothing to project" and everything else is
+        // uncertainty. A Session that does not exist yet is ordinary -- `start`
+        // runs this before the Session is created -- and so is one this
+        // invocation may not see. A Session that exists but cannot be read is
+        // neither, and reporting it as nothing to do would let a caller
+        // continue against state nobody can account for.
+        let record = match Self::read_owned_session_record(state_root, invocation, session_id) {
+            Ok(record) => record,
+            Err(LocalRuntimeError::Execution(_)) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let Some(branch) = record.branches.get(&branch_id) else {
             return Ok(());
@@ -6194,22 +6309,37 @@ impl LocalRuntimeHost {
         // off the Run record would make this projection wait for a projection,
         // which is how the window stayed open in the first place; recovery
         // already keys off the Checkpoint and this must agree with it.
+        // No Checkpoint yet means the Turn is still owed work, which is the one
+        // ordinary reason not to project.
         let checkpoint_path = Self::checkpoint_path(state_root, active.run_id);
         if !checkpoint_path.is_file() {
             return Ok(());
         }
-        let Ok(checkpoint) = Self::load_checkpoint(&checkpoint_path) else {
-            return Ok(());
-        };
-        if !checkpoint.verify_digest() || !checkpoint.status.is_terminal() {
+        // From here the Turn claims to be finished. A Checkpoint that cannot be
+        // read, does not verify, or yields no transcript is a Turn whose result
+        // exists and cannot be recovered -- the caller has to be told, because
+        // the alternative is a branch that stays quietly stuck forever while
+        // every read reports it as merely still running.
+        let checkpoint = Self::load_checkpoint(&checkpoint_path)?;
+        if !checkpoint.verify_digest() {
+            return Err(LocalRuntimeError::Checkpoint(
+                "terminal root Session Checkpoint failed its digest".into(),
+            ));
+        }
+        if !checkpoint.status.is_terminal() {
             return Ok(());
         }
         let status = checkpoint.status;
         let transcript = if status == RunStatus::Succeeded {
-            match WorkerProcessor::conversation_transcript_from_checkpoint(&checkpoint) {
-                Ok(transcript) => Some(transcript),
-                Err(_) => return Ok(()),
-            }
+            Some(
+                WorkerProcessor::conversation_transcript_from_checkpoint(&checkpoint).map_err(
+                    |error| {
+                        LocalRuntimeError::Checkpoint(format!(
+                            "terminal root Session Checkpoint has no usable transcript: {error}"
+                        ))
+                    },
+                )?,
+            )
         } else {
             None
         };
@@ -6220,7 +6350,7 @@ impl LocalRuntimeHost {
         let run_id = active.run_id;
         let input = active.input.clone();
         drop(record);
-        let _ = Self::commit_session_turn(
+        match Self::commit_session_turn(
             state_root,
             session_id,
             branch_id,
@@ -6229,8 +6359,14 @@ impl LocalRuntimeHost {
             &input,
             status,
             transcript.as_deref(),
-        );
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            // The fence: the branch moved between the read above and the write,
+            // so someone else already finished this Turn. Nothing was lost and
+            // the caller reads the newer head.
+            Err(LocalRuntimeError::Execution(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn session_head_at(
@@ -6247,6 +6383,90 @@ impl LocalRuntimeHost {
             .ok_or_else(|| {
                 LocalRuntimeError::Execution("root Session branch does not exist".into())
             })
+    }
+
+    fn session_record_encoded_len(record: &LocalSessionRecord) -> Result<usize, LocalRuntimeError> {
+        // Measured the way it is written, not estimated. A ceiling checked
+        // against a guess is a ceiling that is wrong in one direction or the
+        // other, and the direction that matters is the one that admits a record
+        // the store then cannot persist.
+        serde_json::to_vec_pretty(record)
+            .map(|body| body.len())
+            .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))
+    }
+
+    /// Refuses a record that would not fit, with `reserve` bytes still to come.
+    fn check_session_record_fits(
+        policy: SessionStoragePolicy,
+        record: &LocalSessionRecord,
+        reserve: usize,
+    ) -> Result<(), LocalRuntimeError> {
+        let projected = Self::session_record_encoded_len(record)?.saturating_add(reserve);
+        if projected > policy.max_session_record_bytes {
+            return Err(LocalRuntimeError::SessionCapacity(format!(
+                "Session record would reach {projected} bytes against a ceiling of {}",
+                policy.max_session_record_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many Sessions this invocation's workspace and tenant already hold.
+    ///
+    /// A full scan, because the store is one file per Session and keeps no
+    /// index. That is affordable at these ceilings and honest about what the
+    /// store is; an index is a different design, not a tweak to this one.
+    fn count_owned_sessions(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+    ) -> Result<(usize, usize), LocalRuntimeError> {
+        let entries = match std::fs::read_dir(state_root.join("sessions")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        };
+        let (mut workspace, mut tenant) = (0_usize, 0_usize);
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            let Some(session_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let record = Self::read_session_record(state_root, session_id)?;
+            if record.invocation.tenant_id != invocation.tenant_id {
+                continue;
+            }
+            tenant += 1;
+            if record.invocation.workspace_id == invocation.workspace_id {
+                workspace += 1;
+            }
+        }
+        Ok((workspace, tenant))
+    }
+
+    /// Refuses a new Session that would pass an owner's ceiling.
+    fn check_session_headroom(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        policy: SessionStoragePolicy,
+    ) -> Result<(), LocalRuntimeError> {
+        let (workspace, tenant) = Self::count_owned_sessions(state_root, invocation)?;
+        if workspace >= policy.max_sessions_per_workspace {
+            return Err(LocalRuntimeError::SessionCapacity(format!(
+                "workspace already holds {workspace} Sessions against a ceiling of {}",
+                policy.max_sessions_per_workspace
+            )));
+        }
+        if tenant >= policy.max_sessions_per_tenant {
+            return Err(LocalRuntimeError::SessionCapacity(format!(
+                "tenant already holds {tenant} Sessions against a ceiling of {}",
+                policy.max_sessions_per_tenant
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn list_session_heads_at(
