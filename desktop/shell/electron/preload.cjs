@@ -62,6 +62,7 @@ contextBridge.exposeInMainWorld("desk", {
     },
     launch: () => ipcRenderer.invoke("runtime:launch"),
     workspace: () => ipcRenderer.invoke("workspace:status"),
+    chooseWorkspace: () => ipcRenderer.invoke("workspace:choose"),
     listFiles: (relative) => ipcRenderer.invoke("workspace:list", relative),
     readFile: (relative) => ipcRenderer.invoke("workspace:read", relative),
     providers: () => ipcRenderer.invoke("providers:list"),

@@ -38,6 +38,56 @@ function size(bytes: number | null): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/// Which folder the agent works in, and how to change it.
+///
+/// Its own row above the listing because it is not part of browsing: it is the
+/// containment boundary every read and write is checked against. The path is
+/// shown in full -- a person about to hand an agent a directory should see
+/// which one, not its last component.
+function Folder({ status }: { status: WorkspaceStatus | null }) {
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  if (!status) return null;
+
+  const choose = async () => {
+    const api = bridge();
+    if (!api?.chooseWorkspace) return;
+    setBusy(true);
+    const reply = await api.chooseWorkspace();
+    setBusy(false);
+    // A cancelled picker changed nothing and is not news. Only a folder that
+    // was actually chosen gets a line, because that line is a promise about
+    // what the next runtime will be given.
+    if (reply.ok && reply.value.chosen) setChosen(reply.value.chosen);
+  };
+
+  return (
+    <div className="folder">
+      <div className="folder-row">
+        <span className="mono">{status.root}</span>
+        {status.choosable === false
+          ? (
+            <span className="note-inline">
+              由环境变量固定，这个窗口改不了
+            </span>
+          )
+          : (
+            <button type="button" onClick={() => void choose()} disabled={busy}>
+              {busy ? "选择中" : "选择工作目录"}
+            </button>
+          )}
+      </div>
+      {chosen && (
+        <p className="note">
+          下一个 Runtime 会用 <b>{chosen}</b>。Runtime 是在启动时读这个目录的，
+          所以<b>重启 Runtime 之后才生效</b> —— 在设置里。现在跑着的这个仍然在
+          上面那个目录里工作。
+        </p>
+      )}
+    </div>
+  );
+}
+
 function WorkspaceView() {
   const desk = useDesk();
   const [status, setStatus] = useState<WorkspaceStatus | null>(null);
@@ -97,6 +147,7 @@ function WorkspaceView() {
     );
   }
 
+
   return (
     <div className="pane split">
       <nav className="idx">
@@ -113,6 +164,7 @@ function WorkspaceView() {
         )}
       </nav>
       <div className="body">
+        <Folder status={status} />
         {error && <div className="err">{error}</div>}
 
         {file ? (

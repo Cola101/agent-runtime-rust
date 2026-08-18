@@ -309,7 +309,10 @@ export function installDevBridge() {
     saveMcpServer: async () => ok({ name: "filesystem" }),
     forgetMcpServer: async () => ok({ name: "filesystem" }),
     resolveMcpInput: async () => ok({}),
-    workspace: async () => ok({ root: "/tmp/dev-state/workspace", configured: true }),
+    workspace: async () => ok({
+      root: "/tmp/dev-state/workspace", configured: true, choosable: true, fixedBy: null,
+    }),
+    chooseWorkspace: async () => ok({ chosen: "/Users/x/code", reason: null }),
     listFiles: async (relative: string) => ok({
       path: relative,
       truncated: false,

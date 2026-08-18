@@ -5,7 +5,7 @@
 // Chromium means one rendering target instead of one per platform. That is the
 // trade Electron makes, and it is the right side of it for an app whose job is
 // to host other things.
-const { app, BrowserWindow, Notification, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Notification, dialog, ipcMain, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const grpcRuntime = require("./runtime.cjs");
@@ -99,9 +99,39 @@ const SUBAGENT_ROLES = [
   },
 ];
 
-const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
+/// Where the chosen folder is remembered.
+///
+/// Read at launch and written when a person picks one. Its own file rather
+/// than a key in the provider store: this is not a credential and does not
+/// belong beside one.
+function chosenWorkspaceFile() {
+  return path.join(app.getPath("userData"), "workspace.json");
+}
+
+function readChosenWorkspace() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(chosenWorkspaceFile(), "utf8"));
+    const folder = typeof stored?.root === "string" ? stored.root : null;
+    // A folder that has since been deleted or unmounted is not a folder. Left
+    // unset rather than handed to a runtime that would refuse to start on it.
+    return folder && fs.existsSync(folder) && fs.statSync(folder).isDirectory()
+      ? folder
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/// The environment still wins.
+///
+/// `RUNTIME_DESK_WORKSPACE` is how a checkout is used during development, and
+/// a stored choice quietly overriding it would make a dev runtime work in a
+/// folder nobody pointed it at. The chooser writes the stored one, which is
+/// what an installed app has.
+const environmentWorkspace = process.env.RUNTIME_DESK_WORKSPACE
   ?? process.env.AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT
   ?? null;
+let chosenWorkspace = null;
 
 /// Set once the folder exists, which is why it is not built here: the default
 /// lives under `app.getPath("userData")` and that is not readable until Electron
@@ -321,7 +351,51 @@ ipcMain.handle("runtime:unwatch", (_event, runId) => {
 
 // The workspace, read for the person. Every path is relative and contained;
 // see `workspace.cjs` for why the check happens after `realpath`.
-ipcMain.handle("workspace:status", guarded(() => workspace.status()));
+ipcMain.handle("workspace:status", guarded(() => ({
+  ...workspace.status(),
+  // Whether this window can change it, and why not when it cannot. An app that
+  // offered the chooser and then quietly did nothing would be worse than one
+  // that says the environment is holding the folder.
+  choosable: environmentWorkspace === null,
+  fixedBy: environmentWorkspace === null ? null : "environment",
+})));
+
+/// Lets a person point the agent at their own folder.
+///
+/// The single largest thing between this app and being usable: without it the
+/// agent works in a directory under the app's own data, and there was no way
+/// to change that from the window at all -- only an environment variable set
+/// before launch, which an installed app cannot ask anyone for.
+///
+/// Choosing is a grant. The folder is where every workspace read and write is
+/// contained after `realpath`, so this is the boundary itself being moved, and
+/// it is a deliberate act with a system dialog rather than a text field that
+/// takes effect as it is typed.
+///
+/// It does not restart anything. `runtime-host` reads the root at startup, so
+/// the new folder is what the *next* runtime gets; the window says so and the
+/// restart control beside it is the one that costs something.
+ipcMain.handle("workspace:choose", guarded(async () => {
+  if (environmentWorkspace !== null) {
+    return { chosen: null, reason: "environment" };
+  }
+  const picked = await dialog.showOpenDialog({
+    title: "选择工作目录",
+    properties: ["openDirectory", "createDirectory"],
+    defaultPath: chosenWorkspace ?? app.getPath("home"),
+  });
+  if (picked.canceled || picked.filePaths.length === 0) {
+    return { chosen: null, reason: "cancelled" };
+  }
+  const [folder] = picked.filePaths;
+  fs.writeFileSync(
+    chosenWorkspaceFile(),
+    `${JSON.stringify({ root: folder }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  chosenWorkspace = folder;
+  return { chosen: folder, reason: null };
+}));
 ipcMain.handle("workspace:list", guarded((relative) => workspace.list(relative ?? "")));
 ipcMain.handle("workspace:read", guarded((relative) => workspace.read(relative)));
 
@@ -406,7 +480,8 @@ ipcMain.handle("remote:control", guarded((request) => grpcRuntime.control(reques
 /// not know where that runtime's workspace is, and the surface says exactly
 /// that rather than showing a plausible folder.
 function openWorkspace({ mayDefault }) {
-  const folder = workspaceRoot
+  const folder = environmentWorkspace
+    ?? chosenWorkspace
     ?? (mayDefault ? path.join(app.getPath("userData"), "workspace") : null);
   if (!folder) return null;
   fs.mkdirSync(folder, { recursive: true });
@@ -551,6 +626,10 @@ function settleInstalledPaths() {
 
 app.whenReady().then(async () => {
   settleInstalledPaths();
+  // Before the runtime starts, because the folder it is given is read once at
+  // spawn. Reading it after would give the first runtime of every launch the
+  // default and the next one the choice.
+  chosenWorkspace = readChosenWorkspace();
   await openRuntime();
 
   if (endpoint) {

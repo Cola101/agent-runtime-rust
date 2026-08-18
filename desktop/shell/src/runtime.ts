@@ -146,7 +146,15 @@ export type McpServers = {
   applied: { name: string; digest: string }[] | null;
 };
 
-export type WorkspaceStatus = { root: string | null; configured: boolean };
+export type WorkspaceStatus = {
+  root: string | null;
+  configured: boolean;
+  /// Whether this window may change the folder. False when an environment
+  /// variable is holding it, which is how a checkout is used in development --
+  /// offering a chooser that then did nothing would be worse than saying so.
+  choosable?: boolean;
+  fixedBy?: string | null;
+};
 
 export type WorkspaceEntry = {
   name: string;
@@ -298,6 +306,11 @@ export type Bridge = {
   /// there being a process at all.
   launch(): Promise<Reply<{ started: boolean; owned: boolean }>>;
   workspace(): Promise<Reply<WorkspaceStatus>>;
+  /// Opens the system folder picker. Answers the folder chosen, or null with a
+  /// reason -- `cancelled` when the person closed the dialog, `environment`
+  /// when a variable is holding the folder. It changes nothing that is
+  /// running: the root is read at startup, so the next runtime gets it.
+  chooseWorkspace(): Promise<Reply<{ chosen: string | null; reason: string | null }>>;
   listFiles(relative: string): Promise<Reply<WorkspaceListing>>;
   readFile(relative: string): Promise<Reply<WorkspaceFile>>;
   providers(): Promise<Reply<ProviderView[]>>;

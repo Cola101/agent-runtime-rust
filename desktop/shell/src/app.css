@@ -385,6 +385,21 @@ p.note {
 .restart .note-inline { color: var(--ink-3); font-size: 11.5px; max-width: 62ch; }
 .restart .err { color: var(--accent); font-size: 11.5px; max-width: 62ch; }
 
+/* The containment boundary, above the listing rather than inside it: what a
+   person is about to hand an agent is a directory, and the path is shown whole
+   because its last component is not which one. */
+.folder { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--rule-2); }
+.folder-row { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.folder-row .mono { color: var(--ink); font-size: 12.5px; overflow-wrap: anywhere; }
+.folder-row button {
+  font: inherit; font-size: 12px; padding: 3px 13px; margin-left: auto;
+  border: 1px solid var(--rule); border-radius: 4px; background: none;
+  color: var(--ink-2); cursor: pointer; white-space: nowrap;
+}
+.folder-row button:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+.folder-row button:disabled { color: var(--ink-3); cursor: default; }
+.folder-row .note-inline { margin-left: auto; color: var(--ink-3); font-size: 11.5px; }
+
 /* ---------- drawer ---------- */
 .drawer { border-left: 1px solid var(--rule); background: var(--sunk, var(--paper)); padding: 14px 15px; overflow-y: auto; }
 

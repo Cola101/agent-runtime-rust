@@ -5,7 +5,7 @@
 /// one. Run ids and payload shapes are copied from a real dev-runtime session.
 import { vi } from "vitest";
 import { uuidv7 } from "../ids";
-import type { Reply } from "../runtime";
+import type { Reply, WorkspaceStatus } from "../runtime";
 
 export const RUN_WAITING = "01a0122b-217e-7e72-bec8-ad3273f16cd1";
 export const RUN_DONE = "01a0122a-18c8-7012-972a-d422fe9abde8";
@@ -440,6 +440,14 @@ export function installFakeRuntime(
   } = {},
 ) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
+  /// Answers as the system dialog would when a folder was picked. A test that
+  /// wants the cancel or the environment-held case says so with
+  /// `mockResolvedValueOnce` -- those replies are what the client has to read
+  /// rather than assume, because both mean "nothing changed" for different
+  /// reasons and only one of them is worth telling a person about.
+  const chooseWorkspace = vi.fn(async (): Promise<Reply<{
+    chosen: string | null; reason: string | null;
+  }>> => ({ ok: true, value: { chosen: "/Users/x/code", reason: null } }));
   /// Answers as a runtime this app started and could restart. A test that wants
   /// the other case says so with `mockResolvedValueOnce` -- that reply is the
   /// one the client has to read rather than assume.
@@ -821,7 +829,13 @@ export function installFakeRuntime(
     },
     onWatchEnded: () => () => {},
     launch,
-    workspace: async () => ({ ok: true as const, value: { root: "/tmp/workspace", configured: true } }),
+    // Typed by the contract rather than by this literal, so a test can answer
+    // with the environment-held case without casting its way past the shape.
+    workspace: async (): Promise<Reply<WorkspaceStatus>> => ({
+      ok: true,
+      value: { root: "/tmp/workspace", configured: true, choosable: true, fixedBy: null },
+    }),
+    chooseWorkspace,
     listFiles: async (relative: string) => (
       FILES[relative]
         ? { ok: true as const, value: { path: relative, entries: FILES[relative].entries, truncated: false } }
@@ -887,7 +901,7 @@ export function installFakeRuntime(
     for (const listener of listeners) listener({ runId, event });
   };
   return {
-    control, restart, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
+    control, restart, chooseWorkspace, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
     resolveMcpInput, saveProvider, forgetProvider, saveMcpServer, forgetMcpServer,
     watch, unwatch, emit, event, launch, steer,
     desk, elsewhere, waiting, attend: (runId: string) => attendee?.(runId),
