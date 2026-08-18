@@ -21,9 +21,9 @@ async function installedRuns() {
   return listed.ok ? listed.value.runs : [];
 }
 
-async function open(surface: string) {
+async function open(surface: string, options?: Parameters<typeof installFakeRuntime>[0]) {
   const user = userEvent.setup();
-  const bridge = installFakeRuntime();
+  const bridge = installFakeRuntime(options);
   render(<App />);
   // The store polls; the first page has to land before anything is on screen.
   await waitFor(() => expect(screen.getByRole("button", { name: /对话/ })).toBeTruthy());
@@ -95,6 +95,11 @@ describe("every advertised key is bound", () => {
   });
 });
 
+/// The chat surface's own key bindings, from the registry the shell reads.
+function chatKeys() {
+  return all().find((surface) => surface.id === "chat")?.keys ?? [];
+}
+
 describe("approvals", () => {
   it("decides with the digit shown next to the option", async () => {
     const { user, bridge } = await open("待决定");
@@ -112,6 +117,43 @@ describe("approvals", () => {
     await user.click(deny);
     await waitFor(() =>
       expect(bridge.control).toHaveBeenCalledWith({ action: "deny", runId: RUN_WAITING }));
+  });
+
+  /// The key must act on the Run whose gate is drawn, and on no other.
+  ///
+  /// The chat surface drew its transcript from one Run and bound its approval
+  /// keys to another: the transcript takes the Run this conversation is
+  /// running, the keys took "the newest Run touched anywhere". Open a
+  /// conversation with nothing in flight while another one is parked on an
+  /// approval, and `1` answered a question that was never on screen.
+  ///
+  /// Driven through the registry rather than the window because the divergence
+  /// depends on which Run happens to be newest, and a fixture that arranges
+  /// that is a fixture asserting its own arrangement. What matters is the rule:
+  /// a conversation showing no Run has nothing for the digit to answer.
+  it("binds the approval digits to the Run on screen, not the newest one", () => {
+    const decide = vi.fn();
+    const parkedElsewhere = {
+      id: RUN_WAITING,
+      approval: { approval_id: "a", call: { name: "shell.exec", arguments: {} } },
+      updatedAt: "2026-08-18T23:59:00.000Z",
+      lifecycle: { kind: "waiting" },
+      events: [],
+    };
+    const desk = {
+      selected: null,
+      runs: [parkedElsewhere],
+      // A conversation is open and nothing in it is running.
+      current: { activeRunId: null, turns: [] },
+      decide,
+    } as unknown as Parameters<NonNullable<ReturnType<typeof chatKeys>[number]["when"]>>[0];
+
+    for (const key of chatKeys().filter((candidate) => /^[0-9]$/.test(candidate.key))) {
+      expect(key.when?.(desk), `key ${key.key} offers itself with no gate on screen`)
+        .toBeFalsy();
+      key.run(desk);
+    }
+    expect(decide).not.toHaveBeenCalled();
   });
 
   it("does not fire a digit while a sentence is being typed", async () => {
@@ -200,7 +242,10 @@ describe("the run list is operable from the keyboard", () => {
 
 describe("the command palette", () => {
   it("opens focused, filters as you type, and runs on Enter", async () => {
-    const { user, bridge } = await open("对话");
+    // With the conversation's own Run live, because 停止当前 Run is about the
+    // Run on screen: the fixture's default conversation has none running, and
+    // the command correctly does not offer itself then.
+    const { user, bridge } = await open("对话", { activeRunId: RUN_LIVE });
     await user.keyboard("{Meta>}k{/Meta}");
     const input = await screen.findByPlaceholderText("输入命令");
     expect(document.activeElement).toBe(input);
@@ -216,6 +261,19 @@ describe("the command palette", () => {
     await waitFor(() => expect(screen.queryByPlaceholderText("输入命令")).toBeNull());
     await waitFor(() =>
       expect(bridge.control).toHaveBeenCalledWith({ action: "cancel", runId: RUN_LIVE }));
+  });
+
+  /// Same rule as the approval digits, on the command that ends a Run.
+  ///
+  /// 停止当前 Run offered itself whenever any Run anywhere was running, and
+  /// stopped that one -- so reading a finished conversation while another was
+  /// working put "stop" in the palette and ended the other one.
+  it("does not offer 停止当前 Run when the conversation on screen has none", async () => {
+    const { user } = await open("对话");
+    await user.keyboard("{Meta>}k{/Meta}");
+    const input = await screen.findByPlaceholderText("输入命令");
+    await user.type(input, "停止");
+    expect(screen.queryByText("停止当前 Run")).toBeNull();
   });
 
   it("hides a command that cannot run right now", async () => {

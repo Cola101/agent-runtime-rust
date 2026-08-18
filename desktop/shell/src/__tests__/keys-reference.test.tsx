@@ -17,11 +17,11 @@ import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { all, commands } from "../surfaces/registry";
 import { DRAWER_KEY, SHELL_KEYS, printedKey } from "../shell-keys";
-import { installFakeRuntime } from "./fake-runtime";
+import { installFakeRuntime, RUN_LIVE } from "./fake-runtime";
 
-async function open(surface: string) {
+async function open(surface: string, options?: Parameters<typeof installFakeRuntime>[0]) {
   const user = userEvent.setup();
-  const bridge = installFakeRuntime();
+  const bridge = installFakeRuntime(options);
   render(<App />);
   await waitFor(() => expect(screen.getByRole("button", { name: /对话/ })).toBeTruthy());
   await waitFor(() => expect(bridge.desk.runtime.list).toBeDefined());
@@ -188,9 +188,12 @@ describe("what the reference says about a key right now", () => {
   });
 
   it("marks a command whose own condition does not hold, and leaves an unconditional one alone", async () => {
-    const { user } = await open("键位");
-    // Nothing is selected, so the transcript is showing the run that is
-    // actually running and stopping it is something you can do right now.
+    // The open conversation's own Run is running, which is what makes 停止
+    // something you can do right now. Said explicitly rather than left to the
+    // fixture's default: the command asks about the Run on screen, and the
+    // default conversation has none running -- in which case the reference is
+    // right to mark it, and this test would be asserting the opposite.
+    const { user } = await open("键位", { activeRunId: RUN_LIVE });
     expect(marked(row(section("命令"), "停止当前 Run"))).toBe(false);
     // A command that declares no condition is never in doubt.
     expect(marked(row(section("命令"), "回到对话"))).toBe(false);

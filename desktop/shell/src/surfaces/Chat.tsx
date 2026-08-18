@@ -883,7 +883,11 @@ function ChatView() {
 /// two disagree the log is right, and there has to be somewhere to look.
 function ChatDrawer() {
   const desk = useDesk();
-  const run = currentRun(desk);
+  // The same Run the transcript is drawing. It read the newest Run anywhere,
+  // so "the log behind what you are reading" could be another Run's log --
+  // with its own id in the header saying so, which is the kind of disagreement
+  // a person resolves by trusting the wrong one.
+  const run = shownRun(desk);
   const [open, setOpen] = useState<number | null>(null);
   if (!run) return <div className="empty">没有选中的 Run。</div>;
   return (
@@ -1174,7 +1178,14 @@ export function ChatStatus() {
   );
 }
 
-const asking = (desk: Desk) => currentRun(desk)?.approval != null;
+/// Whether the Run this surface is drawing is asking.
+///
+/// `shownRun`, not `currentRun`: the transcript beside these keys is drawn from
+/// the Run this conversation is running, and "the newest Run touched anywhere"
+/// is a different Run in a different conversation. Answering a question that is
+/// not on screen is not a key that missed -- it is a decision made about
+/// something the person never saw.
+const asking = (desk: Desk) => shownRun(desk)?.approval != null;
 
 /// Whether there is a conversation on this surface to search: a transcript, or
 /// the committed Turns behind it. A finder over an empty column finds nothing,
@@ -1198,7 +1209,7 @@ register({
       hint: decision.label,
       when: asking,
       run: (desk: Desk) => {
-        const run = currentRun(desk);
+        const run = shownRun(desk);
         if (run) void desk.decide(run.id, decision.action);
       },
     })),
@@ -1234,11 +1245,11 @@ register({
       id: "chat:cancel",
       title: "停止当前 Run",
       when: (desk) => {
-        const run = currentRun(desk);
+        const run = shownRun(desk);
         return run?.lifecycle.kind === "running";
       },
       run: (desk) => {
-        const run = currentRun(desk);
+        const run = shownRun(desk);
         if (run) void desk.decide(run.id, "cancel");
       },
     },
