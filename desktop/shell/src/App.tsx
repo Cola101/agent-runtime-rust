@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { all, byId } from "./surfaces/registry";
-import { DeskContext, useDesk, type Desk } from "./desk";
+import { DeskContext, useDesk, waiting, type Desk } from "./desk";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
 import "./surfaces/Chat";
@@ -143,6 +143,28 @@ export function App() {
       turns: store.sessions.reduce((total, session) => total + session.turnCount, 0),
     });
   }, [store]);
+
+  // Everything the window can see waiting on a person, told to the host every
+  // time that changes — the whole queue every time, not what changed. "This
+  // one is new" is a claim about what has already been said out loud, and the
+  // window is not the side that knows: it cannot see whether anyone is looking
+  // at it, and it forgets everything when it reloads.
+  //
+  // Deliberately not throttled to the poll. The store also folds in streamed
+  // events between polls, so "waiting" can become true a second before the
+  // next read; reporting on every settle means the host hears about it then.
+  // Repeats cost nothing, because the host deduplicates on the log's own ids.
+  useEffect(() => {
+    window.desk?.waiting?.(waiting(desk));
+  }, [desk]);
+
+  // Someone clicked one of those notifications. Land on the queue, on the run
+  // the banner named — coming to the front without it would leave them to find
+  // which decision it meant.
+  useEffect(() => window.desk?.onAttend?.((runId) => {
+    setActive("approvals");
+    setSelected(runId);
+  }), []);
 
   const openPalette = useCallback(() => {
     restore.current = document.activeElement as HTMLElement | null;

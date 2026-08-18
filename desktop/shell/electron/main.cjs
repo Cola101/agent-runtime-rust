@@ -5,7 +5,7 @@
 // Chromium means one rendering target instead of one per platform. That is the
 // trade Electron makes, and it is the right side of it for an app whose job is
 // to host other things.
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, Notification, ipcMain, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const grpcRuntime = require("./runtime.cjs");
@@ -13,6 +13,8 @@ const { LocalRuntime } = require("./localRuntime.cjs");
 const { RuntimeProcess } = require("./runtimeProcess.cjs");
 const { Credentials } = require("./credentials.cjs");
 const { Workspace } = require("./workspace.cjs");
+const { createAttention } = require("./attention.cjs");
+const { bannerText } = require("./banner.cjs");
 
 /// Where the shell expects to find a Runtime.
 ///
@@ -130,6 +132,10 @@ const runtime = new RuntimeProcess();
 /// into it would be a second writer in a directory with one owner.
 const credentials = new Credentials(path.join(app.getPath("userData"), "providers"));
 
+/// One per process, not per window: what a person has already been told about
+/// is a fact about the person, and a second window would otherwise repeat it.
+const attention = createAttention();
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1100,
@@ -148,6 +154,11 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Chromium stops a covered window's timers, and the store is a timer.
+      // Measured, not assumed: with the default on, putting another app over
+      // this window stopped the polling dead, so nothing was read and nothing
+      // was reported — in precisely the situation a notification is for.
+      backgroundThrottling: false,
     },
   });
 
@@ -183,6 +194,57 @@ ipcMain.on("shell:mounted", (_event, surfaces) => {
 /// asking someone to look at the window.
 ipcMain.on("shell:drew", (_event, summary) => {
   console.log(`runtime-desk: drew ${JSON.stringify(summary)}`);
+});
+
+/// One banner for one Run that cannot go on without a person, in the words the
+/// queue itself uses. Nothing is translated on the way out: the tool name is
+/// the runtime's, and "等你决定" is what the surface says about the same Run.
+/// The words themselves live in banner.cjs, where they can be read back.
+///
+/// Clicking it lands on that Run. A notification that only raises the window
+/// leaves the person to find what it was about, which on a queue of several is
+/// close to not having said.
+function raise(win, item) {
+  const words = bannerText(item);
+  // Nothing to say means nothing said. A blank banner is still an interruption.
+  if (!words) return;
+  const runId = String(item.runId ?? "");
+  const banner = new Notification(words);
+  banner.on("click", () => {
+    if (win.isDestroyed()) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    // On macOS raising a window does not bring its app forward. A click on the
+    // banner is the person asking for exactly that, which is what `steal` is.
+    app.focus({ steal: true });
+    win.focus();
+    win.webContents.send("host:attend", runId);
+  });
+  banner.show();
+  // Stated for the same reason the process states what the shell drew: a
+  // client that interrupts someone has to be checkable without watching a
+  // screen and waiting for a banner that may already have gone.
+  console.log(`runtime-desk: raised ${banner.title} for run ${runId.slice(0, 8)}`);
+}
+
+/// What the window says is waiting on a person, every time that changes.
+///
+/// Reported repeatedly and on purpose: the window polls, and streams on top of
+/// the poll, so the same parked Run arrives here many times a second. Deciding
+/// which of those is worth interrupting someone for is this side's job, and
+/// `attention.cjs` does it on the ids the runtime already wrote down.
+///
+/// The decision lives here for two reasons, and both are about this process
+/// knowing something the renderer does not: Electron's Notification exists
+/// only in the main process, and only the main process can say whether anyone
+/// is looking at the window. The window reports what its poll read out of the
+/// durable log — it never decides that something is new, and never decides to
+/// interrupt anyone.
+ipcMain.on("shell:waiting", (event, items) => {
+  if (!Notification.isSupported()) return;
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) return;
+  for (const item of attention.arrived(items, win.isFocused())) raise(win, item);
 });
 
 /// Every call is a plain value in and a plain value out. The renderer never

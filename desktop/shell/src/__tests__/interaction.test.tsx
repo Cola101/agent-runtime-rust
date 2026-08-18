@@ -147,10 +147,10 @@ describe("the run list is operable from the keyboard", () => {
     const { user } = await open("Run");
     const rows = await waitFor(() => {
       const found = document.querySelectorAll("tbody tr");
-      expect(found.length).toBe(3);
+      expect(found.length).toBe(4);
       return found;
     });
-    expect(rows.length).toBe(3);
+    expect(rows.length).toBe(4);
     await user.keyboard("j");
     await waitFor(() =>
       expect(document.querySelector('tr[aria-selected="true"]')).toBeTruthy());
@@ -283,7 +283,10 @@ describe("the shell reports what it drew", () => {
     const summary = bridge.desk.drew.mock.calls[0][0];
     // These numbers are how a headless check tells a client from a shell. An
     // App rewrite dropped this once already.
-    expect(summary).toMatchObject({ link: "live", runs: 3, waiting: 1 });
+    // `waiting` counts approvals, and only one of the four runs is asking.
+    // The Run nobody can judge is blocked on a person too, but it is not a
+    // question the runtime asked, and this summary does not claim it is.
+    expect(summary).toMatchObject({ link: "live", runs: 4, waiting: 1 });
     expect(summary.events).toBeGreaterThan(0);
   });
 });
