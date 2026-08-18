@@ -212,3 +212,24 @@ Runtime(Execution("execution attempt is already terminal"))
 把它分开的：修好 stub 之后成功支立刻走通，失败支照旧不回来。
 
 stub 现在还能按提示词把子代理的预算掐到 1 个 token，用来确定性地造出失败的孩子。
+
+## 四、打包产物上的验收
+
+用 `package-app.sh` 重新构建，拿 **bundle 自己的** `agent-runtime-host`，
+在全新 state root 上连跑三个场景（仓库自带的 stub provider，不是真实厂商）：
+
+| Run | 结果 |
+| --- | --- |
+| 委托，子代理预算掐到 1 token（必然失败） | **`run.succeeded`** |
+| 进程会话（61 个事件的 PTY 往返） | `run.succeeded` |
+| 读文件 | `run.succeeded` |
+| 子 Run | `run.failed`，按设计饿死 |
+
+**宿主 ERROR 行：0。**
+
+第一行就是这一天的差别：同一个场景在修复之前，父 Run 会永远停在 `suspended`，
+宿主静默，界面上是一个永远转下去的 Run。
+
+打包脚本加宽后的依赖检查自报加载了九个宿主模块
+（`attention / banner / childEnv / credentials / localRuntime / mcpServers /
+runtime / runtimeProcess / workspace`）——原来那份手写名单只查四个。
