@@ -586,11 +586,18 @@ export function installFakeRuntime(
   }) => ({
     ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
   }));
-  const sessionContinue = vi.fn(async (_request: {
-    sessionId: string; branchId: string; generation: number; runId: string; input: string;
-  }) => ({
-    ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
-  }));
+  /// Typed as the real call is -- a `Reply`, either half. The daemon refuses a
+  /// continuation on a branch that is still finishing a Turn, which is exactly
+  /// what a Runtime restart produces for a moment, and a mock that could only
+  /// succeed made that case unwritable.
+  const sessionContinue = vi.fn(
+    async (_request: {
+      sessionId: string; branchId: string; generation: number; runId: string; input: string;
+    }): Promise<Reply<Record<string, unknown>>> => ({
+      ok: true,
+      value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
+    }),
+  );
   /// The stream, as the host delivers it: a subscription plus a way to push.
   /// Tests drive `emit` to make an event arrive between polls, which is the
   /// only way to tell a streamed transcript from a polled one.

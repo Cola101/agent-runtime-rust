@@ -987,6 +987,12 @@ export function Composer() {
     // their head.
     const failure = turning ? await desk.steer(input) : await desk.send(input);
     setError(failure);
+    // Put it back. The box is cleared before the write so that a send feels
+    // finished the moment it is made, and that is right for the case that
+    // works -- but a refusal then left the person looking at an error and an
+    // empty box, with what they wrote reachable only if they knew to press ↑.
+    // A refused send did not happen, so the sentence is still theirs to send.
+    if (failure) setDraft(input);
     setSending(false);
     // A new run is the one you want to watch. Clearing the cursor rather than
     // pointing it at the new id keeps "newest" honest if the send failed.

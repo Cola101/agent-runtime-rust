@@ -1115,6 +1115,27 @@ export function useRuntime(): Store {
   /// Two things here are read from the runtime immediately before the write
   /// rather than remembered: whether a Turn is already in flight, and which
   /// generation the branch is on. Remembering either is how a client sends a
+/// What a branch that is still finishing a Turn is called, in one place.
+///
+/// The check above the write and the runtime's own refusal are the same fact
+/// arriving twice, and they were two different sentences -- one written here,
+/// one the runtime's internals. The window between them is real: a Runtime
+/// restart resumes the Turn it interrupted, so a person typing right after
+/// pressing 重启 Runtime can read a head with no active Run and still be
+/// refused a moment later.
+const BRANCH_BUSY = "这轮还没结束，等它停下再说下一句";
+
+/// The runtime's refusal, said as the thing it means.
+///
+/// Matched on the runtime's own phrase rather than on a code, because there is
+/// no code here to match: the local surface answers a refused mutation with a
+/// message. An error this does not recognise is passed through untouched --
+/// printing the runtime's words is worse than a sentence, and much better than
+/// swallowing something nobody predicted.
+function sendRefusal(error: string): string {
+  return error.includes("already has an active Turn") ? BRANCH_BUSY : error;
+}
+
   /// Turn into history the person already rolled back, or asks for a second
   /// Turn the branch is bound to refuse.
   const send = useCallback(async (input: string) => {
@@ -1134,11 +1155,11 @@ export function useRuntime(): Store {
 
     const head = await api.sessionRead(at);
     if (!head.ok) return head.error;
-    if (head.value.active_run_id) return "这轮还没结束，等它停下再说下一句";
+    if (head.value.active_run_id) return BRANCH_BUSY;
     const reply = await api.sessionContinue({
       ...at, generation: head.value.generation, runId: uuidv7(), input,
     });
-    if (!reply.ok) return reply.error;
+    if (!reply.ok) return sendRefusal(reply.error);
     void load();
     return null;
   }, [load]);

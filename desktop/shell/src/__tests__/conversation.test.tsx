@@ -57,6 +57,40 @@ describe("a conversation", () => {
     expect(bridge.sessionStart).not.toHaveBeenCalled();
   });
 
+  /// A refused send must not eat what was typed.
+  ///
+  /// The box is cleared before the write, so any refusal -- the branch busy
+  /// finishing the Turn a Runtime restart interrupted, a socket that went away
+  /// -- leaves the person looking at an error and an empty box, with the
+  /// sentence they wrote reachable only if they know to press ↑.
+  it("puts the message back in the box when the send was refused", async () => {
+    const { user, bridge } = await openChat();
+    bridge.sessionContinue.mockResolvedValueOnce({
+      ok: false as const, error: "local execution was refused: root Session branch already has an active Turn",
+    });
+    const box = await screen.findByRole("textbox");
+    await user.click(box);
+    await user.type(box, "重启之后的第一句");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(bridge.sessionContinue).toHaveBeenCalled());
+    await waitFor(() =>
+      expect((box as HTMLTextAreaElement).value).toBe("重启之后的第一句"));
+  });
+
+  /// And what it says is a sentence, not the runtime's own words.
+  it("says a branch still finishing a Turn in words a person can act on", async () => {
+    const { user, bridge } = await openChat();
+    bridge.sessionContinue.mockResolvedValueOnce({
+      ok: false as const, error: "local execution was refused: root Session branch already has an active Turn",
+    });
+    const box = await screen.findByRole("textbox");
+    await user.click(box);
+    await user.type(box, "重启之后的第一句");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByText(/这轮还没结束/)).toBeTruthy());
+    expect(screen.queryByText(/root Session branch/)).toBeNull();
+  });
+
   it("starts a new branch after 新对话, instead of continuing the old one", async () => {
     const { user, bridge } = await openChat();
     await waitFor(() => expect(screen.getByText("小林。")).toBeTruthy());
