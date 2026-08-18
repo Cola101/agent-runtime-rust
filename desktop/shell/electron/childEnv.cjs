@@ -38,6 +38,24 @@ const BASE_SCOPES = [
 
 const PROCESS_SESSION_SCOPE = "tool:process.session";
 
+/// What one Run may spend, and what the window says it may spend.
+///
+/// The host's own defaults are 8k tokens and one dollar. They are right for a
+/// host nobody configured and wrong for this one: 8k is a couple of file reads,
+/// and a Run that ends on `budget_exhausted` in the middle of a task reads as a
+/// broken agent rather than as a limit someone chose. These are the app's
+/// choice, stated here so the window can show the same numbers the runtime is
+/// holding it to -- a cap a person cannot see is a Run that dies for no visible
+/// reason.
+///
+/// Still bounded, and deliberately: this is the person's own money and their
+/// own machine. A runaway Run stops.
+const RUN_BUDGET = {
+  maxTokens: 400_000,
+  maxCostCents: 500,
+  maxDurationSeconds: 3_600,
+};
+
 /// Whether the runtime would accept this path as a process executable.
 ///
 /// `TrustedNativeExecutor::new` reads it with `symlink_metadata` and refuses a
@@ -140,6 +158,9 @@ function runtimeEnv({
       processSession: Boolean(shell),
     }),
     ...(subagentRoles ? { AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG: rolesFile } : {}),
+    AGENT_RUNTIME_LOCAL_BUDGET_MAX_TOKENS: String(RUN_BUDGET.maxTokens),
+    AGENT_RUNTIME_LOCAL_BUDGET_MAX_COST_CENTS: String(RUN_BUDGET.maxCostCents),
+    AGENT_RUNTIME_LOCAL_BUDGET_MAX_DURATION_SECONDS: String(RUN_BUDGET.maxDurationSeconds),
     // Explicit rather than inherited from the host's default. A security
     // boundary that holds because nobody set a variable is a boundary that
     // moves when someone else's default does.
@@ -147,4 +168,6 @@ function runtimeEnv({
   };
 }
 
-module.exports = { runtimeEnv, loginShell, instructions, BASE_SCOPES, PROCESS_SESSION_SCOPE };
+module.exports = {
+  runtimeEnv, loginShell, instructions, BASE_SCOPES, PROCESS_SESSION_SCOPE, RUN_BUDGET,
+};

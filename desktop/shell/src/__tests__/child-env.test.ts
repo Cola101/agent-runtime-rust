@@ -31,6 +31,7 @@ type ChildEnv = {
     environment?: Record<string, string | undefined>;
   }): Record<string, string>;
   loginShell(environment?: Record<string, string | undefined>): string | null;
+  RUN_BUDGET: { maxTokens: number; maxCostCents: number; maxDurationSeconds: number };
 };
 
 const require_ = createRequire(import.meta.url);
@@ -149,6 +150,32 @@ describe("what the app hands the runtime", () => {
     });
     expect(scopesOf(env)).toContain("tool:mcp:docs");
     expect(env.AGENT_RUNTIME_LOCAL_MCP_CONFIG).toBe("/mcp.json");
+  });
+
+  /// The host's own defaults are 8k tokens and one dollar per Run. 8k is a
+  /// couple of file reads, so a coding session ends on `budget_exhausted` part
+  /// way through a task -- which reads as a broken agent rather than as a limit
+  /// anyone chose. The app sets its own, and they are still bounded: this is
+  /// the person's own money.
+  it("gives a Run a budget a coding session can finish inside", () => {
+    const env = childEnv.runtimeEnv({ ...base, workspace: "/w" });
+    expect(Number(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_TOKENS)).toBeGreaterThan(8_192);
+    // Bounded, not absent. A runaway Run on someone's own machine stops.
+    expect(Number(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_COST_CENTS)).toBeGreaterThan(0);
+    expect(Number(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_DURATION_SECONDS)).toBeGreaterThan(0);
+  });
+
+  /// The window shows the cap beside the usage, and it must be the same cap.
+  /// Two numbers from two places is how a person is told they have room they
+  /// do not have.
+  it("exports the same budget the environment carries", () => {
+    const env = childEnv.runtimeEnv({ ...base, workspace: "/w" });
+    expect(String(childEnv.RUN_BUDGET.maxTokens))
+      .toBe(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_TOKENS);
+    expect(String(childEnv.RUN_BUDGET.maxCostCents))
+      .toBe(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_COST_CENTS);
+    expect(String(childEnv.RUN_BUDGET.maxDurationSeconds))
+      .toBe(env.AGENT_RUNTIME_LOCAL_BUDGET_MAX_DURATION_SECONDS);
   });
 
   it("keeps the consent boundary explicit rather than inherited", () => {

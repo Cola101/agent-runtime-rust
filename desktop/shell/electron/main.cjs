@@ -364,6 +364,14 @@ ipcMain.handle("runtime:restart", guarded(async () => {
   };
 }));
 
+/// The Run budget this app hands the runtime.
+///
+/// Read from the same constant the environment is built from, so the window
+/// cannot show a cap the runtime is not holding the Run to. A number a person
+/// sees their usage against is the difference between "the agent stopped" and
+/// "it reached the limit you set".
+ipcMain.handle("runtime:budget", guarded(() => childEnv.RUN_BUDGET));
+
 ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));

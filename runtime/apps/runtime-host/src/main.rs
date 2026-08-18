@@ -104,6 +104,45 @@ fn load_subagent_roles_from_path(
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 
+/// One dimension of the Run budget, from the environment or from the default.
+///
+/// Refused rather than clamped when it cannot be read: a budget silently
+/// replaced by a default is a Run that ends for a reason nobody chose, and the
+/// dimension it ends on is reported to the person as though it were intended.
+fn budget_dimension(name: &str, fallback: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    match std::env::var(name) {
+        Err(_) => Ok(fallback),
+        Ok(raw) => {
+            let value: u64 = raw
+                .trim()
+                .parse()
+                .map_err(|_| format!("{name} must be a whole number, not {raw:?}"))?;
+            if value == 0 {
+                return Err(format!("{name} must be greater than zero").into());
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// What one Run may spend.
+///
+/// The defaults are what this host has always used. They are small on purpose
+/// for a host nobody configured -- a runaway Run on someone's own machine
+/// spends their money -- and too small for a coding session: 8k tokens is a
+/// couple of file reads. An embedder that knows what it is paying for sets
+/// these; the desktop app does.
+fn load_budget() -> Result<RunBudget, Box<dyn std::error::Error>> {
+    Ok(RunBudget {
+        max_tokens: budget_dimension("AGENT_RUNTIME_LOCAL_BUDGET_MAX_TOKENS", 8_192)?,
+        max_cost_cents: budget_dimension("AGENT_RUNTIME_LOCAL_BUDGET_MAX_COST_CENTS", 100)?,
+        max_duration_seconds: budget_dimension(
+            "AGENT_RUNTIME_LOCAL_BUDGET_MAX_DURATION_SECONDS",
+            600,
+        )?,
+    })
+}
+
 fn load_subagent_roles() -> Result<Vec<SubagentRole>, Box<dyn std::error::Error>> {
     match std::env::var("AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG") {
         Ok(path) => load_subagent_roles_from_path(std::path::Path::new(&path)),
@@ -259,11 +298,7 @@ fn load_config() -> Result<LocalRuntimeConfig, Box<dyn std::error::Error>> {
             },
         ),
         consent,
-        budget: RunBudget {
-            max_tokens: 8_192,
-            max_cost_cents: 100,
-            max_duration_seconds: 600,
-        },
+        budget: load_budget()?,
         runtime_policy: agent_protocol::RuntimeExecutionPolicySnapshot::default(),
     })
 }

@@ -230,6 +230,14 @@ export type Bridge = {
   /// for a runtime this app did not start -- it cannot stop what it did not
   /// spawn, and starting a second host over one state root is worse than
   /// saying so.
+  /// What one Run may spend, as this app configured the runtime. Read rather
+  /// than assumed: the window must not show a cap the runtime is not holding
+  /// the Run to.
+  budget(): Promise<Reply<{
+    maxTokens: number;
+    maxCostCents: number;
+    maxDurationSeconds: number;
+  }>>;
   restart(): Promise<Reply<{
     restarted: boolean;
     reason: string | null;

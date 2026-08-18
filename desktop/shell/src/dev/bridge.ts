@@ -260,6 +260,7 @@ export function installDevBridge() {
     startRuntime: async () => ok(true),
     shutdown: async () => ok({}),
     restart: async () => ok({ restarted: true, reason: null, report: null, escalated: false }),
+    budget: async () => ok({ maxTokens: 400_000, maxCostCents: 500, maxDurationSeconds: 3_600 }),
     events: async ({ runId }) => {
       const log = LOGS[runId];
       if (!log) {

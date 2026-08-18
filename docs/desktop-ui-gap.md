@@ -67,7 +67,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 26 | `indeterminate` 人工裁决 | 已接入 | 在待决定队列里和审批并列；它没有 approval id，用 Run 自己的 id 命名——一个 Run 只到一次终局边界 |
 | 27 | 事件游标 / 原始事件检查器 | 已接入 | ⌘I 在对话面开原始事件；游标的 gap 与分页上限是两件不同的事，都各自说出来 |
 | 28 | 每工具审批策略 | 待接入 | 设置里的 Tools & access |
-| 29 | 预算与配额 | 待接入 | 状态行 + 抽屉 |
+| 29 | 预算与配额 | 部分接入 | Run 的 token 在状态行按「已用 / 上限」显示，上限来自应用配置 Runtime 时用的同一个常量。内核原来把 `RunBudget` 写死成 8k token —— 读两个文件就见底，一次编码任务必然中途 `budget_exhausted`；现在三个维度都可由环境变量设，默认不变。**还没有**：改预算的界面、成本与时长的同款显示 |
 | 30 | 容器边界能力可视（ADR-0122） | 待接入 | 哪些保证这台机器给不了 |
 | 31 | MCP 输入请求（elicitation）应答 | **已接入** | `mcp.input.required` 原来只能看不能答；表单按 `requested_schema` 渲染，URL 模式给真实地址，回复经 `resolve_mcp_input` 原样回传 input id / 版本 / 绑定摘要 |
 

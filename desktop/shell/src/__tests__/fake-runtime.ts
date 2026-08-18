@@ -721,6 +721,12 @@ export function installFakeRuntime(
     startRuntime: async () => ({ ok: true as const, value: true }),
     shutdown: async () => ({ ok: true as const, value: {} }),
     restart,
+    // The cap the app configured. Read by the surface so a token count is
+    // shown against something rather than on its own.
+    budget: async () => ({
+      ok: true as const,
+      value: { maxTokens: 400_000, maxCostCents: 500, maxDurationSeconds: 3_600 },
+    }),
     events: async (
       { runId, afterSequence = 0, limit = 256 }:
       { runId: string; afterSequence?: number; limit?: number },

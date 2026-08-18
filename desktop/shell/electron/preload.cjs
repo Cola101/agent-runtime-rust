@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld("desk", {
     startRuntime: () => ipcRenderer.invoke("runtime:startRuntime"),
     shutdown: () => ipcRenderer.invoke("runtime:shutdown"),
     restart: () => ipcRenderer.invoke("runtime:restart"),
+    budget: () => ipcRenderer.invoke("runtime:budget"),
     events: (request) => ipcRenderer.invoke("runtime:events", request),
     submit: (input) => ipcRenderer.invoke("runtime:submit", input),
     control: (request) => ipcRenderer.invoke("runtime:control", request),

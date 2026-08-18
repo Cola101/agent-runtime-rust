@@ -960,7 +960,16 @@ export function ChatStatus() {
         </>
       )}
       <i>・</i><span className="mono">{shortId(run.id)}</span>
-      <i>・</i><span>{run.tokens.toLocaleString()} token</span>
+      {/* Against the cap this app configured, when it knows one. A count on
+          its own does not say whether a Run is near the limit that will end
+          it, and `budget_exhausted` arriving with no warning reads as a broken
+          agent rather than as a limit someone chose. */}
+      <i>・</i>
+      <span title={desk.budget ? `上限 ${desk.budget.maxTokens.toLocaleString()} token` : ""}>
+        {desk.budget
+          ? `${run.tokens.toLocaleString()} / ${desk.budget.maxTokens.toLocaleString()} token`
+          : `${run.tokens.toLocaleString()} token`}
+      </span>
       <i>・</i><span>{costLabel(run.costMicros)}</span>
       <i>・</i>
       {moving

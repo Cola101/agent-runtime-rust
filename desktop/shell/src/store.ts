@@ -721,6 +721,11 @@ export type Store = {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }): Promise<string | null>;
   forgetProvider(id: string): Promise<string | null>;
+  /// What one Run may spend, as this app configured the runtime it started.
+  /// Null when the host will not say -- a runtime this app did not start has a
+  /// budget of its own and this window does not know it, which is a different
+  /// answer from "no limit" and is rendered as one.
+  budget: { maxTokens: number; maxCostCents: number; maxDurationSeconds: number } | null;
   /// Configured MCP servers, and what the runtime was started with. Never a
   /// claim that a server is running — nothing on the socket can say that.
   mcp: McpServers;
@@ -829,6 +834,7 @@ export function useRuntime(): Store {
   /// a runtime this app did not start. Both mean "this client cannot say", and
   /// collapsing either into an empty list would be a claim.
   const [mcp, setMcp] = useState<McpServers>({ servers: [], applied: null });
+  const [budget, setBudget] = useState<Store["budget"]>(null);
   /// Events that arrived on the stream ahead of the poll.
   ///
   /// Dropped per run once the poll's own read has reached them, so this stays a
@@ -989,6 +995,16 @@ export function useRuntime(): Store {
   }, []);
 
   useEffect(() => { void refreshMcp(); }, [refreshMcp]);
+
+  /// Read once. It is a constant of this app's own configuration, not runtime
+  /// state, and it changes only when the app restarts the runtime with a
+  /// different one. An older preload has no `budget` at all, which stays null
+  /// rather than becoming a guess.
+  useEffect(() => {
+    const api = bridge();
+    if (!api?.budget) return;
+    void api.budget().then((reply) => { if (reply.ok) setBudget(reply.value); });
+  }, []);
 
   const saveMcpServer = useCallback(async (request: {
     name: string; command: string; args: string[]; cwd: string | null;
@@ -1213,7 +1229,7 @@ export function useRuntime(): Store {
     current: sessions.find((session) => session.key === current) ?? null,
     selectSession, newConversation, send, steer, fork, rollback,
     providers, saveProvider, forgetProvider,
-    mcp, mcpFailures: readMcpFailures(merged), saveMcpServer, forgetMcpServer,
+    budget, mcp, mcpFailures: readMcpFailures(merged), saveMcpServer, forgetMcpServer,
     submit, decide, answerMcpInput, refresh: () => void load(),
   };
 }
