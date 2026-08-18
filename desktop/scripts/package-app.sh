@@ -100,11 +100,21 @@ done
 # A require that resolves only through the checkout would pass every check above
 # and fail on a machine that has no checkout. This asks the bundle to load its
 # own host modules from inside itself.
+#
+# Every module rather than a list. The list was written when `electron/` held
+# four files; six more arrived since, and each one that a hand-maintained check
+# does not name is a module whose missing dependency this gate would let ship.
+# The two exclusions are not omissions: `main.cjs` and `preload.cjs` require
+# `electron` itself, which only resolves inside the Electron process, so bare
+# node cannot load them and their absence here says nothing about the bundle.
 if ! (cd "$app/Contents/Resources/app" && node -e "
-  require('./electron/runtime.cjs');
-  require('./electron/credentials.cjs');
-  require('./electron/workspace.cjs');
-  require('./electron/runtimeProcess.cjs');
+  const fs = require('node:fs');
+  const inside = fs.readdirSync('./electron')
+    .filter((name) => name.endsWith('.cjs'))
+    .filter((name) => name !== 'main.cjs' && name !== 'preload.cjs');
+  if (inside.length === 0) throw new Error('no host modules were bundled at all');
+  for (const name of inside) require('./electron/' + name);
+  console.log('host modules loaded: ' + inside.join(', '));
 "); then
   echo "the bundled host process cannot resolve its own dependencies" >&2
   exit 1
