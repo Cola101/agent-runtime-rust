@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
 import {
-  belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote,
-  lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
+  belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote, eventWords,
+  knownEvent, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
@@ -97,6 +97,44 @@ function Acts({ events }: { events: RunEvent[] }) {
   );
 }
 
+/// Events this build has no account of.
+///
+/// The runtime is versioned separately from this window and adds event types
+/// without asking it. Until now anything unlisted was dropped on the floor,
+/// which made the newest thing the runtime can report the one thing the client
+/// is guaranteed to hide.
+///
+/// It draws what the log actually carries and nothing more: the type verbatim,
+/// the sequence, and the payload. It does not guess a label, a severity or a
+/// place in the conversation -- deciding an unknown event is routine is a
+/// judgement this client is in no position to make.
+///
+/// Folded, and folded together, for the reason `Acts` is: a runtime that began
+/// emitting an unlisted type per token would otherwise wallpaper the column,
+/// and the failure mode being avoided is the transcript becoming the log. The
+/// payload opens on a click; `⌘I` still has all of it either way.
+function Unheard({ events }: { events: RunEvent[] }) {
+  const [open, setOpen] = useState(false);
+  const types = [...new Set(events.map((event) => event.type))].join("・");
+  return (
+    <div className="acts unheard">
+      <button type="button" className="fold" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="caret">{open ? "▾" : "▸"}</span>
+        {events.length === 1
+          ? "本版本不认识的事件"
+          : `${events.length} 条本版本不认识的事件`}
+        <span className="mono dim">{types}</span>
+      </button>
+      {open && events.map((event) => (
+        <div className="heard" key={event.event_id || event.sequence}>
+          <div className="mono dim">第 {event.sequence} 条・{event.type}</div>
+          <pre className="mono">{JSON.stringify(event.payload, null, 2)}</pre>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /// The transcript, rendered from the durable log.
 ///
 /// Text deltas are joined into one block rather than drawn per event: the
@@ -106,6 +144,7 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
   const blocks: React.ReactNode[] = [];
   let text = "";
   let acts: RunEvent[] = [];
+  let unheard: RunEvent[] = [];
 
   const flushText = (key: string, last = false) => {
     if (!text) return;
@@ -128,6 +167,11 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
     blocks.push(<Acts events={acts} key={`a-${key}`} />);
     acts = [];
   };
+  const flushUnheard = (key: string) => {
+    if (unheard.length === 0) return;
+    blocks.push(<Unheard events={unheard} key={`u-${key}`} />);
+    unheard = [];
+  };
 
   // Which block the text being accumulated came from. The runtime now says so
   // (`model.output.delta` carries `block`), and two blocks are two things the
@@ -138,6 +182,15 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
   let block: number | undefined;
 
   for (const event of run.events) {
+    // An unlisted type is folded with its neighbours, so it ends every other
+    // run and every other run ends it.
+    if (!knownEvent(event.type)) {
+      flushText(String(event.sequence));
+      flushActs(String(event.sequence));
+      unheard.push(event);
+      continue;
+    }
+    flushUnheard(String(event.sequence));
     if (event.type === "model.output.delta") {
       // Text ends a run of calls: what the model says after using a tool is a
       // new part of the conversation, not more of the same fold.
@@ -166,10 +219,22 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
           {note} <span className="mono dim">{event.type}</span>
         </Note>,
       );
+      // A refusal and a reasoning summary are words the model produced, and
+      // the note above only names them. Drawn under the note that says which
+      // it is, so it cannot be read as the ordinary reply it sits beside.
+      const words = eventWords(event.type, event.payload);
+      if (words) {
+        blocks.push(
+          <div className="rep said" key={`w-${event.event_id || event.sequence}`}>
+            <p>{words}</p>
+          </div>,
+        );
+      }
     }
   }
   flushText("end", true);
   flushActs("end");
+  flushUnheard("end");
   return <>{blocks}</>;
 }
 
@@ -506,10 +571,27 @@ export function ChatStatus() {
           <i>・</i>
           {activity
             ? <span>{activity}</span>
-            // Named rather than smoothed over: an event this build does not
-            // recognise is worth seeing, and the type is what makes it
-            // lookupable instead of mysterious.
-            : <span className="dim mono" title="这个版本不认识这个事件类型">{lastEvent}</span>}
+            // Named rather than smoothed over: an event with no phrase for it
+            // is worth seeing, and the type is what makes it lookupable
+            // instead of mysterious.
+            //
+            // Two different reasons for landing here, and they are not the
+            // same admission. Most types this build knows perfectly well and
+            // simply has no words for as an activity -- `run.timed_out` is one
+            // -- and telling a person the version does not recognise it would
+            // be the window lying about itself. Only a type nothing here
+            // accounts for gets that sentence, and it is the same sentence the
+            // transcript uses for the same event.
+            : (
+              <span
+                className="dim mono"
+                title={lastEvent !== null && knownEvent(lastEvent)
+                  ? "这个版本没有给这个事件写说法"
+                  : "这个版本不认识这个事件类型"}
+              >
+                {lastEvent}
+              </span>
+            )}
           <i>・</i>
           {/* Counted from the Run's first event to now. A finished Run is
               measured end to end instead. */}
