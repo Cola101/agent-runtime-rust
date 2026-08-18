@@ -79,6 +79,28 @@ ERROR a detached execution failed after durable acceptance and left no terminal
 
 Provider 在 `run.started` 之后失败时，这条原则已经被执行了；子代理失败这条路径没有。
 
+### 再追一层：错误是**子 Run** 的，而且子 Run 本身没问题
+
+`execution attempt is already terminal` 来自 `WorkerAssignmentError::AttemptAlreadyTerminal`，
+由 `accept`、`record_required_mcp_unavailable`、`apply_model_event`、`apply_steering`、
+`bind_cancellation_token` 五处返回。
+
+顺序是这样的：
+
+1. 子 Run 预算耗尽，**正确地**写下 `run.failed{budget_exhausted}` ——
+   它的事件日志里就是这条，而且是最后一条。**子 Run 的终局是对的。**
+2. 子的驱动循环**没有停**，又调了一次 `apply_model_event`，被拒。
+3. 这个 `Err` 逃出 `execute_subagent`（`return Err(error)`）→ 穿过
+   `run_subagent_batch` 的 `outcome?` → 穿过父的 `.await?` → 从父的 `execute` 出来。
+4. 父既没拿到结果，也没拿到自己的终局。
+
+**坏的不是"子代理失败没有被投递"，而是"子代理在写完自己的终局之后多走了一步，
+那一步的错误被当成整条委托链的失败往上抛"。**
+
+这把问题从「一个契约决定」缩小成了一件具体得多的事：驱动循环在自己已经发出终局事件
+之后应当返回，而不是再问一次模型。父那边"错误应当成为durable 终局"仍然成立，
+但它现在是第二道防线，不是第一处该改的地方。
+
 ### 还没确定的
 
 - 父的时长看门狗（默认 600 秒）会不会最终把它收掉。没等满十分钟，所以说不准是
