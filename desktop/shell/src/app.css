@@ -209,6 +209,39 @@ body {
 /* Words an event carried, under the note that names them. One thing, so they
    sit closer together than two blocks of the transcript do. */
 .flow > .rep.said { margin-top: 7px; }
+/* ---------- finding text in the conversation ---------- */
+
+/* The bar sits where a toolbar would, with the same gutter and rule, because
+   while it is up it is what the top of this surface is. It is not permanent
+   chrome: ⌘F puts it there and Esc takes it away. */
+.find {
+  flex: none; display: flex; align-items: baseline; gap: 14px;
+  padding: 8px 28px; border-bottom: 1px solid var(--rule);
+  font-size: 11.5px; color: var(--ink-3);
+}
+.find input.in {
+  flex: 1; min-width: 0; max-width: 46ch; padding: 0;
+  background: none; border: 0; outline: none;
+  font: inherit; font-size: 12.5px; color: var(--ink);
+}
+.find input.in::placeholder { color: var(--ink-3); }
+.find .tally { flex: none; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.find .find-keys { flex: none; margin-left: auto; }
+.find button.flat { flex: none; font-size: 11.5px; }
+
+/* Every match is marked; the one you are on is the only filled one. Two
+   strengths of the single accent rather than a second colour -- the transcript
+   already spends its one colour on the decision you owe someone.
+
+   The weak one is mixed from the accent rather than taking `--accent-wash`,
+   which is a block fill: behind eight characters in the dark theme it came out
+   a shade off the panel and the other matches were invisible, which is most of
+   what a count of eight is for. */
+mark {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: inherit; border-radius: 2px; padding: 0 1px;
+}
+mark.on { background: var(--accent); color: var(--paper); }
 
 /* A file preview. Wraps rather than scrolls sideways: a line long enough to
    need horizontal scrolling is a line the reader has already lost. */

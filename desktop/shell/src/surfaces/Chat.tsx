@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { register } from "./registry";
 import {
   belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote, eventWords,
@@ -6,23 +6,51 @@ import {
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
+import { closeFind, findOpened, has, openFind, split, watchFind } from "./find";
 import { currentRun, useDesk, type Desk } from "../desk";
 import type { RunEvent } from "../runtime";
 import type { RunView } from "../store";
 import { textOf, type SessionView } from "../session";
-import { lineage, subagentsOf } from "../subagents";
+import { lineage, subagentsOf, type SubagentState } from "../subagents";
+
+/// One run of drawn text, with whatever ⌘F is looking for marked in it.
+///
+/// `<mark>` is the element for this, and it is also how the finder counts: the
+/// marks standing in the column, in document order, are the hits. Everything
+/// the transcript draws that a person could search goes through here, and
+/// nothing that goes through here is invisible.
+function Mark({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>;
+  return (
+    <>
+      {split(text, query).map((part, index) => (
+        part.hit
+          ? <mark key={index}>{part.text}</mark>
+          : <Fragment key={index}>{part.text}</Fragment>
+      ))}
+    </>
+  );
+}
+
+/// What one tool call draws: the tool's name, and its arguments as the line
+/// shows them. The fold asks this what it contains and the line renders from
+/// it, so a fold cannot decide it holds no match over a line that draws one.
+function callSpans(event: RunEvent): [string, string] {
+  const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
+  const args = call.arguments;
+  return [String(call.name ?? ""), args ? JSON.stringify(args) : ""];
+}
 
 /// A tool call is two lines, not a card.
 ///
 /// Boxing each one puts a border around every third element and the column
 /// stops reading as a conversation.
-function Act({ event }: { event: RunEvent }) {
-  const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
-  const args = call.arguments;
+function Act({ event, query }: { event: RunEvent; query: string }) {
+  const [name, args] = callSpans(event);
   return (
     <div className="act">
-      <b>{String(call.name ?? "")}</b>
-      <span className="out mono">{args ? JSON.stringify(args) : ""}</span>
+      <b><Mark text={name} query={query} /></b>
+      <span className="out mono"><Mark text={args} query={query} /></span>
     </div>
   );
 }
@@ -39,26 +67,38 @@ function Note({ children }: { children: React.ReactNode }) {
 /// The decision is bound to one call. There is deliberately no "approve
 /// whatever is current" affordance, because that races a transcript that is
 /// still moving.
-function Gate({ run }: { run: RunView }) {
+///
+/// The card stands in the column ⌘F searches, so its words go through `Mark`
+/// like the rest of that column. The command it is asking about is the most
+/// searchable text on the screen -- it is the thing a person came to look at --
+/// and a card the finder stepped over would be a "没有匹配" said over a line
+/// the reader can point at. The buttons underneath are not searched: they are
+/// the choice, not the transcript.
+function Gate({ run, query }: { run: RunView; query: string }) {
   const approval = run.approval;
   if (!approval) return null;
   return (
     <div className="gate">
-      <div className="h">等你决定</div>
-      <code className="cmd">{approval.toolName}({JSON.stringify(approval.arguments)})</code>
+      <div className="h"><Mark text="等你决定" query={query} /></div>
+      <code className="cmd">
+        <Mark
+          text={`${approval.toolName}(${JSON.stringify(approval.arguments)})`}
+          query={query}
+        />
+      </code>
       <div className="facts">
-        <span>{effectLabel(approval.effect)}</span>
-        <span>{sandboxLabel(approval.sandbox)}</span>
+        <span><Mark text={effectLabel(approval.effect)} query={query} /></span>
+        <span><Mark text={sandboxLabel(approval.sandbox)} query={query} /></span>
       </div>
       <Decisions run={run} />
-      <div className="bind mono">绑定 {approval.bindingDigest.slice(0, 16)}…・只对这一次调用有效</div>
+      <div className="bind mono">
+        <Mark
+          text={`绑定 ${approval.bindingDigest.slice(0, 16)}…・只对这一次调用有效`}
+          query={query}
+        />
+      </div>
     </div>
   );
-}
-
-function toolName(event: RunEvent): string {
-  const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
-  return String(call.name ?? "");
 }
 
 /// A run of tool calls, folded.
@@ -70,28 +110,36 @@ function toolName(event: RunEvent): string {
 ///
 /// One call is not folded. Hiding a single line behind a control to reveal it
 /// is not a saving.
-function Acts({ events }: { events: RunEvent[] }) {
+function Acts({ events, query }: { events: RunEvent[]; query: string }) {
   const [open, setOpen] = useState(false);
-  if (events.length === 1) return <Act event={events[0]} />;
+  if (events.length === 1) return <Act event={events[0]} query={query} />;
 
   const counted = new Map<string, number>();
   for (const event of events) {
-    const name = toolName(event);
+    const [name] = callSpans(event);
     counted.set(name, (counted.get(name) ?? 0) + 1);
   }
   const named = [...counted.entries()]
     .map(([name, count]) => (count > 1 ? `${name} ×${count}` : name))
     .join("・");
 
+  // A hit nobody can see is not a hit. While the finder is holding a query one
+  // of these calls answers, the group is open whatever the caret last said --
+  // otherwise the count in the finder would include lines the fold is hiding.
+  // The summary row is left unmarked on purpose: it is a tally of the very
+  // lines being counted, and marking it too would count each call twice.
+  const found = events.some((event) => callSpans(event).some((span) => has(span, query)));
+  const showing = open || found;
+
   return (
     <div className="acts">
-      <button type="button" className="fold" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="caret">{open ? "▾" : "▸"}</span>
+      <button type="button" className="fold" aria-expanded={showing} onClick={() => setOpen(!showing)}>
+        <span className="caret">{showing ? "▾" : "▸"}</span>
         {events.length} 个工具调用
         <span className="mono dim">{named}</span>
       </button>
-      {open && events.map((event) => (
-        <Act event={event} key={event.event_id || event.sequence} />
+      {showing && events.map((event) => (
+        <Act event={event} key={event.event_id || event.sequence} query={query} />
       ))}
     </div>
   );
@@ -140,7 +188,7 @@ function Unheard({ events }: { events: RunEvent[] }) {
 /// Text deltas are joined into one block rather than drawn per event: the
 /// runtime streams a word at a time and a person reads paragraphs. Consecutive
 /// tool calls are folded for the same reason at a larger scale.
-function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
+function Transcript({ run, writing, query }: { run: RunView; writing: boolean; query: string }) {
   const blocks: React.ReactNode[] = [];
   let text = "";
   let acts: RunEvent[] = [];
@@ -151,7 +199,7 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
     blocks.push(
       <div className="rep" key={`t-${key}`}>
         <p>
-          {text}
+          <Mark text={text} query={query} />
           {/* Only on the block still being written, and only while the Run is
               producing text. A sentence that stops mid-clause reads the same
               whether more is coming or the model finished there, and the
@@ -164,7 +212,7 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
   };
   const flushActs = (key: string) => {
     if (acts.length === 0) return;
-    blocks.push(<Acts events={acts} key={`a-${key}`} />);
+    blocks.push(<Acts events={acts} key={`a-${key}`} query={query} />);
     acts = [];
   };
   const flushUnheard = (key: string) => {
@@ -216,7 +264,8 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
       flushActs(String(event.sequence));
       blocks.push(
         <Note key={event.event_id || event.sequence}>
-          {note} <span className="mono dim">{event.type}</span>
+          <Mark text={note} query={query} />{" "}
+          <span className="mono dim"><Mark text={event.type} query={query} /></span>
         </Note>,
       );
       // A refusal and a reasoning summary are words the model produced, and
@@ -245,12 +294,26 @@ function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
 /// the child's own Run, because that is where what the child actually did
 /// lives -- this side only knows what was asked, what came back, and what it
 /// cost.
-function Delegations({ run }: { run: RunView }) {
+///
+/// These rows stand in the searched column, so what the runtime reported about
+/// each delegation -- the role it was given, the sentence it was handed, where
+/// it got to -- goes through `Mark`. The heading above them is a tally of the
+/// rows themselves and is left alone, for the same reason the fold's summary
+/// row is.
+function Delegations({ run, query }: { run: RunView; query: string }) {
   const desk = useDesk();
   const rows = lineage(subagentsOf(run.events));
   if (rows.length === 0) return null;
 
   const running = rows.filter((row) => row.view.state.kind === "running").length;
+  const stateLabel = (state: SubagentState) => {
+    if (state.kind === "requested") return "已请求";
+    if (state.kind === "running") return "在跑";
+    if (state.kind === "closed") return "被关掉";
+    return state.error
+      ? `失败・${state.status}`
+      : lifecycleLabel({ kind: "terminal", status: state.status });
+  };
   return (
     <div className="kids">
       <div className="kids-hd">
@@ -260,24 +323,33 @@ function Delegations({ run }: { run: RunView }) {
       {rows.map(({ view, depth }) => (
         <div className={`kid d${depth}`} key={view.id}>
           <div className="kid-top">
-            <b>{view.role || "（未命名角色）"}</b>
+            <b><Mark text={view.role || "（未命名角色）"} query={query} /></b>
             <span className={`kid-state s-${view.state.kind}`}>
-              {view.state.kind === "requested" && "已请求"}
-              {view.state.kind === "running" && "在跑"}
-              {view.state.kind === "closed" && "被关掉"}
-              {view.state.kind === "finished"
-                && (view.state.error ? `失败・${view.state.status}` : lifecycleLabel({
-                  kind: "terminal", status: view.state.status,
-                }))}
+              <Mark text={stateLabel(view.state)} query={query} />
             </span>
-            {view.queued > 0 && <span className="kid-flag">{view.queued} 条排队</span>}
-            {view.generation > 1 && <span className="kid-flag">第 {view.generation} 代</span>}
+            {view.queued > 0 && (
+              <span className="kid-flag"><Mark text={`${view.queued} 条排队`} query={query} /></span>
+            )}
+            {view.generation > 1 && (
+              <span className="kid-flag"><Mark text={`第 ${view.generation} 代`} query={query} /></span>
+            )}
           </div>
-          {view.asked && <div className="kid-ask">{view.asked}</div>}
+          {view.asked && <div className="kid-ask"><Mark text={view.asked} query={query} /></div>}
           <div className="kid-facts mono">
-            {view.forkedFrom && <span>从 {shortId(view.forkedFrom.id)} 的第 {view.forkedFrom.generation} 代分叉</span>}
-            {view.tokens > 0 && <span>{view.tokens.toLocaleString()} token</span>}
-            {view.costMicros > 0 && <span>{costLabel(view.costMicros)}</span>}
+            {view.forkedFrom && (
+              <span>
+                <Mark
+                  text={`从 ${shortId(view.forkedFrom.id)} 的第 ${view.forkedFrom.generation} 代分叉`}
+                  query={query}
+                />
+              </span>
+            )}
+            {view.tokens > 0 && (
+              <span><Mark text={`${view.tokens.toLocaleString()} token`} query={query} /></span>
+            )}
+            {view.costMicros > 0 && (
+              <span><Mark text={costLabel(view.costMicros)} query={query} /></span>
+            )}
             {view.childRunId
               ? (
                 <button
@@ -291,7 +363,7 @@ function Delegations({ run }: { run: RunView }) {
               // Said rather than left blank: the id arrives with the terminal,
               // so its absence means the child has not finished, not that this
               // client lost it.
-              : <span className="dim">还没有子 Run 可看</span>}
+              : <span className="dim"><Mark text="还没有子 Run 可看" query={query} /></span>}
           </div>
         </div>
       ))}
@@ -306,7 +378,7 @@ function Delegations({ run }: { run: RunView }) {
 /// what happened while a Turn ran, and the transcript is what the runtime
 /// carried into the next Turn as history. When a log is retired the events go
 /// and the conversation stays.
-function Turns({ session }: { session: SessionView }) {
+function Turns({ session, query }: { session: SessionView; query: string }) {
   return (
     <>
       {session.turns.map((turn) => {
@@ -314,8 +386,8 @@ function Turns({ session }: { session: SessionView }) {
         const back = textOf(turn, "assistant");
         return (
           <div className="turn" key={turn.digest || turn.turn_ordinal}>
-            {said && <div className="ask">{said}</div>}
-            {back && <div className="rep"><p>{back}</p></div>}
+            {said && <div className="ask"><Mark text={said} query={query} /></div>}
+            {back && <div className="rep"><p><Mark text={back} query={query} /></p></div>}
           </div>
         );
       })}
@@ -349,6 +421,58 @@ function shownRun(desk: Desk): RunView | null {
   return currentRun(desk);
 }
 
+/// The finder, over the conversation column.
+///
+/// It says how many matches there are and which one you are on, and refuses to
+/// imply anything past that: when this client only read part of a Run's log,
+/// the count is a count over the part it read, and the row says so. A bare
+/// "没有匹配" over a truncated log would answer a question nobody asked.
+function Finder({
+  box, query, onQuery, hits, current, onStep, onClose, partial,
+}: {
+  box: React.RefObject<HTMLInputElement | null>;
+  query: string;
+  onQuery(next: string): void;
+  hits: number;
+  current: number;
+  onStep(delta: number): void;
+  onClose(): void;
+  partial: boolean;
+}) {
+  return (
+    <div className="find">
+      <input
+        ref={box}
+        className="in"
+        value={query}
+        placeholder="在这段对话里找"
+        aria-label="在这段对话里找"
+        spellCheck={false}
+        onChange={(event) => onQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            onStep(event.shiftKey ? -1 : 1);
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            onClose();
+          }
+        }}
+      />
+      {query !== "" && (
+        <span className="tally">
+          {hits === 0 ? "没有匹配" : `${current + 1}/${hits}`}
+          {partial && <span className="dim">・只在读到的这段里找</span>}
+        </span>
+      )}
+      <span className="find-keys">
+        <kbd>↵</kbd> 下一个 ・ <kbd>⇧↵</kbd> 上一个
+      </span>
+      <button type="button" className="flat" onClick={onClose}>关闭</button>
+    </div>
+  );
+}
+
 function ChatView() {
   const desk = useDesk();
   const chosen = desk.selected
@@ -359,63 +483,158 @@ function ChatView() {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
 
-  // Follows the tail while you are at the tail, and stops the moment you
-  // scroll up. A transcript that yanks itself down while you are reading is
-  // worse than one that never scrolls.
+  const opened = useSyncExternalStore(watchFind, findOpened);
+  const finding = opened >= 0;
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState(0);
+  const [at, setAt] = useState(0);
+  const box = useRef<HTMLInputElement>(null);
+  const restore = useRef<HTMLElement | null>(null);
+  const current = hits === 0 ? -1 : ((at % hits) + hits) % hits;
+
+  const close = () => {
+    closeFind();
+    setQuery("");
+    setAt(0);
+    restore.current?.focus();
+  };
+
+  // Leaving the surface closes it. The open flag outlives this component -- it
+  // has to, since the key that sets it is dispatched by the shell -- and a
+  // finder that reappeared over a transcript nobody was searching would be the
+  // cost of that.
+  useEffect(() => () => closeFind(), []);
+
+  // ⌘F puts the focus in the box, and a second ⌘F selects what is already
+  // there: pressing it again is how a person searches for something else.
+  useEffect(() => {
+    if (!finding) return;
+    const active = document.activeElement as HTMLElement | null;
+    if (active && active !== box.current) restore.current = active;
+    box.current?.focus();
+    box.current?.select();
+  }, [finding, opened]);
+
+  // The hits are counted off the rendered column, after it is rendered.
+  //
+  // Draw order is the only order a finder can count in, and the drawn document
+  // is the one place that order actually exists -- a parallel list of blocks
+  // would be a second source for it, free to drift from what is on screen. A
+  // fold holding a match has already opened by the time this runs, so every hit
+  // counted here is one a person can see.
   useEffect(() => {
     const node = scroller.current;
-    if (!node || !pinned.current) return;
+    if (!node) return;
+    const marks = node.querySelectorAll<HTMLElement>("mark");
+    if (marks.length !== hits) setHits(marks.length);
+    marks.forEach((mark, index) => mark.classList.toggle("on", index === current));
+  });
+
+  // Only when the hit moves. Re-running this on every render would drag the
+  // column back to the match each time an event arrives.
+  useEffect(() => {
+    if (current < 0) return;
+    scroller.current?.querySelectorAll<HTMLElement>("mark")[current]
+      ?.scrollIntoView({ block: "center" });
+  }, [current, query]);
+
+  // Follows the tail while you are at the tail, and stops the moment you
+  // scroll up. A transcript that yanks itself down while you are reading is
+  // worse than one that never scrolls -- and reading a match is reading, so a
+  // search in progress holds the column still too.
+  useEffect(() => {
+    const node = scroller.current;
+    if (!node || !pinned.current || query !== "") return;
     node.scrollTop = node.scrollHeight;
-  }, [run?.events.length, run?.id, session?.turnCount, session?.sessionId]);
+  }, [run?.events.length, run?.id, session?.turnCount, session?.sessionId, query]);
 
   return (
-    <div
-      className="flow"
-      ref={scroller}
-      onScroll={(event) => {
-        const node = event.currentTarget;
-        pinned.current = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
-      }}
-    >
-      <LinkBanner link={desk.link} />
-
-      {desk.link.state === "live" && !run && !session && desk.listedAt !== null && (
-        <div className="empty">还没有对话。在下面写一句话就开始。</div>
+    <>
+      {finding && (
+        <Finder
+          box={box}
+          query={query}
+          onQuery={(next) => { setQuery(next); setAt(0); }}
+          hits={hits}
+          current={current}
+          // Counted from where the step lands rather than from what this render
+          // saw: two presses inside one batch would otherwise both step from the
+          // same place and move one hit between them.
+          onStep={(delta) => setAt((was) => was + delta)}
+          onClose={close}
+          // What this client actually read. Neither flag is a guess: one is the
+          // paging ceiling this client stopped at, the other is the runtime
+          // saying the earlier events are gone.
+          partial={Boolean(run?.truncated || run?.historyGap)}
+        />
       )}
+      <div
+        className="flow"
+        ref={scroller}
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          pinned.current = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+        }}
+      >
+        <LinkBanner link={desk.link} />
 
-      {session && <Turns session={session} />}
+        {desk.link.state === "live" && !run && !session && desk.listedAt !== null && (
+          <div className="empty">还没有对话。在下面写一句话就开始。</div>
+        )}
 
-      {run && (
-        <>
-          {run.truncated && <Note>这个 Run 的事件太多，只读到了前面一段</Note>}
-          {run.historyGap && (
-            <Note>
-              更早的事件已被回收，这段转录不完整 —— 最早还能读到第 {run.earliestSequence} 条
-            </Note>
-          )}
-          {(!session || run.id === session.activeRunId) && <div className="ask">{run.asked}</div>}
-          {run.error ? (
-            <div className="offline">
-              这个 Run 的日志读不出来：<span className="mono">{run.error.code}</span>
-              {run.error.message ? ` —— ${run.error.message}` : ""}
-            </div>
-          ) : (
-            <Transcript
-              run={run}
-              // The Run is producing text right now: it is moving, and the last
-              // thing it wrote was text rather than a tool call or a question.
-              // Both come from the log; neither is a guess about the model.
-              writing={
-                (run.lifecycle.kind === "running")
-                && run.events[run.events.length - 1]?.type === "model.output.delta"
-              }
-            />
-          )}
-          <Delegations run={run} />
-          <Gate run={run} />
-        </>
-      )}
-    </div>
+        {session && <Turns session={session} query={query} />}
+
+        {run && (
+          <>
+            {/* Both of these are notes like any other note, and the finder has
+                no way to know they were written by hand rather than read off an
+                event -- so they are marked like any other note. Text drawn
+                outside `Mark` is text the count denies. */}
+            {run.truncated && (
+              <Note>
+                <Mark text="这个 Run 的事件太多，只读到了前面一段" query={query} />
+              </Note>
+            )}
+            {run.historyGap && (
+              <Note>
+                <Mark
+                  text={`更早的事件已被回收，这段转录不完整 —— 最早还能读到第 ${run.earliestSequence} 条`}
+                  query={query}
+                />
+              </Note>
+            )}
+            {(!session || run.id === session.activeRunId) && (
+              <div className="ask"><Mark text={run.asked} query={query} /></div>
+            )}
+            {run.error ? (
+              // Also marked: the finder can be open over a Run whose log would
+              // not read, and the code is the one string a person searching a
+              // broken transcript is actually looking for.
+              <div className="offline">
+                <Mark text="这个 Run 的日志读不出来：" query={query} />
+                <span className="mono"><Mark text={run.error.code} query={query} /></span>
+                {run.error.message
+                  && <Mark text={` —— ${run.error.message}`} query={query} />}
+              </div>
+            ) : (
+              <Transcript
+                run={run}
+                query={query}
+                // The Run is producing text right now: it is moving, and the last
+                // thing it wrote was text rather than a tool call or a question.
+                // Both come from the log; neither is a guess about the model.
+                writing={
+                  (run.lifecycle.kind === "running")
+                  && run.events[run.events.length - 1]?.type === "model.output.delta"
+                }
+              />
+            )}
+            <Delegations run={run} query={query} />
+            <Gate run={run} query={query} />
+          </>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -618,6 +837,12 @@ export function ChatStatus() {
 
 const asking = (desk: Desk) => currentRun(desk)?.approval != null;
 
+/// Whether there is a conversation on this surface to search: a transcript, or
+/// the committed Turns behind it. A finder over an empty column finds nothing,
+/// and the shell would be drawing a key hint for it.
+const readable = (desk: Desk) =>
+  shownRun(desk) !== null || (desk.current?.turns.length ?? 0) > 0;
+
 register({
   id: "chat",
   label: "对话",
@@ -627,23 +852,36 @@ register({
   drawerLabel: "原始事件",
   composer: Composer,
   status: ChatStatus,
-  // Same rule as the queue: the irreversible one is not a bare key.
-  keys: DECISIONS.filter((decision) => !decision.destructive).map((decision) => ({
-    key: decision.key,
-    hint: decision.label,
-    when: asking,
-    run: (desk: Desk) => {
-      const run = currentRun(desk);
-      if (run) void desk.decide(run.id, decision.action);
+  keys: [
+    // Same rule as the queue: the irreversible one is not a bare key.
+    ...DECISIONS.filter((decision) => !decision.destructive).map((decision) => ({
+      key: decision.key,
+      hint: decision.label,
+      when: asking,
+      run: (desk: Desk) => {
+        const run = currentRun(desk);
+        if (run) void desk.decide(run.id, decision.action);
+      },
+    })),
+    {
+      key: "n",
+      hint: "新对话",
+      // Nothing to leave when no conversation is open, and starting one is what
+      // typing already does.
+      when: (desk: Desk) => desk.current !== null,
+      run: (desk: Desk) => desk.newConversation(),
     },
-  })).concat([{
-    key: "n",
-    hint: "新对话",
-    // Nothing to leave when no conversation is open, and starting one is what
-    // typing already does.
-    when: (desk: Desk) => desk.current !== null,
-    run: (desk: Desk) => desk.newConversation(),
-  }]),
+    {
+      key: "f",
+      meta: true,
+      hint: "查找",
+      when: readable,
+      // The finder is the surface's own state, and this is the whole reason it
+      // is not React state: the binding is dispatched by the shell, outside any
+      // component, and it still has to reach the transcript's finder.
+      run: () => openFind(),
+    },
+  ],
   commands: [
     { id: "chat:open", title: "回到对话", hint: "当前 Run 的转录" },
     {

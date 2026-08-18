@@ -120,14 +120,32 @@ const TURNS = [
 
 type FakeEvent = ReturnType<typeof event>;
 
-/// `later` appends to a run's durable log, so a test can set up a Run that had
-/// already written something before this client read it. `emit` cannot stand in
-/// for that: a streamed event is folded onto a Run whose boundary and pending
-/// approval came from the cursor, which is exactly the distinction the store
-/// draws on purpose.
 export function installFakeRuntime(
-  { activeRunId = null, later = {} }:
-  { activeRunId?: string | null; later?: Record<string, FakeEvent[]> } = {},
+  /// `later` appends to a run's durable log, so a test can set up a Run that had
+  /// already written something before this client read it. `emit` cannot stand
+  /// in for that: a streamed event is folded onto a Run whose boundary and
+  /// pending approval came from the cursor, which is exactly the distinction
+  /// the store draws on purpose.
+  ///
+  /// `gap` is the runtime saying the earlier events of a log are gone. It is a
+  /// field on the cursor page, not something a client can work out, and what a
+  /// transcript is allowed to claim about itself depends on it.
+  ///
+  /// `capped` is the other half of the same question and a different fact: the
+  /// log is whole, and this client stopped paging before the end of it. Both
+  /// mean "you are looking at part of a Run", and a client that only handled
+  /// one of them would be silent in exactly the other case.
+  ///
+  /// `unreadable` is a run whose log the daemon will not return at all.
+  {
+    activeRunId = null, later = {}, gap = false, capped = false, unreadable = null,
+  }: {
+    activeRunId?: string | null;
+    later?: Record<string, FakeEvent[]>;
+    gap?: boolean;
+    capped?: boolean;
+    unreadable?: string | null;
+  } = {},
 ) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
@@ -222,16 +240,57 @@ export function installFakeRuntime(
     }),
     startRuntime: async () => ({ ok: true as const, value: true }),
     shutdown: async () => ({ ok: true as const, value: {} }),
-    events: async ({ runId, limit = 256 }: { runId: string; limit?: number }) => {
+    events: async (
+      { runId, afterSequence = 0, limit = 256 }:
+      { runId: string; afterSequence?: number; limit?: number },
+    ) => {
       // The daemon rejects an oversized page rather than clamping it. A test
       // that clamped here would hide exactly the bug this caught in practice.
       if (limit > 256) {
         return { ok: true as const, value: { ok: false as const, error: { code: "invalid_request" } } };
       }
-      const log = LOGS[runId];
+      const log = runId === unreadable ? undefined : LOGS[runId];
       if (!log) return { ok: true as const, value: { ok: false as const, error: { code: "not_found" } } };
+      // The durable log as this Run actually stands: what the fixture declared,
+      // plus anything a test said had been written since. Every branch below
+      // reads from this, so "the log grew" and "this page is a prefix of it"
+      // stay two separate facts rather than one flag doing both jobs.
       const events = [...log.events, ...(later[runId] ?? [])];
       const highest = events[events.length - 1].sequence;
+      if (capped) {
+        // A log longer than this client will walk. Every page comes back full
+        // and says there is more behind it, and the cursor keeps moving --
+        // which is what the daemon does over a run that outran the client's
+        // page budget. A page that claimed more and returned nothing would be
+        // a different thing (a runtime bug), and a fake that served one would
+        // send the reader down the loop's defensive break instead.
+        const page = [];
+        for (let sequence = afterSequence + 1; page.length < limit; sequence += 1) {
+          page.push(
+            sequence <= events.length
+              ? events[sequence - 1]
+              : event(sequence, "model.usage", {
+                input_tokens: 0, output_tokens: 0, cost_micros: 0,
+              }, 30),
+          );
+        }
+        const next = afterSequence + page.length;
+        return {
+          ok: true as const,
+          value: {
+            ok: true as const,
+            page: {
+              run_id: runId, requested_after_sequence: afterSequence,
+              next_after_sequence: next,
+              earliest_available_sequence: 1,
+              // Strictly ahead of this page: there is more log than the client
+              // is going to read, which is the whole point of this branch.
+              highest_committed_sequence: next + 1,
+              history_gap: gap, has_more: true, state: log.state, events: page,
+            },
+          },
+        };
+      }
       return {
         ok: true as const,
         value: {
@@ -241,7 +300,9 @@ export function installFakeRuntime(
             next_after_sequence: highest,
             earliest_available_sequence: 1,
             highest_committed_sequence: highest,
-            history_gap: false, has_more: false, state: log.state, events,
+            // `gap` is the runtime's own claim that earlier events are gone; it
+            // is not derivable from a page, so it comes from the fixture.
+            history_gap: gap, has_more: false, state: log.state, events,
           },
         },
       };

@@ -88,3 +88,14 @@ const PRINTED: Record<string, string> = { " ": "空格" };
 export function printedKey(key: string): string {
   return PRINTED[key] ?? key;
 }
+
+/// How a whole binding is written down, modifier included.
+///
+/// The ⌘ comes off the same declaration the dispatcher matches on, so a hint
+/// cannot promise a modifier the dispatcher does not require or drop one it
+/// does. And the key itself goes through `printedKey`, because a chord on a key
+/// with no visible character has both problems at once.
+export function keyLabel(key: { key: string; meta?: boolean }): string {
+  const name = printedKey(key.key);
+  return key.meta ? `⌘${name.toUpperCase()}` : name;
+}

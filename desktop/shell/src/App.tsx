@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { all, byId } from "./surfaces/registry";
+import { all, byId, type KeyBinding } from "./surfaces/registry";
 import { DeskContext, useDesk, type Desk } from "./desk";
-import { DRAWER_KEY, PALETTE_KEY, SHELL_KEYS, printedKey, type Shell } from "./shell-keys";
+import { DRAWER_KEY, PALETTE_KEY, SHELL_KEYS, keyLabel, type Shell } from "./shell-keys";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
 import "./surfaces/Chat";
@@ -94,8 +94,8 @@ function KeyHints({ desk, surfaceId }: { desk: Desk; surfaceId: string }) {
   return (
     <span className="keys">
       {keys.map((key) => (
-        <span key={key.key}>
-          <kbd>{printedKey(key.key)}</kbd> {key.hint}
+        <span key={`${key.meta ? "⌘" : ""}${key.key}`}>
+          <kbd>{keyLabel(key)}</kbd> {key.hint}
         </span>
       ))}
     </span>
@@ -190,14 +190,31 @@ export function App() {
         }
       }
       if (palette) return;
-      if (typing(event.target) || meta || event.altKey) return;
+      // ⌘I is not handled here any more: it is one of `SHELL_KEYS`, claimed
+      // above with the rest of the chords the shell owns, so the reference page
+      // prints it from the same declaration that dispatches it.
+      //
+      // And `meta` no longer returns early. A surface may claim a ⌘-key, and it
+      // has to answer while the composer holds the focus -- the bare-key guard
+      // below still stops a letter from firing into a sentence.
+      if (event.altKey) return;
 
-      const surface = byId(latest.current.active);
-      const binding = (surface?.keys ?? []).find((key) => key.key === event.key);
-      if (binding && (binding.when?.(latest.current.desk) ?? true)) {
+      const keys = byId(latest.current.active)?.keys ?? [];
+      const fire = (binding: KeyBinding | undefined) => {
+        if (!binding || !(binding.when?.(latest.current.desk) ?? true)) return;
         event.preventDefault();
         binding.run(latest.current.desk);
+      };
+      // A ⌘-key the surface claims runs even while a sentence is being typed.
+      // That is the point of one: the composer holds the focus almost all the
+      // time here, and a finder you have to click out of the box to open is a
+      // finder nobody opens.
+      if (meta) {
+        fire(keys.find((key) => key.meta && key.key === event.key.toLowerCase()));
+        return;
       }
+      if (typing(event.target)) return;
+      fire(keys.find((key) => !key.meta && key.key === event.key));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
