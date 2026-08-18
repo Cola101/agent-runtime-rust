@@ -53,7 +53,41 @@ execution.transcript.push(/* 用户消息 */);
 **这不是可以先上再说的差别。** 把它叫 steer 而它其实是「下一轮才生效」，
 正是这一路一直在避免的那种半真话。
 
-## 要做对，需要的四件事
+### 但今天这条拓扑是空转的，不是活着的缺陷
+
+追完之后要把话说准：本地 host **从不依赖** processor 的绑定 token 去停任何东西。
+
+- 时长看门狗取消的是 host 自己的根 token（`lib.rs:7314`），模型调用是它的子孙，所以停得住；
+  之后才调 `processor.timeout_duration(attempt_id)` **记录**事件。
+- `terminate_interrupted` 里的 `processor.cancel(attempt_id)` 同理——循环是先自己发现
+  `self.cancellation.is_cancelled()` 才走到那里的，那次调用只负责产出终止事件。
+
+processor 侧有五处会取消绑定 token（`record_required_mcp_unavailable`、`apply_model_event`、
+`terminate_uncertain_tool_with_interruption`、`timeout_duration`、`cancel`），
+在本地它们全部只用于记录。**所以兄弟拓扑现在无害，它只在 steering 开始依赖它时才变成承重件。**
+
+## 另外两条改变设计的发现
+
+### 一、`apply_steering` 装的是**无父** token —— 不重绑会让取消静默失效
+
+```rust
+execution.cancellation.cancel();
+execution.cancellation = CancellationToken::new();   // 没有父级
+```
+
+本地的 Run 级取消靠父子链向下传播。一次 steer 之后，若 host 不立刻用
+`self.cancellation.child_token()` 重绑，这个 attempt 就脱离了那棵树——
+**"取消"会从此对这个 Run 失效**，而且只有在有人真去取消一个被 steer 过的 Run 时才会发现。
+
+比原先记的「重绑是为了第二次 steer 打得断」严重得多。`bind_cancellation_token` 允许覆盖
+（终止后除外），所以重绑本身是可行的。
+
+### 二、被 steer 打断的模型调用现在会被记成**超时失败**
+
+`ProviderExecutionError::Cancelled` 映射为 `ModelErrorKind::Timeout` +「provider call cancelled」
+（`lib.rs:3839`）。不分叉这条映射，一次成功的改向会在事件日志里留下一次模型超时。
+
+## 要做对，需要的四件事（按上面两条修正过）
 
 1. **取消拓扑**：host 自己持有 per-attempt token，绑一份进 processor，
    模型调用从**同一个** token 派生。这样 `apply_steering` 取消它就能打断在途调用，
@@ -61,20 +95,26 @@ execution.transcript.push(/* 用户消息 */);
 2. **区分中断原因**：调用被取消后，若父 token 未取消，则是 steer——
    循环应带着更新后的 transcript 继续，而不是走 `terminate_interrupted`。
    `ProviderExecutionError::Cancelled` 当前的映射（`lib.rs:3839`）必须相应分叉。
-3. **重新绑定**：`apply_steering` 会把 `execution.cancellation` 换成新 token，
-   host 下一次调用必须用新的那个，否则第二次 steer 打不断。
+3. **重新绑定**：`apply_steering` 换上的是**无父** token。host 必须立刻用
+   `self.cancellation.child_token()` 重绑，否则这个 attempt 脱离取消树，
+   **Run 级取消会对它静默失效**——这比「第二次 steer 打不断」严重。
 4. **控制面**：`RuntimeControlAction::Steer { steering_id, input }`、
    owner/local socket 变体、桌面 composer 在跑动时可发。
 
 ## 验证需要什么
 
-现有 stub provider 整段回复只要 120ms，**打不出「中途改向」这个场景**。
-需要一个可延迟的 provider fixture，才能测到：
+fixture **已经有了**：`tests/embedded_control.rs::spawn_cancellable_provider` 接下请求、
+发出「已收到」信号，然后**永不回应**——正好把一次调用按在途状态上。
+（桌面用的 stub provider 整段回复只要 120ms，打不出这个场景。）
+
+要测到：
 
 - 在途调用被 steer 打断，下一轮 transcript 里有那句话
 - 有未决工具/审批/子代理时被 `SteeringUnsafe` 拒绝
 - 同一 `steering_id` 重发是幂等的；同 id 不同输入是冲突
 - Run 级取消仍然是取消，不会被当成 steer
+- **被 steer 过的 Run 仍然取消得掉**（第一条发现直接对应的回归）
+- 被 steer 打断的调用**不留下一次模型超时**
 
 ## 结论
 
