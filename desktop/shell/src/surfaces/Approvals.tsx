@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
 import { effectLabel, sandboxLabel, shortId, since } from "./model";
+import { WriteReview } from "./WriteReview";
 import { LinkBanner } from "./Link";
 import { McpInputForm } from "./McpInput";
 import { blocked, moveCursor, useDesk } from "../desk";
@@ -111,6 +112,18 @@ function ApprovalsView() {
                 <code className="cmd">
                   {approval.toolName}({JSON.stringify(approval.arguments)})
                 </code>
+                {/* The same comparison the transcript draws. This queue is
+                    where someone comes *to* decide, so evidence there and not
+                    here would leave the deciding surface the blind one. */}
+                {approval.toolName === "workspace.write_text"
+                  && typeof approval.arguments.path === "string"
+                  && typeof approval.arguments.text === "string" && (
+                  <WriteReview
+                    path={approval.arguments.path}
+                    text={approval.arguments.text}
+                    query=""
+                  />
+                )}
                 {/* Why the runtime is asking, in the runtime's own terms. An
                     approval without its effect class is a yes/no with the
                     reason removed. */}

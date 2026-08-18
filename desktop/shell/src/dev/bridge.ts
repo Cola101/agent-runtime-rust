@@ -61,7 +61,12 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       ev("model.output.delta", { text: "先看一眼目录里有什么，再决定改哪一个文件。" }),
       ev("model.usage", { input_tokens: 180, output_tokens: 24, cost_micros: 0 }),
       ev("model.tool_call", {
-        name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-1",
+        name: "workspace.write_text",
+        arguments: {
+          path: "notes.txt",
+          text: "扫描每个 run 目录，把结论写下来。\n再补一句：只看 terminal 的。\n",
+        },
+        id: "stub-call-1",
       }),
       ev("approval.required", {
         status: "waiting_approval",
@@ -69,15 +74,22 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
           approval_id: "01a0122b-217e-7e72-bec8-ad3273f16cd2",
           execution: {
             binding_digest: "3be24149daa5170d4f45345772146ab599c5044abfae3e1daf546f03bb1591b9",
-            call: { arguments: { command: "ls -la" }, id: "stub-call-1", name: "shell.exec" },
+            call: {
+              id: "stub-call-1",
+              name: "workspace.write_text",
+              arguments: {
+                path: "notes.txt",
+                text: "扫描每个 run 目录，把结论写下来。\n再补一句：只看 terminal 的。\n",
+              },
+            },
             effect: "non_idempotent",
             sandbox: "trusted_native",
           },
           policy_digest: "210ca211f3b9a04823034901842751bf6f28720a6d4e1eb8bdc904446ef342c2",
           policy_snapshot: {
             approval: "ask", auto_approval: "never", effect: "non_idempotent",
-            required_scopes: ["tool:shell.exec"], sandbox: "trusted_native",
-            tool_name: "shell.exec",
+            required_scopes: ["tool:workspace.write"], sandbox: "trusted_native",
+            tool_name: "workspace.write_text",
           },
         },
       }),

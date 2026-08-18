@@ -435,6 +435,18 @@ p.note {
 .act .said .exit { display: flex; gap: 12px; margin-top: 3px; font-size: 10.5px; color: var(--ink-3); }
 .act .said .exit .warn { color: var(--accent); }
 
+/* What a write would change, inside the gate that is asking about it. Quiet
+   and monospaced: it is evidence for a decision, not a code editor. */
+.gate .review {
+  margin: 8px 0 10px; padding: 6px 0; max-height: 24em; overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+}
+.gate .review .line { padding: 0 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gate .review .line.same { color: var(--ink-3); }
+.gate .review .line.add { color: var(--ink); background: var(--accent-wash); }
+.gate .review .line.drop { color: var(--ink-3); text-decoration: line-through; }
+.gate .review .skip { padding: 3px 9px; color: var(--ink-3); font-size: 10.5px; }
+
 /* ---------- drawer ---------- */
 .drawer { border-left: 1px solid var(--rule); background: var(--sunk, var(--paper)); padding: 14px 15px; overflow-y: auto; }
 

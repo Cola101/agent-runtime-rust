@@ -86,20 +86,32 @@ export const RUN_PROCESS = "01a01519-9102-72e2-b80e-f0990dcbd799";
 /// with its cursors, from a runtime-host run recorded against a real PTY.
 export const PROCESS_SESSION = "01a0151c-914a-7c31-8f0d-1b7c1a4e5d20";
 
-const APPROVAL = {
+/// The call the pending approval is about.
+///
+/// Replaceable because whether a Run is parked on a person is the cursor's to
+/// say -- `withStreamed` keeps `run.approval` exactly as the page reported it,
+/// on purpose -- so a test cannot stream a different approval in. It has to be
+/// in the log, which is what this is for.
+export type PendingCall = { id: string; name: string; arguments: Record<string, unknown> };
+
+const SHELL_CALL: PendingCall = {
+  arguments: { command: "ls -la" }, id: "stub-call-1", name: "shell.exec",
+};
+
+const approvalOf = (call: PendingCall) => ({
   approval_id: APPROVAL_ID,
   execution: {
     binding_digest: "3be24149daa5170d4f45345772146ab599c5044abfae3e1daf546f03bb1591b9",
-    call: { arguments: { command: "ls -la" }, id: "stub-call-1", name: "shell.exec" },
+    call,
     effect: "non_idempotent",
     sandbox: "trusted_native",
   },
   policy_digest: "210ca211f3b9a04823034901842751bf6f28720a6d4e1eb8bdc904446ef342c2",
   policy_snapshot: {
     approval: "ask", auto_approval: "never", effect: "non_idempotent",
-    required_scopes: ["tool:shell.exec"], sandbox: "trusted_native", tool_name: "shell.exec",
+    required_scopes: ["tool:shell.exec"], sandbox: "trusted_native", tool_name: call.name,
   },
-};
+});
 
 export function event(
   sequence: number, type: string, payload: Record<string, unknown>,
@@ -154,7 +166,7 @@ type Log = { state: Record<string, unknown>; events: ReturnType<typeof event>[] 
 
 /// The runs this host has started, built per install so a test can hand the
 /// MCP round a request set of its own.
-function logs(mcpRequests: Record<string, unknown>): Record<string, Log> {
+function logs(mcpRequests: Record<string, unknown>, pending: PendingCall): Record<string, Log> {
   return {
     /// A whole PTY session as the durable log holds one.
     ///
@@ -227,8 +239,12 @@ function logs(mcpRequests: Record<string, unknown>): Record<string, Log> {
         // dev-runtime log. It nests the call inside `approval.required` and not
         // here, and a fake that nested both would let this client pass against a
         // shape the runtime does not emit.
-        event(4, "model.tool_call", { name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-1" }),
-        event(5, "approval.required", { approval: APPROVAL, status: "waiting_approval" }),
+        event(4, "model.tool_call", {
+          name: pending.name, arguments: pending.arguments, id: pending.id,
+        }),
+        event(5, "approval.required", {
+          approval: approvalOf(pending), status: "waiting_approval",
+        }),
       ],
     },
     // Suspended on an MCP server's input request. `suspended` is the boundary
@@ -418,6 +434,7 @@ export function installFakeRuntime(
     activeRunId = null, later = {}, gap = false, capped = false,
     unreadable = null, maxBranches = 32, mcpRequests = MCP_INPUT.requests,
     mcpApplied = [{ name: MCP_SERVER.name, digest: MCP_SERVER.digest }], failed = null,
+    pending = SHELL_CALL,
   }: {
     activeRunId?: string | null;
     later?: Record<string, FakeEvent[]>;
@@ -437,6 +454,9 @@ export function installFakeRuntime(
     /// Null by default: a state root does not usually hold one, and every other
     /// test would otherwise be reading a run list with a failure in it.
     failed?: "required_mcp_unavailable" | "budget_exhausted" | null;
+    /// The call the waiting Run is parked on. In the log rather than streamed,
+    /// because the cursor is what says a Run is parked at all.
+    pending?: PendingCall;
   } = {},
 ) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
@@ -463,7 +483,7 @@ export function installFakeRuntime(
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
   // Built per install, so a test can hand the MCP round a request set of its
   // own -- including one this build does not understand.
-  const runLogs = logs(mcpRequests);
+  const runLogs = logs(mcpRequests, pending);
   // The two payloads the Kernel actually writes, copied field for field. Only
   // one of them carries `servers` -- which is why a client that read the event
   // type without the kind would attribute a budget to a missing server.

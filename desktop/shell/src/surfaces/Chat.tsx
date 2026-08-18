@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { register } from "./registry";
 import {
   belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote, eventWords,
@@ -7,7 +7,7 @@ import {
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
-import { closeFind, findOpened, has, openFind, split, watchFind } from "./find";
+import { closeFind, findOpened, has, openFind, watchFind } from "./find";
 import { mentionAt, narrow, walkWorkspace, withMention } from "../mentions";
 import { McpInputForm } from "./McpInput";
 import { currentRun, useDesk, type Desk } from "../desk";
@@ -15,25 +15,8 @@ import { bridge, type RunEvent } from "../runtime";
 import type { RunView } from "../store";
 import { textOf, type SessionView } from "../session";
 import { lineage, subagentsOf, type SubagentState } from "../subagents";
-
-/// One run of drawn text, with whatever ⌘F is looking for marked in it.
-///
-/// `<mark>` is the element for this, and it is also how the finder counts: the
-/// marks standing in the column, in document order, are the hits. Everything
-/// the transcript draws that a person could search goes through here, and
-/// nothing that goes through here is invisible.
-function Mark({ text, query }: { text: string; query: string }) {
-  if (!query) return <>{text}</>;
-  return (
-    <>
-      {split(text, query).map((part, index) => (
-        part.hit
-          ? <mark key={index}>{part.text}</mark>
-          : <Fragment key={index}>{part.text}</Fragment>
-      ))}
-    </>
-  );
-}
+import { Mark } from "./Mark";
+import { WriteReview } from "./WriteReview";
 
 /// What one tool call draws: the tool's name, and its arguments as the line
 /// shows them. The fold asks this what it contains and the line renders from
@@ -153,6 +136,8 @@ function Note({ children }: { children: React.ReactNode }) {
 function Gate({ run, query }: { run: RunView; query: string }) {
   const approval = run.approval;
   if (!approval) return null;
+  const path = typeof approval.arguments.path === "string" ? approval.arguments.path : null;
+  const writing = typeof approval.arguments.text === "string" ? approval.arguments.text : null;
   return (
     <div className="gate">
       <div className="h"><Mark text="等你决定" query={query} /></div>
@@ -162,6 +147,9 @@ function Gate({ run, query }: { run: RunView; query: string }) {
           query={query}
         />
       </code>
+      {approval.toolName === "workspace.write_text" && path && writing !== null && (
+        <WriteReview path={path} text={writing} query={query} />
+      )}
       <div className="facts">
         <span><Mark text={effectLabel(approval.effect)} query={query} /></span>
         <span><Mark text={sandboxLabel(approval.sandbox)} query={query} /></span>
