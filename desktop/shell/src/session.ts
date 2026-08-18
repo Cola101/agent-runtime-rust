@@ -9,6 +9,14 @@
 import type { SessionHead, SessionTurn } from "./runtime";
 
 export type SessionView = {
+  /// What identifies a conversation on screen.
+  ///
+  /// The branch, not the Session. A Fork puts a second branch under one Session
+  /// id, and everything keyed by the Session alone then has two answers to one
+  /// question: which row is open, and whose Turns are in the cache. Both were
+  /// keyed by Session before Fork existed, when a Session held exactly one
+  /// branch and the difference could not show.
+  key: string;
   sessionId: string;
   branchId: string;
   generation: number;
@@ -46,8 +54,13 @@ export function titleFrom(turns: SessionTurn[]): string {
   return first ? textOf(first, "user") : "";
 }
 
+export function keyOf(conversation: { sessionId: string; branchId: string }): string {
+  return `${conversation.sessionId}/${conversation.branchId}`;
+}
+
 export function viewOf(head: SessionHead, turns: SessionTurn[], fallbackTitle = ""): SessionView {
   return {
+    key: keyOf({ sessionId: head.session_id, branchId: head.branch_id }),
     sessionId: head.session_id,
     branchId: head.branch_id,
     generation: head.generation,
@@ -58,12 +71,16 @@ export function viewOf(head: SessionHead, turns: SessionTurn[], fallbackTitle = 
   };
 }
 
-/// Newest first.
+/// Newest first, with a Session's branches kept together.
 ///
 /// Sound only because this client mints v7 session ids: the runtime returns
 /// heads sorted by `(session_id, branch_id)`, so with time-ordered ids that
 /// sort is chronological. See `ids.ts` -- with v4 ids this function would be
 /// putting a confident label on an arbitrary order.
+///
+/// The branch is the tiebreak rather than a second axis: a Fork is a second
+/// strand of the same conversation, and sorting it by its own age would file it
+/// among strangers -- newest at the top, its source somewhere far below.
 export function newestFirst(views: SessionView[]): SessionView[] {
-  return [...views].sort((a, b) => (a.sessionId < b.sessionId ? 1 : a.sessionId > b.sessionId ? -1 : 0));
+  return [...views].sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0));
 }

@@ -349,6 +349,50 @@ class LocalRuntime {
     return reply.receipt;
   }
 
+  /// Cut a second branch from a Session, carrying history through one Turn.
+  ///
+  /// `targetBranchId` is the caller's, and it is what identifies the Fork
+  /// afterwards: the daemon answers a repeated request from the branch that
+  /// request already produced, so a client that minted a fresh id on retry
+  /// would cut a second branch instead of finding the first.
+  ///
+  /// `sourceGeneration` is the same fence `continue` carries. A Fork from a
+  /// generation the branch has already left is refused rather than quietly cut
+  /// from history nobody is looking at any more.
+  async sessionFork(
+    { sessionId, sourceBranchId, sourceGeneration, throughTurnOrdinal, targetBranchId },
+  ) {
+    const reply = await this.#owner({
+      type: "session_fork",
+      session_id: sessionId,
+      source_branch_id: sourceBranchId,
+      source_generation: sourceGeneration,
+      through_turn_ordinal: throughTurnOrdinal,
+      target_branch_id: targetBranchId,
+    });
+    if (reply.type !== "session_head") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.head;
+  }
+
+  /// Take a branch back to a Turn, dropping every Turn after it.
+  ///
+  /// The branch moves to a new generation, and what it carries into the next
+  /// Turn is the shorter history. The daemon refuses an ordinal that is not
+  /// strictly earlier than the last committed Turn -- a Rollback that removes
+  /// nothing is a mistake, not a no-op -- which is why the surface only offers
+  /// this where there is something after the Turn to drop.
+  async sessionRollback({ sessionId, branchId, generation, throughTurnOrdinal }) {
+    const reply = await this.#owner({
+      type: "session_rollback",
+      session_id: sessionId,
+      branch_id: branchId,
+      generation,
+      through_turn_ordinal: throughTurnOrdinal,
+    });
+    if (reply.type !== "session_head") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.head;
+  }
+
   /// A branch's head: generation, turn count, history digest, and the run id of
   /// a Turn still in flight.
   async sessionRead({ sessionId, branchId }) {

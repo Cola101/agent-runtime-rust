@@ -223,6 +223,21 @@ function Delegations({ run }: { run: RunView }) {
   );
 }
 
+/// What one arming is aimed at.
+///
+/// Not the ordinal on its own. "回到第 1 轮" drops two Turns in a three-Turn
+/// conversation and three in a four-Turn one, and the head moves under a person
+/// who has armed and not yet fired: a Turn lands from another window, or a
+/// Rollback takes the branch to another generation and the Turns after this one
+/// are different Turns. So an arming names the head it was armed against, and a
+/// press that no longer matches arms again instead of firing -- what the second
+/// press destroys is what the first press named, or it destroys nothing.
+type Aim = { ordinal: number; generation: number; turnCount: number };
+
+const aimedAt = (armed: Aim | null, at: Aim): boolean =>
+  armed !== null && armed.ordinal === at.ordinal && armed.generation === at.generation
+    && armed.turnCount === at.turnCount;
+
 /// The committed conversation.
 ///
 /// Drawn from the Session's frozen transcripts rather than from the event log,
@@ -230,19 +245,81 @@ function Delegations({ run }: { run: RunView }) {
 /// what happened while a Turn ran, and the transcript is what the runtime
 /// carried into the next Turn as history. When a log is retired the events go
 /// and the conversation stays.
+///
+/// This is also where branching lives, because a Turn is the only place a
+/// person can point at when they mean "from here". Both operations take an
+/// ordinal, and the ordinal is on the row.
 function Turns({ session }: { session: SessionView }) {
+  const desk = useDesk();
+  /// One arming for the whole conversation. Reaching for a different Rollback
+  /// re-arms rather than fires, and a Fork disarms -- same rule as the approval
+  /// queue, where an armed destructive key must not survive the person deciding
+  /// to do something else.
+  const [armed, setArmed] = useState<Aim | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+
+  const fork = async (ordinal: number) => {
+    setArmed(null);
+    setFailed(await desk.fork(ordinal));
+  };
+  const rollback = async (at: Aim) => {
+    if (!aimedAt(armed, at)) {
+      setArmed(at);
+      return;
+    }
+    setArmed(null);
+    setFailed(await desk.rollback(at.ordinal));
+  };
+
   return (
     <>
       {session.turns.map((turn) => {
         const said = textOf(turn, "user");
         const back = textOf(turn, "assistant");
+        // Ordinals are 1..turn_count with nothing missing -- the runtime numbers
+        // each committed Turn by the length of the history before it -- so this
+        // is how many Turns a Rollback here would drop, counted rather than
+        // guessed. Zero on the last Turn, where the runtime refuses a Rollback
+        // that would remove nothing.
+        const after = session.turnCount - turn.turn_ordinal;
+        // The head this row was drawn from, carried into the arming: 撤掉后面
+        // N 轮 is that count, and the generation is which N Turns those are.
+        // Together they are what the person confirmed, rather than a number
+        // that merely happened to be on screen when they first pressed.
+        const at = {
+          ordinal: turn.turn_ordinal,
+          generation: session.generation,
+          turnCount: session.turnCount,
+        };
         return (
           <div className="turn" key={turn.digest || turn.turn_ordinal}>
             {said && <div className="ask">{said}</div>}
             {back && <div className="rep"><p>{back}</p></div>}
+            {/* Both are refused while a Turn is in flight, so neither is
+                offered then. A control that is certain to be refused is the
+                same mistake as a key hint for a key that does nothing. */}
+            {!session.activeRunId && (
+              <div className="branch">
+                <button type="button" className="flat" onClick={() => void fork(turn.turn_ordinal)}>
+                  从这里分叉
+                </button>
+                {after > 0 && (
+                  <button
+                    type="button"
+                    className="flat back"
+                    onClick={() => void rollback(at)}
+                  >
+                    回到这里
+                    <span className="dim">撤掉后面 {after} 轮</span>
+                    {aimedAt(armed, at) && <b className="arm">再按一次确认</b>}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         );
       })}
+      {failed && <div className="err">{failed}</div>}
     </>
   );
 }
@@ -290,7 +367,7 @@ function ChatView() {
     const node = scroller.current;
     if (!node || !pinned.current) return;
     node.scrollTop = node.scrollHeight;
-  }, [run?.events.length, run?.id, session?.turnCount, session?.sessionId]);
+  }, [run?.events.length, run?.id, session?.turnCount, session?.key]);
 
   return (
     <div
@@ -307,7 +384,12 @@ function ChatView() {
         <div className="empty">还没有对话。在下面写一句话就开始。</div>
       )}
 
-      {session && <Turns session={session} />}
+      {/* Keyed by branch, because what this holds belongs to one conversation:
+          an arming, and the runtime's answer to the last thing tried. The
+          branch is this component's identity rather than a fourth field in the
+          aim -- which is where an arming's safety actually rests, and where it
+          is watched. */}
+      {session && <Turns session={session} key={session.key} />}
 
       {run && (
         <>
