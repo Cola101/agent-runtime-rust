@@ -53,6 +53,14 @@ export function blocked(desk: Desk) {
   );
 }
 
+/// The runs whose log contains at least one `process.*` call.
+///
+/// Used for the cursor on the process surface, so j/k there steps between runs
+/// that have something to show rather than through every run in the list.
+export function withProcessSessions(desk: Desk) {
+  return byRecency(desk).filter((run) => run.processSessions.length > 0);
+}
+
 /// The run the transcript should show: the chosen one, or the most recently
 /// touched. Never silently a different run than the one the list highlights.
 export function currentRun(desk: Desk) {

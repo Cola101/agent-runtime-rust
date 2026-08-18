@@ -29,6 +29,70 @@ const PAGE_LIMIT = 256;
 const MAX_PAGES = 12;
 const POLL_MS = 1_200;
 
+/// One `ProcessSessionOutput` as a `tool.result` carried it.
+///
+/// Every field is the runtime's, including the words: `state` and
+/// `terminationReason` are `ProcessSessionState` and
+/// `ProcessSessionTerminationReason` verbatim.
+///
+/// The cursors are the load-bearing part. `from`/`to` are byte offsets into the
+/// session's own stdout or stderr log, so a client can say exactly which bytes
+/// it is holding and exactly where it is holding nothing — which is the whole
+/// difference between replaying a session and drawing one.
+export type ProcessOutput = {
+  sessionId: string;
+  state: string;
+  pid: number | null;
+  exitCode: number | null;
+  terminationReason: string | null;
+  stdout: string;
+  stdoutFrom: number;
+  stdoutTo: number;
+  stdoutTruncated: boolean;
+  stderr: string;
+  stderrFrom: number;
+  stderrTo: number;
+  stderrTruncated: boolean;
+};
+
+/// One `process.*` call, and whatever became of it.
+///
+/// `wrote` is the only record of what the agent sent: `process.start` carries
+/// `initial_stdin` and `process.write` carries `stdin`. Nothing anywhere in the
+/// log names the program those bytes are being typed at — see `ProcessSession`.
+export type ProcessCall = {
+  sequence: number;
+  timestamp: string;
+  /// The runtime's tool name, verbatim.
+  tool: string;
+  toolCallId: string;
+  arguments: Record<string, unknown>;
+  wrote: string | null;
+  output: ProcessOutput | null;
+  /// A failed `process.start` names the session it failed to start, so the
+  /// error carries a session id where the output would have.
+  error: { code: string; message: string; sessionId: string | null } | null;
+  /// Why this call has no output, when it has none. Both are separate event
+  /// types in the log, never inferred from the absence of a result.
+  outcome: "output" | "error" | "waiting" | "denied";
+};
+
+/// The calls of one durable process session, in log order.
+///
+/// What this deliberately does not have is a command. `process.start` takes no
+/// argv — the program is `AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE`, chosen by
+/// whoever launched the runtime-host, and it appears in no event. The only
+/// thing resembling an identity in the log is the policy snapshot's
+/// `implementation_digest`, which is a hash of the binary, not its path.
+export type ProcessSession = {
+  /// The runtime's session id, or null while a `process.start` has not come
+  /// back with one.
+  id: string | null;
+  /// Stable across polls so React can keep a row. Not shown.
+  key: string;
+  calls: ProcessCall[];
+};
+
 export type Approval = {
   approvalId: string;
   toolName: string;
@@ -66,6 +130,14 @@ export type RunView = {
   events: RunEvent[];
   text: string;
   toolCalls: { name: string; arguments: unknown }[];
+  /// The durable process sessions this run's log contains. Empty is a real
+  /// answer — it means no `process.*` call was recorded, not that the runtime
+  /// has no such tools. Nothing in the log states which tools are installed.
+  ///
+  /// Named apart from the Session/Turn conversation this client also holds:
+  /// they are different objects that happen to share a word, and one field
+  /// called `sessions` on two types is how they get confused.
+  processSessions: ProcessSession[];
   approval: Approval | null;
   tokens: number;
   costMicros: number;
@@ -86,6 +158,149 @@ export type RunView = {
 function payloadString(payload: Record<string, unknown>, key: string): string {
   const value = payload[key];
   return typeof value === "string" ? value : "";
+}
+
+/// Matched by prefix rather than against a list of the eight tools this build
+/// knows. A ninth `process.*` tool must show up as a call that happened, not
+/// vanish because this file was written before it existed.
+function isProcessTool(name: string): boolean {
+  return name.startsWith("process.");
+}
+
+/// `model.tool_call` in the durable log is flat — `{id, name, arguments}`. The
+/// nested `{call: {…}}` shape is what other payloads carry the same tool in,
+/// so both are read here rather than trusting one.
+function readCall(payload: Record<string, unknown>): {
+  id: string; name: string; arguments: Record<string, unknown>;
+} | null {
+  const call = (payload.call ?? payload) as Record<string, unknown>;
+  const name = call.name;
+  const id = call.id;
+  if (typeof name !== "string" || typeof id !== "string") return null;
+  return {
+    id, name,
+    arguments: (call.arguments as Record<string, unknown>) ?? {},
+  };
+}
+
+function num(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function readProcessOutput(content: unknown): ProcessOutput | null {
+  if (!content || typeof content !== "object") return null;
+  const body = content as Record<string, unknown>;
+  // A result is a session output only if it identifies a session and says what
+  // state it is in. Anything else — an error envelope, a shape from a future
+  // schema — is not decoded into one.
+  if (typeof body.session_id !== "string" || typeof body.state !== "string") return null;
+  return {
+    sessionId: body.session_id,
+    state: body.state,
+    pid: typeof body.pid === "number" ? body.pid : null,
+    exitCode: typeof body.exit_code === "number" ? body.exit_code : null,
+    terminationReason:
+      typeof body.termination_reason === "string" ? body.termination_reason : null,
+    stdout: typeof body.stdout === "string" ? body.stdout : "",
+    stdoutFrom: num(body.stdout_start_cursor),
+    stdoutTo: num(body.stdout_cursor),
+    stdoutTruncated: body.stdout_truncated === true,
+    stderr: typeof body.stderr === "string" ? body.stderr : "",
+    stderrFrom: num(body.stderr_start_cursor),
+    stderrTo: num(body.stderr_cursor),
+    stderrTruncated: body.stderr_truncated === true,
+  };
+}
+
+/// The bytes the agent sent on this call, or null if it sent none.
+///
+/// Read from the arguments the model actually produced, not from a guess about
+/// which tools take input: `process.start` and `process.write` are the only two
+/// that carry stdin, and they name the field differently.
+function readWrite(tool: string, args: Record<string, unknown>): string | null {
+  const field = tool === "process.start" ? "initial_stdin"
+    : tool === "process.write" ? "stdin"
+    : null;
+  if (!field) return null;
+  const value = args[field];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/// Every `process.*` call in one run's log, grouped into the sessions they name.
+///
+/// The grouping key is the runtime's `session_id` wherever the log has one: in
+/// the arguments of every call but `process.start`, and in the result — or the
+/// start-failure error — of that one. A `process.start` still parked on a
+/// person has no session id anywhere, and gets its own group rather than being
+/// filed under a session that does not exist yet.
+function readProcessSessions(events: RunEvent[]): ProcessSession[] {
+  const calls = new Map<string, ProcessCall>();
+  const order: string[] = [];
+
+  for (const event of events) {
+    if (event.type === "model.tool_call") {
+      const call = readCall(event.payload);
+      if (!call || !isProcessTool(call.name)) continue;
+      if (calls.has(call.id)) continue;
+      calls.set(call.id, {
+        sequence: event.sequence,
+        timestamp: event.timestamp,
+        tool: call.name,
+        toolCallId: call.id,
+        arguments: call.arguments,
+        wrote: readWrite(call.name, call.arguments),
+        output: null,
+        error: null,
+        outcome: "waiting",
+      });
+      order.push(call.id);
+      continue;
+    }
+    if (event.type === "tool.result") {
+      const id = event.payload.tool_call_id;
+      if (typeof id !== "string") continue;
+      const call = calls.get(id);
+      if (!call) continue;
+      const output = readProcessOutput(event.payload.content);
+      if (output) {
+        call.output = output;
+        call.outcome = "output";
+        continue;
+      }
+      const error = (event.payload.content as Record<string, unknown> | null)?.error as
+        | Record<string, unknown>
+        | undefined;
+      call.error = {
+        code: String(error?.code ?? ""),
+        message: String(error?.message ?? ""),
+        sessionId: typeof error?.session_id === "string" ? error.session_id : null,
+      };
+      call.outcome = "error";
+      continue;
+    }
+    if (event.type === "tool.denied") {
+      const execution = event.payload.execution as Record<string, unknown> | undefined;
+      const call = execution ? readCall(execution) : null;
+      const denied = call ? calls.get(call.id) : undefined;
+      if (denied) denied.outcome = "denied";
+    }
+  }
+
+  const sessions = new Map<string, ProcessSession>();
+  for (const id of order) {
+    const call = calls.get(id)!;
+    const fromArguments = call.arguments.session_id;
+    const sessionId =
+      call.output?.sessionId
+      ?? (typeof fromArguments === "string" ? fromArguments : null)
+      ?? call.error?.sessionId
+      ?? null;
+    const key = sessionId ?? `call:${call.toolCallId}`;
+    const existing = sessions.get(key);
+    if (existing) existing.calls.push(call);
+    else sessions.set(key, { id: sessionId, key, calls: [call] });
+  }
+  return [...sessions.values()];
 }
 
 function readApproval(payload: Record<string, unknown>): Approval | null {
@@ -184,6 +399,7 @@ function project(
     events,
     text,
     toolCalls,
+    processSessions: readProcessSessions(events),
     approval: lifecycle.kind === "waiting_approval" ? approval : null,
     tokens,
     costMicros,
@@ -238,7 +454,7 @@ function withStreamed(run: RunView, streamed: RunEvent[]): RunView {
 function failed(id: string, asked: string, error: CursorError): RunView {
   return {
     id, asked, lifecycle: { kind: "unrecognised" }, events: [], text: "",
-    toolCalls: [], approval: null, tokens: 0, costMicros: 0,
+    toolCalls: [], processSessions: [], approval: null, tokens: 0, costMicros: 0,
     startedAt: null, updatedAt: null, historyGap: false, truncated: false,
     earliestSequence: null, highestSequence: 0, error,
   };

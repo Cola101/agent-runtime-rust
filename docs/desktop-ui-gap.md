@@ -60,7 +60,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 22 | 子代理树（角色 / 深度 / 并发 / 预算子集） | 未做 | 内核做得最深的一块，UI 一个像素都没有 |
 | 23 | Session fork / rollback | 待接入 | 详情页工具栏有按钮，无界面 |
 | 23.5 | 子代理树 | 已接入 | 角色、状态、排队输入、代数、用量、分叉血缘，各字段都来自事件；每行可跳到子 Run |
-| 24 | 持久进程会话 / PTY | 未做 | `process.*` 工具族，需要终端面 |
+| 24 | 持久进程会话 / PTY | **已接入（不是终端）** | 进程会话面。渲染 `tool.result` 里 `ProcessSessionOutput` 真正带回来的字节，每段标出字节区间、缺口与重读。**不是终端**：本地适配器没有任何 `process.*` 调用，读不到实时输出也无法输入；日志里也没有程序路径 |
 | 25 | MCP resources / prompts 浏览 | 未做 | ADR-0116/0117 已实现读取契约 |
 | 26 | `indeterminate` 人工裁决 | 待接入 | 已在 Approvals 队列里设计 |
 | 27 | 事件游标 / 原始事件检查器 | 待接入 | 抽屉里有位置 |
@@ -74,6 +74,8 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | --- | --- |
 | ~~中途改向（#8）~~ | ✅ 已解除。取消拓扑、`select!` 安全时机、重绑、控制面四步落地并实测；`docs/evidence/2026-08-18-local-steer-blocker.md` 记录了定位、设计与三条守卫 |
 | 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
+| 同一个 Run 的第二次审批 | `ipc.rs` 的 `decide` 仍用 `legacy_command_id(run_id, kind, None)`：`(run_id, "approve")` 摘要成固定的 control command id，第二次 Approve 命中同一张回执并重放它，而不是决定新的问题。`Steer` 已经按 `steering_id` 派生命令 id，`decide` 没跟上——同一处代码里两种做法。一次进程会话要审 5 次（8 个 `process.*` 工具里有 5 个是 Ask），所以从窗口里只批得动第一次。实测于 `dev-runtime.sh` |
+| 实时进程输出 | Runtime 侧没有面向客户端的 `process.*` 读取契约。字节只在 Agent 调用工具时进入事件日志，`LocalRequest` 里也没有对应的动作。不是 UI 问题 |
 
 ## 五、推进顺序
 

@@ -8,6 +8,11 @@ import { vi } from "vitest";
 export const RUN_WAITING = "01a0122b-217e-7e72-bec8-ad3273f16cd1";
 export const RUN_DONE = "01a0122a-18c8-7012-972a-d422fe9abde8";
 export const RUN_LIVE = "01a01231-9f40-7d31-8c22-6b1a0e55c704";
+export const RUN_PROCESS = "01a01519-9102-72e2-b80e-f0990dcbd799";
+
+/// The durable process session the `process.*` events below belong to. Taken,
+/// with its cursors, from a runtime-host run recorded against a real PTY.
+export const PROCESS_SESSION = "01a0151c-914a-7c31-8f0d-1b7c1a4e5d20";
 
 const APPROVAL = {
   approval_id: "01a0122b-217e-7e72-bec8-ad3273f16cd2",
@@ -25,14 +30,50 @@ const APPROVAL = {
 };
 
 function event(
-  sequence: number, type: string, payload: Record<string, unknown>, minute = 0,
+  sequence: number, type: string, payload: Record<string, unknown>,
+  minute = 0, runId = RUN_WAITING,
 ) {
   return {
-    event_id: `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
-    sequence, run_id: RUN_WAITING,
-    timestamp: `2026-08-18T00:${String(minute).padStart(2, "0")}:0${sequence}.000Z`,
+    event_id: `${runId.slice(0, 8)}-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+    sequence, run_id: runId,
+    timestamp:
+      `2026-08-18T00:${String(minute).padStart(2, "0")}:${String(sequence % 60).padStart(2, "0")}.000Z`,
     type, payload, digest: "d".repeat(64),
   };
+}
+
+/// One `tool.result` carrying a `ProcessSessionOutput`.
+///
+/// Field names and the byte-cursor semantics are the runtime's: `stdout` is the
+/// range `[stdout_start_cursor, stdout_cursor)` of the session's own log, and
+/// `stdout_truncated` means a tail read started past bytes the log never got.
+function output(over: Record<string, unknown>) {
+  return {
+    session_id: PROCESS_SESSION,
+    state: "running",
+    pid: 66775,
+    exit_code: null,
+    termination_reason: null,
+    stdout: "", stdout_start_cursor: 0, stdout_cursor: 0, stdout_truncated: false,
+    stderr: "", stderr_start_cursor: 0, stderr_cursor: 0, stderr_truncated: false,
+    ...over,
+  };
+}
+
+function processCall(
+  sequence: number, id: string, name: string, args: Record<string, unknown>, runId: string,
+) {
+  return event(sequence, "model.tool_call", { id, name, arguments: args }, 20, runId);
+}
+
+function processResult(
+  sequence: number, id: string, content: Record<string, unknown>, runId: string,
+) {
+  return event(
+    sequence, "tool.result",
+    { tool_call_id: id, binding_digest: "b".repeat(64), content, is_error: false },
+    20, runId,
+  );
 }
 
 const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<typeof event>[] }> = {
@@ -67,7 +108,74 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       event(3, "model.tool_call", {
         name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
       }),
-      event(4, "run.succeeded", { status: "succeeded" }),
+      // A second run with a session, so "move to the next run that has one" is
+      // a key with somewhere to go.
+      processCall(4, "done-start", "process.start", { initial_stdin: "uname\n" }, RUN_DONE),
+      processResult(5, "done-start", output({
+        stdout: "Darwin\r\n", stdout_cursor: 8,
+      }), RUN_DONE),
+      event(6, "run.succeeded", { status: "succeeded" }),
+    ],
+  },
+  /// A whole PTY session as the durable log holds one.
+  ///
+  /// Every shape here was recorded from a runtime-host run against a real
+  /// `/bin/sh` on a PTY: the flat `model.tool_call` payload, the
+  /// `ProcessSessionOutput` inside `tool.result`, and the byte cursors that
+  /// make each read locatable. What is constructed rather than recorded is the
+  /// pair of bounded `process.attach` reads — a tail read whose `max_bytes` is
+  /// smaller than the log is how bytes the agent never read become a hole the
+  /// client has to say out loud.
+  [RUN_PROCESS]: {
+    state: { state: "terminal", status: "succeeded" },
+    events: [
+      event(1, "run.started", { status: "running" }, 20, RUN_PROCESS),
+      processCall(2, "call-start", "process.start", {
+        initial_stdin: "echo hello-from-session\n",
+        tty: true, cols: 100, rows: 30, yield_time_ms: 2000,
+      }, RUN_PROCESS),
+      // The PTY echoes what was typed before the shell has answered anything.
+      processResult(3, "call-start", output({
+        stdout: "echo hello-from-session\r\n", stdout_cursor: 25,
+      }), RUN_PROCESS),
+      processCall(4, "call-write", "process.write", {
+        session_id: PROCESS_SESSION, stdout_cursor: 25, stderr_cursor: 0,
+        stdin: "printf 'line-two\\n'\n", yield_time_ms: 2000,
+      }, RUN_PROCESS),
+      processResult(5, "call-write", output({
+        stdout: "printf 'line-two\\n'\r\n",
+        stdout_start_cursor: 25, stdout_cursor: 46,
+      }), RUN_PROCESS),
+      processCall(6, "call-poll", "process.poll", {
+        session_id: PROCESS_SESSION, stdout_cursor: 46, stderr_cursor: 0,
+      }, RUN_PROCESS),
+      processResult(7, "call-poll", output({
+        stdout_start_cursor: 46, stdout_cursor: 46,
+      }), RUN_PROCESS),
+      processCall(8, "call-attach", "process.attach", {
+        session_id: PROCESS_SESSION, max_bytes: 19,
+      }, RUN_PROCESS),
+      // The log reached 531 bytes while nothing was reading it. A 19-byte tail
+      // read starts at 512, and 46–512 exists only in the session's own file.
+      processResult(9, "call-attach", output({
+        stdout: "\u001b[32mline-two\u001b[0m\r\n",
+        stdout_start_cursor: 512, stdout_cursor: 531, stdout_truncated: true,
+      }), RUN_PROCESS),
+      processCall(10, "call-again", "process.attach", {
+        session_id: PROCESS_SESSION, max_bytes: 19,
+      }, RUN_PROCESS),
+      processResult(11, "call-again", output({
+        stdout: "\u001b[32mline-two\u001b[0m\r\n",
+        stdout_start_cursor: 512, stdout_cursor: 531, stdout_truncated: true,
+      }), RUN_PROCESS),
+      processCall(12, "call-close", "process.close", {
+        session_id: PROCESS_SESSION, stdout_cursor: 531, stderr_cursor: 0,
+      }, RUN_PROCESS),
+      processResult(13, "call-close", output({
+        state: "terminated", pid: null, termination_reason: "closed",
+        stdout_start_cursor: 531, stdout_cursor: 531,
+      }), RUN_PROCESS),
+      event(14, "run.succeeded", { status: "succeeded" }, 20, RUN_PROCESS),
     ],
   },
 };
@@ -195,6 +303,10 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
           { run_id: RUN_WAITING, input: "run a shell command", state: { state: "waiting_approval" } },
           { run_id: RUN_LIVE, input: "something still going", state: { state: "running" } },
           { run_id: RUN_DONE, input: "something finished", state: { state: "finished", status: "succeeded" } },
+          {
+            run_id: RUN_PROCESS, input: "open a shell session",
+            state: { state: "finished", status: "succeeded" },
+          },
         ],
         nextAfterRunId: null,
       },
