@@ -164,6 +164,16 @@ type Bridge = {
   sessionContinue(request: {
     sessionId: string; branchId: string; generation: number; runId: string; input: string;
   }): Promise<Reply<SessionTurnReceipt>>;
+  /// Both answer with the head of the branch the operation produced: Fork with
+  /// the new branch's, Rollback with the same branch's at its new generation.
+  /// Neither is a Turn -- nothing runs, and no model is asked anything.
+  sessionFork(request: {
+    sessionId: string; sourceBranchId: string; sourceGeneration: number;
+    throughTurnOrdinal: number; targetBranchId: string;
+  }): Promise<Reply<SessionHead>>;
+  sessionRollback(request: {
+    sessionId: string; branchId: string; generation: number; throughTurnOrdinal: number;
+  }): Promise<Reply<SessionHead>>;
   sessionRead(request: { sessionId: string; branchId: string }): Promise<Reply<SessionHead>>;
   sessionList(request?: {
     afterSessionId?: string | null; afterBranchId?: string | null; limit?: number;

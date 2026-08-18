@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld("desk", {
     steer: (request) => ipcRenderer.invoke("runtime:steer", request),
     sessionStart: (request) => ipcRenderer.invoke("session:start", request),
     sessionContinue: (request) => ipcRenderer.invoke("session:continue", request),
+    sessionFork: (request) => ipcRenderer.invoke("session:fork", request),
+    sessionRollback: (request) => ipcRenderer.invoke("session:rollback", request),
     sessionRead: (request) => ipcRenderer.invoke("session:read", request),
     sessionList: (request) => ipcRenderer.invoke("session:list", request),
     sessionHistory: (request) => ipcRenderer.invoke("session:history", request),

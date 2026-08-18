@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { register } from "./registry";
-import { since } from "./model";
+import { shortId, since } from "./model";
 import { LinkBanner } from "./Link";
 import { useDesk, type Desk } from "../desk";
 import type { SessionView } from "../session";
@@ -27,13 +27,13 @@ function name(session: SessionView): string {
 }
 
 function move(desk: Desk, delta: number): void {
-  const ids = desk.sessions.map((session) => session.sessionId);
-  if (ids.length === 0) return;
-  const at = desk.current ? ids.indexOf(desk.current.sessionId) : -1;
+  const rows = desk.sessions;
+  if (rows.length === 0) return;
+  const at = desk.current ? rows.findIndex((row) => row.key === desk.current!.key) : -1;
   const next = at === -1
-    ? (delta > 0 ? 0 : ids.length - 1)
-    : Math.min(Math.max(at + delta, 0), ids.length - 1);
-  desk.selectSession(ids[next]);
+    ? (delta > 0 ? 0 : rows.length - 1)
+    : Math.min(Math.max(at + delta, 0), rows.length - 1);
+  desk.selectSession(rows[next]);
 }
 
 function ConversationsToolbar() {
@@ -64,7 +64,16 @@ function ConversationsView() {
   useEffect(() => {
     body.current?.querySelector<HTMLElement>('[aria-selected="true"]')
       ?.scrollIntoView({ block: "nearest" });
-  }, [desk.current?.sessionId]);
+  }, [desk.current?.key]);
+
+  // How many rows each Session has. A Session with one branch is just a
+  // conversation and its branch id is noise; a Session with two is two rows
+  // with the same first sentence, and then the branch is the only thing that
+  // tells them apart.
+  const strands = new Map<string, number>();
+  for (const session of desk.sessions) {
+    strands.set(session.sessionId, (strands.get(session.sessionId) ?? 0) + 1);
+  }
 
   return (
     <div className="pane">
@@ -87,20 +96,20 @@ function ConversationsView() {
           </thead>
           <tbody ref={body}>
             {desk.sessions.map((session) => {
-              const open = desk.current?.sessionId === session.sessionId;
+              const open = desk.current?.key === session.key;
               return (
                 <tr
-                  key={session.sessionId}
+                  key={session.key}
                   tabIndex={0}
                   role="button"
                   aria-selected={open}
                   className={open ? "on" : ""}
-                  onClick={() => desk.selectSession(session.sessionId)}
-                  onDoubleClick={() => { desk.selectSession(session.sessionId); desk.go("chat"); }}
-                  onFocus={() => desk.selectSession(session.sessionId)}
+                  onClick={() => desk.selectSession(session)}
+                  onDoubleClick={() => { desk.selectSession(session); desk.go("chat"); }}
+                  onFocus={() => desk.selectSession(session)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
-                      desk.selectSession(session.sessionId);
+                      desk.selectSession(session);
                       desk.go("chat");
                     }
                   }}
@@ -114,6 +123,12 @@ function ConversationsView() {
                         saying: it is why an earlier Turn is no longer here. */}
                     {session.generation > 1 && (
                       <span className="flag">已回滚到第 {session.generation} 代</span>
+                    )}
+                    {/* Which strand this row is, and nothing about where it came
+                        from: a head carries no parent, so "分叉自……" would be a
+                        sentence the runtime never said. */}
+                    {(strands.get(session.sessionId) ?? 0) > 1 && (
+                      <span className="flag mono">分支 {shortId(session.branchId)}</span>
                     )}
                   </td>
                   <td className="num">{session.turnCount}</td>

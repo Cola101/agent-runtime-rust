@@ -16,7 +16,7 @@ import {
   type CursorError, type CursorPage, type Link, type RunEvent,
   type SessionHead, type SessionTurn, type ProviderView,
 } from "./runtime";
-import { newestFirst, viewOf, type SessionView } from "./session";
+import { keyOf, newestFirst, viewOf, type SessionView } from "./session";
 import { uuidv7 } from "./ids";
 import type { Lifecycle } from "./surfaces/model";
 
@@ -287,6 +287,9 @@ async function readHistory(
   return { turns, truncated: true };
 }
 
+/// Keyed by branch rather than by Session: two branches of one Session are two
+/// different conversations with two different histories, and one entry for both
+/// would hand a Fork its source's Turns.
 type HistoryCache = Map<string, { generation: number; turnCount: number; turns: SessionTurn[] }>;
 
 /// Fills in every conversation, re-reading as little as the runtime allows.
@@ -303,15 +306,16 @@ async function readSessions(
 ): Promise<SessionView[]> {
   const views: SessionView[] = [];
   for (const head of heads) {
-    const selected = head.session_id === current;
-    const cached = cache.get(head.session_id);
+    const key = keyOf({ sessionId: head.session_id, branchId: head.branch_id });
+    const selected = key === current;
+    const cached = cache.get(key);
     const stale = !cached
       || cached.generation !== head.generation
       || cached.turnCount !== head.turn_count
       || (selected && cached.turns.length < head.turn_count);
     if (stale && head.turn_count > 0) {
       const read = await readHistory(api, head, selected);
-      cache.set(head.session_id, {
+      cache.set(key, {
         generation: head.generation,
         turnCount: head.turn_count,
         turns: read.turns,
@@ -323,7 +327,7 @@ async function readSessions(
     const live = head.active_run_id
       ? runs.find((run) => run.id === head.active_run_id)?.asked ?? ""
       : "";
-    views.push(viewOf(head, cache.get(head.session_id)?.turns ?? [], live));
+    views.push(viewOf(head, cache.get(key)?.turns ?? [], live));
   }
   return newestFirst(views);
 }
@@ -342,7 +346,9 @@ export type Store = {
   /// The conversation the composer is writing into, or null for "the next
   /// thing typed starts a new one".
   current: SessionView | null;
-  selectSession(sessionId: string | null): void;
+  /// Opens one branch. A Session is not enough to name a conversation once it
+  /// has been forked, so the caller passes the branch it is pointing at.
+  selectSession(conversation: { sessionId: string; branchId: string }): void;
   /// Leave the current conversation, so the next thing typed starts a new one.
   newConversation(): void;
   /// Configured providers. Never carries a secret -- no bridge call returns
@@ -365,6 +371,17 @@ export type Store = {
   /// or an approval is unresolved, and the only honest evidence is
   /// `run.steer.applied` appearing in that Run's log.
   steer(input: string): Promise<string | null>;
+  /// Cut a new branch carrying this conversation through one Turn, and open it.
+  ///
+  /// Nothing is lost: the branch this was cut from keeps every Turn it had.
+  /// What the person gets is a second strand to say something else in, from a
+  /// point they chose.
+  fork(throughTurnOrdinal: number): Promise<string | null>;
+  /// Take this branch back to a Turn, dropping the Turns after it.
+  ///
+  /// Irreversible from the client's side: there is no call here that puts them
+  /// back, and the next Turn is given the shorter history.
+  rollback(throughTurnOrdinal: number): Promise<string | null>;
   submit(input: string): Promise<string | null>;
   decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
   refresh(): void;
@@ -416,14 +433,16 @@ export function useRuntime(): Store {
   const watching = useRef<string | null>(null);
   const [current, setCurrent] = useState<string | null>(null);
   const busy = useRef(false);
-  /// Read inside the poll, which must not be rebuilt every time the selection
-  /// changes -- that would restart the interval on every click.
-  const currentRef = useRef<string | null>(null);
+  /// The open branch, read inside the poll and by every write. A ref rather
+  /// than state because the poll must not be rebuilt every time the selection
+  /// changes -- that would restart the interval on every click -- and because a
+  /// write has to use the branch that is open now, not the one that was open
+  /// when its callback was built.
+  const open = useRef<{ sessionId: string; branchId: string } | null>(null);
   /// Whether the first list has already chosen a conversation. Without this
   /// the poll would re-open the newest one a second after the person asked for
   /// a new one, which reads as the button not working.
   const opened = useRef(false);
-  const branches = useRef(new Map<string, string>());
   const history = useRef<HistoryCache>(new Map());
 
   const load = useCallback(async () => {
@@ -466,21 +485,22 @@ export function useRuntime(): Store {
 
       const heads = await api.sessionList();
       if (heads.ok) {
-        for (const head of heads.value.heads) branches.current.set(head.session_id, head.branch_id);
         // Chosen before the histories are read, not after. Reading first would
         // fetch the conversation about to be opened as if it were a list row --
         // one Turn, its name -- and the person would watch the rest of it
         // arrive a poll later. Which conversation is open decides how much of
         // it to read, so it has to be decided first.
         if (!opened.current && heads.value.heads.length > 0) {
-          const newest = [...heads.value.heads]
-            .sort((a, b) => (a.session_id < b.session_id ? 1 : -1))[0];
+          const newest = [...heads.value.heads].sort((a, b) => {
+            if (a.session_id !== b.session_id) return a.session_id < b.session_id ? 1 : -1;
+            return a.branch_id < b.branch_id ? 1 : -1;
+          })[0];
           opened.current = true;
-          currentRef.current = newest.session_id;
-          setCurrent(newest.session_id);
+          open.current = { sessionId: newest.session_id, branchId: newest.branch_id };
+          setCurrent(keyOf(open.current));
         }
         setSessions(await readSessions(
-          api, heads.value.heads, currentRef.current, history.current, views,
+          api, heads.value.heads, open.current && keyOf(open.current), history.current, views,
         ));
       }
       // Last, and after the conversations rather than after the runs. This is
@@ -583,7 +603,7 @@ export function useRuntime(): Store {
   /// head names it. Following every run instead would hold a connection each
   /// for logs nobody is reading, and following "the selected run" would follow
   /// finished runs that have nothing left to say.
-  const live = sessions.find((session) => session.sessionId === current)?.activeRunId ?? null;
+  const live = sessions.find((session) => session.key === current)?.activeRunId ?? null;
   useEffect(() => {
     const api = bridge();
     if (!api?.watch) return;
@@ -596,8 +616,9 @@ export function useRuntime(): Store {
   const steer = useCallback(async (input: string) => {
     const api = bridge();
     if (!api?.steer) return "not running in the desktop host";
-    const runId = currentRef.current
-      ? sessions.find((session) => session.sessionId === currentRef.current)?.activeRunId ?? null
+    const at = open.current;
+    const runId = at
+      ? sessions.find((session) => session.key === keyOf(at))?.activeRunId ?? null
       : null;
     if (!runId) return "这轮已经结束了，直接说下一句";
     // One id per steer, minted here so a retry of the same call is idempotent
@@ -608,16 +629,16 @@ export function useRuntime(): Store {
     return null;
   }, [sessions, load]);
 
-  const selectSession = useCallback((sessionId: string | null) => {
+  const selectSession = useCallback((conversation: { sessionId: string; branchId: string }) => {
     opened.current = true;
-    currentRef.current = sessionId;
-    setCurrent(sessionId);
+    open.current = { sessionId: conversation.sessionId, branchId: conversation.branchId };
+    setCurrent(keyOf(conversation));
     void load();
   }, [load]);
 
   const newConversation = useCallback(() => {
     opened.current = true;
-    currentRef.current = null;
+    open.current = null;
     setCurrent(null);
   }, []);
 
@@ -631,25 +652,78 @@ export function useRuntime(): Store {
   const send = useCallback(async (input: string) => {
     const api = bridge();
     if (!api) return "not running in the desktop host";
-    const sessionId = currentRef.current;
-    const branchId = sessionId ? branches.current.get(sessionId) : undefined;
+    const at = open.current;
 
-    if (!sessionId || !branchId) {
+    if (!at) {
       const ids = { sessionId: uuidv7(), branchId: uuidv7(), runId: uuidv7() };
       const started = await api.sessionStart({ ...ids, input });
       if (!started.ok) return started.error;
-      branches.current.set(ids.sessionId, ids.branchId);
-      currentRef.current = ids.sessionId;
-      setCurrent(ids.sessionId);
+      open.current = { sessionId: ids.sessionId, branchId: ids.branchId };
+      setCurrent(keyOf(open.current));
       void load();
       return null;
     }
 
-    const head = await api.sessionRead({ sessionId, branchId });
+    const head = await api.sessionRead(at);
     if (!head.ok) return head.error;
     if (head.value.active_run_id) return "这轮还没结束，等它停下再说下一句";
     const reply = await api.sessionContinue({
-      sessionId, branchId, generation: head.value.generation, runId: uuidv7(), input,
+      ...at, generation: head.value.generation, runId: uuidv7(), input,
+    });
+    if (!reply.ok) return reply.error;
+    void load();
+    return null;
+  }, [load]);
+
+  /// Fork and Rollback, which share everything except what they do.
+  ///
+  /// Both read the head immediately before the write, for the same two reasons
+  /// `send` does: the branch refuses either while a Turn is in flight, and the
+  /// generation is a fence a rollback moves. Sending a remembered generation
+  /// gets a refusal that was avoidable by asking.
+  const fork = useCallback(async (throughTurnOrdinal: number) => {
+    const api = bridge();
+    if (!api) return "not running in the desktop host";
+    const at = open.current;
+    if (!at) return "还没有打开的对话";
+    const head = await api.sessionRead(at);
+    if (!head.ok) return head.error;
+    if (head.value.active_run_id) return "这轮还在跑，等它停下再分叉";
+    const reply = await api.sessionFork({
+      sessionId: at.sessionId,
+      sourceBranchId: at.branchId,
+      sourceGeneration: head.value.generation,
+      throughTurnOrdinal,
+      // The caller's id, and the Fork's identity afterwards: a retry that
+      // minted a fresh one would cut a second branch rather than find the
+      // first. Minted per attempt, which is what makes the retry the same
+      // request.
+      targetBranchId: uuidv7(),
+    });
+    if (!reply.ok) return reply.error;
+    // Open the head the reply carried, and only because a reply carried it: a
+    // refused Fork cut nothing, and moving the person into a branch no answer
+    // named would be drawing a conversation that does not exist. The id in that
+    // head is the one this call asked for -- the daemon identifies a Fork by
+    // its target, which is what makes a retry find the first cut instead of
+    // making a second -- so this reads the same value from the side that is
+    // authoritative about it.
+    open.current = { sessionId: reply.value.session_id, branchId: reply.value.branch_id };
+    setCurrent(keyOf(open.current));
+    void load();
+    return null;
+  }, [load]);
+
+  const rollback = useCallback(async (throughTurnOrdinal: number) => {
+    const api = bridge();
+    if (!api) return "not running in the desktop host";
+    const at = open.current;
+    if (!at) return "还没有打开的对话";
+    const head = await api.sessionRead(at);
+    if (!head.ok) return head.error;
+    if (head.value.active_run_id) return "这轮还在跑，等它停下再回滚";
+    const reply = await api.sessionRollback({
+      ...at, generation: head.value.generation, throughTurnOrdinal,
     });
     if (!reply.ok) return reply.error;
     void load();
@@ -675,8 +749,8 @@ export function useRuntime(): Store {
   return {
     link, runs: merged, policies: readPolicies(merged), loading, listedAt,
     sessions,
-    current: sessions.find((session) => session.sessionId === current) ?? null,
-    selectSession, newConversation, send, steer,
+    current: sessions.find((session) => session.key === current) ?? null,
+    selectSession, newConversation, send, steer, fork, rollback,
     providers, saveProvider, forgetProvider,
     submit, decide, refresh: () => void load(),
   };

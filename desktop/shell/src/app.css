@@ -531,6 +531,7 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
 .pane, .flow { padding: 20px 28px 14px; }
 .chrome-r { display: inline-flex; align-items: center; gap: 6px; }
 
+<<<<<<< HEAD
 /* ---------- keyboard reference ---------- */
 
 /* Two columns, not a table: the chords align so the eye can run down them,
@@ -573,3 +574,20 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
   border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px;
 }
 .keyref .crow .d { color: var(--ink-3); font-size: 11.5px; }
+=======
+/* ---------- branching ---------- */
+
+/* Where a conversation can be cut, drawn on the Turn it would be cut at.
+   Quiet and one line high: there is a row of these under every Turn, and
+   controls that competed with the words would turn a conversation into a
+   toolbar with paragraphs between the buttons. */
+.turn .branch { display: flex; gap: 16px; margin-top: 6px; font-size: 11.5px; }
+.turn .branch button.flat { color: var(--ink-3); }
+.turn .branch button.flat:hover { color: var(--ink); }
+.turn .branch .back:hover { color: var(--accent); }
+/* Armed: the second press is the one that drops Turns. The accent appears in a
+   transcript for an approval and for this, which are the two places where the
+   next click cannot be taken back. */
+.turn .branch .arm { color: var(--accent); font-weight: 600; }
+.flow > .err { color: var(--accent); font-size: 12px; }
+>>>>>>> worktree-wf_ee7bf5f1-0a3-4

@@ -215,6 +215,8 @@ ipcMain.handle("runtime:steer", guarded((request) => local.steer(request)));
 // invocation and none of it is the renderer's to choose.
 ipcMain.handle("session:start", guarded((request) => local.sessionStart(request)));
 ipcMain.handle("session:continue", guarded((request) => local.sessionContinue(request)));
+ipcMain.handle("session:fork", guarded((request) => local.sessionFork(request)));
+ipcMain.handle("session:rollback", guarded((request) => local.sessionRollback(request)));
 ipcMain.handle("session:read", guarded((request) => local.sessionRead(request)));
 ipcMain.handle("session:list", guarded((request) => local.sessionList(request ?? {})));
 ipcMain.handle("session:history", guarded((request) => local.sessionHistory(request)));

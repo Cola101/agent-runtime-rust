@@ -55,6 +55,10 @@ describe("the clock", () => {
       // minutes is enough to be certain: the fixture's Run started long enough
       // ago that the label is at minute resolution, and crossing two of them
       // cannot leave a live clock reading what it read before.
+      //
+      // Found twice, independently, by two people working in parallel branches
+      // -- which is the strongest evidence available that the diagnosis is the
+      // machinery and not the machine.
       await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
       expect(clock()).not.toBe(first);
     } finally {
