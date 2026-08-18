@@ -128,6 +128,46 @@ describe("the runtime this app owns", () => {
     expect(runtime.log.some((line: string) => line.includes("socket closed"))).toBe(true);
   }, 20_000);
 
+  /// Restarting is stop-then-start, and the second runtime has to be stoppable
+  /// the same way the first was -- otherwise quitting leaves every restarted
+  /// runtime behind, which is the one thing the quit path exists to prevent.
+  /// The restart control added for provider changes is what makes this
+  /// sequence reachable at all.
+  ///
+  /// What this does *not* cover, said here because it looked covered on the
+  /// first attempt: whether `openRuntime` picks `start` over `attach` after a
+  /// restart. `attach` drops ownership, and an app that attached to the corpse
+  /// of the runtime it just stopped would refuse to stop the next one. That
+  /// decision lives in `main.cjs`, needs Electron, and is not reachable from
+  /// here. An `owned` assertion in this test would be vacuous -- `start` sets
+  /// it either way, which is exactly what an earlier version of this test
+  /// asserted while proving nothing.
+  it("starts a second runtime after stopping the first, and stops that one too", async () => {
+    const dir = root();
+    const runtime = new RuntimeProcess();
+    const first = runtime.start({
+      binary: process.execPath, args: fakeRuntime(dir), stateRoot: dir,
+    });
+    await listening(runtime);
+
+    await runtime.stop({ drain: async () => ({ active_before_drain: 0 }) });
+    expect(runtime.running).toBe(false);
+
+    // `start` throws while a child is still held, so reaching here at all says
+    // the first one was released rather than merely signalled.
+    runtime.log.length = 0;
+    const second = runtime.start({
+      binary: process.execPath, args: fakeRuntime(dir), stateRoot: dir,
+    });
+    await listening(runtime);
+    expect(second).not.toBe(first);
+    expect(runtime.running).toBe(true);
+
+    const outcome = await runtime.stop({ drain: async () => ({ active_before_drain: 0 }) });
+    expect(outcome.stopped).toBe(true);
+    expect(runtime.running).toBe(false);
+  }, 20_000);
+
   it("refuses to stop a runtime it only attached to", async () => {
     const runtime = new RuntimeProcess();
     runtime.attach();
