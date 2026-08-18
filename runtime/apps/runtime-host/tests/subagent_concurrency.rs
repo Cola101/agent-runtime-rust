@@ -892,7 +892,29 @@ async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<Result
         )
         .await;
 
-        let child_closed = tokio::time::timeout(Duration::from_secs(1), async {
+        // Sequential, because the thing being measured is. The reap has to
+        // finish before the parent can make its next Provider call, so a
+        // deadline for the parent that starts here would be a deadline for the
+        // reap *and* the turn -- while the message it prints says "of the
+        // close". Both waited concurrently before, and under a full-parallel
+        // binary the reap ate the turn's budget and the failure blamed the
+        // turn. Waiting one after the other allows more wall clock in total,
+        // and that is the point rather than a side effect: it separates "the
+        // runtime is slow to continue after a close" from "the machine was
+        // busy during the close", which is the distinction the assertion is
+        // for.
+        //
+        // What this bound can and cannot see, because the first version of
+        // this comment claimed more than could be shown: it waits on an
+        // `accept`, and a connection the parent already opened sits in the
+        // backlog, so accepting late still returns at once. Delaying the
+        // accept by two and a half seconds does not fail the test. What it
+        // catches is the parent not having connected at all inside the window
+        // -- a liveness check, not a latency one. Making it a latency check
+        // would mean measuring at the runtime rather than at a socket this
+        // test happens to own.
+        let closing = std::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
             let mut byte = [0_u8; 1];
             loop {
                 match child.read(&mut byte).await {
@@ -900,27 +922,34 @@ async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<Result
                     Ok(_) => continue,
                 }
             }
-        });
-        let parent_result = tokio::time::timeout(Duration::from_secs(1), listener.accept());
-        let (closed, parent_result) = tokio::join!(child_closed, parent_result);
+        })
+        .await;
         match closed {
             Ok(true) => {}
             Ok(false) => {
                 return Err("the child stream ended without reaching end-of-stream".into());
             }
             Err(_) => {
-                return Err("agent.close did not reap the child stream within one second".into());
+                return Err(format!(
+                    "agent.close did not reap the child stream within one second (waited {:?})",
+                    closing.elapsed(),
+                ));
             }
         }
+        let reaped = std::time::Instant::now();
+        let parent_result = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
         let parent_after_close = match parent_result {
             Ok(Ok((socket, _))) => socket,
             Ok(Err(error)) => {
                 return Err(format!("the parent turn could not be accepted: {error}"));
             }
             Err(_) => {
-                return Err(
-                    "the parent's next turn did not arrive within one second of the close".into(),
-                );
+                return Err(format!(
+                    "the parent's next turn did not arrive within one second of the close \
+                     (the reap took {:?}, then waited {:?})",
+                    reaped.duration_since(closing),
+                    reaped.elapsed(),
+                ));
             }
         };
         let mut parent_after_close = parent_after_close;
