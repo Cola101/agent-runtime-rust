@@ -64,6 +64,61 @@ describe("a run of tool calls", () => {
     expect(screen.queryByText(/个工具调用/)).toBeNull();
   });
 
+  it("folds a real run of calls, which arrive with their results between them", async () => {
+    // Every test above emitted calls back to back, and no Run does that: the
+    // runtime writes `tool.result` after each call, so consecutive calls are
+    // never adjacent in a real log. Drawing a rule between every stage of every
+    // call is the thing the fold exists to prevent, and a successful result was
+    // drawing one -- which meant the fold had never once fired outside a test.
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    const done = (sequence: number, id: string) =>
+      bridge.emit(RUN_LIVE, bridge.event(sequence, "tool.result", {
+        tool_call_id: id, binding_digest: "b".repeat(64), content: {}, is_error: false,
+      }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "ls" }, id: "c0",
+    }, 30));
+    done(21, "c0");
+    bridge.emit(RUN_LIVE, bridge.event(22, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "cat notes.txt" }, id: "c1",
+    }, 30));
+    done(23, "c1");
+    bridge.emit(RUN_LIVE, bridge.event(24, "model.tool_call", {
+      name: "workspace.read_text", arguments: { path: "notes.txt" }, id: "c2",
+    }, 30));
+    done(25, "c2");
+
+    await waitFor(() => expect(screen.getByText("3 个工具调用")).toBeTruthy());
+    expect(screen.getByText(/shell\.exec ×2/)).toBeTruthy();
+    // And a result that succeeded says nothing of its own: the note carried no
+    // outcome, so it was a line per call that added nothing and cost the fold.
+    expect(screen.queryByText(/工具返回/)).toBeNull();
+  });
+
+  it("breaks the fold for a tool call that failed, and says it failed", async () => {
+    // The other half of the rule. A failure is not routine, and folding it into
+    // a tally would report a call that did not work as one of N that ran.
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "ls" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64),
+      content: { text: "no such file" }, is_error: true,
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(22, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "cat notes.txt" }, id: "c1",
+    }, 30));
+
+    await waitFor(() => expect(screen.getByText(/工具报错/)).toBeTruthy());
+    // Two calls either side of it, and neither folded into the other.
+    expect(screen.queryByText(/个工具调用/)).toBeNull();
+  });
+
   it("does not fold across what the model said in between", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

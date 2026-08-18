@@ -288,6 +288,17 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
       acts.push(event);
       continue;
     }
+    // A result belongs to the call above it, not between it and the next one.
+    // Drawn as its own line it separated every pair of consecutive calls, so
+    // the fold -- which exists precisely so that a turn with eleven calls is
+    // not eleven blocks -- had never fired outside a test that emitted calls
+    // with nothing in between. A success is folded in and says nothing of its
+    // own; a failure is not routine and gets the line, which is why it is the
+    // failure the note is now worded for.
+    if (event.type === "tool.result" && event.payload.is_error !== true) {
+      flushText(String(event.sequence));
+      continue;
+    }
     flushText(String(event.sequence));
     const note = eventNote(event.type);
     // Two reasons an event that has a note still does not get a hairline here.

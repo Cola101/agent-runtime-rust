@@ -147,7 +147,11 @@ const EVENT_NOTE: Record<string, string> = {
   /// taken against the digest that was on screen a moment ago no longer binds.
   "approval.rebound": "这次调用重新绑定了",
   "tool.denied": "已拒绝",
-  "tool.result": "工具返回",
+  /// Only ever drawn for a call that failed -- `Chat` folds a successful result
+  /// in with the call it answers. A successful one said nothing this note could
+  /// carry, and it said it between every two calls, which is what kept the fold
+  /// from ever firing.
+  "tool.result": "工具报错",
   /// The call's outcome was never observed, and its effect class made running
   /// it again safe. Whatever the tool touched, it may have touched twice.
   "tool.retry_requested": "结果未知，重试工具",
