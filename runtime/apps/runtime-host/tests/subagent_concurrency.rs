@@ -854,7 +854,15 @@ async fn spawn_async_handle_provider() -> (String, tokio::task::JoinHandle<bool>
     )
 }
 
-async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<bool>) {
+/// Reports which step of the close handshake did not happen.
+///
+/// It used to answer `bool`, and two independent one-second bounds -- the child
+/// stream closing, and the parent's next turn arriving -- both collapsed into
+/// the same `false`. The assertion then named one of them, so a failure of the
+/// other was reported as a cause it could not distinguish. Under a loaded full
+/// run either bound can be exceeded, which made "agent.close did not reap the
+/// active child stream" a message nobody could act on.
+async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<Result<(), String>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind provider");
@@ -895,12 +903,27 @@ async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<bool>)
         });
         let parent_result = tokio::time::timeout(Duration::from_secs(1), listener.accept());
         let (closed, parent_result) = tokio::join!(child_closed, parent_result);
-        let Ok(true) = closed else {
-            return false;
+        match closed {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err("the child stream ended without reaching end-of-stream".into());
+            }
+            Err(_) => {
+                return Err("agent.close did not reap the child stream within one second".into());
+            }
+        }
+        let parent_after_close = match parent_result {
+            Ok(Ok((socket, _))) => socket,
+            Ok(Err(error)) => {
+                return Err(format!("the parent turn could not be accepted: {error}"));
+            }
+            Err(_) => {
+                return Err(
+                    "the parent's next turn did not arrive within one second of the close".into(),
+                );
+            }
         };
-        let Ok(Ok((mut parent_after_close, _))) = parent_result else {
-            return false;
-        };
+        let mut parent_after_close = parent_after_close;
         let close_result = read_request(&mut parent_after_close).await;
         assert!(close_result.contains("cancelled"));
         respond(
@@ -908,7 +931,7 @@ async fn spawn_async_close_provider() -> (String, tokio::task::JoinHandle<bool>)
             &text_turn("parent closed async child"),
         )
         .await;
-        true
+        Ok(())
     });
     (
         format!("http://127.0.0.1:{port}/v1/chat/completions"),
@@ -3176,10 +3199,8 @@ async fn close_cancels_only_the_targeted_asynchronous_child_and_reaps_its_stream
     let observed_close = provider.await.expect("provider lifecycle");
     host.shutdown().await;
 
-    assert!(
-        observed_close,
-        "agent.close did not reap the active child stream"
-    );
+    // Whatever went wrong, the message says which step it was.
+    observed_close.expect("the close handshake did not complete");
     assert_eq!(outcome.status, RunStatus::Succeeded);
     assert_eq!(outcome.output, "parent closed async child");
     assert_eq!(

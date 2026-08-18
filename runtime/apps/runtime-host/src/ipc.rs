@@ -658,7 +658,7 @@ impl LocalRuntimeDaemon {
         // Run ids are UUIDv7, so descending id is newest first and is also a
         // stable paging order -- no timestamp to tie-break and no scan state to
         // keep between pages.
-        records.sort_by(|left, right| right.run_id.cmp(&left.run_id));
+        records.sort_by_key(|record| std::cmp::Reverse(record.run_id));
         let start = match after_run_id {
             Some(cursor) => records
                 .iter()

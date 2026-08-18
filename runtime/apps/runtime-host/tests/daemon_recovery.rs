@@ -287,6 +287,10 @@ async fn the_local_adapter_migrates_only_fully_legacy_run_identity() {
             input: "legacy local input".into(),
             state: LocalRunState::Interrupted {
                 reason: "legacy fixture".into(),
+                // What a record written before this field existed loads as.
+                // Naming it here rather than guessing a cause keeps the fixture
+                // a legacy record instead of quietly becoming a modern one.
+                cause: agent_runtime_host::RunInterruptCause::Unknown,
             },
             owner_epoch: 1,
         },
@@ -317,7 +321,12 @@ fn crash_after_first_checkpoint(config: LocalRuntimeConfig, accepted: Arc<Atomic
             let socket = default_socket_path(&config.state_root);
             let listener = LocalRuntimeDaemon::bind(&socket).await.expect("bind");
             let daemon = LocalRuntimeDaemon::new(config);
-            tokio::spawn(daemon.serve(listener));
+            tokio::spawn(std::sync::Arc::clone(&daemon).serve(listener));
+            // These tests hand a daemon a state root with work to resume, so
+            // recovery genuinely takes time and a client submitting into it is
+            // told `NotReady`. That is the contract; a test exercising what
+            // happens after recovery waits for it rather than racing it.
+            daemon.wait_until_ready().await;
             let run_id = submit(&socket, "Summarize the workspace.").await;
             // Both conditions: a Checkpoint on disk, and this daemon having
             // been the one the provider stranded.
@@ -346,7 +355,12 @@ fn crash_after_cancel_ack(config: LocalRuntimeConfig, accepted: Arc<AtomicU32>) 
             let socket = default_socket_path(&config.state_root);
             let listener = LocalRuntimeDaemon::bind(&socket).await.expect("bind");
             let daemon = LocalRuntimeDaemon::new(config);
-            tokio::spawn(daemon.serve(listener));
+            tokio::spawn(std::sync::Arc::clone(&daemon).serve(listener));
+            // These tests hand a daemon a state root with work to resume, so
+            // recovery genuinely takes time and a client submitting into it is
+            // told `NotReady`. That is the contract; a test exercising what
+            // happens after recovery waits for it rather than racing it.
+            daemon.wait_until_ready().await;
             let run_id = submit(&socket, "Summarize until cancelled.").await;
             wait_for("the run to checkpoint and reach the provider", || {
                 LocalRuntimeHost::checkpoint_path(&state_root, run_id).is_file()

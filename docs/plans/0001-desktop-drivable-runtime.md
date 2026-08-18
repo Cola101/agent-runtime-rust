@@ -70,7 +70,21 @@ session_list → session_history → session_rollback` 全程由一个**不提�
 
 生命周期部分尚未开始。
 
-## 阶段 1：应用生命周期
+## 阶段 1：应用生命周期 —— 已完成（2026-08-18）
+
+`runtime_lifecycle` 6/6，`owner_socket_contract` 6/6，全套 0.2 秒以内——因为期限从一开始就是构造参数，
+没有一个测试在干等。
+
+已落地：状态机与单次转换、多等待者同一答案、停止后不重启、恢复进度可见、关闭报告交接一次、
+**用户 Cancel 与 Runtime Stop 两条互不相干的路径**、单一任务注册点、admission `close()`、
+`Interrupted` 带来源与 Checkpoint 分类、`NotReady` 作为独立应答类型、SIGINT/SIGTERM 经同一 Controller
+（**真二进制实测**：排空 → 报告 → 退出 → 同目录重启，关闭前提交的 Run 重启后可见）。
+
+1.5 与 1.6 两个"说不清的失败"也已修好，且都**验证过守卫会失败**：
+子代理 close 现在报"父回合未在一秒内到达"而不是笼统的"没有回收子流"；
+`approval_flow` 缺二进制时 60 秒 → 0.00 秒并给出构建命令。**一个界都没有抬高。**
+
+
 
 沿用既定设计：状态机 `Created → Recovering → Ready → Draining → Stopped`、单次转换、多等待者结果一致、
 per-Profile 恢复隔离、admission `close()`、**用户 Cancel 与 Runtime Stop 是两条互不相干的路径**、

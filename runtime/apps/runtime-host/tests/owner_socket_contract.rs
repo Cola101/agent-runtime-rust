@@ -9,7 +9,7 @@
 
 use agent_protocol::RunBudget;
 use agent_runtime_host::ipc::{
-    LocalRequest, LocalResponse, LocalRuntimeDaemon, OwnerRequest, OwnerResponse, OwnerRunState,
+    LocalRequest, LocalResponse, LocalRuntimeDaemon, OwnerResponse, OwnerRunState,
     default_socket_path,
 };
 use agent_runtime_host::{
