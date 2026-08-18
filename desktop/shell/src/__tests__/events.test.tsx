@@ -109,6 +109,31 @@ describe("events the runtime reports about the exchange", () => {
     await waitFor(() => expect(screen.getByText(/你没让它执行：这个目录不要动/)).toBeTruthy());
   });
 
+  /// A reasoning model streams its thinking, and it has to be on screen.
+  ///
+  /// Found on a real self-hosted server: one short answer streamed 34
+  /// `delta.reasoning` fragments and 2 `delta.content` fragments, and the
+  /// adapter read only content -- so a person watched an empty screen for all
+  /// of the thinking and then saw four characters appear. On a coding task
+  /// that silence is most of the wall clock.
+  it("shows the model thinking, apart from what it answered", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "model.reasoning.delta", { text: "先看 " }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(41, "model.reasoning.delta", { text: "目录里有什么。" }, 30));
+    await waitFor(() => expect(screen.getByText(/先看 目录里有什么。/)).toBeTruthy());
+    // Its own block, not folded into the reply: on a reasoning model the
+    // thinking is most of the words, and burying the answer in it would be
+    // worse than the silence it replaces.
+    expect(screen.getByText("在想", { selector: ".think-tag" })).toBeTruthy();
+    // And the status line says the same thing, because that is what it is doing.
+    expect(screen.getAllByText("在想").length).toBeGreaterThan(1);
+
+    bridge.emit(RUN_LIVE, bridge.event(42, "model.output.delta", { text: "目录里有三样东西。" }, 30));
+    await waitFor(() => expect(screen.getByText("目录里有三样东西。")).toBeTruthy());
+    // Still both, still apart.
+    expect(screen.getByText(/先看 目录里有什么。/)).toBeTruthy();
+  });
+
   /// A configured MCP server that never came up.
   ///
   /// The Run carries on without those Tools, so the only observable difference

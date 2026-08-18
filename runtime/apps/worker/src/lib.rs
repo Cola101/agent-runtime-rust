@@ -6198,6 +6198,13 @@ impl WorkerProcessor {
             ModelStreamEvent::TextDelta { text, block: _ } => {
                 execution.assistant_text_buffer.push_str(&text);
             }
+            // Deliberately not buffered into the transcript. Streamed thinking
+            // is for the person watching now; whether it should also be sent
+            // back to the model on the next Turn is a durable-format decision,
+            // and every provider answers it differently. Today a provider that
+            // streams reasoning contributes nothing to the transcript, and this
+            // keeps that true while making the thinking visible.
+            ModelStreamEvent::ReasoningDelta { .. } => {}
             ModelStreamEvent::Reasoning {
                 summary,
                 private_state,

@@ -5,10 +5,10 @@ pub use read_only_shell::{ShellCommandClass, classify_shell_command};
 use agent_protocol::{
     ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope,
     MCP_INPUT_VERSION, McpInputContinuation, McpInputRequired, McpServerDiscoveryStatus,
-    ModelErrorKind, ModelFinishReason,
-    ModelStreamEvent, RunStatus, SandboxClass, SubagentForkReceipt, SubagentResultDelivery,
-    SubagentRollbackReceipt, SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalPolicySnapshot,
-    ToolApprovalRequest, ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
+    ModelErrorKind, ModelFinishReason, ModelStreamEvent, RunStatus, SandboxClass,
+    SubagentForkReceipt, SubagentResultDelivery, SubagentRollbackReceipt, SubagentSpawnMode,
+    SubagentSpawnRequest, ToolApprovalPolicySnapshot, ToolApprovalRequest, ToolCall,
+    ToolDescriptor, ToolEffect, ToolExecutionRequest,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -467,6 +467,18 @@ impl RunMachine {
                 // a client reads a Run it did not watch happen. Omitted when the
                 // provider gave none, so a record written before this existed
                 // and a stream that genuinely has no blocks read the same.
+                match block {
+                    Some(block) => json!({ "text": text, "block": block }),
+                    None => json!({ "text": text }),
+                },
+            ),
+            // Beside `model.output.delta` and shaped the same, because it is
+            // the same kind of thing: something the model is producing, now.
+            // A reasoning model spends most of a Turn here, and a client that
+            // cannot see it is a client showing a frozen screen.
+            ModelStreamEvent::ReasoningDelta { text, block } => self.emit(
+                RunStatus::Running,
+                "model.reasoning.delta",
                 match block {
                     Some(block) => json!({ "text": text, "block": block }),
                     None => json!({ "text": text }),

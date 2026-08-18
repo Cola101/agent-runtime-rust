@@ -383,6 +383,30 @@ async fn consume_chunk(
 ) -> Result<(), ProviderExecutionError> {
     for choice in chunk["choices"].as_array().into_iter().flatten() {
         let delta = &choice["delta"];
+        // Two spellings, one fact. `reasoning` is what a vLLM-served Qwen3
+        // emits; `reasoning_content` is DeepSeek's and what the SGLang and
+        // vLLM reasoning parsers produce. Neither was read, so on a reasoning
+        // model the entire thinking was dropped: one short answer from a real
+        // server streamed 34 reasoning fragments and 2 content fragments, and
+        // a person watched an empty screen for all of the first and then saw
+        // four characters.
+        let thinking = delta["reasoning"]
+            .as_str()
+            .or_else(|| delta["reasoning_content"].as_str())
+            .filter(|text| !text.is_empty());
+        if let Some(text) = thinking {
+            let block = choice["index"]
+                .as_u64()
+                .map(|index| u32::try_from(index).unwrap_or(u32::MAX));
+            emit(
+                events,
+                ModelStreamEvent::ReasoningDelta {
+                    text: text.into(),
+                    block,
+                },
+            )
+            .await?;
+        }
         if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
             // The choice's own index. This protocol has one content stream per
             // choice, so the choice *is* the block, and a provider asked for

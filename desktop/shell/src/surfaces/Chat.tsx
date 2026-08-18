@@ -316,9 +316,25 @@ const PARKS_THE_RUN: ReadonlySet<string> = new Set([
 function Transcript({ run, writing, query }: { run: RunView; writing: boolean; query: string }) {
   const blocks: React.ReactNode[] = [];
   let text = "";
+  /// What the model is thinking, as it arrives.
+  ///
+  /// Its own accumulator rather than folded into `text`, because it is not the
+  /// answer: on a reasoning model it is most of the wall clock and most of the
+  /// words, and mixing the two would bury the reply inside the deliberation.
+  let thinking = "";
   let acts: RunEvent[] = [];
   let unheard: RunEvent[] = [];
 
+  const flushThinking = (key: string) => {
+    if (!thinking) return;
+    blocks.push(
+      <div className="think" key={`k-${key}`}>
+        <span className="think-tag">在想</span>
+        <p><Mark text={thinking} query={query} /></p>
+      </div>,
+    );
+    thinking = "";
+  };
   const flushText = (key: string, last = false) => {
     if (!text) return;
     blocks.push(
@@ -365,10 +381,22 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
       continue;
     }
     flushUnheard(String(event.sequence));
+    // Streamed thinking. A provider that reasons out loud sends far more of
+    // this than of the answer -- a real server sent 34 fragments of thinking
+    // and 2 of answer for one short reply -- and until it was read the screen
+    // stayed empty for all of it.
+    if (event.type === "model.reasoning.delta") {
+      flushActs(String(event.sequence));
+      flushText(String(event.sequence));
+      thinking += String(event.payload.text ?? "");
+      continue;
+    }
     if (event.type === "model.output.delta") {
       // Text ends a run of calls: what the model says after using a tool is a
       // new part of the conversation, not more of the same fold.
       flushActs(String(event.sequence));
+      // The answer closes the thinking that led to it.
+      flushThinking(String(event.sequence));
       const at = typeof event.payload.block === "number" ? event.payload.block : undefined;
       if (text && at !== block) flushText(String(event.sequence));
       block = at;
@@ -429,6 +457,7 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
       }
     }
   }
+  flushThinking("end");
   flushText("end", true);
   flushActs("end");
   flushUnheard("end");

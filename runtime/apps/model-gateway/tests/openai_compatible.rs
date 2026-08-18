@@ -120,6 +120,107 @@ async fn real_http_sse_maps_request_and_emits_text_usage_then_completion() {
     );
 }
 
+/// A reasoning model streams its thinking, and this adapter dropped all of it.
+///
+/// The chunk shape is copied from a real server (a self-hosted vLLM serving
+/// Qwen3): one short answer produced 34 `delta.reasoning` chunks and 2
+/// `delta.content` chunks. Reading only `content` meant a person watched an
+/// empty screen for the whole of the thinking and then saw four characters
+/// appear -- and on a coding task that silence is most of the wall clock.
+///
+/// `reasoning_content` is the other spelling in the wild (DeepSeek's API and
+/// the vLLM/SGLang reasoning parsers), so both are read.
+#[tokio::test]
+async fn streamed_reasoning_is_reported_rather_than_dropped() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"We need \"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"two characters.\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let thinking = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        thinking, "We need two characters.",
+        "the model's thinking must reach the client: {events:?}",
+    );
+    // The answer is still the answer: reasoning is beside the content, not
+    // instead of it.
+    let answer = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(answer, "你好");
+}
+
+/// The other spelling, from the same family of servers.
+#[tokio::test]
+async fn reasoning_content_is_read_under_its_other_name() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ReasoningDelta { text, .. } if text == "thinking"
+        )),
+        "`reasoning_content` is the same fact under another name: {events:?}",
+    );
+}
+
 #[tokio::test]
 async fn cancellation_stops_a_live_provider_http_stream_without_waiting_for_timeout() {
     let first_delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"started\"},\"finish_reason\":null}]}\n\n";

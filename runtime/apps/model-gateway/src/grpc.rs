@@ -7,7 +7,8 @@ use agent_model_gateway_protocol::v1::model_execution_server::ModelExecution;
 use agent_model_gateway_protocol::v1::{
     Completed, Failed, FinishReason, ModelErrorKind as WireErrorKind, ModelEvent, ModelInvocation,
     PrivateStateOmitted as WirePrivateStateOmitted, ProviderPrivateState as WirePrivateState,
-    Reasoning as WireReasoning, Refusal as WireRefusal, TextDelta, ToolCall as WireToolCall, Usage,
+    Reasoning as WireReasoning, ReasoningDelta as WireReasoningDelta, Refusal as WireRefusal,
+    TextDelta, ToolCall as WireToolCall, Usage,
 };
 use agent_protocol::{
     ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
@@ -292,6 +293,9 @@ fn encode_event(sequence: u64, event: ModelStreamEvent) -> Result<ModelEvent, St
     let body = match event {
         ModelStreamEvent::TextDelta { text, block } => {
             EventBody::TextDelta(TextDelta { text, block })
+        }
+        ModelStreamEvent::ReasoningDelta { text, block } => {
+            EventBody::ReasoningDelta(WireReasoningDelta { text, block })
         }
         ModelStreamEvent::Usage {
             input_tokens,

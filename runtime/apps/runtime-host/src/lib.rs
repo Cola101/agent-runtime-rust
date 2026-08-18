@@ -5156,6 +5156,9 @@ impl LocalRuntimeHost {
         for event in events {
             match event {
                 ModelStreamEvent::TextDelta { text, .. } => summary.push_str(&text),
+                // A compaction summary is what the model wrote, not what it
+                // thought on the way there.
+                ModelStreamEvent::ReasoningDelta { .. } => {}
                 ModelStreamEvent::Usage {
                     input_tokens: input,
                     output_tokens: output,

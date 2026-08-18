@@ -558,6 +558,10 @@ function failedOver(payload: Record<string, unknown>): string[] | null {
 /// about the runtime.
 const DRAWN_ELSEWHERE: ReadonlySet<string> = new Set([
   "model.output.delta",
+  /// Drawn by the transcript itself, as its own quiet block, exactly as
+  /// `model.output.delta` is. Routine here means "not a note in the column",
+  /// not "unread".
+  "model.reasoning.delta",
   "model.tool_call",
   "approval.required",
   "subagent.spawn.requested",
@@ -640,6 +644,8 @@ export function doing(lastEventType: string | null): string | null {
     case "model.output.delta":
     case "model.reasoning":
       return "在回答";
+    case "model.reasoning.delta":
+      return "在想";
     case "model.tool_call":
     case "tool.execution.requested":
     case "tool.execution.started":

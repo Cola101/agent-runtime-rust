@@ -121,7 +121,19 @@ message ModelEvent {
     Reasoning reasoning = 8;
     Refusal refusal = 9;
     PrivateStateOmitted private_state_omitted = 10;
+    ReasoningDelta reasoning_delta = 11;
   }
+}
+
+// One fragment of the model's thinking, as it arrives.
+//
+// Beside Reasoning rather than instead of it: a provider that returns a
+// finished summary has something to commit, and a provider that streams the
+// thinking has something to show now. Shaped like TextDelta because it is the
+// same kind of thing.
+message ReasoningDelta {
+  string text = 1;
+  optional uint32 block = 2;
 }
 
 message TextDelta {

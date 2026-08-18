@@ -3025,6 +3025,28 @@ pub enum ModelStreamEvent {
         name: String,
         arguments: Value,
     },
+    /// One fragment of the model's thinking, as it arrives.
+    ///
+    /// Beside `Reasoning` rather than instead of it, because the two are
+    /// genuinely different facts. A provider that returns a finished summary
+    /// (OpenAI's Responses API) has something to put in the transcript; a
+    /// provider that streams the thinking token by token has something to put
+    /// on screen *now*, and nothing to commit until it ends.
+    ///
+    /// Added because a real reasoning server made the difference impossible to
+    /// ignore: one short answer streamed 34 reasoning fragments and 2 content
+    /// fragments, and reading only content meant the whole of the thinking was
+    /// dropped -- a person watched an empty screen and then saw four
+    /// characters. Codex models it the same way, as a delta beside the answer's
+    /// delta (`codex-rs/protocol/src/protocol.rs:1462`, `:1875-1883`).
+    ReasoningDelta {
+        text: String,
+        /// Which summary block this belongs to, when the provider says. Same
+        /// meaning as `TextDelta::block`: two blocks are two things, not one
+        /// thing cut in half.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block: Option<u32>,
+    },
     Reasoning {
         summary: Vec<String>,
         private_state: Option<ProviderPrivateState>,
