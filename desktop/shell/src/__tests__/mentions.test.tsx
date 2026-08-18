@@ -63,6 +63,21 @@ describe("naming a file with @", () => {
     expect(screen.queryByText("src")).toBeNull();
   });
 
+  /// A coding workspace keeps its files in folders. A completion that only knew
+  /// the root would miss every one of them, which is most of what anyone wants
+  /// to name -- and it would look like the file is not there rather than like
+  /// the completion cannot see it.
+  it("offers files inside folders, by the path the runtime would resolve", async () => {
+    const { user, box } = await composer();
+    await user.click(box);
+    await user.keyboard("@main");
+    // The fixture keeps `main.rs` under `src`, and what goes in the message is
+    // the path from the workspace root rather than the bare name.
+    await waitFor(() => expect(screen.getByText("src/main.rs")).toBeTruthy());
+    await user.click(screen.getByText("src/main.rs"));
+    await waitFor(() => expect(box.value).toBe("@src/main.rs "));
+  });
+
   /// An `@` in the middle of a word is an email address, a decorator, a handle.
   /// Opening a file list over one of those would interrupt ordinary typing.
   it("does not open on an @ that is inside a word", async () => {

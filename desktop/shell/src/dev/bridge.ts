@@ -333,14 +333,35 @@ export function installDevBridge() {
       root: "/tmp/dev-state/workspace", configured: true, choosable: true, fixedBy: null,
     }),
     chooseWorkspace: async () => ok({ chosen: "/Users/x/code", reason: null }),
-    listFiles: async (relative: string) => ok({
-      path: relative,
-      truncated: false,
-      entries: [
-        { name: "notes.txt", kind: "file" as const, size: 14, modified: "2026-08-18T09:00:00.000Z" },
-        { name: "runtime", kind: "folder" as const, size: null, modified: null },
-      ],
-    }),
+    // A tree rather than one listing repeated for every path. The first
+    // version answered the same two entries whatever it was asked for, which
+    // made the `@` walk see one folder inside itself forever and find nothing
+    // in it -- a fixture that does not stand for a workspace cannot be looked
+    // at to decide whether the thing that reads workspaces works.
+    listFiles: async (relative: string) => {
+      const tree: Record<string, { name: string; kind: "file" | "folder" }[]> = {
+        "": [
+          { name: "notes.txt", kind: "file" },
+          { name: "runtime", kind: "folder" },
+        ],
+        runtime: [
+          { name: "main.rs", kind: "file" },
+          { name: "crates", kind: "folder" },
+        ],
+        "runtime/crates": [{ name: "kernel.rs", kind: "file" }],
+      };
+      const entries = tree[relative];
+      if (!entries) return { ok: false as const, error: "no such path in the workspace" };
+      return ok({
+        path: relative,
+        truncated: false,
+        entries: entries.map((entry) => ({
+          ...entry,
+          size: entry.kind === "file" ? 14 : null,
+          modified: entry.kind === "file" ? "2026-08-18T09:00:00.000Z" : null,
+        })),
+      });
+    },
     readFile: async () => ok({
       path: "notes.txt", binary: false, size: 14, truncated: false, text: "扫描每个 run 目录",
     }),

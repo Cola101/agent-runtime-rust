@@ -63,3 +63,46 @@ export function narrow(names: string[], query: string, limit = 8): string[] {
   }
   return [...starts, ...contains].slice(0, limit);
 }
+
+/// Every file the workspace holds, as paths from its root.
+///
+/// Walked rather than listed, because a coding workspace keeps its files in
+/// folders and a completion that knew only the root would miss most of what
+/// anyone wants to name -- and would look like the file is absent rather than
+/// like the completion cannot see it.
+///
+/// Bounded on both axes, and the bounds are the point rather than a detail: a
+/// workspace can be a checkout with a hundred thousand files under it, and an
+/// unbounded walk would spend a person's first keystroke reading their disk.
+/// What is dropped is dropped silently here and said by the caller, because
+/// this function does not know whether anyone is looking.
+export async function walkWorkspace(
+  list: (path: string) => Promise<{ ok: true; value: { entries: { name: string; kind: string }[] } }
+    | { ok: false; error: string }>,
+  { maxDepth = 4, maxFiles = 2_000, maxFolders = 400 } = {},
+): Promise<{ files: string[]; complete: boolean }> {
+  const files: string[] = [];
+  let folders = 0;
+  let complete = true;
+  const queue: { path: string; depth: number }[] = [{ path: "", depth: 0 }];
+  while (queue.length > 0) {
+    const { path, depth } = queue.shift()!;
+    if (folders >= maxFolders) { complete = false; break; }
+    folders += 1;
+    const reply = await list(path);
+    // A folder that will not list is not a reason to abandon the rest. It is
+    // also not something to claim completeness over.
+    if (!reply.ok) { complete = false; continue; }
+    for (const entry of reply.value.entries) {
+      const full = path === "" ? entry.name : `${path}/${entry.name}`;
+      if (entry.kind === "folder") {
+        if (depth + 1 <= maxDepth) queue.push({ path: full, depth: depth + 1 });
+        else complete = false;
+        continue;
+      }
+      if (files.length >= maxFiles) { complete = false; continue; }
+      files.push(full);
+    }
+  }
+  return { files, complete };
+}

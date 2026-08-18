@@ -7,7 +7,7 @@ import {
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
 import { closeFind, findOpened, has, openFind, split, watchFind } from "./find";
-import { mentionAt, narrow, withMention } from "../mentions";
+import { mentionAt, narrow, walkWorkspace, withMention } from "../mentions";
 import { McpInputForm } from "./McpInput";
 import { currentRun, useDesk, type Desk } from "../desk";
 import { bridge, type RunEvent } from "../runtime";
@@ -826,6 +826,9 @@ export function Composer() {
   /// the filesystem between someone and their own typing.
   const [files, setFiles] = useState<string[] | null>(null);
   const [mention, setMention] = useState<{ at: number; query: string } | null>(null);
+  /// Whether the walk saw the whole workspace. A completion that quietly
+  /// stopped at a bound would read as "that file is not there".
+  const [whole, setWhole] = useState(true);
   const [pick, setPick] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -841,8 +844,9 @@ export function Composer() {
   useEffect(() => {
     const api = bridge();
     if (!api?.listFiles) return;
-    void api.listFiles("").then((reply) => {
-      if (reply.ok) setFiles(reply.value.entries.map((entry) => entry.name));
+    void walkWorkspace((path) => api.listFiles(path)).then((walked) => {
+      setFiles(walked.files);
+      setWhole(walked.complete);
     });
   }, []);
 
@@ -894,6 +898,9 @@ export function Composer() {
     <div className="write">
       {offered.length > 0 && (
         <ul className="mentions" role="listbox">
+          {!whole && (
+            <li className="capped">这个工作区太大，下面只是其中一部分</li>
+          )}
           {offered.map((name, index) => (
             <li key={name}>
               <button

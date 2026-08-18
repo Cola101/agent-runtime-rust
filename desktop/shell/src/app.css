@@ -415,6 +415,11 @@ p.note {
 }
 .mentions button:hover { color: var(--ink); }
 .mentions button.on { background: var(--accent-wash); color: var(--ink); }
+/* Said rather than left to look like the file is missing. */
+.mentions .capped {
+  padding: 3px 11px 5px; color: var(--ink-3); font-size: 11px;
+  border-bottom: 1px solid var(--rule-2); margin-bottom: 3px;
+}
 
 /* ---------- drawer ---------- */
 .drawer { border-left: 1px solid var(--rule); background: var(--sunk, var(--paper)); padding: 14px 15px; overflow-y: auto; }
