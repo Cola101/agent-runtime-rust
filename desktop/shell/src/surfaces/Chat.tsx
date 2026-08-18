@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { register } from "./registry";
 import {
-  belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote, eventWords,
+  belongsInConversation, callLine, costLabel, doing, effectLabel, elapsed, eventNote,
+  eventWords,
   size,
   knownEvent, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
 } from "./model";
@@ -23,8 +24,13 @@ import { WriteReview } from "./WriteReview";
 /// it, so a fold cannot decide it holds no match over a line that draws one.
 function callSpans(event: RunEvent): [string, string] {
   const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
-  const args = call.arguments;
-  return [String(call.name ?? ""), args ? JSON.stringify(args) : ""];
+  const name = String(call.name ?? "");
+  const args = (call.arguments ?? {}) as Record<string, unknown>;
+  // A write's argument is the file, and the result below this line already
+  // draws it. Spelling it out here would print the whole new content twice,
+  // once as an argument and once as what was written.
+  if (name === "workspace.write_text" && typeof args.path === "string") return [name, args.path];
+  return [name, call.arguments ? JSON.stringify(args) : ""];
 }
 
 /// What a finished call answered with.
@@ -142,10 +148,7 @@ function Gate({ run, query }: { run: RunView; query: string }) {
     <div className="gate">
       <div className="h"><Mark text="等你决定" query={query} /></div>
       <code className="cmd">
-        <Mark
-          text={`${approval.toolName}(${JSON.stringify(approval.arguments)})`}
-          query={query}
-        />
+        <Mark text={callLine(approval.toolName, approval.arguments)} query={query} />
       </code>
       {approval.toolName === "workspace.write_text" && path && writing !== null && (
         <WriteReview path={path} text={writing} query={query} />

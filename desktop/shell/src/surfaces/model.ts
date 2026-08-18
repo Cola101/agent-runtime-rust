@@ -257,6 +257,22 @@ export function size(bytes: number | null): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/// One tool call as a line.
+///
+/// The arguments are stringified because for most tools they are the call: a
+/// command, a path, a query. A write is the exception -- its argument *is* the
+/// file, so inlining it puts the whole new content above the comparison that
+/// exists to make it readable, and the path is what identifies the call
+/// anyway. Here rather than on either surface, because the transcript and the
+/// approval queue draw the same call and two spellings of it would be two
+/// answers to "what is being asked".
+export function callLine(name: string, args: Record<string, unknown>): string {
+  if (name === "workspace.write_text" && typeof args.path === "string") {
+    return `${name}(${args.path})`;
+  }
+  return `${name}(${JSON.stringify(args)})`;
+}
+
 /// What one event says, in words.
 ///
 /// Takes the payload as well as the type because one type is not always one

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
-import { effectLabel, sandboxLabel, shortId, since } from "./model";
+import { callLine, effectLabel, sandboxLabel, shortId, since } from "./model";
 import { WriteReview } from "./WriteReview";
 import { LinkBanner } from "./Link";
 import { McpInputForm } from "./McpInput";
@@ -109,9 +109,7 @@ function ApprovalsView() {
             {run.asked && <p className="q">{run.asked}</p>}
             {approval ? (
               <>
-                <code className="cmd">
-                  {approval.toolName}({JSON.stringify(approval.arguments)})
-                </code>
+                <code className="cmd">{callLine(approval.toolName, approval.arguments)}</code>
                 {/* The same comparison the transcript draws. This queue is
                     where someone comes *to* decide, so evidence there and not
                     here would leave the deciding surface the blind one. */}

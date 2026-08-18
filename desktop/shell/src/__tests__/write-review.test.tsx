@@ -69,6 +69,23 @@ describe("approving a write", () => {
     await waitFor(() => expect(screen.getByText(/\+two point five/)).toBeTruthy());
   });
 
+  /// The arguments line is `JSON.stringify` of the call, and for a write the
+  /// arguments *are* the file -- so a two-thousand-line write puts two
+  /// thousand lines in one `<code>` element above the comparison that was
+  /// added to make it readable. The path is what identifies the call; the
+  /// content is what the diff is for.
+  it("names the file being written rather than inlining all of it", async () => {
+    pendingWrite("one\n", "one\ntwo\n");
+    render(<App />);
+    const line = await screen.findByText(/workspace\.write_text\(notes\.txt\)/);
+    const gate = line.closest(".gate")!;
+    expect(gate.querySelector("code.cmd")!.textContent).toBe("workspace.write_text(notes.txt)");
+    // And nowhere on the screen is the whole new content printed as an
+    // argument -- the transcript's own call line names the file too, because
+    // the result underneath it already draws what was written.
+    expect(document.body.textContent).not.toContain('"text":');
+  });
+
   it("says a file is new rather than diffing against nothing", async () => {
     pendingWrite(null, "hello\n", "new.txt");
     render(<App />);
