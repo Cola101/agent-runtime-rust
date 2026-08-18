@@ -49,7 +49,12 @@ describe("the clock", () => {
       await waitFor(() => expect(screen.getByText("运行中")).toBeTruthy());
       const clock = () => screen.getByText(/^\d+[smh]/).textContent;
       const first = clock();
-      await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+      // Five minutes, not an hour. The cost of this line is one `load()` per
+      // POLL_MS of simulated time -- an hour was 3000 polls, and on a loaded
+      // machine that ran past the 5s budget more often than not. Five minutes
+      // is 250, and still crosses a unit the clock prints, which is all the
+      // assertion below is asking about.
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
       expect(clock()).not.toBe(first);
     } finally {
       vi.useRealTimers();
