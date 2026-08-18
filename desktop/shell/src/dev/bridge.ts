@@ -207,6 +207,9 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
         provider_id: "local-stub", provider_attempt: 2, delay_ms: 1500,
         kind: "rate_limited", status: "running",
       }, RUN_BROKE, 25),
+      ev("model.provider.selected", {
+        provider_id: "backup-stub", failed_provider_ids: ["local-stub"],
+      }, RUN_BROKE, 25),
       ev("model.usage", { input_tokens: 399_000, output_tokens: 1_400, cost_micros: 8_200 }, RUN_BROKE, 25),
       ev("run.failed", {
         status: "failed", kind: "budget_exhausted", dimension: "tokens", retryable: false,

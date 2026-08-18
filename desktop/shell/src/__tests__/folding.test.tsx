@@ -405,6 +405,36 @@ describe("what the runtime said in words", () => {
     await waitFor(() => expect(screen.getByText(/moon_phase/)).toBeTruthy());
   });
 
+  /// Which Provider answered is bookkeeping right up until it is not the one
+  /// that was asked. `failed_provider_ids` says a failover happened, and a Run
+  /// answered by a fallback is a Run answered by a different model, at a
+  /// different price, behaving differently -- and it looked identical.
+  it("says when a Run was answered by a Provider that was not the first choice", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.selected", {
+      provider_id: "backup", failed_provider_ids: ["local-stub"],
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/backup/)).toBeTruthy());
+    expect(screen.getByText(/local-stub/)).toBeTruthy();
+  });
+
+  /// And stays quiet when the first choice answered, which is every ordinary
+  /// turn. A line per turn saying which Provider answered would be a machine
+  /// log printed through a conversation.
+  it("says nothing when the Provider asked is the Provider that answered", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.selected", {
+      provider_id: "local-stub", failed_provider_ids: [],
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "model.output.delta", { text: "答完了" }, 30));
+    await waitFor(() => expect(screen.getByText(/答完了/)).toBeTruthy());
+    expect(screen.queryByText(/选定 Provider/)).toBeNull();
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

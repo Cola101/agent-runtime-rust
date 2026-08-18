@@ -122,7 +122,10 @@ const EVENT_NOTE: Record<string, string> = {
   /// A terminal, and the only one of the six that had no line. Every other way
   /// a Run ends says so where it ended.
   "run.timed_out": "Run 超时",
-  "model.provider.selected": "选定 Provider",
+  /// Only ever drawn when a failover happened -- `belongsInConversation` keeps
+  /// it out of the column otherwise -- so the words are about the change of
+  /// Provider rather than about the ordinary act of choosing one.
+  "model.provider.selected": "换了 Provider",
   "model.provider.failed": "Provider 失败",
   /// The pause has a reason and a length. Without this the transcript simply
   /// stops for `delay_ms`, which reads as a hang.
@@ -326,6 +329,12 @@ function providerRetry(payload: Record<string, unknown>): string | null {
 }
 
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
+  if (type === "model.provider.selected") {
+    const failed = failedOver(payload);
+    if (!failed) return null;
+    const chose = typeof payload.provider_id === "string" ? payload.provider_id : "另一个 Provider";
+    return [`换成了 ${chose} 来答，因为 ${failed.join("、")} 没答应`];
+  }
   if (type === "model.provider.failed") {
     const why = providerFailure(payload);
     return why ? [why] : null;
@@ -389,8 +398,24 @@ const ROUTINE: ReadonlySet<string> = new Set([
 /// exchange. A Provider failing, a Run restored from a Checkpoint, a tool
 /// denied, a redirect applied -- each of those changes the reading of what
 /// follows it, and each stays. Starting and finishing normally does not.
-export function belongsInConversation(type: string): boolean {
+export function belongsInConversation(
+  type: string,
+  payload: Record<string, unknown> = {},
+): boolean {
+  // Which Provider answered is bookkeeping on every ordinary turn, and a line
+  // per turn saying so would be a machine log printed through a conversation.
+  // It stops being bookkeeping the moment it is not the Provider that was
+  // asked: a Run answered by a fallback is answered by a different model, at a
+  // different price, behaving differently -- and it looked identical.
+  if (type === "model.provider.selected") return failedOver(payload) !== null;
   return !ROUTINE.has(type);
+}
+
+/// The Providers that did not answer, when any did not.
+function failedOver(payload: Record<string, unknown>): string[] | null {
+  const failed = payload.failed_provider_ids;
+  if (!Array.isArray(failed) || failed.length === 0) return null;
+  return failed.map(String);
 }
 
 /// Types the conversation column draws as something other than a note.

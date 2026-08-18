@@ -406,7 +406,7 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
     // events that park the Run on a person are drawn as their own gate below,
     // with what they are asking for; a hairline saying it happened as well
     // would be the same fact twice.
-    if (note && !PARKS_THE_RUN.has(event.type) && belongsInConversation(event.type)) {
+    if (note && !PARKS_THE_RUN.has(event.type) && belongsInConversation(event.type, event.payload)) {
       flushActs(String(event.sequence));
       blocks.push(
         <Note key={event.event_id || event.sequence}>
