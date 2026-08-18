@@ -162,7 +162,13 @@ function project(
         });
         break;
       }
+      // Both carry a whole `ToolApprovalRequest`, and the rebound one is the
+      // request re-issued under a fresh binding after a recovery. Reading only
+      // the first left the gate offering a digest the runtime had already
+      // replaced -- a decision taken against it does not bind, so the screen
+      // was showing a button that could not do what it said.
       case "approval.required":
+      case "approval.rebound":
         approval = readApproval(event.payload);
         break;
       // An answered approval clears the one on screen. Without this a decided

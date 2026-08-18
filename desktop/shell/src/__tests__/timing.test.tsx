@@ -76,15 +76,36 @@ describe("what it says the Run is doing", () => {
     expect(doing(null)).toBeNull();
   });
 
-  it("shows the raw type when it does not recognise the last event", async () => {
+  it("shows the raw type when it has no phrase for the last event", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);
     await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
     bridge.emit(RUN_LIVE, bridge.event(40, "model.private_state.omitted", {}, 30));
-    // Named rather than smoothed over: an event this build does not know is
-    // worth seeing, and the type is what makes it lookupable.
-    await waitFor(() =>
-      expect(screen.getByText("model.private_state.omitted")).toBeTruthy());
+    // Named rather than smoothed over: an event with no phrase for it is worth
+    // seeing, and the type is what makes it lookupable.
+    //
+    // Found by its title rather than by its text. The transcript names the
+    // same type on the line it drew for the event, and a bare `getByText` was
+    // asserting "this string is somewhere on the page" -- which stopped being
+    // a statement about the status line the moment anything else said it too.
+    await waitFor(() => {
+      // A type this build knows and has no phrase for. It says that, and not
+      // that it does not recognise the type -- which would be the window
+      // making a false admission about itself.
+      const said = screen.getByTitle("这个版本没有给这个事件写说法");
+      expect(said.textContent).toBe("model.private_state.omitted");
+    });
+  });
+
+  it("says it does not recognise a type only when nothing here accounts for it", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(40, "policy.reloaded", {}, 30));
+    await waitFor(() => {
+      const said = screen.getByTitle("这个版本不认识这个事件类型");
+      expect(said.textContent).toBe("policy.reloaded");
+    });
   });
 
   it("says nothing about activity once the Run is over", async () => {

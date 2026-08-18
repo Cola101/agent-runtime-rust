@@ -97,17 +97,70 @@ const EVENT_NOTE: Record<string, string> = {
   "run.resumed": "已批准，继续执行",
   "run.restored": "从 Checkpoint 恢复",
   "run.steer.applied": "已改向",
+  /// A terminal, and the only one of the six that had no line. Every other way
+  /// a Run ends says so where it ended.
+  "run.timed_out": "Run 超时",
   "model.provider.selected": "选定 Provider",
   "model.provider.failed": "Provider 失败",
+  /// The pause has a reason and a length. Without this the transcript simply
+  /// stops for `delay_ms`, which reads as a hang.
+  "model.provider.retry_scheduled": "已安排重试 Provider",
   "model.tool_call": "模型请求调用工具",
   "model.turn.completed": "本轮结束",
+  /// The model answered by refusing. It is an answer, not a failure: the Run
+  /// keeps running and the next thing on screen is the model's, so a refusal
+  /// that left no mark made the reply look like it changed its mind.
+  "model.refusal": "模型拒绝回答",
+  /// Not bookkeeping: the payload is a summary the model wrote. It is here for
+  /// the same reason the refusal is -- the runtime reported words, and words
+  /// dropped are words dropped. Named as reasoning so it cannot be mistaken
+  /// for the reply it sits next to.
+  "model.reasoning": "模型的推理摘要",
+  /// A failover carried the conversation to another Provider but could not
+  /// carry the first one's private reasoning state. What follows was written
+  /// by a model that no longer has it.
+  "model.private_state.omitted": "换 Provider 时丢了推理状态",
   "approval.required": "需要你决定",
+  /// Recovery re-issued the pending approval under a fresh binding. A decision
+  /// taken against the digest that was on screen a moment ago no longer binds.
+  "approval.rebound": "这次调用重新绑定了",
   "tool.denied": "已拒绝",
   "tool.result": "工具返回",
+  /// The call's outcome was never observed, and its effect class made running
+  /// it again safe. Whatever the tool touched, it may have touched twice.
+  "tool.retry_requested": "结果未知，重试工具",
+  /// Everything before this is a summary now. The model's memory of it is not
+  /// what the transcript above says, which is exactly the kind of thing a
+  /// person re-reading a reply needs to know.
+  "context.compacted": "上文压成了摘要",
+  /// The other way a Run parks itself on a person. `approval.required` has the
+  /// gate to speak for it; this one had nothing, so a Run that stopped waiting
+  /// for an answer looked like a Run that had stopped.
+  "mcp.input.required": "工具要一个输入",
+  "mcp.input.resolved": "输入已提交",
 };
 
 export function eventNote(type: string): string | null {
   return EVENT_NOTE[type] ?? null;
+}
+
+/// Events whose payload carries words rather than only a name.
+///
+/// A hairline and a label are enough for an event that *is* its name. They are
+/// not enough when the runtime reported prose: a refusal says why it refused
+/// and a reasoning summary says what the model thought it was doing. Reducing
+/// either to six characters and a type name drops what the runtime said, which
+/// is the same loss as not drawing the event at all.
+const EVENT_WORDS: Record<string, string> = {
+  "model.refusal": "text",
+  "model.reasoning": "summary",
+};
+
+export function eventWords(type: string, payload: Record<string, unknown>): string | null {
+  const field = EVENT_WORDS[type];
+  if (!field) return null;
+  const words = payload[field];
+  return typeof words === "string" && words.trim() !== "" ? words : null;
 }
 
 /// Bookkeeping the conversation does not need to carry.
@@ -130,6 +183,21 @@ const ROUTINE: ReadonlySet<string> = new Set([
   "model.provider.selected",
   "model.turn.completed",
   "model.usage",
+  /// The four stages of one tool call. The call itself is already a line of
+  /// the transcript, and it is folded with its neighbours precisely so that a
+  /// turn with eleven calls is not eleven blocks; a rule drawn between every
+  /// stage of every call would undo that and say nothing the call does not.
+  /// `auto_approved` is the borderline one -- it means policy exempted a call
+  /// that would otherwise have asked -- and it loses on frequency: it happens
+  /// once per exempted call, and its reason, snapshot and policy digest are
+  /// all in the drawer.
+  "tool.execution.requested",
+  "tool.execution.auto_approved",
+  "tool.execution.started",
+  "tool.execution.progress",
+  /// The other half of `mcp.input.resolved`, which stays. One resumption, and
+  /// the half that says the input landed is the half a person is waiting for.
+  "mcp.input.continuation.started",
 ]);
 
 /// Whether an event belongs in the conversation column.
@@ -140,6 +208,45 @@ const ROUTINE: ReadonlySet<string> = new Set([
 /// follows it, and each stays. Starting and finishing normally does not.
 export function belongsInConversation(type: string): boolean {
   return !ROUTINE.has(type);
+}
+
+/// Types the conversation column draws as something other than a note.
+///
+/// The model's prose, its tool calls, the approval gate and the delegation
+/// panel are all rendered from these, elsewhere in `Chat`. They are listed
+/// here for one reason: so that "this build has never heard of this type"
+/// stays a true sentence. An event drawn as a subagent row is not an unknown
+/// event, and saying so on screen would be a lie about the client rather than
+/// about the runtime.
+const DRAWN_ELSEWHERE: ReadonlySet<string> = new Set([
+  "model.output.delta",
+  "model.tool_call",
+  "approval.required",
+  "subagent.spawn.requested",
+  "subagent.spawned",
+  "subagent.forked",
+  "subagent.rolled_back",
+  "subagent.input.accepted",
+  "subagent.input.activated",
+  "subagent.terminal.observed",
+  "subagent.result.received",
+  "subagent.closed",
+]);
+
+/// Whether this build has an account of the type at all.
+///
+/// Three sets, and between them they have to cover everything the runtime
+/// emits. A type in none of them is one this client was written before: it has
+/// a name, a sequence and a payload, all of them real, and the one thing that
+/// must not happen to it is nothing. `Unheard` in `Chat` draws it.
+///
+/// This is deliberately not the same question as `belongsInConversation`. That
+/// one is a judgement about a type someone here has read; there is no such
+/// judgement to make about a type nobody has, and defaulting an unknown to
+/// "routine" would hide exactly the events this client is least equipped to
+/// have an opinion about.
+export function knownEvent(type: string): boolean {
+  return type in EVENT_NOTE || ROUTINE.has(type) || DRAWN_ELSEWHERE.has(type);
 }
 
 /// Relative time, in the granularity a person actually reads. Absolute

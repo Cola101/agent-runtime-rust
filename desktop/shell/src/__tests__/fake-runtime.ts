@@ -24,7 +24,7 @@ const APPROVAL = {
   },
 };
 
-function event(
+export function event(
   sequence: number, type: string, payload: Record<string, unknown>, minute = 0,
 ) {
   return {
@@ -118,7 +118,17 @@ const TURNS = [
   },
 ];
 
-export function installFakeRuntime({ activeRunId = null }: { activeRunId?: string | null } = {}) {
+type FakeEvent = ReturnType<typeof event>;
+
+/// `later` appends to a run's durable log, so a test can set up a Run that had
+/// already written something before this client read it. `emit` cannot stand in
+/// for that: a streamed event is folded onto a Run whose boundary and pending
+/// approval came from the cursor, which is exactly the distinction the store
+/// draws on purpose.
+export function installFakeRuntime(
+  { activeRunId = null, later = {} }:
+  { activeRunId?: string | null; later?: Record<string, FakeEvent[]> } = {},
+) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
   const head = () => ({
@@ -220,16 +230,18 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
       }
       const log = LOGS[runId];
       if (!log) return { ok: true as const, value: { ok: false as const, error: { code: "not_found" } } };
+      const events = [...log.events, ...(later[runId] ?? [])];
+      const highest = events[events.length - 1].sequence;
       return {
         ok: true as const,
         value: {
           ok: true as const,
           page: {
             run_id: runId, requested_after_sequence: 0,
-            next_after_sequence: log.events.length,
+            next_after_sequence: highest,
             earliest_available_sequence: 1,
-            highest_committed_sequence: log.events.length,
-            history_gap: false, has_more: false, state: log.state, events: log.events,
+            highest_committed_sequence: highest,
+            history_gap: false, has_more: false, state: log.state, events,
           },
         },
       };
