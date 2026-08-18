@@ -70,3 +70,30 @@ describe("the workspace surface", () => {
     expect(screen.queryByText("shell.exec")).toBeNull();
   });
 });
+
+/// The first run of an installed app has no provider, so nothing is behind the
+/// window until one is configured. Making the person quit and reopen to get
+/// what they just configured is the difference between an app that works when
+/// installed and one that needs instructions.
+describe("configuring a provider on a fresh install", () => {
+  it("brings a runtime up instead of asking for a restart", async () => {
+    const user = userEvent.setup();
+    const bridge = installFakeRuntime();
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /设置/ })).toBeTruthy());
+    await user.click(
+      screen.getAllByRole("button", { name: /^设置/ }).find((node) => node.classList.contains("r"))!,
+    );
+    await user.click(screen.getByRole("button", { name: /模型/ }));
+
+    await user.type(screen.getByPlaceholderText("local-stub"), "local-stub");
+    await user.type(
+      screen.getByPlaceholderText(/^http:\/\/127/), "http://127.0.0.1:9/v1/chat/completions",
+    );
+    await user.type(screen.getByPlaceholderText("stub"), "stub");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(bridge.saveProvider).toHaveBeenCalled());
+    await waitFor(() => expect(bridge.launch).toHaveBeenCalled());
+  });
+});

@@ -521,8 +521,16 @@ export function useRuntime(): Store {
     if (!api) return "not running in the desktop host";
     const reply = await api.saveProvider(request);
     await refreshProviders();
-    return reply.ok ? null : reply.error;
-  }, [refreshProviders]);
+    if (!reply.ok) return reply.error;
+    // A freshly installed app has no provider, so its first launch has no
+    // runtime behind the window. Bringing one up here is what stops "configure,
+    // quit, reopen" from being the documented first run.
+    if (api.launch) {
+      await api.launch();
+      void load();
+    }
+    return null;
+  }, [refreshProviders, load]);
 
   const forgetProvider = useCallback(async (id: string) => {
     const api = bridge();

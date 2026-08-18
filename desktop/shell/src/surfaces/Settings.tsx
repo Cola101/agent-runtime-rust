@@ -181,7 +181,8 @@ function Models() {
       {error && <div className="err">{error}</div>}
       <p className="note">
         密钥存在登录钥匙串里，配置文件只留一个环境变量名 —— 这正是 runtime-host 路由配置要的形状。
-        改完要重开应用才生效：Runtime 是在启动时读这份配置的。
+        保存后会立刻尝试启动 Runtime。已经在跑的 Runtime 不会重启：它是在启动时读这份配置的，
+        换 Provider 要退出应用再打开。
       </p>
     </>
   );

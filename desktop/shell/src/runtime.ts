@@ -175,6 +175,10 @@ type Bridge = {
   unwatch(runId: string): Promise<Reply<unknown>>;
   onEvent(handler: (payload: { runId: string; event: RunEvent }) => void): () => void;
   onWatchEnded(handler: (payload: { runId: string; reason: Record<string, unknown> }) => void): () => void;
+  /// Brings a runtime up now. Distinct from `startRuntime`, which asks a
+  /// runtime that is already listening to finish recovering: this one is about
+  /// there being a process at all.
+  launch(): Promise<Reply<{ started: boolean; owned: boolean }>>;
   workspace(): Promise<Reply<WorkspaceStatus>>;
   listFiles(relative: string): Promise<Reply<WorkspaceListing>>;
   readFile(relative: string): Promise<Reply<WorkspaceFile>>;

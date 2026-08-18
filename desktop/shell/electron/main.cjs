@@ -23,10 +23,16 @@ const { Workspace } = require("./workspace.cjs");
 ///                            one that can populate a run list.
 ///   RUNTIME_DESK_ENDPOINT    a runtime elsewhere, over gRPC with mTLS.
 ///
-/// Neither has a default. A client that silently falls back to some likely
-/// path or address is a client that will one day be talking to a runtime
-/// nobody meant to reach.
-const stateRoot =
+/// Neither has a default *from configuration*. A client that silently falls
+/// back to some likely path or address is a client that will one day be
+/// talking to a runtime nobody meant to reach.
+///
+/// An installed build is the one case that is not a guess: it has no
+/// configuration to read, and the directory it falls back to is one it made
+/// under its own data. That is not "some likely path" -- it is this app's own,
+/// and the runtime living in it is one this app started. The rule still holds
+/// where it was aimed: at reaching a runtime someone else owns.
+let stateRoot =
   process.env.RUNTIME_DESK_STATE_ROOT ?? process.env.AGENT_RUNTIME_LOCAL_STATE_ROOT ?? null;
 const endpoint = process.env.RUNTIME_DESK_ENDPOINT ?? null;
 
@@ -42,7 +48,10 @@ const token = process.env.RUNTIME_DESK_TOKEN ?? null;
 /// Without it the app only ever attaches to a runtime someone else started,
 /// which is the development setup. With it the app owns a process, and owning
 /// one is what obliges it to stop it again on the way out.
-const runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
+/// In a packaged build the binary ships beside the app, so there is nothing to
+/// configure. In a checkout there is no plausible guess -- debug and release
+/// are different builds and picking one would be picking wrong half the time.
+let runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
 
 /// The folder the agent is allowed to work in.
 ///
@@ -59,7 +68,7 @@ const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
 /// is ready.
 let workspace = new Workspace(null);
 
-const local = new LocalRuntime(stateRoot);
+let local = new LocalRuntime(stateRoot);
 const runtime = new RuntimeProcess();
 /// Provider configuration lives beside the app's own data, not in the state
 /// root: the state root is the runtime's, and a client writing its settings
@@ -202,6 +211,18 @@ ipcMain.handle("workspace:status", guarded(() => workspace.status()));
 ipcMain.handle("workspace:list", guarded((relative) => workspace.list(relative ?? "")));
 ipcMain.handle("workspace:read", guarded((relative) => workspace.read(relative)));
 
+/// Starts a runtime now, for the case that made this necessary: a freshly
+/// installed app has no provider, so the first launch brings up a window with
+/// nothing behind it. Once a provider is configured there is no reason to make
+/// a person quit and reopen to get what they just configured.
+///
+/// Safe to ask twice -- `openRuntime` probes first and attaches rather than
+/// starting a second host over one state root.
+ipcMain.handle("runtime:launch", guarded(async () => {
+  await openRuntime();
+  return { started: runtime.running, owned: runtime.owned };
+}));
+
 ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));
@@ -301,7 +322,14 @@ async function openRuntime() {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  console.error("runtime-desk: runtime-host did not begin listening");
+  // Says where it looked. "Did not begin listening" without a path is a
+  // message that sends the next person to read the runtime's source to find
+  // out which socket was meant, and the answer is usually that the two sides
+  // disagreed about the path rather than that nothing was listening.
+  console.error(
+    `runtime-desk: runtime-host did not begin listening at ${local.status().socketPath}` +
+      ` (state root ${stateRoot})`,
+  );
 }
 
 /// Stops the runtime this app started, and says what that cost.
@@ -332,7 +360,28 @@ function closeRuntime() {
   return stopping;
 }
 
+/// Fills in what an installed build has no configuration for.
+///
+/// Only when packaged, and only what is missing: a checkout that forgot to set
+/// a state root should hear so rather than silently get a second one under the
+/// app's data, where its runs would be invisible next to the ones it meant.
+function settleInstalledPaths() {
+  if (!app.isPackaged) return;
+  if (!stateRoot) {
+    stateRoot = path.join(app.getPath("userData"), "state");
+    fs.mkdirSync(stateRoot, { recursive: true });
+    local = new LocalRuntime(stateRoot);
+  }
+  if (!runtimeBinary) {
+    // `extraResource` puts it here. Not in `app.asar`: an archived file is not
+    // executable, and a binary that cannot be spawned would surface as a
+    // runtime that never listened.
+    runtimeBinary = path.join(process.resourcesPath, "agent-runtime-host");
+  }
+}
+
 app.whenReady().then(async () => {
+  settleInstalledPaths();
   await openRuntime();
 
   if (endpoint) {

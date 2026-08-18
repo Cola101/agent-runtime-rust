@@ -14,6 +14,7 @@
 // work this app did not begin. `owned` is set only where this file spawns.
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 
 /// How long to wait for the process to go after asking it to. Past this the
 /// signal escalates. A quit that hangs forever on a wedged child is a quit
@@ -57,7 +58,23 @@ class RuntimeProcess {
     if (this.child) throw new Error("a runtime is already running under this app");
     if (!binary) throw new Error("no runtime binary configured");
     const child = spawn(binary, args, {
-      env: { ...process.env, ...env, AGENT_RUNTIME_LOCAL_STATE_ROOT: stateRoot },
+      env: {
+        ...process.env,
+        ...env,
+        AGENT_RUNTIME_LOCAL_STATE_ROOT: stateRoot,
+        // Pinned so both sides compute the same socket path by construction.
+        //
+        // A state root too long for a `sockaddr` makes both the client and the
+        // daemon fall back to a socket in the temp directory, and each of them
+        // asks its own language for where that is: `os.tmpdir()` here,
+        // `std::env::temp_dir()` there. Both read `TMPDIR`, so both are right
+        // and they can still disagree -- an app launched without one connected
+        // to nothing while the runtime it had just started was listening
+        // perfectly well in `/var/folders`. Passing this makes the two answers
+        // the same string rather than the same rule applied to two
+        // environments.
+        TMPDIR: os.tmpdir(),
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.child = child;

@@ -23,4 +23,5 @@ console/playwright-report/
 # Native local development state, toolchain, logs and ephemeral secrets
 .local/
 desktop/shell/dist/
+desktop/dist-app/
 desktop/.dev/

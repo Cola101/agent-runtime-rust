@@ -84,8 +84,8 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
    **仍缺**：workspace 目录选择器（现在是 `<userData>/workspace` 默认值）、改配置后自动重启 Runtime
 4. ~~**真实 Session 闭环**~~ ✅ 创建/继续、Turn 级转录、会话列表与切换、审批/拒绝/取消、
    基础 Workspace 交互（目录、文件预览、代理动过的路径）全部接真数据
-5. **干净分发验收**：干净 state root + 仅钥匙串凭据启动、跑通一轮、退出后无残留 —— 已验证；
-   **仍缺**打包成可分发 artifact（现在还是 `pnpm app`）
+5. ~~**干净分发验收**~~ ✅ `Runtime Desk.app` 复制到别处、全新 userData、清空环境后完成
+   「首启无 Provider → 配置 → 启动 Runtime → 跑通一轮 → 退出无残留」。**仍未签名**
 6. **Alpha 后对标交互**：命令面板、文件引用、diff 审阅、待办清单、排队输入、子代理树和 PTY
 7. **steer**：需先在 Runtime 侧补 `RuntimeControlAction`
 

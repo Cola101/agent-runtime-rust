@@ -9,7 +9,9 @@
 /// The escapes are the tests. A containment check nobody has watched refuse is
 /// a containment check nobody has tested.
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync } from "node:fs";
+import {
+  mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync, readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -110,5 +112,49 @@ describe("what it says about a file it will not print", () => {
     expect(read.truncated).toBe(true);
     expect(read.text).toHaveLength(MAX_PREVIEW_BYTES);
     expect(read.size).toBe(MAX_PREVIEW_BYTES + 10);
+  });
+});
+
+/// The packaged app finds two files by convention: the runtime binary and the
+/// proto, both dropped beside the bundle by `package-app.sh`. Nothing links the
+/// two ends -- rename either and the app builds, launches, opens a window and
+/// then reports it has no runtime. So the ends are checked against each other.
+describe("what the packaged app expects to find beside it", () => {
+  const root = path.join(import.meta.dirname, "..", "..");
+
+  it("looks for exactly what the packaging script ships", () => {
+    const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
+    const script = readFileSync(
+      path.join(root, "..", "scripts", "package-app.sh"), "utf8",
+    );
+    // The binary: resolved from `process.resourcesPath` in the app, copied in
+    // as an extra resource by the script, and checked in the bundle by name.
+    expect(main).toContain("process.resourcesPath");
+    expect(main).toContain('"agent-runtime-host"');
+    expect(script).toContain("Contents/Resources/agent-runtime-host");
+    expect(script).toContain('cp "$runtime" "$app/Contents/Resources/agent-runtime-host"');
+
+    const client = readFileSync(path.join(root, "electron", "runtime.cjs"), "utf8");
+    expect(client).toContain('path.join(process.resourcesPath, "runtime.proto")');
+    expect(script).toContain("Contents/Resources/runtime.proto");
+    expect(script).toContain("contracts/proto/runtime.proto");
+  });
+
+  it("ships only what the host process needs, not the whole tree", () => {
+    const script = readFileSync(
+      path.join(root, "..", "scripts", "package-app.sh"), "utf8",
+    );
+    // Copying `node_modules` wholesale would put the test runner and the
+    // TypeScript compiler in a shipped app, and would copy pnpm's symlinks into
+    // a store the target machine does not have.
+    expect(script).toContain("bundle-deps.mjs");
+    expect(script).not.toMatch(/cp -R "\$shell\/node_modules"/);
+    // The closure, not the direct dependencies: a bundle with only the latter
+    // passes every file check and then cannot load `@grpc/grpc-js`.
+    const bundler = readFileSync(
+      path.join(root, "..", "scripts", "bundle-deps.mjs"), "utf8",
+    );
+    expect(bundler).toContain("queue.push");
+    expect(bundler).toContain("dereference: true");
   });
 });

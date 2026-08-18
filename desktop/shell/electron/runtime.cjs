@@ -12,8 +12,22 @@
 const path = require("node:path");
 const grpc = require("@grpc/grpc-js");
 const protoLoader = require("@grpc/proto-loader");
+const fs = require("node:fs");
 
-const PROTO = path.join(__dirname, "..", "..", "..", "contracts", "proto", "runtime.proto");
+/// In a checkout this is `contracts/proto/runtime.proto` itself -- the same
+/// file the Rust runtime compiles, which is what makes "protocol neutral" a
+/// fact rather than a claim.
+///
+/// A packaged app cannot reach outside its bundle, so the build copies that
+/// file in beside the runtime binary. The claim there is weaker and worth
+/// stating: it is a copy taken at build time, from the same source, alongside
+/// the binary built from the same tree.
+const BUNDLED = process.resourcesPath
+  ? path.join(process.resourcesPath, "runtime.proto")
+  : null;
+const PROTO = BUNDLED && fs.existsSync(BUNDLED)
+  ? BUNDLED
+  : path.join(__dirname, "..", "..", "..", "contracts", "proto", "runtime.proto");
 
 let client = null;
 let describe = "not connected";

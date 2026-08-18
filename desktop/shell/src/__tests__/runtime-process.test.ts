@@ -53,6 +53,32 @@ afterEach(() => {
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+describe("the environment the runtime is given", () => {
+  /// A state root too long for a `sockaddr` makes both sides fall back to a
+  /// socket in the temp directory, each asking its own language where that is.
+  /// Both read `TMPDIR`, so both are right and they can still disagree: an app
+  /// launched without one connected to nothing while the runtime it had just
+  /// started was listening in `/var/folders`. Pinning it makes the two answers
+  /// the same string rather than the same rule applied twice.
+  it("pins the temp directory both sides derive the socket path from", async () => {
+    const dir = root();
+    const runtime = new RuntimeProcess();
+    const file = path.join(dir, "print-env.mjs");
+    writeFileSync(file, [
+      'process.stderr.write(`TMPDIR=${process.env.TMPDIR}\\n`);',
+      "setInterval(() => {}, 1000);",
+    ].join("\n"));
+    runtime.start({ binary: process.execPath, args: [file], stateRoot: dir });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (runtime.log.some((line: string) => line.startsWith("TMPDIR="))) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const reported = runtime.log.find((line: string) => line.startsWith("TMPDIR="));
+    expect(reported).toBe(`TMPDIR=${tmpdir()}`);
+    await runtime.stop();
+  }, 20_000);
+});
+
 describe("the runtime this app owns", () => {
   it("stops on quit, and drains before it signals", async () => {
     const dir = root();

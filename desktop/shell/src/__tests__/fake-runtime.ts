@@ -170,6 +170,7 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
       entries: [{ name: "main.rs", kind: "file", size: 30, modified: "2026-08-18T09:10:00.000Z" }],
     },
   };
+  const launch = vi.fn(async () => ({ ok: true as const, value: { started: true, owned: true } }));
   const saveProvider = vi.fn(async (_request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }) => ({ ok: true as const, value: { id: "local-stub" } }));
@@ -254,6 +255,7 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
       return () => listeners.delete(handler);
     },
     onWatchEnded: () => () => {},
+    launch,
     workspace: async () => ({ ok: true as const, value: { root: "/tmp/workspace", configured: true } }),
     listFiles: async (relative: string) => (
       FILES[relative]
@@ -297,6 +299,6 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   };
   return {
     control, submit, sessionStart, sessionContinue, sessionRead,
-    saveProvider, forgetProvider, watch, unwatch, emit, event, desk,
+    saveProvider, forgetProvider, watch, unwatch, emit, event, launch, desk,
   };
 }
