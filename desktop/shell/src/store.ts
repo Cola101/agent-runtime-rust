@@ -14,7 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   bridge, lifecycleFromCursor, probe,
   type CursorError, type CursorPage, type Link, type RunEvent,
-  type SessionHead, type SessionTurn,
+  type SessionHead, type SessionTurn, type ProviderView,
 } from "./runtime";
 import { newestFirst, viewOf, type SessionView } from "./session";
 import { uuidv7 } from "./ids";
@@ -301,6 +301,13 @@ export type Store = {
   selectSession(sessionId: string | null): void;
   /// Leave the current conversation, so the next thing typed starts a new one.
   newConversation(): void;
+  /// Configured providers. Never carries a secret -- no bridge call returns
+  /// one.
+  providers: ProviderView[];
+  saveProvider(request: {
+    id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
+  }): Promise<string | null>;
+  forgetProvider(id: string): Promise<string | null>;
   /// Say something in the current conversation, starting one if there is none.
   ///
   /// This is what `submit` should have been. `submit` starts a bare Run, which
@@ -348,6 +355,7 @@ export function useRuntime(): Store {
   const [loading, setLoading] = useState(true);
   const [listedAt, setListedAt] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]);
+  const [providers, setProviders] = useState<ProviderView[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
   const busy = useRef(false);
   /// Read inside the poll, which must not be rebuilt every time the selection
@@ -435,6 +443,38 @@ export function useRuntime(): Store {
     return null;
   }, [load]);
 
+  /// Read on mount and after a change, never on the poll.
+  ///
+  /// Each provider costs a `security` process to answer, and putting that on a
+  /// 1.2s timer would spawn one per provider per second and a quarter for an
+  /// answer that changes when a person changes it.
+  const refreshProviders = useCallback(async () => {
+    const api = bridge();
+    if (!api) return;
+    const reply = await api.providers();
+    if (reply.ok) setProviders(reply.value);
+  }, []);
+
+  useEffect(() => { void refreshProviders(); }, [refreshProviders]);
+
+  const saveProvider = useCallback(async (request: {
+    id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
+  }) => {
+    const api = bridge();
+    if (!api) return "not running in the desktop host";
+    const reply = await api.saveProvider(request);
+    await refreshProviders();
+    return reply.ok ? null : reply.error;
+  }, [refreshProviders]);
+
+  const forgetProvider = useCallback(async (id: string) => {
+    const api = bridge();
+    if (!api) return "not running in the desktop host";
+    const reply = await api.forgetProvider(id);
+    await refreshProviders();
+    return reply.ok ? null : reply.error;
+  }, [refreshProviders]);
+
   const selectSession = useCallback((sessionId: string | null) => {
     opened.current = true;
     currentRef.current = sessionId;
@@ -499,6 +539,7 @@ export function useRuntime(): Store {
     sessions,
     current: sessions.find((session) => session.sessionId === current) ?? null,
     selectSession, newConversation, send,
+    providers, saveProvider, forgetProvider,
     submit, decide, refresh: () => void load(),
   };
 }

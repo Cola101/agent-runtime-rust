@@ -30,7 +30,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 7 | 运行中排队输入 | 未做 | 边跑边打字，跑完依次生效 |
 | 8 | 中途改向（steer） | **阻塞** | `runtime-host` 无 steer 动作，见下 |
 | 9 | 转录搜索（⌘F） | 未做 | |
-| 10 | 模型快速切换 | 未做 | 设置里有分区，缺快捷入口 |
+| 10 | 模型快速切换 | 部分接入 | 设置里可增删 Provider；**改完要重开应用**，也没有会话级切换 |
 | 11 | 命令历史（↑） | 已接入 | 空行或未改动的行才回溯，不吃光标移动 |
 | 12 | 多行输入与编辑键位 | 已接入 | ↵ 发送、⇧↵ 换行 |
 | 13 | 原生通知 | 未做 | 后台时"有事等你"必须能穿透 |
@@ -79,10 +79,12 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
    `contracts/proto/runtime.proto`——Rust runtime 编译的同一份文件。**契约现由两种语言各自生成，
    "协议中立"从声称变为事实。** 连接只在主进程；preload 暴露五个方法；渲染进程没有 channel、
    没有 stream、也拿不到 token。非回环地址无 mTLS 直接拒绝，但窗口仍会打开——好过一个直接退出的进程
-3. **Profile / credential**：完成安全添加、替换和 resolver handle，不让密钥进入 renderer 或持久配置
+3. ~~**Profile / credential**~~ ✅ 密钥进登录钥匙串，配置文件只留环境变量名；桥接上不存在能取回密钥的调用。
+   **仍缺**：workspace 目录选择器（现在是 `<userData>/workspace` 默认值）、改配置后自动重启 Runtime
 4. **真实 Session 闭环**：~~创建/继续~~ ✅、~~转录（Turn 级）~~ ✅、Runs 与审批/拒绝/取消 ✅；
    **仍缺会话列表与切换**、基础 Workspace 交互
-5. **干净分发验收**：新目录安装启动、真实 Provider、恢复和退出后无 Runtime/子进程残留
+5. **干净分发验收**：干净 state root + 仅钥匙串凭据启动、跑通一轮、退出后无残留 —— 已验证；
+   **仍缺**打包成可分发 artifact（现在还是 `pnpm app`）
 6. **Alpha 后对标交互**：命令面板、文件引用、diff 审阅、待办清单、排队输入、子代理树和 PTY
 7. **steer**：需先在 Runtime 侧补 `RuntimeControlAction`
 

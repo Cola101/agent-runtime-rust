@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "desktop-shell",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@agent-runtime/desktop-shell", "dev", "--port", "5199", "--strictPort"],
+      "port": 5199
+    }
+  ]
+}

@@ -101,6 +101,20 @@ export type SessionTurn = {
   digest: string;
 };
 
+/// A provider as the host is willing to describe it.
+///
+/// There is no secret on this type, and no bridge call returns one. `hasSecret`
+/// is read back from the Keychain rather than from a flag, so it cannot claim a
+/// key that is not there.
+export type ProviderView = {
+  id: string;
+  protocol: string;
+  endpoint: string;
+  model: string;
+  hasSecret: boolean;
+  secretSetAt: string | null;
+};
+
 export type RuntimeLifecycle = {
   lifecycle: string;
   recovery: { completed_profiles: number; total_profiles: number };
@@ -136,6 +150,11 @@ type Bridge = {
     sessionId: string; branchId: string; generation: number;
     afterTurnOrdinal?: number; limit?: number | null;
   }): Promise<Reply<{ turns: SessionTurn[]; nextAfterTurnOrdinal: number | null }>>;
+  providers(): Promise<Reply<ProviderView[]>>;
+  saveProvider(request: {
+    id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
+  }): Promise<Reply<{ id: string }>>;
+  forgetProvider(id: string): Promise<Reply<{ id: string }>>;
 };
 
 declare global {

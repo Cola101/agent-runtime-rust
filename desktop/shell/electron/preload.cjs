@@ -23,6 +23,12 @@ contextBridge.exposeInMainWorld("desk", {
     sessionRead: (request) => ipcRenderer.invoke("session:read", request),
     sessionList: (request) => ipcRenderer.invoke("session:list", request),
     sessionHistory: (request) => ipcRenderer.invoke("session:history", request),
+    // One way in. There is no `providers:get` and there is not meant to be:
+    // the renderer can set a secret and can be told one exists, and has no
+    // call that would hand it back.
+    providers: () => ipcRenderer.invoke("providers:list"),
+    saveProvider: (request) => ipcRenderer.invoke("providers:save", request),
+    forgetProvider: (id) => ipcRenderer.invoke("providers:forget", id),
   },
   remote: {
     status: () => ipcRenderer.invoke("remote:status"),

@@ -7,9 +7,11 @@
 // to host other things.
 const { app, BrowserWindow, ipcMain, shell } = require("electron");
 const path = require("node:path");
+const fs = require("node:fs");
 const grpcRuntime = require("./runtime.cjs");
 const { LocalRuntime } = require("./localRuntime.cjs");
 const { RuntimeProcess } = require("./runtimeProcess.cjs");
+const { Credentials } = require("./credentials.cjs");
 
 /// Where the shell expects to find a Runtime.
 ///
@@ -41,8 +43,22 @@ const token = process.env.RUNTIME_DESK_TOKEN ?? null;
 /// one is what obliges it to stop it again on the way out.
 const runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
 
+/// The folder the agent is allowed to work in.
+///
+/// App-owned, with a default under the app's own data, because a distributable
+/// build cannot ask a person to set an environment variable before it will
+/// start. The override exists for development, where the workspace is a
+/// checkout rather than a folder this app made.
+const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
+  ?? process.env.AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT
+  ?? null;
+
 const local = new LocalRuntime(stateRoot);
 const runtime = new RuntimeProcess();
+/// Provider configuration lives beside the app's own data, not in the state
+/// root: the state root is the runtime's, and a client writing its settings
+/// into it would be a second writer in a directory with one owner.
+const credentials = new Credentials(path.join(app.getPath("userData"), "providers"));
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -132,6 +148,14 @@ ipcMain.handle("session:read", guarded((request) => local.sessionRead(request)))
 ipcMain.handle("session:list", guarded((request) => local.sessionList(request ?? {})));
 ipcMain.handle("session:history", guarded((request) => local.sessionHistory(request)));
 
+// Provider configuration. `list` answers with what a person may see; there is
+// deliberately no call that returns a secret, because a bridge method that
+// could return one is a bridge method that will one day be called by a surface
+// rendering someone else's transcript.
+ipcMain.handle("providers:list", guarded(() => credentials.list()));
+ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
+ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));
+
 // The remote transport, unchanged and still explicit. Kept separate rather
 // than hidden behind the same calls: "this runtime is on my machine" and "this
 // runtime is somewhere else, reached with a credential" are different enough
@@ -162,8 +186,30 @@ async function openRuntime() {
     console.log(`runtime-desk: no local runtime at ${first.socketPath} — ${first.error}`);
     return;
   }
+  // Read once, here, and handed to the child. The secret exists in this
+  // process for the length of a spawn and never reaches the renderer, the
+  // config file, or a log line.
+  const routing = await credentials.routing();
+  if (!routing) {
+    console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
+    return;
+  }
+  const workspace = workspaceRoot ?? path.join(app.getPath("userData"), "workspace");
+  fs.mkdirSync(workspace, { recursive: true });
   try {
-    const pid = runtime.start({ binary: runtimeBinary, stateRoot });
+    const pid = runtime.start({
+      binary: runtimeBinary,
+      stateRoot,
+      env: {
+        ...routing.env,
+        AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
+        AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: workspace,
+        // The runtime binary is also the trusted workspace tool -- it re-execs
+        // itself for that role. Pointing at the binary this app just spawned
+        // means the two can never be different builds.
+        AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN: runtimeBinary,
+      },
+    });
     console.log(`runtime-desk: started runtime-host (pid ${pid})`);
   } catch (error) {
     console.error(`runtime-desk: could not start a runtime — ${error.message}`);

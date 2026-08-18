@@ -91,11 +91,106 @@ function Tools() {
   );
 }
 
+const PROTOCOLS = [
+  { id: "openai_compatible", label: "OpenAI 兼容 /chat/completions" },
+  { id: "openai_responses", label: "OpenAI Responses" },
+  { id: "anthropic_messages", label: "Anthropic Messages" },
+];
+
+/// Where a provider is configured, and the only place a secret is typed.
+///
+/// The secret goes one way. It is written to the login Keychain by the host
+/// process and handed to the runtime as an environment variable on the child;
+/// no bridge call returns it, and this page has nothing to render it into. What
+/// it can say is whether one is on file and when it was set.
+function Models() {
+  const desk = useDesk();
+  const [id, setId] = useState("");
+  const [protocol, setProtocol] = useState(PROTOCOLS[0].id);
+  const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState("");
+  const [secret, setSecret] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    const failure = await desk.saveProvider({
+      id: id.trim(), protocol, endpoint: endpoint.trim(), model: model.trim(),
+      secret: secret === "" ? null : secret,
+    });
+    setError(failure);
+    setBusy(false);
+    if (!failure) {
+      // Cleared on success rather than kept for convenience: a key sitting in
+      // a form field is a key on screen.
+      setSecret("");
+      setId(""); setEndpoint(""); setModel("");
+    }
+  };
+
+  return (
+    <>
+      {desk.providers.length > 0 && (
+        <table className="rows">
+          <thead>
+            <tr><th>名字</th><th>协议</th><th>模型</th><th>密钥</th><th className="num" /></tr>
+          </thead>
+          <tbody>
+            {desk.providers.map((provider) => (
+              <tr key={provider.id}>
+                <td className="p mono" title={provider.endpoint}>{provider.id}</td>
+                <td>{PROTOCOLS.find((entry) => entry.id === provider.protocol)?.label ?? provider.protocol}</td>
+                <td className="mono">{provider.model}</td>
+                <td className={provider.hasSecret ? "" : "warn"}>
+                  {provider.hasSecret
+                    ? <>在钥匙串里{provider.secretSetAt && ` ・ ${since(provider.secretSetAt)}存的`}</>
+                    : "缺密钥 —— Runtime 起不来"}
+                </td>
+                <td className="num">
+                  <button type="button" className="flat" onClick={() => void desk.forgetProvider(provider.id)}>
+                    删掉
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="form">
+        <label>名字<input value={id} onChange={(e) => setId(e.target.value)} placeholder="local-stub" /></label>
+        <label>
+          协议
+          <select value={protocol} onChange={(e) => setProtocol(e.target.value)}>
+            {PROTOCOLS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+          </select>
+        </label>
+        <label>地址<input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="http://127.0.0.1:8080/v1/chat/completions" /></label>
+        <label>模型<input value={model} onChange={(e) => setModel(e.target.value)} placeholder="stub" /></label>
+        <label>
+          密钥
+          <input type="password" value={secret} onChange={(e) => setSecret(e.target.value)}
+            placeholder="存进钥匙串，不写进配置文件" />
+        </label>
+        <button type="button" disabled={busy || !id.trim() || !endpoint.trim() || !model.trim()}
+          onClick={() => void save()}>
+          {busy ? "保存中" : "保存"}
+        </button>
+      </div>
+      {error && <div className="err">{error}</div>}
+      <p className="note">
+        密钥存在登录钥匙串里，配置文件只留一个环境变量名 —— 这正是 runtime-host 路由配置要的形状。
+        改完要重开应用才生效：Runtime 是在启动时读这份配置的。
+      </p>
+    </>
+  );
+}
+
 /// Everything not yet reachable says exactly what is missing, and where the
 /// gap is tracked. An empty section that only says "coming soon" tells a
 /// person nothing they can act on.
 const PENDING: Record<string, { need: string }> = {
-  models: { need: "本地适配器没有读取路由配置或切换模型的调用；模型现在由 runtime-host 的环境变量决定。" },
   mcp: { need: "MCP 服务清单在 Runtime 侧已有读取契约（ADR-0116/0117），但本地适配器还没有暴露出来。" },
   appearance: { need: "只影响这个客户端。还没做。" },
   advanced: { need: "只影响这个客户端。还没做。" },
@@ -122,6 +217,7 @@ function SettingsView() {
       <div className="body">
         {section === "connection" && <Connection />}
         {section === "tools" && <Tools />}
+        {section === "models" && <Models />}
         {PENDING[section] && (
           <div className="empty">
             {current?.title} —— 还没接。
@@ -143,5 +239,6 @@ register({
   commands: [
     { id: "settings:connection", title: "连接设置", hint: "连的是哪个 Runtime" },
     { id: "settings:tools", title: "工具与授权", hint: "实际生效过的策略快照" },
+    { id: "settings:models", title: "模型与密钥", hint: "密钥进钥匙串，不进配置文件" },
   ],
 });

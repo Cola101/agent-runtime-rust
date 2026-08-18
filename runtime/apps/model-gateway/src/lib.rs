@@ -31,10 +31,22 @@ pub use openai_compatible::{
 pub use openai_responses::{OpenAiResponsesAdapter, OpenAiResponsesConfig};
 pub use provider_registry::ModelPolicyRouteResolver;
 
+/// The aliases are not decoration. `rename_all = "snake_case"` turns
+/// `OpenAiCompatible` into `open_ai_compatible`, while `FromStr` below -- and
+/// therefore `provider_registry`, `edge-node` and the gateway's own CLI -- has
+/// always taken `openai_compatible`. One protocol with two spellings, and the
+/// one a person writes was the one the config parser rejected: a desktop
+/// client wrote a routing file from the spelling every other config path uses
+/// and `runtime-host` exited before it listened.
+///
+/// Accepting both is additive: the serialized form is unchanged, so nothing
+/// already written to disk or folded into a digest moves.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
+    #[serde(alias = "openai_compatible")]
     OpenAiCompatible,
+    #[serde(alias = "openai_responses")]
     OpenAiResponses,
     AnthropicMessages,
 }

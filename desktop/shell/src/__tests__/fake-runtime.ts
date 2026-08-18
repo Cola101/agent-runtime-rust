@@ -139,6 +139,10 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   }) => ({
     ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
   }));
+  const saveProvider = vi.fn(async (_request: {
+    id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
+  }) => ({ ok: true as const, value: { id: "local-stub" } }));
+  const forgetProvider = vi.fn(async (_id: string) => ({ ok: true as const, value: { id: "local-stub" } }));
   const sessionRead = vi.fn(async (request: { sessionId: string; branchId: string }) => ({
     ok: true as const,
     value: request.sessionId === OLDER_SESSION ? olderHead() : head(),
@@ -200,6 +204,20 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     sessionStart,
     sessionContinue,
     sessionRead,
+    // No secret, because the host has no call that returns one.
+    providers: async () => ({
+      ok: true as const,
+      value: [{
+        id: "local-stub",
+        protocol: "openai_compatible",
+        endpoint: "http://127.0.0.1:51234/v1/chat/completions",
+        model: "stub",
+        hasSecret: true,
+        secretSetAt: "2026-08-18T09:00:00.000Z",
+      }],
+    }),
+    saveProvider,
+    forgetProvider,
     // Ascending by id, the order `list_session_heads` returns.
     sessionList: async () => ({
       ok: true as const, value: { heads: [olderHead(), head()], nextAfter: null },
@@ -222,5 +240,8 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   });
   const desk = { mounted: vi.fn(), drew: vi.fn(), runtime };
   (window as unknown as { desk: typeof desk }).desk = desk;
-  return { control, submit, sessionStart, sessionContinue, sessionRead, desk };
+  return {
+    control, submit, sessionStart, sessionContinue, sessionRead,
+    saveProvider, forgetProvider, desk,
+  };
 }
