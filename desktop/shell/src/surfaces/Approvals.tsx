@@ -1,54 +1,99 @@
 import { register } from "./registry";
-import { blocked } from "../sample";
+import { effectLabel, sandboxLabel, shortId, since } from "./model";
+import { LinkBanner } from "./Link";
+import { useDesk } from "../desk";
 
 /// The queue you actually work from.
 ///
-/// Deliberately not a filter over Runs: "what is blocked on me" and "what has
-/// run" are different questions, and answering the first by scanning the
-/// second is how a decision sits unnoticed for an hour.
+/// Deliberately not a filter over the run list: "什么在等我" and "跑过什么" are
+/// different questions, and answering the first by scanning the second is how
+/// a decision sits unnoticed for an hour.
 function ApprovalsView() {
+  const desk = useDesk();
+  const waiting = desk.runs.filter((run) => run.approval);
+  const unresolved = desk.runs.filter(
+    (run) =>
+      (run.lifecycle.kind === "terminal" || run.lifecycle.kind === "retired") &&
+      run.lifecycle.status === "indeterminate",
+  );
+
   return (
     <div className="pane flow">
-      {blocked.map((item) => (
-        <div key={item.runId} className={item.kind === "approval" ? "gate" : "gate unknown"}>
-          <div className="h">
-            {item.kind === "approval" ? "Waiting on you" : "Outcome unknown"}
-            <span className="of"> · {item.runTitle}</span>
+      <LinkBanner link={desk.link} />
+
+      {waiting.map((run) => {
+        const approval = run.approval!;
+        return (
+          <div key={run.id} className="gate">
+            <div className="h">
+              等你决定
+              <span className="of"> ・ Run {shortId(run.id)} ・ {since(run.updatedAt)}</span>
+            </div>
+            {run.asked && <p className="q">{run.asked}</p>}
+            <code className="cmd">
+              {approval.toolName}({JSON.stringify(approval.arguments)})
+            </code>
+            {/* Why the runtime is asking, in the runtime's own terms. An
+                approval without its effect class is a yes/no with the reason
+                removed. */}
+            <div className="facts">
+              <span>{effectLabel(approval.effect)}</span>
+              <span>{sandboxLabel(approval.sandbox)}</span>
+              {approval.requiredScopes.map((scope) => (
+                <span key={scope} className="mono">{scope}</span>
+              ))}
+            </div>
+            <ol>
+              <li className="pick" onClick={() => void desk.decide(run.id, "approve")}>
+                <span className="k">1</span> 执行
+              </li>
+              <li onClick={() => void desk.decide(run.id, "deny")}>
+                <span className="k">2</span> 不执行，让它换个做法
+              </li>
+              <li onClick={() => void desk.decide(run.id, "cancel")}>
+                <span className="k">3</span> 结束这个 Run
+              </li>
+            </ol>
+            <div className="bind mono">绑定 {approval.bindingDigest.slice(0, 16)}…・只对这一次调用有效</div>
           </div>
-          {item.kind === "approval" ? (
-            <>
-              <code className="cmd">{item.command}</code>
-              <ol>
-                <li className="pick"><span className="k">1</span> Run it</li>
-                <li><span className="k">2</span> Run it, and stop asking for this tool here</li>
-                <li><span className="k">3</span> No — say what to do instead</li>
-              </ol>
-              <div className="bind">bound to call {item.digest} — applies to that command only</div>
-            </>
-          ) : (
-            <>
-              <p className="q">{item.question}</p>
-              <ol>
-                <li className="pick"><span className="k">1</span> It happened — continue from there</li>
-                <li><span className="k">2</span> It didn't — nothing landed</li>
-                <li><span className="k">3</span> Can't tell — leave it unresolved</li>
-              </ol>
-              <div className="bind">this run does not continue until you answer</div>
-            </>
-          )}
+        );
+      })}
+
+      {unresolved.map((run) => (
+        <div key={run.id} className="gate unknown">
+          <div className="h">
+            结果无法判定
+            <span className="of"> ・ Run {shortId(run.id)} ・ {since(run.updatedAt)}</span>
+          </div>
+          <p className="q">
+            工具执行过程中断了，Runtime 无法确定这次副作用到底有没有生效。
+            它不会替你猜 —— 只有你能定。
+          </p>
+          <div className="bind">这个 Run 在你回答之前不会继续</div>
         </div>
       ))}
-      {blocked.length === 0 && <div className="empty">Nothing is waiting on you.</div>}
+
+      {desk.link.state === "live" && waiting.length === 0 && unresolved.length === 0 && (
+        <div className="empty">没有事情等你。</div>
+      )}
     </div>
   );
 }
 
 register({
   id: "approvals",
-  label: "Approvals",
+  label: "待决定",
   group: "work",
-  badge: () => (blocked.length === 0 ? undefined : blocked.length),
+  badge: (desk) => {
+    const count = desk.runs.filter(
+      (run) =>
+        run.approval !== null ||
+        ((run.lifecycle.kind === "terminal" || run.lifecycle.kind === "retired") &&
+          run.lifecycle.status === "indeterminate"),
+    ).length;
+    return count === 0 ? undefined : count;
+  },
   view: ApprovalsView,
-  toolbar: () => (<><b>Waiting on you</b><span className="tb-r">j/k move · ↵ decide</span></>),
-  commands: [{ id: "approvals:open", title: "Go to Approvals", hint: "decisions blocking work" }],
+  toolbar: () => <b>等你决定</b>,
+  commands: [{ id: "approvals:open", title: "查看待决定", hint: "卡住工作的决定" }],
 });

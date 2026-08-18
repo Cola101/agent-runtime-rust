@@ -7,12 +7,19 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("desk", {
   mounted: (surfaces) => ipcRenderer.send("shell:mounted", surfaces),
-  endpoint: () => ipcRenderer.invoke("shell:endpoint"),
+  drew: (summary) => ipcRenderer.send("shell:drew", summary),
   runtime: {
     status: () => ipcRenderer.invoke("runtime:status"),
-    connect: (options) => ipcRenderer.invoke("runtime:connect", options),
-    readEvents: (request) => ipcRenderer.invoke("runtime:readEvents", request),
-    submit: (request) => ipcRenderer.invoke("runtime:submit", request),
+    probe: () => ipcRenderer.invoke("runtime:probe"),
+    list: () => ipcRenderer.invoke("runtime:list"),
+    events: (request) => ipcRenderer.invoke("runtime:events", request),
+    submit: (input) => ipcRenderer.invoke("runtime:submit", input),
     control: (request) => ipcRenderer.invoke("runtime:control", request),
+  },
+  remote: {
+    status: () => ipcRenderer.invoke("remote:status"),
+    readEvents: (request) => ipcRenderer.invoke("remote:readEvents", request),
+    submit: (request) => ipcRenderer.invoke("remote:submit", request),
+    control: (request) => ipcRenderer.invoke("remote:control", request),
   },
 });
