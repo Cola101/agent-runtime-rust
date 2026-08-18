@@ -66,6 +66,44 @@ ws2 还额外说明：`cargo test` 默认 fail-fast，那轮只跑了 411 条就
 而我第一次读日志时**它根本还没跑完**——据此报出的 "742 passed, 0 failed" 无效。
 之后一律加 `--no-fail-fast`，读之前先确认日志里有 `EXIT=`。
 
+## 干净门禁的最新一次（含中断修复）
+
+**887 passed, 2 failed。** `interrupt_reaches_...` 已经消失——而且那一次门禁是
+**故意用 `&` 起的**，正是原来必然让它失败的方式。
+
+### `one_thousand_runs_...`：指标行现在在失败时也打印
+
+把 `println!` 挪到断言之前的目的就在这里：
+
+```
+elapsed_ms=198099        ← 界限 180s，超 10%
+recovery_scan_ms=763     ← 界限 2s
+fd_baseline=42 fd_peak=42 fd_final=12
+rss 18.5MB → 27.7MB      ← 界限 512MB
+```
+
+对照单独跑的 **161.7 秒**：门禁自身的负载让它慢了 **22%**。而这条测试名字里写的那几条
+资源界限，依然全部以 30~90 倍余量通过。**紧的只有那条墙钟兜底，而它不是这条测试的主题。**
+
+### `a_network_caller_...`：我加的 host 侧诊断对它是空转的
+
+早些时候给 `LocalRuntimeError::StateRoot` 加了 `tracing::warn!`，把脱敏前的真实错误
+留在 host 侧。**这次失败里一行都没出现。**
+
+原因很直白：`tracing_subscriber` 只在 `main.rs` 里装（`fmt().json().init()`），
+测试二进制没有装。所以那条诊断帮的是**真在跑的 host**（桌面应用的 runtime），
+不是测试。**这是那次改动的一个限制，之前没说清楚。**
+
+给这条测试补了一条它自己能说的话：失败时把**它自己的状态根里有什么**打印出来。
+先看到过实际输出：
+
+```
+state root /var/folders/…/.tmpFdiekh held ["runtime-state.lock", "retention", "sessions", "runs"]
+```
+
+下次它在门禁里翻红，就能看出 `sessions` 目录是不是还在——那是"文件系统瞬时错误"
+和"目录根本不在"之间的第一个岔路口。仍然**没有放宽任何边界**。
+
 ## 还开着的两条
 
 - `one_thousand_runs_keep_hot_state_recovery_and_process_resources_bounded`：

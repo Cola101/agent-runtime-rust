@@ -280,7 +280,25 @@ async fn a_network_caller_starts_continues_forks_and_reads_a_real_session() {
             &token,
         ))
         .await
-        .expect("continue session")
+        // The reply is deliberately sanitised -- a host path must not cross the
+        // client contract -- so this failure has said only "Session storage is
+        // unavailable" for weeks, under load, with no way to tell an exhausted
+        // descriptor table from a transient ENOENT. The host logs the real
+        // error now, but a test binary installs no tracing subscriber, so that
+        // line goes nowhere here. What the test *can* say is what its own state
+        // root looked like at the moment it was refused.
+        .unwrap_or_else(|status| {
+            panic!(
+                "continue session: {status:?}\nstate root {} held {:?}",
+                state.path().display(),
+                std::fs::read_dir(state.path())
+                    .map(|entries| entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        })
         .into_inner();
     assert_eq!(continued.run_id, second_run_id.to_string());
     assert_eq!(

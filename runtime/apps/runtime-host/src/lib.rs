@@ -8480,9 +8480,13 @@ impl LocalRuntimeHost {
                 // the error was dropped; under a delegation it left the parent
                 // with neither a result nor a terminal of its own.
                 //
-                // Nothing is lost by stopping here. The terminal is emitted,
-                // and an attempt that has reached one cannot be changed by
-                // what the provider said next in the same breath.
+                // Nothing recorded is lost by stopping here, and that is the
+                // whole safety argument: these events were already being
+                // refused, so none of them ever reached the log. The change is
+                // that the refusal is no longer raised as the Run's error. A
+                // usage line behind a terminal is the one that costs something
+                // -- its tokens go uncounted -- and it went uncounted before
+                // this too.
                 if self
                     .processor
                     .attempt_is_terminal(attempt_id)
