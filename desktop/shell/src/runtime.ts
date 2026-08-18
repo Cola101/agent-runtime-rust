@@ -67,6 +67,40 @@ export type RunSummary = {
   state: Record<string, unknown>;
 };
 
+/// A branch head, exactly as the runtime reports it.
+///
+/// `active_run_id` is the only thing that says a Turn is still in flight, and
+/// the branch refuses a second Turn while it is set. A client that continued on
+/// hope rather than on this field gets a refusal it could have avoided asking
+/// for.
+export type SessionHead = {
+  session_id: string;
+  branch_id: string;
+  generation: number;
+  turn_count: number;
+  history_digest: string;
+  active_run_id: string | null;
+};
+
+export type SessionTurnReceipt = {
+  head: SessionHead;
+  run_id: string;
+  owner_epoch: number | null;
+  state: Record<string, unknown>;
+};
+
+export type ContentPart = { type: string; text?: string; [key: string]: unknown };
+
+/// One committed Turn's frozen transcript. Not a rendering of the event log:
+/// the events can be retired while this survives, and only one of the two is
+/// what the next Turn is actually given as history.
+export type SessionTurn = {
+  turn_ordinal: number;
+  run_id: string;
+  transcript: { role: string; content: ContentPart[] }[];
+  digest: string;
+};
+
 export type RuntimeLifecycle = {
   lifecycle: string;
   recovery: { completed_profiles: number; total_profiles: number };
@@ -88,6 +122,20 @@ type Bridge = {
   >;
   submit(input: string): Promise<Reply<string>>;
   control(request: { action: string; runId: string }): Promise<Reply<unknown>>;
+  sessionStart(request: {
+    sessionId: string; branchId: string; runId: string; input: string;
+  }): Promise<Reply<SessionTurnReceipt>>;
+  sessionContinue(request: {
+    sessionId: string; branchId: string; generation: number; runId: string; input: string;
+  }): Promise<Reply<SessionTurnReceipt>>;
+  sessionRead(request: { sessionId: string; branchId: string }): Promise<Reply<SessionHead>>;
+  sessionList(request?: {
+    afterSessionId?: string | null; afterBranchId?: string | null; limit?: number;
+  }): Promise<Reply<{ heads: SessionHead[]; nextAfter: [string, string] | null }>>;
+  sessionHistory(request: {
+    sessionId: string; branchId: string; generation: number;
+    afterTurnOrdinal?: number; limit?: number | null;
+  }): Promise<Reply<{ turns: SessionTurn[]; nextAfterTurnOrdinal: number | null }>>;
 };
 
 declare global {

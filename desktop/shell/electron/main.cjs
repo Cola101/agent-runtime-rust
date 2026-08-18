@@ -115,6 +115,13 @@ ipcMain.handle("runtime:shutdown", guarded(() => local.shutdown()));
 ipcMain.handle("runtime:events", guarded((request) => local.eventCursor(request)));
 ipcMain.handle("runtime:submit", guarded((input) => local.submit(input)));
 ipcMain.handle("runtime:control", guarded((request) => local.control(request)));
+// Session operations. Every one of them is an owner request, so none carries an
+// invocation and none of it is the renderer's to choose.
+ipcMain.handle("session:start", guarded((request) => local.sessionStart(request)));
+ipcMain.handle("session:continue", guarded((request) => local.sessionContinue(request)));
+ipcMain.handle("session:read", guarded((request) => local.sessionRead(request)));
+ipcMain.handle("session:list", guarded((request) => local.sessionList(request ?? {})));
+ipcMain.handle("session:history", guarded((request) => local.sessionHistory(request)));
 
 // The remote transport, unchanged and still explicit. Kept separate rather
 // than hidden behind the same calls: "this runtime is on my machine" and "this

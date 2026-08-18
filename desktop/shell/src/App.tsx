@@ -133,6 +133,12 @@ export function App() {
       waiting: store.runs.filter((run) => run.approval).length,
       events: store.runs.reduce((total, run) => total + run.events.length, 0),
       policies: store.policies.length,
+      // Reported because the launcher's line is how this client is checked
+      // without asking a person to look at a window. A conversation count of
+      // zero beside a run count that is not is exactly the failure this batch
+      // was about.
+      sessions: store.sessions.length,
+      turns: store.sessions.reduce((total, session) => total + session.turnCount, 0),
     });
   }, [store]);
 

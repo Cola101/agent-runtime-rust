@@ -1,7 +1,17 @@
 # 桌面客户端能力清单（对标 Codex / OpenClaw）
 
-- 日期：2026-08-17
+- 日期：2026-08-18
 - 范围：`desktop/`。**不含** Runtime 内核；内核缺口见 `docs/roadmap.md`
+
+## 当前目标：可日用的 macOS Desktop Alpha
+
+本清单不再等待所有内核能力完成后才启动。当前优先形成一条真实纵向闭环：应用启动并恢复 Runtime，
+安全配置 Profile/credential，创建或继续 Session，流式显示事件，完成 Tool 审批/拒绝/取消，查看历史并
+进行基础 Workspace 交互，最后随应用退出完全停止 Runtime。现有 Electron + React 实现继续使用；
+renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
+
+命令面板、子代理树、PTY、MCP 浏览器和复杂 Diff 审阅仍保留在对标清单，但不阻塞 Alpha；Profile/credential、
+真实 Session 主链和干净目录可分发验收是硬门禁。
 
 状态取值：`未做` / `待接入`（界面在、数据未接） / `已接入`
 
@@ -21,10 +31,10 @@
 | 8 | 中途改向（steer） | **阻塞** | `runtime-host` 无 steer 动作，见下 |
 | 9 | 转录搜索（⌘F） | 未做 | |
 | 10 | 模型快速切换 | 未做 | 设置里有分区，缺快捷入口 |
-| 11 | 命令历史（↑） | 未做 | |
-| 12 | 多行输入与编辑键位 | 未做 | 当前输入框是静态占位 |
+| 11 | 命令历史（↑） | 已接入 | 空行或未改动的行才回溯，不吃光标移动 |
+| 12 | 多行输入与编辑键位 | 已接入 | ↵ 发送、⇧↵ 换行 |
 | 13 | 原生通知 | 未做 | 后台时"有事等你"必须能穿透 |
-| 14 | 会话恢复 / 继续 | 待接入 | Runtime 侧已完备，UI 未接 |
+| 14 | 会话恢复 / 继续 | 部分接入 | 启动打开最近一段、继续同一分支已通；**切换到另一段仍缺列表** |
 | 15 | 键位速查 | 未做 | |
 | 16 | 导出 / 分享转录 | 未做 | |
 
@@ -54,24 +64,26 @@
 | 29 | 预算与配额 | 待接入 | 状态行 + 抽屉 |
 | 30 | 容器边界能力可视（ADR-0122） | 待接入 | 哪些保证这台机器给不了 |
 
-## 四、被 Runtime 侧阻塞的
+## 四、Runtime 侧阻塞与接入边界
 
 | 能力 | 阻塞原因 |
 | --- | --- |
 | 中途改向（#8） | `runtime-host` 的 `RuntimeControlAction` 只有 Resume / DecideApproval / Cancel / ResolveMcpInput。**没有 steer**，本地适配器也没有。这不是 UI 问题 |
-| 真实连接（全部） | 需要 Node 侧 gRPC 客户端；Rust 客户端已证明契约可用，但 Electron 主进程是 Node |
+| 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
 
 ## 五、推进顺序
 
-1. **面骨架**：Runs / Approvals / Settings / Run detail 注册进外壳，可导航 ← *进行中*
-2. **共享构件**：命令面板、抽屉、身份气泡、每面工具栏
-3. ~~**Node gRPC 客户端**~~ ✅ 已完成。`@grpc/grpc-js` + `@grpc/proto-loader` 直接加载
+1. ~~**Owner 主链与生命周期**~~ ✅ 已完成。Electron 主进程可驱动 owner socket、恢复与退出；renderer
+   不持有 socket、channel 或 token。
+2. ~~**Node gRPC 客户端**~~ ✅ 已完成。`@grpc/grpc-js` + `@grpc/proto-loader` 直接加载
    `contracts/proto/runtime.proto`——Rust runtime 编译的同一份文件。**契约现由两种语言各自生成，
    "协议中立"从声称变为事实。** 连接只在主进程；preload 暴露五个方法；渲染进程没有 channel、
    没有 stream、也拿不到 token。非回环地址无 mTLS 直接拒绝，但窗口仍会打开——好过一个直接退出的进程
-4. **只读接入**：Runs 列表与转录接真数据
-5. **决策接入**：审批与裁决走 `Control`
-6. **编码客户端交互**：文件引用、diff 审阅、待办清单、排队输入
+3. **Profile / credential**：完成安全添加、替换和 resolver handle，不让密钥进入 renderer 或持久配置
+4. **真实 Session 闭环**：~~创建/继续~~ ✅、~~转录（Turn 级）~~ ✅、Runs 与审批/拒绝/取消 ✅；
+   **仍缺会话列表与切换**、基础 Workspace 交互
+5. **干净分发验收**：新目录安装启动、真实 Provider、恢复和退出后无 Runtime/子进程残留
+6. **Alpha 后对标交互**：命令面板、文件引用、diff 审阅、待办清单、排队输入、子代理树和 PTY
 7. **steer**：需先在 Runtime 侧补 `RuntimeControlAction`
 
 ## 不做

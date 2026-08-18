@@ -14,7 +14,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   bridge, lifecycleFromCursor, probe,
   type CursorError, type CursorPage, type Link, type RunEvent,
+  type SessionHead, type SessionTurn,
 } from "./runtime";
+import { newestFirst, viewOf, type SessionView } from "./session";
+import { uuidv7 } from "./ids";
 import type { Lifecycle } from "./surfaces/model";
 
 /// `RUNTIME_EVENT_CURSOR_MAX_EVENTS`. Larger is not a bigger page — the daemon
@@ -203,6 +206,84 @@ function failed(id: string, asked: string, error: CursorError): RunView {
   };
 }
 
+/// How many history pages this client will walk before it stops and says so.
+/// Eight pages of the daemon's ceiling is over a thousand Turns.
+const MAX_HISTORY_PAGES = 8;
+
+/// Reads a branch's committed Turns.
+///
+/// `limit: 1` is not a smaller version of the same request -- it is a different
+/// question. The full history is what the selected conversation renders; one
+/// Turn is only what the conversation is *called*, which is all a list row
+/// needs. Asking every conversation for its whole transcript on every poll
+/// would be the client doing work nobody asked to see.
+async function readHistory(
+  api: NonNullable<ReturnType<typeof bridge>>,
+  head: SessionHead,
+  whole: boolean,
+): Promise<{ turns: SessionTurn[]; truncated: boolean }> {
+  const turns: SessionTurn[] = [];
+  let after = 0;
+  for (let pages = 0; pages < MAX_HISTORY_PAGES; pages += 1) {
+    const reply = await api.sessionHistory({
+      sessionId: head.session_id,
+      branchId: head.branch_id,
+      generation: head.generation,
+      afterTurnOrdinal: after,
+      ...(whole ? {} : { limit: 1 }),
+    });
+    if (!reply.ok) return { turns, truncated: false };
+    turns.push(...reply.value.turns);
+    const next = reply.value.nextAfterTurnOrdinal;
+    if (!whole || next === null) return { turns, truncated: false };
+    // A page that reports more but returns nothing would otherwise spin here.
+    if (next <= after) break;
+    after = next;
+  }
+  return { turns, truncated: true };
+}
+
+type HistoryCache = Map<string, { generation: number; turnCount: number; turns: SessionTurn[] }>;
+
+/// Fills in every conversation, re-reading as little as the runtime allows.
+///
+/// A committed Turn is immutable, so history is only re-read when the head says
+/// there is more of it, or when a rollback moved the generation out from under
+/// what was cached.
+async function readSessions(
+  api: NonNullable<ReturnType<typeof bridge>>,
+  heads: SessionHead[],
+  current: string | null,
+  cache: HistoryCache,
+  runs: RunView[],
+): Promise<SessionView[]> {
+  const views: SessionView[] = [];
+  for (const head of heads) {
+    const selected = head.session_id === current;
+    const cached = cache.get(head.session_id);
+    const stale = !cached
+      || cached.generation !== head.generation
+      || cached.turnCount !== head.turn_count
+      || (selected && cached.turns.length < head.turn_count);
+    if (stale && head.turn_count > 0) {
+      const read = await readHistory(api, head, selected);
+      cache.set(head.session_id, {
+        generation: head.generation,
+        turnCount: head.turn_count,
+        turns: read.turns,
+      });
+    }
+    // A Session whose first Turn is still running has committed no title yet.
+    // Its Run record carries the sentence -- the same sentence, from the other
+    // durable source, rather than a guess or a copy this client kept.
+    const live = head.active_run_id
+      ? runs.find((run) => run.id === head.active_run_id)?.asked ?? ""
+      : "";
+    views.push(viewOf(head, cache.get(head.session_id)?.turns ?? [], live));
+  }
+  return newestFirst(views);
+}
+
 export type Store = {
   link: Link;
   runs: RunView[];
@@ -212,6 +293,20 @@ export type Store = {
   /// Null until the first list has come back, so a surface can tell "no runs"
   /// apart from "have not looked yet".
   listedAt: number | null;
+  /// Conversations, newest first. Each is one branch of one Session.
+  sessions: SessionView[];
+  /// The conversation the composer is writing into, or null for "the next
+  /// thing typed starts a new one".
+  current: SessionView | null;
+  selectSession(sessionId: string | null): void;
+  /// Leave the current conversation, so the next thing typed starts a new one.
+  newConversation(): void;
+  /// Say something in the current conversation, starting one if there is none.
+  ///
+  /// This is what `submit` should have been. `submit` starts a bare Run, which
+  /// carries no history: every sentence sent that way is the first sentence of
+  /// its own conversation, and the model is never told what was said before.
+  send(input: string): Promise<string | null>;
   submit(input: string): Promise<string | null>;
   decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
   refresh(): void;
@@ -252,7 +347,18 @@ export function useRuntime(): Store {
   const [runs, setRuns] = useState<RunView[]>([]);
   const [loading, setLoading] = useState(true);
   const [listedAt, setListedAt] = useState<number | null>(null);
+  const [sessions, setSessions] = useState<SessionView[]>([]);
+  const [current, setCurrent] = useState<string | null>(null);
   const busy = useRef(false);
+  /// Read inside the poll, which must not be rebuilt every time the selection
+  /// changes -- that would restart the interval on every click.
+  const currentRef = useRef<string | null>(null);
+  /// Whether the first list has already chosen a conversation. Without this
+  /// the poll would re-open the newest one a second after the person asked for
+  /// a new one, which reads as the button not working.
+  const opened = useRef(false);
+  const branches = useRef(new Map<string, string>());
+  const history = useRef<HistoryCache>(new Map());
 
   const load = useCallback(async () => {
     if (busy.current) return;
@@ -262,6 +368,7 @@ export function useRuntime(): Store {
       setLink(next);
       if (next.state !== "live") {
         setRuns([]);
+        setSessions([]);
         setListedAt(Date.now());
         return;
       }
@@ -278,6 +385,31 @@ export function useRuntime(): Store {
         }),
       );
       setRuns(views);
+
+      const heads = await api.sessionList();
+      if (heads.ok) {
+        for (const head of heads.value.heads) branches.current.set(head.session_id, head.branch_id);
+        // Chosen before the histories are read, not after. Reading first would
+        // fetch the conversation about to be opened as if it were a list row --
+        // one Turn, its name -- and the person would watch the rest of it
+        // arrive a poll later. Which conversation is open decides how much of
+        // it to read, so it has to be decided first.
+        if (!opened.current && heads.value.heads.length > 0) {
+          const newest = [...heads.value.heads]
+            .sort((a, b) => (a.session_id < b.session_id ? 1 : -1))[0];
+          opened.current = true;
+          currentRef.current = newest.session_id;
+          setCurrent(newest.session_id);
+        }
+        setSessions(await readSessions(
+          api, heads.value.heads, currentRef.current, history.current, views,
+        ));
+      }
+      // Last, and after the conversations rather than after the runs. This is
+      // what says "the first list is in", and the launcher's self-report reads
+      // it: set before the Sessions land, it reported zero conversations about
+      // a state root holding two. A diagnostic that measures the moment before
+      // the thing arrives is worse than none.
       setListedAt(Date.now());
     } finally {
       busy.current = false;
@@ -303,6 +435,54 @@ export function useRuntime(): Store {
     return null;
   }, [load]);
 
+  const selectSession = useCallback((sessionId: string | null) => {
+    opened.current = true;
+    currentRef.current = sessionId;
+    setCurrent(sessionId);
+    void load();
+  }, [load]);
+
+  const newConversation = useCallback(() => {
+    opened.current = true;
+    currentRef.current = null;
+    setCurrent(null);
+  }, []);
+
+  /// Start a conversation, or add a Turn to the current one.
+  ///
+  /// Two things here are read from the runtime immediately before the write
+  /// rather than remembered: whether a Turn is already in flight, and which
+  /// generation the branch is on. Remembering either is how a client sends a
+  /// Turn into history the person already rolled back, or asks for a second
+  /// Turn the branch is bound to refuse.
+  const send = useCallback(async (input: string) => {
+    const api = bridge();
+    if (!api) return "not running in the desktop host";
+    const sessionId = currentRef.current;
+    const branchId = sessionId ? branches.current.get(sessionId) : undefined;
+
+    if (!sessionId || !branchId) {
+      const ids = { sessionId: uuidv7(), branchId: uuidv7(), runId: uuidv7() };
+      const started = await api.sessionStart({ ...ids, input });
+      if (!started.ok) return started.error;
+      branches.current.set(ids.sessionId, ids.branchId);
+      currentRef.current = ids.sessionId;
+      setCurrent(ids.sessionId);
+      void load();
+      return null;
+    }
+
+    const head = await api.sessionRead({ sessionId, branchId });
+    if (!head.ok) return head.error;
+    if (head.value.active_run_id) return "这轮还没结束，等它停下再说下一句";
+    const reply = await api.sessionContinue({
+      sessionId, branchId, generation: head.value.generation, runId: uuidv7(), input,
+    });
+    if (!reply.ok) return reply.error;
+    void load();
+    return null;
+  }, [load]);
+
   const decide = useCallback(
     async (runId: string, action: "approve" | "deny" | "cancel" | "resume") => {
       const api = bridge();
@@ -316,6 +496,9 @@ export function useRuntime(): Store {
 
   return {
     link, runs, policies: readPolicies(runs), loading, listedAt,
+    sessions,
+    current: sessions.find((session) => session.sessionId === current) ?? null,
+    selectSession, newConversation, send,
     submit, decide, refresh: () => void load(),
   };
 }

@@ -108,10 +108,11 @@ variant 的理由正是「那些名字指的是本平台施加的容器边界，
 
 ---
 
-### 阶段 1.5 — Desktop-Ready Runtime（**进行中**）
+### 阶段 1.5 — Desktop Alpha 纵向闭环（**进行中**）
 
-**目标。** 不开发 UI，把 Rust Runtime 收口为随时可装入 Tauri、Electron sidecar、CLI 或 Java
-adapter 的稳定无 UI 内核。
+**目标。** 在 Rust Runtime 保持唯一执行与恢复权威的前提下，复用现有 Electron + React 客户端，
+交付一个可日用的 macOS Apple Silicon 桌面 Alpha。Runtime 收口与真实 UI 接入并行推进，UI 不创建
+第二套 Run/Session 状态机，也不直接持有 Provider credential 或 owner token。
 
 **已完成（2026-08-18，ADR-0142）。** `RuntimeClient v1` 及 initialize/version/capability negotiation；
 执行方法只由初始化成功后的 client 暴露；
@@ -139,11 +140,14 @@ SIGINT/SIGTERM 经同一 Controller，真二进制实测。owner_socket_contract
    **"退出应用"不再被记录成"用户取消 Run"**——停止走 `AbortHandle`，从不触碰 `CancellationToken`，
    不发 `run.cancelled`、不写操作者 Cancel 收据。同时新增 owner 作用域，使这些能力可由独立进程
    （Electron 等）驱动，而不只是同进程宿主（Tauri）。
-3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令或持久配置。
-4. 可分发验收：一个无 UI artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、
-   升级迁移和优雅退出，无 Java/云服务/GUI 依赖。
+3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令、
+   renderer 或持久配置。
+4. 桌面可用闭环：创建/恢复 Session、提交输入、流式转录、审批/拒绝/取消、历史和基础 Workspace 交互
+   全部使用真实 owner/runtime 数据；连接、恢复、失败和预算状态对用户可见。
+5. 可分发验收：桌面 artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、升级迁移
+   和优雅退出；退出应用后 Runtime 与子进程全部停止，无 Java 或云服务依赖。
 
-**未完成前的表述边界。** 可以说“Run-level client port 已可嵌入”，不得说“Desktop-Ready 已完成”。
+**未完成前的表述边界。** 可以说“桌面 owner 主链已接通”，不得说“桌面版可用”或“Desktop-Ready 已完成”。
 
 ---
 
@@ -201,10 +205,11 @@ Context7 与 Microsoft Learn 两个无需凭据的公开生产端点完成只读
 
 ---
 
-### 阶段 5 — 产品形态（前四阶段的函数）
+### 阶段 5 — 其他产品形态
 
-Java SDK、CLI、GUI、Edge 解冻。**不在前面阶段完成前启动**——目标文档写死了：
-「前一项没有真实闭环证据时，不用 GUI、控制面或部署编排把它包装成"已完成"」。
+桌面 Alpha 已提前到阶段 1.5，作为 Runtime 的首个参考客户端和持续 dogfood 入口。Java SDK、云控制面、
+CLI、Edge、Windows/Linux 桌面仍在相应运行环境和公共契约成熟后解冻；它们不得成为 macOS 桌面 Alpha
+或独立 Rust Runtime 的必需依赖。
 
 ## 明确不做
 

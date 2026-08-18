@@ -241,7 +241,14 @@ describe("the composer", () => {
     await user.click(box);
     await user.type(box, "看看 notes.txt");
     await user.keyboard("{Enter}");
-    await waitFor(() => expect(bridge.submit).toHaveBeenCalledWith("看看 notes.txt"));
+    // A Turn in the open conversation, not a bare Run. `submit` starts a Run
+    // that carries no history, so a composer wired to it makes every sentence
+    // the first sentence of its own conversation.
+    await waitFor(() =>
+      expect(bridge.sessionContinue).toHaveBeenCalledWith(
+        expect.objectContaining({ input: "看看 notes.txt", generation: 1 }),
+      ));
+    expect(bridge.submit).not.toHaveBeenCalled();
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe(""));
     await user.keyboard("{ArrowUp}");
     expect((box as HTMLTextAreaElement).value).toBe("看看 notes.txt");
@@ -254,7 +261,8 @@ describe("the composer", () => {
     await user.type(box, "第一行");
     await user.keyboard("{Shift>}{Enter}{/Shift}");
     await user.type(box, "第二行");
-    expect(bridge.submit).not.toHaveBeenCalled();
+    expect(bridge.sessionContinue).not.toHaveBeenCalled();
+    expect(bridge.sessionStart).not.toHaveBeenCalled();
     expect((box as HTMLTextAreaElement).value).toBe("第一行\n第二行");
   });
 });

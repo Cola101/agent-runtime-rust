@@ -21,6 +21,15 @@ const EVENT_CURSOR_SCHEMA_VERSION = 1;
 /// invalid request rather than clamping it, so asking for more is not a bigger
 /// page — it is no page at all.
 const EVENT_CURSOR_MAX_EVENTS = 256;
+/// `OWNER_MAX_HISTORY_PAGE`. Only an upper clamp for a caller that names a
+/// page size; the common path sends no limit at all and takes the daemon's.
+///
+/// This is a page ceiling, not an identity: if it drifts low the client asks
+/// for smaller pages and pages again, and if the daemon's own bound is what
+/// moved it answers with a refusal that says so. The identity constants this
+/// client used to mirror had neither property, which is why they are gone and
+/// this is not.
+const SESSION_HISTORY_MAX_TURNS = 128;
 const MAX_SOCKET_PATH_BYTES = 100;
 const CONNECT_TIMEOUT_MS = 3_000;
 const CALL_TIMEOUT_MS = 30_000;
@@ -240,6 +249,94 @@ class LocalRuntime {
     return { runs: reply.runs, nextAfterRunId: reply.next_after_run_id ?? null };
   }
 
+  /// Start a Session's first Turn.
+  ///
+  /// The three ids are the caller's to choose, and `runId` is the idempotency
+  /// key rather than a name: the daemon answers a repeated `runId` from what it
+  /// already accepted, without charging admission for it. A client that
+  /// generated a fresh id on retry would turn one Turn into two.
+  ///
+  /// Returns as soon as the Turn is *durably accepted*, not when it is done --
+  /// the Turn runs detached. `head.active_run_id` is what says whether it is
+  /// still running, and the branch refuses a second Turn until it clears.
+  async sessionStart({ sessionId, branchId, runId, input }) {
+    const reply = await this.#owner({
+      type: "session_start",
+      session_id: sessionId,
+      branch_id: branchId,
+      run_id: runId,
+      input,
+    });
+    if (reply.type !== "session_turn") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.receipt;
+  }
+
+  /// Continue a Session on a branch, at a generation.
+  ///
+  /// `generation` is a fence, not a formality: it is what a rollback moves, so
+  /// a client holding a stale one is a client whose Turn would land on history
+  /// the person already retired. Read the head immediately before continuing
+  /// rather than remembering one -- the daemon will refuse a stale generation,
+  /// which is the correct outcome but a worse experience than not sending it.
+  async sessionContinue({ sessionId, branchId, generation, runId, input }) {
+    const reply = await this.#owner({
+      type: "session_continue",
+      session_id: sessionId,
+      branch_id: branchId,
+      generation,
+      run_id: runId,
+      input,
+    });
+    if (reply.type !== "session_turn") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.receipt;
+  }
+
+  /// A branch's head: generation, turn count, history digest, and the run id of
+  /// a Turn still in flight.
+  async sessionRead({ sessionId, branchId }) {
+    const reply = await this.#owner({
+      type: "session_read",
+      session_id: sessionId,
+      branch_id: branchId,
+    });
+    if (reply.type !== "session_head") throw new Error(`unexpected reply: ${reply.type}`);
+    return reply.head;
+  }
+
+  /// Every branch head this state root holds.
+  async sessionList({ afterSessionId = null, afterBranchId = null, limit = 256 } = {}) {
+    const reply = await this.#owner({
+      type: "session_list",
+      ...(afterSessionId ? { after_session_id: afterSessionId } : {}),
+      ...(afterBranchId ? { after_branch_id: afterBranchId } : {}),
+      limit,
+    });
+    if (reply.type !== "session_list") throw new Error(`unexpected reply: ${reply.type}`);
+    return { heads: reply.page.heads, nextAfter: reply.page.next_after ?? null };
+  }
+
+  /// One bounded page of committed Turns, each carrying the transcript the
+  /// runtime froze for it -- roles and content parts, not a rendering of the
+  /// event log. The two are different sources and only this one survives the
+  /// event log being retired.
+  async sessionHistory({ sessionId, branchId, generation, afterTurnOrdinal = 0, limit = null }) {
+    const reply = await this.#owner({
+      type: "session_history",
+      session_id: sessionId,
+      branch_id: branchId,
+      generation,
+      after_turn_ordinal: afterTurnOrdinal,
+      // Omitted rather than mirrored: the daemon has a default and this client
+      // has no better opinion than the server about its own page ceiling. A
+      // caller that does ask is clamped down, because the daemon *rejects* an
+      // oversized page instead of clamping it -- asking for too much is how a
+      // history becomes empty rather than paged.
+      ...(limit === null ? {} : { limit: Math.min(Math.max(1, limit), SESSION_HISTORY_MAX_TURNS) }),
+    });
+    if (reply.type !== "session_history") throw new Error(`unexpected reply: ${reply.type}`);
+    return { turns: reply.page.turns, nextAfterTurnOrdinal: reply.page.next_after_turn_ordinal ?? null };
+  }
+
   async submit(input) {
     const reply = await this.#request({ type: "submit", input });
     if (reply.type !== "accepted") throw new Error(`unexpected reply: ${reply.type}`);
@@ -258,4 +355,4 @@ class LocalRuntime {
   }
 }
 
-module.exports = { LocalRuntime, socketPathFor, EVENT_CURSOR_MAX_EVENTS };
+module.exports = { LocalRuntime, socketPathFor, EVENT_CURSOR_MAX_EVENTS, SESSION_HISTORY_MAX_TURNS };

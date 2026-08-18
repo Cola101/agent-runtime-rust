@@ -8,6 +8,7 @@ import { DECISIONS, Decisions } from "./Approvals";
 import { currentRun, useDesk, type Desk } from "../desk";
 import type { RunEvent } from "../runtime";
 import type { RunView } from "../store";
+import { textOf, type SessionView } from "../session";
 
 /// A tool call is two lines, not a card.
 ///
@@ -90,9 +91,47 @@ function Transcript({ run }: { run: RunView }) {
   return <>{blocks}</>;
 }
 
+/// The committed conversation.
+///
+/// Drawn from the Session's frozen transcripts rather than from the event log,
+/// because those are the two different things they look like: the event log is
+/// what happened while a Turn ran, and the transcript is what the runtime
+/// carried into the next Turn as history. When a log is retired the events go
+/// and the conversation stays.
+function Turns({ session }: { session: SessionView }) {
+  return (
+    <>
+      {session.turns.map((turn) => {
+        const said = textOf(turn, "user");
+        const back = textOf(turn, "assistant");
+        return (
+          <div className="turn" key={turn.digest || turn.turn_ordinal}>
+            {said && <div className="ask">{said}</div>}
+            {back && <div className="rep"><p>{back}</p></div>}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 function ChatView() {
   const desk = useDesk();
-  const run = currentRun(desk);
+  // Two cursors meet on this surface, and the explicit one wins. Picking a Run
+  // out of a list and coming here has to show that Run -- if the open
+  // conversation could displace it, the list would be pointing at something
+  // the transcript is not showing.
+  const chosen = desk.selected
+    ? desk.runs.find((candidate) => candidate.id === desk.selected) ?? null
+    : null;
+  const session = chosen ? null : desk.current;
+  // Inside a conversation the only Run worth drawing under it is the Turn
+  // still running. Falling back to "the newest Run anywhere" would append a
+  // different conversation's transcript to this one.
+  const live = session?.activeRunId
+    ? desk.runs.find((candidate) => candidate.id === session.activeRunId) ?? null
+    : null;
+  const run = chosen ?? (session ? live : currentRun(desk));
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
 
@@ -103,7 +142,7 @@ function ChatView() {
     const node = scroller.current;
     if (!node || !pinned.current) return;
     node.scrollTop = node.scrollHeight;
-  }, [run?.events.length, run?.id]);
+  }, [run?.events.length, run?.id, session?.turnCount, session?.sessionId]);
 
   return (
     <div
@@ -116,9 +155,11 @@ function ChatView() {
     >
       <LinkBanner link={desk.link} />
 
-      {desk.link.state === "live" && !run && desk.listedAt !== null && (
-        <div className="empty">还没有 Run。在下面写一句话就开始。</div>
+      {desk.link.state === "live" && !run && !session && desk.listedAt !== null && (
+        <div className="empty">还没有对话。在下面写一句话就开始。</div>
       )}
+
+      {session && <Turns session={session} />}
 
       {run && (
         <>
@@ -128,7 +169,7 @@ function ChatView() {
               更早的事件已被回收，这段转录不完整 —— 最早还能读到第 {run.earliestSequence} 条
             </Note>
           )}
-          <div className="ask">{run.asked}</div>
+          {(!session || run.id === session.activeRunId) && <div className="ask">{run.asked}</div>}
           {run.error ? (
             <div className="offline">
               这个 Run 的日志读不出来：<span className="mono">{run.error.code}</span>
@@ -189,19 +230,23 @@ export function Composer() {
   const [at, setAt] = useState(-1);
   const box = useRef<HTMLTextAreaElement>(null);
   const live = desk.link.state === "live";
+  /// A branch refuses a second Turn while one is in flight. Reading that off
+  /// the head and disabling the box is the difference between a rule the
+  /// person can see and a rule they discover by being refused.
+  const turning = desk.current?.activeRunId != null;
 
   const send = async () => {
     const input = draft.trim();
-    if (!input || !live || sending) return;
+    if (!input || !live || sending || turning) return;
     setSending(true);
     setDraft("");
     setHistory((past) => [input, ...past]);
     setAt(-1);
-    const failure = await desk.submit(input);
+    const failure = await desk.send(input);
     setError(failure);
     setSending(false);
     // A new run is the one you want to watch. Clearing the cursor rather than
-    // pointing it at the new id keeps "newest" honest if the submit failed.
+    // pointing it at the new id keeps "newest" honest if the send failed.
     if (!failure) desk.select(null);
     box.current?.focus();
   };
@@ -214,8 +259,12 @@ export function Composer() {
           className="in"
           rows={1}
           value={draft}
-          disabled={!live || sending}
-          placeholder={live ? "说一句话，或者告诉它换个做法" : "没有连上 Runtime"}
+          disabled={!live || sending || turning}
+          placeholder={
+            !live ? "没有连上 Runtime"
+              : turning ? "这轮还在跑，跑完再说下一句"
+                : desk.current ? "接着说" : "说一句话，就开始一段对话"
+          }
           onChange={(event) => { setDraft(event.target.value); setAt(-1); }}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
@@ -237,12 +286,21 @@ export function Composer() {
             }
           }}
         />
-        <button type="button" className="send" disabled={!live || sending || !draft.trim()} onClick={() => void send()}>
+        <button type="button" className="send" disabled={!live || sending || turning || !draft.trim()} onClick={() => void send()}>
           {sending ? "发送中" : "发送"}
         </button>
       </div>
       <div className="write-hint">
         <kbd>↵</kbd> 发送 ・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
+        {desk.current && (
+          <button
+            type="button"
+            className="flat new"
+            onClick={() => { desk.newConversation(); box.current?.focus(); }}
+          >
+            新对话
+          </button>
+        )}
       </div>
       {error && <div className="err">{error}</div>}
     </div>
@@ -294,9 +352,23 @@ register({
       const run = currentRun(desk);
       if (run) void desk.decide(run.id, decision.action);
     },
-  })),
+  })).concat([{
+    key: "n",
+    hint: "新对话",
+    // Nothing to leave when no conversation is open, and starting one is what
+    // typing already does.
+    when: (desk: Desk) => desk.current !== null,
+    run: (desk: Desk) => desk.newConversation(),
+  }]),
   commands: [
     { id: "chat:open", title: "回到对话", hint: "当前 Run 的转录" },
+    {
+      id: "chat:new",
+      title: "开一段新对话",
+      hint: "下一句话会开一段新的",
+      when: (desk) => desk.current !== null,
+      run: (desk) => desk.newConversation(),
+    },
     {
       id: "chat:cancel",
       title: "停止当前 Run",

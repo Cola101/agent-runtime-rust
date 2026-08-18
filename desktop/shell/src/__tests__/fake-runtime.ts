@@ -63,9 +63,59 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
   },
 };
 
-export function installFakeRuntime() {
+/// A Session with two committed Turns and nothing in flight.
+///
+/// Shapes copied from a real `session_history` reply: roles, content parts and
+/// a per-Turn digest. A fake that flattened a Turn to a string would let the
+/// renderer pass against a transcript the runtime does not have.
+export const SESSION = "01a01430-0000-7000-8000-000000000001";
+export const SESSION_BRANCH = "01a01430-0000-7000-8000-000000000002";
+
+const TURNS = [
+  {
+    turn_ordinal: 1,
+    run_id: RUN_DONE,
+    transcript: [
+      { role: "user", content: [{ type: "text", text: "我叫小林，请记住" }] },
+      { role: "assistant", content: [{ type: "text", text: "记住了。" }] },
+    ],
+    digest: "a".repeat(64),
+  },
+  {
+    turn_ordinal: 2,
+    run_id: RUN_LIVE,
+    transcript: [
+      { role: "user", content: [{ type: "text", text: "我刚才说我叫什么？" }] },
+      { role: "assistant", content: [{ type: "text", text: "小林。" }] },
+    ],
+    digest: "b".repeat(64),
+  },
+];
+
+export function installFakeRuntime({ activeRunId = null }: { activeRunId?: string | null } = {}) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
+  const head = () => ({
+    session_id: SESSION,
+    branch_id: SESSION_BRANCH,
+    generation: 1,
+    turn_count: TURNS.length,
+    history_digest: "c".repeat(64),
+    active_run_id: activeRunId,
+  });
+  const sessionStart = vi.fn(async (_request: {
+    sessionId: string; branchId: string; runId: string; input: string;
+  }) => ({
+    ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
+  }));
+  const sessionContinue = vi.fn(async (_request: {
+    sessionId: string; branchId: string; generation: number; runId: string; input: string;
+  }) => ({
+    ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
+  }));
+  const sessionRead = vi.fn(async (_request: { sessionId: string; branchId: string }) => ({
+    ok: true as const, value: head(),
+  }));
   const runtime = {
     status: async () => ({ ok: true as const, value: status() }),
     probe: async () => ({ ok: true as const, value: status() }),
@@ -120,6 +170,19 @@ export function installFakeRuntime() {
     },
     submit,
     control,
+    sessionStart,
+    sessionContinue,
+    sessionRead,
+    sessionList: async () => ({ ok: true as const, value: { heads: [head()], nextAfter: null } }),
+    // The daemon pages history and answers `limit: 1` with exactly one Turn,
+    // which is what the list rows ask for and all they need.
+    sessionHistory: async ({ limit = null }: { limit?: number | null }) => ({
+      ok: true as const,
+      value: {
+        turns: limit === 1 ? TURNS.slice(0, 1) : TURNS,
+        nextAfterTurnOrdinal: null,
+      },
+    }),
   };
   const status = () => ({
     transport: "local", stateRoot: "/tmp/state", socketPath: "/tmp/state/runtime-host.sock",
@@ -127,5 +190,5 @@ export function installFakeRuntime() {
   });
   const desk = { mounted: vi.fn(), drew: vi.fn(), runtime };
   (window as unknown as { desk: typeof desk }).desk = desk;
-  return { control, submit, desk };
+  return { control, submit, sessionStart, sessionContinue, sessionRead, desk };
 }
