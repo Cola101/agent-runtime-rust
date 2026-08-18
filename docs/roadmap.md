@@ -118,6 +118,13 @@ adapter 的稳定无 UI 内核。
 gRPC 与进程内嵌入调用同一门面；无 UI 真实 Run 1/1、受影响 gRPC 26/26。同时修正
 对外 1 MiB/内核 32,000-byte 的 input 上限冲突，拒绝请求不留 durable Run。
 
+**已完成（2026-08-18，ADR-0144）。** Owner 作用域与应用生命周期：本地 socket 分出 owner 面
+（生命周期、Session mutation 与读取、持久 Run 列表），privilege 边界沿用既有的 `0o600`；
+`RuntimeController` 一次通过 `Created → Recovering → Ready → Draining → Stopped`；
+关闭先关准入、再等活跃执行数归零、最后强制停止并按 Checkpoint 分类；`Interrupted` 带来源，
+分得清"你关了应用"与"进程崩了"；恢复期间可连可问，mutation 得到带进度的 `NotReady` 而不是超时。
+SIGINT/SIGTERM 经同一 Controller，真二进制实测。owner_socket_contract 6/6、runtime_lifecycle 6/6。
+
 **已完成（2026-08-18，ADR-0143）。** Session 契约的语义收口：接受顺序改为"只读判定 → 重试免配额 →
 所有权与准入 → 持久化 → 失败补偿"，被拒绝的 Turn 不再留下不可继续的分支；终态 head 投影以 Checkpoint
 为权威，读路径与重启恢复同源，调用方观察到终态事件后可直接继续；"Session 不存在"归 `NotFound`，不再
@@ -128,7 +135,10 @@ gRPC 与进程内嵌入调用同一门面；无 UI 真实 Run 1/1、受影响 gR
 
 1. ~~Session/Thread 契约~~：已完成（ADR-0143），含语义收口与可靠性/容量加固。计划要求的 12 项覆盖全部到位，
    另有投影 fail-closed、Fork 重试跨源分支移动、五道存储上限的 N/N+1 边界与 `u64::MAX` generation 拒绝。
-2. 应用生命周期（计划见 `docs/plans/0001-desktop-drivable-runtime.md`）：停止接纳、有界 drain、安全关闭/下次启动恢复，不把“退出应用”伪造成“用户取消 Run”。
+2. ~~应用生命周期~~：已完成（ADR-0144）。停止接纳、有界 drain、安全关闭与重启恢复均已落地，
+   **"退出应用"不再被记录成"用户取消 Run"**——停止走 `AbortHandle`，从不触碰 `CancellationToken`，
+   不发 `run.cancelled`、不写操作者 Cancel 收据。同时新增 owner 作用域，使这些能力可由独立进程
+   （Electron 等）驱动，而不只是同进程宿主（Tauri）。
 3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令或持久配置。
 4. 可分发验收：一个无 UI artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、
    升级迁移和优雅退出，无 Java/云服务/GUI 依赖。

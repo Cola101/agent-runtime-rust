@@ -24,6 +24,23 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-18 Owner 作用域与应用生命周期完成（ADR-0144）：先定通道再做能力，因为同一个缺口已经踩空两次——
+Session 契约加固在 `RuntimeClient` 与 gRPC 上，而桌面走 Unix socket，`LocalRequest` 十个变体里没有任何
+Session 操作；生命周期把 Controller 交给同进程宿主，Tauri 拿得到而 Electron 拿不到。本地 socket 因此分出
+owner 作用域（privilege 边界沿用既有 `0o600`，分枚举是为了两个面不会悄悄合成一个，且**没有任何回退**），
+承载生命周期、Session 七个操作与持久 `ListRuns`；owner 面**不要求送 invocation**，桌面接入后其镜像的七个
+常量与漂移守卫可一并删除。`RuntimeController` 一次通过状态机、并发等待者同一答案、停止后不重启。
+**用户 Cancel 与 Runtime Stop 是两条不共享机件的路径**：所有分离执行经唯一注册点，停止走 `AbortHandle`，
+从不触碰 `CancellationToken`——测试用"接受连接但永不回答"的 provider 把 Turn 挂在途中，再读持久事件日志与
+控制收据，断言无 `run.cancelled`、无 Cancel 收据。关闭先关准入并释放排队者，再等活跃执行数归零（期限是
+构造参数，六个生命周期测试因此 0.2 秒内跑完），最后强制停止并按 Checkpoint 分类；`Interrupted` 带来源，
+旧记录以 `Unknown` 载入而不是一个猜测。"没开门"是状态不是故障：`NotReady` 是独立应答类型并带恢复进度。
+SIGINT/SIGTERM 经同一 Controller，真二进制实测排空→报告→退出→同目录重启。
+owner_socket_contract **6/6**、runtime_lifecycle **6/6**、daemon_recovery 9/9、approval_flow 9/9、
+subagent_concurrency 20/20、lib 42/42，clippy `-D warnings` 与 fmt 均为 0。总体仍为 **70–75%**：
+本轮把既有能力接到可达的面上并补齐关闭语义，不是新增能力。证据见
+`docs/evidence/2026-08-18-owner-scope-and-lifecycle.md`。
+
 2026-08-18 Session 可靠性与容量加固（ADR-0143 修订）：只补边界，不增加产品功能。投影由"刻意安静"改为
 fail-closed——初版让每一种投影不了的理由都原样返回，但那个理由只对**还没做完**的工作成立：Checkpoint 已落盘
 却验不过的 Turn，其结果已经发生且不可恢复，报成"还在跑"会让分支永远卡着而每次读都说它只是忙。现在只豁免

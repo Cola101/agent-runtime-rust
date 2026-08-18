@@ -44,8 +44,13 @@
   归档，仍缺 OpenClaw 的 Gateway 运维与 Archive/Delete/Switch。本项目在此新增的是两家都未公开明示的东西：
   存储上限在 `Initialize` 就公布、容量拒绝发生在请求模型之前、以及不可恢复的终态 Turn 报 `DataLoss` 而不是
   伪装成"仍在运行"。
-- **下一内核目标**：~~Session/Thread client contract~~（已完成）→应用关闭/恢复生命周期→Profile 与
-  credential resolver→可分发 artifact；不进入 GUI。总体仍为 70–75%：本轮收口的是既有接口的语义与边界，
+- **生命周期对标（2026-08-18，ADR-0144）**：Codex 的 bounded thread shutdown、多等待者与任务 abort
+  reason 已对齐；OpenClaw 的 signal、ingress drain、后台 hook 与子进程回收已对齐。本项目额外证明
+  多租户隔离、Checkpoint 恢复、**"应用退出 ≠ 用户取消"**，以及**恢复期间可观测**——后两条两家都未公开
+  明示。产品面差距一项未变：仍缺 Codex 的完整客户端与 SQLite Thread 产品链，仍缺 OpenClaw 的
+  Gateway 运维与 Archive/Delete/Switch。
+- **下一内核目标**：~~Session/Thread client contract~~（已完成）→~~应用关闭/恢复生命周期~~（已完成）
+  →Profile 与 credential resolver→可分发 artifact；不进入 GUI。总体仍为 70–75%：本轮收口的是既有接口的语义与边界，
   不是新增能力。
 
 ## 上一阶段：可执行 Runtime 控制边界
