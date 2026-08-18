@@ -195,8 +195,12 @@ class LocalRuntime {
   /// the person has to do is add a provider, and this is how the window gets
   /// to say that instead. Null when the app has no better account than the
   /// connection error itself.
-  declined(reason) {
+  declined(reason, said = null) {
     this.reason = reason ?? null;
+    // The runtime's own last words, when there were any. A host that refuses
+    // to start prints why and is then gone, and the person who has to act on
+    // it is at the window rather than at this process's console.
+    this.said = said;
   }
 
   status() {
@@ -207,6 +211,7 @@ class LocalRuntime {
       connected: this.reachable,
       error: this.lastError,
       reason: this.reachable ? null : (this.reason ?? null),
+      said: this.reachable ? null : (this.said ?? null),
     };
   }
 

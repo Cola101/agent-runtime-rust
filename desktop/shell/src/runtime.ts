@@ -22,6 +22,10 @@ export type Link =
   /// why. A fresh install has no provider; naming the socket there would report
   /// a step nobody has taken as a fault in the app.
   | { state: "no-provider" }
+  /// The app tried to start a runtime and it did not come up. `said` is
+  /// whatever the runtime printed on its way out, which is usually the whole
+  /// answer and is otherwise the only lead there is.
+  | { state: "start-failed"; said: string | null }
   | { state: "unreachable"; socketPath: string; reason: string }
   | { state: "live"; socketPath: string };
 
@@ -35,6 +39,9 @@ export type RuntimeStatus = {
   /// `no-provider` means it declined to start a runtime rather than failed to
   /// reach one. Absent from an older preload, which is why it is optional.
   reason?: string | null;
+  /// The last lines the runtime printed before it stopped, when the app has
+  /// them. Absent from an older preload.
+  said?: string | null;
 };
 
 export type RunEvent = {
@@ -359,6 +366,9 @@ function linkFrom(status: RuntimeStatus): Link {
   // Before the socket, because "nothing is listening" is what both look like
   // and only one of them is something the person can act on.
   if (status.reason === "no-provider") return { state: "no-provider" };
+  if (status.reason === "start-failed") {
+    return { state: "start-failed", said: status.said ?? null };
+  }
   return {
     state: "unreachable",
     socketPath: status.socketPath,

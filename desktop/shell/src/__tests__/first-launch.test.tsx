@@ -55,6 +55,29 @@ describe("the first launch", () => {
     await waitFor(() => expect(screen.getByText(/设置/)).toBeTruthy());
   });
 
+  /// A runtime that refuses to start says why on stderr and is then gone.
+  /// `RuntimeProcess` keeps those lines for exactly that reason -- its own
+  /// comment says so -- and they went to the main process's console and
+  /// nowhere else, while the window showed a silent socket. The person who has
+  /// to act on it is the one at the window.
+  it("shows what the runtime said before it died, rather than a silent socket", async () => {
+    const bridge = installFakeRuntime();
+    const died = {
+      transport: "local",
+      stateRoot: "/tmp/state",
+      socketPath: "/tmp/state/runtime-host.sock",
+      connected: false,
+      error: "no runtime is listening",
+      reason: "start-failed",
+      said: 'Error: "AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT is required"',
+    };
+    bridge.desk.runtime.status = async () => ({ ok: true as const, value: died });
+    bridge.desk.runtime.probe = async () => ({ ok: true as const, value: died });
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByText(/AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT/)).toBeTruthy());
+  });
+
   /// A runtime that is genuinely unreachable is a different fact and keeps its
   /// own words: something was there and is not answering.
   it("still names the socket when a runtime should have been there", async () => {

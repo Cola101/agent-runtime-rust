@@ -542,11 +542,11 @@ async function openRuntime({ mustOwn = false } = {}) {
   if (!routing) {
     // Told to the window as well as to the console. This is the state a fresh
     // install is in, and the only screen every new person is guaranteed to see.
-    local.declined("no-provider");
+    local.declined("no-provider", null);
     console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
     return;
   }
-  local.declined(null);
+  local.declined(null, null);
   // Written beside the routing file, and read by the runtime at startup only.
   // Null when no server is configured, so the variable stays unset rather than
   // naming an empty list.
@@ -570,6 +570,7 @@ async function openRuntime({ mustOwn = false } = {}) {
         (mcp ? ` with ${mcp.applied.length} MCP server(s)` : ""),
     );
   } catch (error) {
+    local.declined("start-failed", error.message);
     console.error(`runtime-desk: could not start a runtime — ${error.message}`);
     return;
   }
@@ -583,9 +584,9 @@ async function openRuntime({ mustOwn = false } = {}) {
       return;
     }
     if (!runtime.running) {
-      console.error(
-        `runtime-desk: runtime-host exited before it listened — ${runtime.log.slice(-3).join(" / ")}`,
-      );
+      const said = runtime.log.slice(-3).join(" / ");
+      local.declined("start-failed", said || null);
+      console.error(`runtime-desk: runtime-host exited before it listened — ${said}`);
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 100));

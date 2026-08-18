@@ -28,6 +28,16 @@ export function LinkBanner({ link }: { link: Link }) {
       </div>
     );
   }
+  if (link.state === "start-failed") {
+    return (
+      <div className="offline">
+        <b>Runtime 起不来。</b>
+        {link.said
+          ? <> 它退出前说的是：<code>{link.said}</code></>
+          : " 它退出前什么都没说 —— 这种情况少见，日志里可能有更多。"}
+      </div>
+    );
+  }
   return (
     <div className="offline">
       <b>连不上 Runtime。</b> {link.socketPath} 没有回应 —— {link.reason}

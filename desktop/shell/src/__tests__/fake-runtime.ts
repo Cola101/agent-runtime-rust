@@ -884,7 +884,7 @@ export function installFakeRuntime(
   // its way past the shape.
   const status = (): RuntimeStatus => ({
     transport: "local", stateRoot: "/tmp/state", socketPath: "/tmp/state/runtime-host.sock",
-    connected: true, error: null, reason: null,
+    connected: true, error: null, reason: null, said: null,
   });
   // The host side of the notification: what the window reports, and the way
   // back in when someone clicks one. `attend` stands in for that click.
