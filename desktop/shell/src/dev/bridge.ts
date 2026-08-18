@@ -211,6 +211,10 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
         provider_id: "backup-stub", failed_provider_ids: ["local-stub"],
       }, RUN_BROKE, 25),
       ev("model.usage", { input_tokens: 399_000, output_tokens: 1_400, cost_micros: 8_200 }, RUN_BROKE, 25),
+      ev("model.output.delta", {
+        text: "runtime/ 下面有 crates、apps、contracts 三块，crates 里又分",
+      }, RUN_BROKE, 25),
+      ev("model.turn.completed", { reason: "length" }, RUN_BROKE, 25),
       ev("run.failed", {
         status: "failed", kind: "budget_exhausted", dimension: "tokens", retryable: false,
       }, RUN_BROKE, 25),

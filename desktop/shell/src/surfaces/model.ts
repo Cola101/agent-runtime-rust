@@ -131,7 +131,10 @@ const EVENT_NOTE: Record<string, string> = {
   /// stops for `delay_ms`, which reads as a hang.
   "model.provider.retry_scheduled": "已安排重试 Provider",
   "model.tool_call": "模型请求调用工具",
-  "model.turn.completed": "本轮结束",
+  /// Only ever drawn for a turn that did not end the ordinary way --
+  /// `belongsInConversation` keeps the other two out -- so the words are about
+  /// the answer being short rather than about a turn having ended.
+  "model.turn.completed": "这一轮被截断了",
   /// The model answered by refusing. It is an answer, not a failure: the Run
   /// keeps running and the next thing on screen is the model's, so a refusal
   /// that left no mark made the reply look like it changed its mind.
@@ -329,6 +332,10 @@ function providerRetry(payload: Record<string, unknown>): string | null {
 }
 
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
+  if (type === "model.turn.completed") {
+    const cut = cutShort(payload);
+    return cut ? [cut] : null;
+  }
   if (type === "model.provider.selected") {
     const failed = failedOver(payload);
     if (!failed) return null;
@@ -408,7 +415,21 @@ export function belongsInConversation(
   // asked: a Run answered by a fallback is answered by a different model, at a
   // different price, behaving differently -- and it looked identical.
   if (type === "model.provider.selected") return failedOver(payload) !== null;
+  // Same shape, same reason. A turn ends `stop` or `tool_calls` on every
+  // ordinary exchange, and saying so under every paragraph is a log printed
+  // through a conversation. `length` and `content_filter` are not that: the
+  // reply above is unfinished, and a person reading a cut-off answer takes it
+  // for the whole one unless something says otherwise.
+  if (type === "model.turn.completed") return cutShort(payload) !== null;
   return !ROUTINE.has(type);
+}
+
+/// Why a turn stopped, when it stopped for a reason worth saying.
+function cutShort(payload: Record<string, unknown>): string | null {
+  const reason = typeof payload.reason === "string" ? payload.reason : null;
+  if (reason === "length") return "这段回答没说完 —— 模型到了单轮长度上限";
+  if (reason === "content_filter") return "这段回答被内容过滤挡下了";
+  return null;
 }
 
 /// The Providers that did not answer, when any did not.

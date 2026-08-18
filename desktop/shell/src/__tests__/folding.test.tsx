@@ -435,6 +435,40 @@ describe("what the runtime said in words", () => {
     expect(screen.queryByText(/选定 Provider/)).toBeNull();
   });
 
+  /// `Stop` and `ToolCalls` are bookkeeping -- every turn ends one of those two
+  /// ways. `Length` and `ContentFilter` are not: the reply on screen is
+  /// unfinished, and nothing said so. Someone reads a cut-off answer and takes
+  /// it for the whole one.
+  it("says a reply was cut off by length rather than finished", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.output.delta", { text: "开头是这样的" }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "model.turn.completed", { reason: "length" }, 30));
+    await waitFor(() => expect(screen.getByText(/没说完/)).toBeTruthy());
+  });
+
+  it("says a reply was stopped by a content filter", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.turn.completed", { reason: "content_filter" }, 30));
+    await waitFor(() => expect(screen.getByText(/内容过滤/)).toBeTruthy());
+  });
+
+  /// The two ordinary endings stay silent. A line per turn saying a turn ended
+  /// is a line under every paragraph of every conversation.
+  it("says nothing when a turn ended the ordinary way", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.output.delta", { text: "答完了" }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "model.turn.completed", { reason: "stop" }, 30));
+    await waitFor(() => expect(screen.getByText(/答完了/)).toBeTruthy());
+    expect(screen.queryByText(/这一轮结束/)).toBeNull();
+    expect(screen.queryByText(/没说完/)).toBeNull();
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);
