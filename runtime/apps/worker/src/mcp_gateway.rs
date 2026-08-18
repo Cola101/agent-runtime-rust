@@ -19,7 +19,7 @@ use agent_protocol::{
 };
 use base64::Engine;
 use futures_util::{StreamExt, future::BoxFuture};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -90,28 +90,7 @@ impl McpDiscoveryPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum McpServerHealth {
-    Ready,
-    Unavailable,
-}
-
-/// One server's observable discovery outcome. A missing optional server may
-/// let the Run continue, but it must never disappear from diagnostics.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct McpServerDiscoveryStatus {
-    pub server_name: String,
-    pub required: bool,
-    pub health: McpServerHealth,
-    pub attempts: u8,
-    /// Advertised surfaces frozen into the directory digest. Empty when the
-    /// server was unavailable before a trustworthy discovery completed.
-    #[serde(default)]
-    pub capabilities: std::collections::BTreeSet<McpServerCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
+pub use agent_protocol::{McpServerDiscoveryStatus, McpServerHealth};
 
 /// Process-local admission for MCP discovery calls shared by every clone of a
 /// gateway client.

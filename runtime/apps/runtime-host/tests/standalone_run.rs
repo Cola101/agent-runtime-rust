@@ -4365,7 +4365,15 @@ async fn standalone_stdio_mcp_timeout_reaps_the_entire_process_group() {
     assert_eq!(outcome.status, RunStatus::Failed);
     assert_eq!(
         outcome.event_types,
-        vec!["run.started", "model.provider.failed", "run.failed"]
+        // The optional server that timed out is named in the log rather than
+        // only in this outcome, which is the whole difference between "the
+        // model did not use those tools" and "those tools were not there".
+        vec![
+            "run.started",
+            "mcp.discovery.completed",
+            "model.provider.failed",
+            "run.failed"
+        ]
     );
     let grandchild = read_pid(&pid_file);
     assert!(
@@ -4414,7 +4422,15 @@ async fn standalone_stdio_mcp_initialize_timeout_reaps_the_process_group() {
     assert_eq!(outcome.status, RunStatus::Failed);
     assert_eq!(
         outcome.event_types,
-        vec!["run.started", "model.provider.failed", "run.failed"]
+        // The optional server that timed out is named in the log rather than
+        // only in this outcome, which is the whole difference between "the
+        // model did not use those tools" and "those tools were not there".
+        vec![
+            "run.started",
+            "mcp.discovery.completed",
+            "model.provider.failed",
+            "run.failed"
+        ]
     );
     let grandchild = read_pid(&pid_file);
     assert!(
@@ -4485,6 +4501,84 @@ async fn runtime_host_binary_executes_a_configured_stdio_mcp_tool() {
         wait_for_process_exit(grandchild).await,
         "one-shot binary exit must reap its stdio MCP process tree"
     );
+    provider.abort();
+    let _ = provider.await;
+}
+
+/// An optional MCP server that never came up must leave a trace in the Run's
+/// own log.
+///
+/// It was visible only inside the host process: `LocalRunOutcome::mcp_servers`
+/// carries every server's outcome and neither socket surface returns that
+/// field, so a person who configured a server saw the agent carry on without
+/// those tools and had no way to tell that from the model not using them.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_optional_mcp_server_that_never_started_is_written_into_the_run_log() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let fixture_state = tempfile::tempdir().expect("fixture state");
+    let config_path = fixture_state.path().join("mcp.json");
+    let (endpoint, provider) = spawn_provider(vec![text_turn("answered anyway")]).await;
+    let config_json = serde_json::json!([{
+        "server_id": "00000000-0000-4000-8000-000000000055",
+        "name": "notes",
+        "transport": {
+            "type": "stdio",
+            // A real binary that exits immediately without speaking MCP.
+            // Not a path that is missing: the host refuses a configuration
+            // naming a command that is not there, so that case never reaches
+            // discovery at all -- it stops the Runtime from starting, and the
+            // window says so through the start-failed banner instead.
+            "command": "/usr/bin/false",
+            "args": [],
+            "env": {},
+            "cwd": null,
+        },
+        "tool_names": ["search"],
+        "required": false,
+    }]);
+    std::fs::write(&config_path, serde_json::to_vec(&config_json).unwrap()).unwrap();
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-runtime-host"))
+        .arg("run")
+        .arg("say something")
+        .env("AGENT_RUNTIME_LOCAL_STATE_ROOT", state.path())
+        .env("AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT", workspace.path())
+        .env("AGENT_RUNTIME_LOCAL_PROVIDER_ENDPOINT", endpoint)
+        .env("AGENT_RUNTIME_LOCAL_PROVIDER_MODEL", "test-model")
+        .env("AGENT_RUNTIME_LOCAL_PROVIDER_API_KEY", "test-key")
+        .env("AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES", "tool:mcp:notes")
+        .env("AGENT_RUNTIME_LOCAL_MCP_CONFIG", &config_path)
+        .output()
+        .await
+        .expect("run runtime-host binary");
+    assert!(
+        output.status.success(),
+        "an optional MCP server that failed must not fail the Run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["status"], "succeeded");
+
+    let run_id = outcome["run_id"].as_str().expect("outcome names its Run");
+    let events = std::fs::read_to_string(
+        state.path().join("runs").join(run_id).join("events.jsonl"),
+    )
+    .expect("the Run's event log");
+    let discovery: serde_json::Value = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event JSON"))
+        .find(|event| event["type"] == "mcp.discovery.completed")
+        .expect("a configured MCP server must leave its discovery outcome in the log");
+    let servers = discovery["payload"]["servers"]
+        .as_array()
+        .expect("the event carries every configured server");
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["server_name"], "notes");
+    assert_eq!(servers[0]["health"], "unavailable");
+    assert_eq!(servers[0]["required"], false);
+
     provider.abort();
     let _ = provider.await;
 }

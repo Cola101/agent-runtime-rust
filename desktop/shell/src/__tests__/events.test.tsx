@@ -45,6 +45,41 @@ describe("events the runtime reports about the exchange", () => {
     expect(screen.getByText("这件事我不做。")).toBeTruthy();
   });
 
+  /// A configured MCP server that never came up.
+  ///
+  /// The Run carries on without those Tools, so the only observable difference
+  /// was that the model never used them -- which reads exactly like the model
+  /// choosing not to. Both halves are held here: the failure is said, and the
+  /// ordinary case where every server answered stays out of the column.
+  it("names an MCP server that did not come up, and stays quiet when they all did", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "mcp.discovery.completed", {
+      servers: [
+        { server_name: "docs", required: false, health: "ready", attempts: 1, capabilities: [] },
+        {
+          server_name: "notes", required: false, health: "unavailable", attempts: 3,
+          capabilities: [], error: "server exited before initialize",
+        },
+      ],
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/MCP 服务没起来/)).toBeTruthy());
+    const said = screen.getByText(/MCP 服务没起来/).textContent ?? "";
+    expect(said).toContain("notes");
+    expect(said).toContain("试了 3 次");
+    expect(said).toContain("server exited before initialize");
+    // The one that answered is not named: a line listing what worked is a
+    // machine log printed through a conversation.
+    expect(said).not.toContain("docs");
+
+    bridge.emit(RUN_LIVE, bridge.event(41, "mcp.discovery.completed", {
+      servers: [
+        { server_name: "docs", required: false, health: "ready", attempts: 1, capabilities: [] },
+      ],
+    }, 31));
+    // Still exactly one line, from the first event.
+    await waitFor(() => expect(screen.getAllByText(/MCP 服务没起来/).length).toBe(1));
+  });
+
   it("says the transcript behind the model is a summary now", async () => {
     const { bridge } = await watching();
     bridge.emit(RUN_LIVE, bridge.event(40, "context.compacted", {

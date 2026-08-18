@@ -289,7 +289,50 @@ export function eventNote(type: string, payload: Record<string, unknown> = {}): 
     const declined = toolResultNote(payload);
     if (declined) return declined;
   }
+  if (type === "mcp.discovery.completed") return mcpDiscoveryNote(payload);
   return EVENT_NOTE[type] ?? null;
+}
+
+/// One server's outcome, as the runtime reports it.
+type DiscoveredServer = {
+  server_name: string;
+  required: boolean;
+  health: string;
+  attempts: number;
+  error?: string;
+};
+
+function discoveredServers(payload: Record<string, unknown>): DiscoveredServer[] {
+  const servers = payload.servers;
+  if (!Array.isArray(servers)) return [];
+  return servers.filter(
+    (server): server is DiscoveredServer =>
+      typeof server === "object" &&
+      server !== null &&
+      typeof (server as DiscoveredServer).server_name === "string",
+  );
+}
+
+/// A configured MCP server that did not come up, said out loud.
+///
+/// Silent when every server is ready, which is the ordinary case: a line under
+/// every Run listing servers that worked is a machine log printed through a
+/// conversation. What it exists for is the other case -- the agent carries on
+/// without those tools, and until this said so the only observable difference
+/// was that the model never used them, which is indistinguishable from the
+/// model choosing not to.
+export function mcpDiscoveryNote(payload: Record<string, unknown>): string | null {
+  const missing = discoveredServers(payload).filter((server) => server.health !== "ready");
+  if (missing.length === 0) return null;
+  const said = missing.map((server) => {
+    const tried = server.attempts > 1 ? `，试了 ${server.attempts} 次` : "";
+    // Required failures already end the Run, so naming which kind this is
+    // tells a person whether to expect the Run to continue without it.
+    const weight = server.required ? "必需的 " : "";
+    const why = typeof server.error === "string" && server.error ? `：${server.error}` : "";
+    return `${weight}${server.server_name}${tried}${why}`;
+  });
+  return `MCP 服务没起来——${said.join("；")}`;
 }
 
 /// What a Provider failure means for the person reading it.
@@ -397,6 +440,11 @@ const ROUTINE: ReadonlySet<string> = new Set([
   /// The other half of `mcp.input.resolved`, which stays. One resumption, and
   /// the half that says the input landed is the half a person is waiting for.
   "mcp.input.continuation.started",
+  /// Routine in the ordinary case, which is that every configured MCP server
+  /// answered. `belongsInConversation` lifts it out of here when one did not --
+  /// the same arrangement `model.provider.selected` has, and for the same
+  /// reason: one event type, two different things to say.
+  "mcp.discovery.completed",
 ]);
 
 /// Whether an event belongs in the conversation column.
@@ -415,6 +463,10 @@ export function belongsInConversation(
   // asked: a Run answered by a fallback is answered by a different model, at a
   // different price, behaving differently -- and it looked identical.
   if (type === "model.provider.selected") return failedOver(payload) !== null;
+  // Same rule, same reason: every Run that has MCP servers configured emits
+  // this, and the ordinary answer is that they all came up. The line is worth
+  // a person's attention only when one did not.
+  if (type === "mcp.discovery.completed") return mcpDiscoveryNote(payload) !== null;
   // Same shape, same reason. A turn ends `stop` or `tool_calls` on every
   // ordinary exchange, and saying so under every paragraph is a log printed
   // through a conversation. `length` and `content_filter` are not that: the

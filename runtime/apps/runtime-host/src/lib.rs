@@ -5495,6 +5495,34 @@ impl LocalRuntimeHost {
     /// reconnects replays from the log, so an event that was broadcast but not
     /// yet durable would be visible to a connected client and invisible to a
     /// reconnecting one.
+    /// Puts what discovery found into the Run's own log.
+    ///
+    /// Until this existed, a configured MCP server that failed to come up was
+    /// visible only inside this process: `LocalRunOutcome::mcp_servers` carries
+    /// it, and nothing on either socket surface returns that field. A person
+    /// who configured a server saw the Run carry on with those Tools missing
+    /// and no way to find out why. The event log is where the client already
+    /// looks, so this is one durable record rather than a new call.
+    ///
+    /// Nothing is written when nothing was configured: an empty list would
+    /// appear in every Run's transcript saying nothing.
+    fn note_mcp_discovery(
+        &mut self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        servers: &[McpServerDiscoveryStatus],
+        types: &mut Vec<String>,
+    ) -> Result<(), LocalRuntimeError> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+        let event = self
+            .processor
+            .record_mcp_discovery_completed(attempt_id, servers)
+            .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?;
+        self.emit(run_id, &event, types)
+    }
+
     fn emit(
         &self,
         run_id: Uuid,
@@ -8070,6 +8098,7 @@ impl LocalRuntimeHost {
                         ));
                     }
                     self.emit(run_id, &event, &mut event_types)?;
+                    self.note_mcp_discovery(run_id, attempt_id, &mcp_statuses, &mut event_types)?;
                 }
                 McpDiscoveryCompletion::Restored { mcp_servers, .. } => {
                     mcp_statuses = mcp_servers;
@@ -8079,6 +8108,7 @@ impl LocalRuntimeHost {
                         )
                     })?;
                     self.emit(run_id, event, &mut event_types)?;
+                    self.note_mcp_discovery(run_id, attempt_id, &mcp_statuses, &mut event_types)?;
                 }
                 McpDiscoveryCompletion::Failed {
                     event, mcp_servers, ..

@@ -77,11 +77,27 @@ describe("the configured servers", () => {
 });
 
 describe("whether a server came up", () => {
-  it("says the runtime does not tell it, rather than implying an answer", async () => {
+  /// This page used to say the runtime keeps the answer to itself, which was
+  /// true and is not any more: every Run writes what discovery found into its
+  /// own log. What the page must not do is imply it has a live answer -- one
+  /// Run is one discovery, and a page-level "up / down" would be a claim about
+  /// a moment nobody asked about.
+  it("points at where the answer is, per Run, rather than implying a live one", async () => {
     await openMcp();
     await waitFor(() =>
-      expect(screen.getByText(/本地 socket 没有任何调用能读到它/)).toBeTruthy());
-    expect(screen.getByText("McpServerDiscoveryStatus")).toBeTruthy();
+      expect(screen.getByText(/起没起来是每个 Run 各问一次的事/)).toBeTruthy());
+    expect(screen.getByText("mcp.discovery.completed")).toBeTruthy();
+    // No wording left claiming nothing can read it.
+    expect(screen.queryByText(/本地 socket 没有任何调用能读到它/)).toBeNull();
+  });
+
+  /// The page told people to quit and reopen the app, which stopped being true
+  /// when 重启 Runtime landed -- and quitting is a much bigger thing to ask.
+  it("offers a Runtime restart where the change needs one", async () => {
+    await openMcp();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /重启 Runtime/ })).toBeTruthy());
+    expect(screen.queryByText(/退出应用再打开/)).toBeNull();
   });
 
   it("names a required server a Run was actually refused for", async () => {

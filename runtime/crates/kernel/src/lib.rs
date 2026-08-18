@@ -4,7 +4,8 @@ pub use read_only_shell::{ShellCommandClass, classify_shell_command};
 
 use agent_protocol::{
     ApprovalMode, AutoApproval, BudgetDimension, CheckpointSnapshot, EventEnvelope,
-    MCP_INPUT_VERSION, McpInputContinuation, McpInputRequired, ModelErrorKind, ModelFinishReason,
+    MCP_INPUT_VERSION, McpInputContinuation, McpInputRequired, McpServerDiscoveryStatus,
+    ModelErrorKind, ModelFinishReason,
     ModelStreamEvent, RunStatus, SandboxClass, SubagentForkReceipt, SubagentResultDelivery,
     SubagentRollbackReceipt, SubagentSpawnMode, SubagentSpawnRequest, ToolApprovalPolicySnapshot,
     ToolApprovalRequest, ToolCall, ToolDescriptor, ToolEffect, ToolExecutionRequest,
@@ -1179,6 +1180,39 @@ impl RunMachine {
                 "binding_digest": pending.binding_digest,
                 "round": continuation.round
             }),
+        ))
+    }
+
+    /// Every configured MCP server's discovery outcome, once, at the point the
+    /// Run became able to use them.
+    ///
+    /// The terminal `run.failed{required_mcp_unavailable}` already names a
+    /// *required* server that did not come up. An **optional** one that did not
+    /// come up leaves no trace at all: the Run carries on without those Tools,
+    /// and nothing downstream can tell "the model did not use it" from "it was
+    /// never there". A person who configured a server and sees the agent ignore
+    /// it has no way to find out which of those happened. This event is that
+    /// trace, and it carries the healthy servers too so that the absence of one
+    /// is readable rather than inferred from silence.
+    pub fn record_mcp_discovery_completed(
+        &mut self,
+        servers: &[McpServerDiscoveryStatus],
+    ) -> Result<EventEnvelope, TransitionError> {
+        if self.status.is_terminal() {
+            return Err(TransitionError::TerminalState(self.status));
+        }
+        // Says something without changing anything, so it carries the status
+        // forward rather than naming one. The other shape was written first and
+        // it resurrected a Run: discovery runs again when a replacement host
+        // restores an attempt, and an attempt parked on `mcp.input.required`
+        // restores as `Suspended` -- which an event that names `Running` would
+        // quietly undo, on exactly the path where a server is most likely to
+        // have gone away.
+        let status = self.status;
+        Ok(self.emit(
+            status,
+            "mcp.discovery.completed",
+            json!({ "servers": servers, "status": status }),
         ))
     }
 

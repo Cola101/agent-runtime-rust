@@ -222,7 +222,10 @@ function Restart() {
     // provider, with nothing on screen to say so.
     if (!reply.value.restarted) {
       setRefused(true);
-      setSaid("这个 Runtime 不是这个应用启动的，只能停掉它自己启动的那个。要换配置就退出应用再打开。");
+      setSaid(
+        "这个 Runtime 不是这个应用启动的，这个应用只能停掉它自己启动的那个。"
+        + "要换配置，得去把那个 Runtime 停掉 —— 退出这个应用不会停它。",
+      );
       return;
     }
     const report = reply.value.report ?? {};
@@ -345,7 +348,7 @@ function Mcp() {
       {leftover.length > 0 && (
         <p className="note">
           Runtime 启动时还带着已经删掉的 {leftover.map((entry) => entry.name).join("、")}，
-          它现在仍在跑。退出应用再打开才会真的没有。
+          它现在仍在跑。重启 Runtime 才会真的没有 —— 重启的是 Runtime，不是这个应用。
         </p>
       )}
 
@@ -394,17 +397,20 @@ function Mcp() {
       {error && <div className="err">{error}</div>}
 
       <p className="note">
-        配置了不等于起来了。某个服务有没有起来，是 Runtime 进程里的 <code>McpServerDiscoveryStatus</code>，
-        本地 socket 没有任何调用能读到它 —— 所以这一页只说配了什么，不说它们活着没有。
-        标成「必需」是例外：它起不来时 Run 会直接失败，日志里是 <code>run.failed</code> ・
-        <code>required_mcp_unavailable</code> 并点名，那是这台机器上唯一看得见的地方。
+        配置了不等于起来了，而这一页说的是配了什么 —— <b>起没起来是每个 Run 各问一次的事</b>，
+        不是这一页能有的一个状态。每个 Run 开始时会把这次发现的结果写进它自己的日志
+        （<code>mcp.discovery.completed</code>）：都起来了就不占对话，
+        有没起来的会在那段对话里点名说是哪个、试了几次、报的什么错。
+        标成「必需」的更进一步 —— 它起不来时 Run 直接失败，
+        日志里是 <code>run.failed</code> ・<code>required_mcp_unavailable</code>。
       </p>
       <p className="note">
         工具名要自己写：Runtime 拿它当白名单，发现阶段只会收窄，不会加上没写的工具。
         环境变量这里不收 —— stdio 服务的环境只能写进配置文件，而密钥不写进配置文件是上面那条规矩。
       </p>
+      <Restart />
       <p className="note">
-        Runtime 只在启动时读这份配置。改完要退出应用再打开，新的服务才会真的在。
+        Runtime 只在启动时读这份配置，所以改完要重启它 —— 重启的是 Runtime，不是这个应用。
       </p>
     </>
   );

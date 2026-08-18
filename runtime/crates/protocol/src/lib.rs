@@ -1038,6 +1038,33 @@ fn form_content_matches(schema: &Value, content: &Value) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerHealth {
+    Ready,
+    Unavailable,
+}
+
+/// One server's observable discovery outcome. A missing optional server may
+/// let the Run continue, but it must never disappear from diagnostics.
+///
+/// Lives here rather than in the Worker because it is carried by an event, and
+/// an event's payload is read by everything downstream of the log -- including
+/// clients that never link the Worker.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpServerDiscoveryStatus {
+    pub server_name: String,
+    pub required: bool,
+    pub health: McpServerHealth,
+    pub attempts: u8,
+    /// Advertised surfaces frozen into the directory digest. Empty when the
+    /// server was unavailable before a trustworthy discovery completed.
+    #[serde(default)]
+    pub capabilities: std::collections::BTreeSet<McpServerCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpServerSnapshot {
     pub server_id: Uuid,

@@ -7822,6 +7822,31 @@ impl WorkerProcessor {
         Ok(event)
     }
 
+    /// Records what discovery found, on an attempt that has already started.
+    ///
+    /// Not folded into `start`: discovery for a restored attempt produces no
+    /// start event at all, and the fact is the same in both cases.
+    pub fn record_mcp_discovery_completed(
+        &mut self,
+        attempt_id: Uuid,
+        servers: &[McpServerDiscoveryStatus],
+    ) -> Result<EventEnvelope, WorkerAssignmentError> {
+        if self.completed.contains_key(&attempt_id) {
+            return Err(WorkerAssignmentError::AttemptAlreadyTerminal);
+        }
+        let execution = self
+            .accepted
+            .get_mut(&attempt_id)
+            .ok_or(WorkerAssignmentError::UnknownAttempt)?;
+        if execution.terminal_event.is_some() {
+            return Err(WorkerAssignmentError::AttemptAlreadyTerminal);
+        }
+        execution
+            .machine
+            .record_mcp_discovery_completed(servers)
+            .map_err(|error| WorkerAssignmentError::KernelTransition(error.to_string()))
+    }
+
     pub fn record_tool_execution_progress(
         &mut self,
         attempt_id: Uuid,
