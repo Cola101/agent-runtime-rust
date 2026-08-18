@@ -158,52 +158,6 @@ fn a_write_request_without_text_is_refused_before_touching_the_filesystem() {
     assert!(!workspace.path().join("notes.md").exists());
 }
 
-/// A write replaces whatever is there, including something that arrived after
-/// the agent decided what to write.
-///
-/// This is the sequence a desktop session actually produces: the agent reads a
-/// file, composes new contents, the person is shown what would change and
-/// approves -- and in the gap between the read and the write, an editor or
-/// another Run touches the same file. The write lands on top of it and nothing
-/// anywhere records that anything was lost.
-///
-/// `docs/desktop-ui-gap.md` has said 不得静默覆盖 about this since before this
-/// test existed, and the approval card added this week draws a comparison
-/// computed *before* that gap, which makes approving feel better grounded than
-/// it is.
-///
-/// Marked `#[ignore]` rather than left failing: it is a statement of what is
-/// wanted, not a regression, and turning the suite red would say a change
-/// broke something. Run it with `--ignored` to see the clobber.
-#[test]
-#[ignore = "records the silent clobber; the fix is a contract decision, see docs/evidence/2026-08-19-write-clobbers-silently.md"]
-fn a_write_refuses_to_replace_a_file_that_changed_after_it_was_read() {
-    let workspace = workspace("clobber");
-    let path = workspace.path().join("notes.txt");
-    std::fs::write(&path, "one\n").expect("seed the file");
-
-    // What the agent read, and what it decided to write from it.
-    let read = invoke(workspace.path(), "workspace.read_text", json!({ "path": "notes.txt" }));
-    assert_eq!(read["content"]["text"], "one\n");
-
-    // Someone else edits the same file while the approval is on screen.
-    std::fs::write(&path, "one\ntwo, added by hand\n").expect("edit under it");
-
-    let wrote = invoke(
-        workspace.path(),
-        "workspace.write_text",
-        json!({ "path": "notes.txt", "text": "one\nrewritten by the agent\n" }),
-    );
-
-    // What is wanted: a refusal naming the mismatch, and the hand edit intact.
-    assert_eq!(wrote["is_error"], true, "a write over a changed file must be refused");
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read back"),
-        "one\ntwo, added by hand\n",
-        "the edit made while the approval was on screen must survive",
-    );
-}
-
 /// The check itself, driven directly: a write that carries what it expected to
 /// find is refused when the file no longer holds it.
 ///

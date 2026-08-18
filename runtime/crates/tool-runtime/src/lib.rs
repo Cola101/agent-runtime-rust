@@ -26,15 +26,17 @@ pub use process_session::{
 pub use process_session::run_process_session_pty_supervisor;
 
 use agent_protocol::{
-    McpElicitationRequest, McpInputContinuation, SandboxClass, ToolExecutionRequest,
+    McpElicitationRequest, McpInputContinuation, SandboxClass, ToolCall, ToolExecutionRequest,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -629,7 +631,31 @@ pub struct TrustedNativeExecutor {
     executable: PathBuf,
     executable_digest: String,
     implementation_digest: String,
+    /// What each Run has seen in the workspace, so a later write by the same
+    /// Run can say what it expected to find.
+    ///
+    /// The tool refuses a write whose `expected_sha256` no longer matches, and
+    /// until this existed nothing ever sent that field -- the check was there
+    /// and could not fire. What it protects against is ordinary rather than
+    /// adversarial: a person edits a file while an approval for a write to it
+    /// is on screen, and the write lands on top with nothing recording that
+    /// anything was lost.
+    ///
+    /// Keyed by Run because two Runs are two accounts. What one Run read says
+    /// nothing about what another may overwrite, and sharing the entry would
+    /// refuse a write for a reason that has nothing to do with the Run being
+    /// refused.
+    seen: Arc<Mutex<HashMap<(Uuid, String), String>>>,
 }
+
+/// How many (Run, path) pairs one executor remembers.
+///
+/// A bound rather than a policy: this map lives for the life of the process and
+/// a long-running host would otherwise hold one entry per file per Run for
+/// ever. Reaching it means the oldest entries are dropped, and dropping one is
+/// safe in the direction that matters -- a write with no expectation behaves
+/// exactly as it did before any of this, which is to say it writes.
+const MAX_SEEN_FILES: usize = 4_096;
 
 impl TrustedNativeExecutor {
     pub fn new(definition: TrustedNativeToolDefinition) -> Result<Self, ToolExecutionError> {
@@ -692,7 +718,38 @@ impl TrustedNativeExecutor {
             executable,
             executable_digest,
             implementation_digest,
+            seen: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// What this Run last saw at this path, if it has seen it.
+    fn expectation(&self, run: Uuid, path: &str) -> Option<String> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(run, path.to_owned()))
+            .cloned()
+    }
+
+    /// Records what this Run now knows a path to hold.
+    ///
+    /// Called after a read *and* after a write: a Run that writes twice must
+    /// carry what its own first write left, or the second would be refused for
+    /// a change the Run made itself.
+    fn remember(&self, run: Uuid, path: &str, text: &str) {
+        let mut seen = self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bounded by dropping rather than by refusing. An entry lost means a
+        // later write carries no expectation, which is exactly how every write
+        // behaved before this existed.
+        if seen.len() >= MAX_SEEN_FILES && !seen.contains_key(&(run, path.to_owned())) {
+            if let Some(oldest) = seen.keys().next().cloned() {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert((run, path.to_owned()), digest_bytes(text.as_bytes()));
     }
 
     #[must_use]
@@ -793,10 +850,36 @@ impl TrustedNativeExecutor {
                 "attempt_id": context.attempt_id,
                 "requested_at": context.requested_at,
                 "timeout_ms": context.timeout.as_millis(),
-                "tool_call": request.call,
+                "tool_call": self.with_expectation(&request.call, context),
                 "binding_digest": request.binding_digest,
             }),
         })
+    }
+
+    /// The call as the tool will receive it, with what this Run expects to find
+    /// at the path when it is writing to one it has read.
+    ///
+    /// Added here rather than by the caller because the caller does not know
+    /// what this Run has read -- and must not, since the point of keeping it
+    /// here is that the model cannot decline to send it.
+    fn with_expectation(&self, call: &ToolCall, context: &ToolExecutionContext) -> Value {
+        let mut wire = serde_json::to_value(call).expect("a tool call is serializable");
+        if call.name != "workspace.write_text" {
+            return wire;
+        }
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return wire;
+        };
+        let Some(expected) = self.expectation(context.run_id, path) else {
+            // Never read by this Run: creating a file, or deliberately
+            // replacing one nobody looked at. An expectation invented here
+            // would refuse an act the person is entitled to.
+            return wire;
+        };
+        if let Some(arguments) = wire.get_mut("arguments").and_then(Value::as_object_mut) {
+            arguments.insert("expected_sha256".into(), Value::String(expected));
+        }
+        wire
     }
 
     pub async fn execute(
@@ -901,6 +984,19 @@ impl TrustedNativeExecutor {
         {
             return Err(ToolExecutionError::OutputBindingMismatch);
         }
+        // What this Run now knows the file to hold. Recorded from what the tool
+        // actually returned rather than from what was asked for, so a write the
+        // tool altered or refused does not leave a claim behind.
+        if !response.is_error
+            && matches!(
+                request.call.name.as_str(),
+                "workspace.read_text" | "workspace.write_text"
+            )
+            && let Some(path) = response.content.get("path").and_then(Value::as_str)
+            && let Some(text) = response.content.get("text").and_then(Value::as_str)
+        {
+            self.remember(context.run_id, path, text);
+        }
         Ok(ToolExecutionResult {
             content: response.content,
             is_error: response.is_error,
@@ -976,6 +1072,11 @@ fn digest_file(path: &Path) -> Result<String, std::io::Error> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(path)?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn digest_serializable(value: &Value) -> String {
