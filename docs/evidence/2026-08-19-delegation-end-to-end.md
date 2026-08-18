@@ -53,6 +53,32 @@ let child_outcome = match child_outcome {
 也就是说：**协议、内核、界面三层都准备好接收一个失败的子代理结果，只有本地 host
 把它变成了一个没人接的错误。**
 
+### 让它出声之后，机制更清楚了一层
+
+`execute_detached` 在 **durable 接受时就返回**——那是契约，也是客户端可以挂断而 Run
+继续跑的原因。代价是后台任务的结果被送进一个接收端通常已经走掉的 channel，
+`let _ = send(..)` 把它丢掉。成功时这样是对的（Run 自己的终局才是记录），
+失败时不是：Run 停在最后一次持久化的状态上，没有终局事件，而且**没有任何地方说为什么**。
+
+加了一行日志之后（`note_detached_failure`），同一次复现给出了：
+
+```
+ERROR a detached execution failed after durable acceptance and left no terminal
+      error="local execution was refused: execution attempt is already terminal"
+      operation="execute" run_id=01a0160d-…
+```
+
+**这句话是猜不出来的。** 它说的是：子代理失败之后，父的**内存中的 attempt 已经是终局**，
+而事件日志里一个终局事件都没有。两边脱节了——不是"父在等一个永远不来的结果"，
+而是"父这边已经结束了，只是没人把它写下来"。
+
+这也把修法指向了同一处已有的原则。`terminate_provider_failure` 的注释写着：
+
+> 在这里返回传输错误，会让记录终局而事件日志非终局，使每个外部游标都正确地认定
+> 这个 Run 已损坏。
+
+Provider 在 `run.started` 之后失败时，这条原则已经被执行了；子代理失败这条路径没有。
+
 ### 还没确定的
 
 - 父的时长看门狗（默认 600 秒）会不会最终把它收掉。没等满十分钟，所以说不准是
@@ -60,7 +86,7 @@ let child_outcome = match child_outcome {
 - 子 Run 因别的原因失败（工具报错、被取消、MCP 起不来）是不是同一条路径。
   只测了 `budget_exhausted`。
 
-**没有动手修。** 修它要先决定「子代理失败对父意味着什么」，而 `is_error` 的存在
+**没有动手修。**（只加了诊断。）修它要先决定「子代理失败对父意味着什么」，而 `is_error` 的存在
 强烈暗示答案是「作为一个错误结果投递」而不是「抬成宿主错误」——但这是一个契约决定，
 不是一处补丁，而且我还没测另外几种失败原因。
 

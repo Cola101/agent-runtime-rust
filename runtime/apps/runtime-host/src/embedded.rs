@@ -598,6 +598,34 @@ pub struct EmbeddedRuntime {
     _state_root_leases: Vec<StateRootLease>,
 }
 
+/// Says what a detached execution failed with when nobody is left to be told.
+///
+/// `execute_detached` and the two beside it return at durable acceptance, not
+/// at completion -- that is the contract, and it is why a client can hang up on
+/// a Run that keeps going. The cost is that the background task's result is
+/// sent into a channel whose receiver has usually gone, and `let _ = send(..)`
+/// then drops it.
+///
+/// For a success that is right: the Run's own terminal is the record. For an
+/// error it is not: the Run is left at whatever state was last persisted, with
+/// no terminal event, and nothing anywhere says why. A subagent whose child
+/// fails reaches exactly that -- the parent stays `suspended` and the host is
+/// silent.
+///
+/// This does not fix that. It makes it diagnosable, which is a different and
+/// smaller claim: the fix is for the error to *become* the Run's durable
+/// terminal, the way `terminate_provider_failure` already does for a Provider
+/// failure after `run.started`, and that is a change to the Run lifecycle
+/// rather than a line here.
+fn note_detached_failure(operation: &str, run_id: Uuid, error: &dyn std::fmt::Display) {
+    tracing::error!(
+        error = %error,
+        operation,
+        %run_id,
+        "a detached execution failed after durable acceptance and left no terminal",
+    );
+}
+
 impl EmbeddedRuntime {
     pub fn new(
         limits: RuntimeAdmissionLimits,
@@ -1856,6 +1884,9 @@ impl EmbeddedRuntime {
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         self.spawn_background(async move {
             let result = runtime.execute(invocation, run_id, &input).await;
+            if let Err(error) = &result {
+                note_detached_failure("execute", run_id, error);
+            }
             let _ = finished_tx.send(result);
         });
         loop {
@@ -2252,6 +2283,9 @@ impl EmbeddedRuntime {
                     None,
                 )
                 .await;
+            if let Err(error) = &result {
+                note_detached_failure("session_turn", run_id, error);
+            }
             let _ = finished_tx.send(result);
         });
         loop {
@@ -2489,10 +2523,14 @@ impl EmbeddedRuntime {
         }
         let invocation = command.invocation;
         let command_id = command.command_id;
+        let command_run_id = command.run_id;
         let runtime = Arc::clone(self);
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         self.spawn_background(async move {
             let result = runtime.control(command).await;
+            if let Err(error) = &result {
+                note_detached_failure("control", command_run_id, error);
+            }
             let _ = finished_tx.send(result);
         });
         loop {
