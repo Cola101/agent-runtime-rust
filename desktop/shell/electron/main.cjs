@@ -12,6 +12,7 @@ const grpcRuntime = require("./runtime.cjs");
 const { LocalRuntime } = require("./localRuntime.cjs");
 const { RuntimeProcess } = require("./runtimeProcess.cjs");
 const { Credentials } = require("./credentials.cjs");
+const { McpServers } = require("./mcpServers.cjs");
 const { Workspace } = require("./workspace.cjs");
 
 /// Where the shell expects to find a Runtime.
@@ -129,6 +130,16 @@ const runtime = new RuntimeProcess();
 /// root: the state root is the runtime's, and a client writing its settings
 /// into it would be a second writer in a directory with one owner.
 const credentials = new Credentials(path.join(app.getPath("userData"), "providers"));
+/// The MCP server list, beside the provider one and for the same reason.
+const mcpServers = new McpServers(path.join(app.getPath("userData"), "mcp"));
+
+/// Which MCP servers the runtime behind this window was actually started with.
+///
+/// Null means this app cannot say: it attached to a runtime someone else
+/// started, or there is no runtime at all. The list is read at startup and
+/// never re-read, so "configured" and "running" are different facts and the
+/// only one this app can vouch for is what it handed over itself.
+let mcpApplied = null;
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -283,6 +294,13 @@ ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));
 
+// MCP servers. The list is this app's own configuration; `applied` is the only
+// thing it knows about the runtime, and it is deliberately null rather than
+// empty when this app did not start that runtime.
+ipcMain.handle("mcp:list", guarded(() => ({ servers: mcpServers.list(), applied: mcpApplied })));
+ipcMain.handle("mcp:save", guarded((request) => mcpServers.save(request)));
+ipcMain.handle("mcp:forget", guarded((name) => mcpServers.forget(name)));
+
 // The remote transport, unchanged and still explicit. Kept separate rather
 // than hidden behind the same calls: "this runtime is on my machine" and "this
 // runtime is somewhere else, reached with a credential" are different enough
@@ -348,6 +366,10 @@ async function openRuntime() {
     console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
     return;
   }
+  // Written beside the routing file, and read by the runtime at startup only.
+  // Null when no server is configured, so the variable stays unset rather than
+  // naming an empty list.
+  const mcp = mcpServers.config();
   const folder = openWorkspace({ mayDefault: true });
   try {
     const pid = runtime.start({
@@ -356,6 +378,7 @@ async function openRuntime() {
       env: {
         ...routing.env,
         AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
+        ...(mcp ? { AGENT_RUNTIME_LOCAL_MCP_CONFIG: mcp.file } : {}),
         AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: folder,
         // The runtime binary is also the trusted workspace tool -- it re-execs
         // itself for that role. Pointing at the binary this app just spawned
@@ -370,7 +393,14 @@ async function openRuntime() {
         // Granting a scope is not granting a use. `AGENT_RUNTIME_LOCAL_TOOL_CONSENT`
         // below keeps every call stopping on a person, which is the boundary
         // that matters and the one this window is built to show.
-        AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES: DELEGATED_SCOPES.join(","),
+        //
+        // Each configured MCP server adds its own `tool:mcp:<name>`, and that
+        // is not an enhancement: `valid_mcp_servers` requires the scope for
+        // every server the Run carries, so a runtime started with the config
+        // file and without these would refuse *every* Run -- including the ones
+        // that never mentioned MCP.
+        AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES:
+          [...DELEGATED_SCOPES, ...(mcp?.scopes ?? [])].join(","),
         // Explicit rather than inherited from the host's default. A security
         // boundary that holds because nobody set a variable is a boundary that
         // moves the first time someone does.
@@ -378,7 +408,13 @@ async function openRuntime() {
         AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG: rolesFile,
       },
     });
-    console.log(`runtime-desk: started runtime-host (pid ${pid})`);
+    // Recorded only on the path that actually spawned. This is the whole basis
+    // for the MCP section saying a server is live rather than merely saved.
+    mcpApplied = mcp ? mcp.applied : [];
+    console.log(
+      `runtime-desk: started runtime-host (pid ${pid})` +
+        (mcp ? ` with ${mcp.applied.length} MCP server(s)` : ""),
+    );
   } catch (error) {
     console.error(`runtime-desk: could not start a runtime — ${error.message}`);
     return;

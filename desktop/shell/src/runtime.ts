@@ -115,6 +115,37 @@ export type ProviderView = {
   secretSetAt: string | null;
 };
 
+/// One configured MCP server, as the host describes it.
+///
+/// Every field here is configuration this app wrote. Nothing on this type says
+/// whether the server is running: that is `McpServerDiscoveryStatus`, which
+/// lives inside the runtime process and has no call on the local socket.
+export type McpServerView = {
+  name: string;
+  command: string;
+  args: string[];
+  cwd: string | null;
+  toolNames: string[];
+  /// A required server that fails discovery fails the Run, durably and by
+  /// name. It is the only evidence of a server not coming up that reaches this
+  /// client at all.
+  required: boolean;
+  /// `tool:mcp:<name>`, the authority a Run must be granted to call it.
+  scope: string;
+  /// Covers everything handed to the runtime, so an edited server can be told
+  /// from the one the runtime is actually running.
+  digest: string;
+  addedAt: string | null;
+};
+
+export type McpServers = {
+  servers: McpServerView[];
+  /// What the runtime behind this window was started with, or null when this
+  /// app cannot say — it attached to a runtime it did not start, or there is
+  /// no runtime. Null is not "none": the two are different facts.
+  applied: { name: string; digest: string }[] | null;
+};
+
 export type WorkspaceStatus = { root: string | null; configured: boolean };
 
 export type WorkspaceEntry = {
@@ -190,6 +221,12 @@ type Bridge = {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }): Promise<Reply<{ id: string }>>;
   forgetProvider(id: string): Promise<Reply<{ id: string }>>;
+  mcpServers(): Promise<Reply<McpServers>>;
+  saveMcpServer(request: {
+    name: string; command: string; args: string[]; cwd: string | null;
+    toolNames: string[]; required: boolean;
+  }): Promise<Reply<{ name: string }>>;
+  forgetMcpServer(name: string): Promise<Reply<{ name: string }>>;
 };
 
 declare global {

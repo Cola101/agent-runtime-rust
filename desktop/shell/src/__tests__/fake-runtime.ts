@@ -4,10 +4,16 @@
 /// ceiling, so a test cannot pass against a friendlier runtime than the real
 /// one. Run ids and payload shapes are copied from a real dev-runtime session.
 import { vi } from "vitest";
+import type { Reply } from "../runtime";
 
 export const RUN_WAITING = "01a0122b-217e-7e72-bec8-ad3273f16cd1";
 export const RUN_DONE = "01a0122a-18c8-7012-972a-d422fe9abde8";
 export const RUN_LIVE = "01a01231-9f40-7d31-8c22-6b1a0e55c704";
+/// A Run that failed. Which way it failed is the caller's to choose, and both
+/// spellings are the Kernel's own: `run.failed` is one event type with a `kind`
+/// that separates a missing MCP server from a budget that ran out, and a client
+/// reading the type alone would report the second as the first.
+export const RUN_FAILED = "01a01240-1c3a-7b90-9f01-5d5f1c0b7e22";
 
 const APPROVAL = {
   approval_id: "01a0122b-217e-7e72-bec8-ad3273f16cd2",
@@ -118,7 +124,48 @@ const TURNS = [
   },
 ];
 
-export function installFakeRuntime({ activeRunId = null }: { activeRunId?: string | null } = {}) {
+/// One configured MCP server, shaped exactly as `mcpServers.cjs` answers --
+/// including `digest`, which is what makes "the runtime is running this" a
+/// different fact from "a server with this name is configured".
+const MCP_SERVER = {
+  name: "filesystem",
+  command: "/opt/homebrew/bin/npx",
+  args: ["-y", "@modelcontextprotocol/server-filesystem"],
+  cwd: null,
+  toolNames: ["read_file"],
+  required: false,
+  scope: "tool:mcp:filesystem",
+  digest: "9f2c41ab7d0e5613",
+  addedAt: "2026-08-18T09:00:00.000Z",
+};
+
+export function installFakeRuntime(
+  {
+    activeRunId = null,
+    mcpApplied = [{ name: MCP_SERVER.name, digest: MCP_SERVER.digest }],
+    failed = null,
+  }: {
+    activeRunId?: string | null;
+    mcpApplied?: { name: string; digest: string }[] | null;
+    /// How a fourth, failed Run ended, in the Kernel's own `kind` vocabulary.
+    /// Null by default: a state root does not usually hold one, and every other
+    /// test would otherwise be reading a run list with a failure in it.
+    failed?: "required_mcp_unavailable" | "budget_exhausted" | null;
+  } = {},
+) {
+  // The two payloads the Kernel actually writes, copied field for field. Only
+  // one of them carries `servers` -- which is why a client that read the event
+  // type without the kind would attribute a budget to a missing server.
+  if (failed) {
+    LOGS[RUN_FAILED] = {
+      state: { state: "terminal", status: "failed" },
+      events: [
+        event(1, "run.failed", failed === "required_mcp_unavailable"
+          ? { status: "failed", kind: failed, servers: ["filesystem"], retryable: false }
+          : { status: "failed", kind: failed, dimension: "tokens", retryable: false }, 40),
+      ],
+    };
+  }
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
   const head = () => ({
@@ -178,6 +225,16 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }) => ({ ok: true as const, value: { id: "local-stub" } }));
   const forgetProvider = vi.fn(async (_id: string) => ({ ok: true as const, value: { id: "local-stub" } }));
+  /// Typed as the bridge's own reply rather than as the success shape, because
+  /// the host refuses configuration the runtime would reject later and a test
+  /// has to be able to make it do so.
+  const saveMcpServer = vi.fn(async (_request: {
+    name: string; command: string; args: string[]; cwd: string | null;
+    toolNames: string[]; required: boolean;
+  }): Promise<Reply<{ name: string }>> => ({ ok: true, value: { name: "filesystem" } }));
+  const forgetMcpServer = vi.fn(async (_name: string) => ({
+    ok: true as const, value: { name: "filesystem" },
+  }));
   const sessionRead = vi.fn(async (request: { sessionId: string; branchId: string }) => ({
     ok: true as const,
     value: request.sessionId === OLDER_SESSION ? olderHead() : head(),
@@ -195,6 +252,13 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
           { run_id: RUN_WAITING, input: "run a shell command", state: { state: "waiting_approval" } },
           { run_id: RUN_LIVE, input: "something still going", state: { state: "running" } },
           { run_id: RUN_DONE, input: "something finished", state: { state: "finished", status: "succeeded" } },
+          ...(failed
+            ? [{
+              run_id: RUN_FAILED,
+              input: "search the notes",
+              state: { state: "finished", status: "failed" },
+            }]
+            : []),
         ],
         nextAfterRunId: null,
       },
@@ -276,6 +340,13 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     ),
     saveProvider,
     forgetProvider,
+    // `applied` is null for a runtime this app did not start, which is a
+    // different answer from an empty list and is rendered as one.
+    mcpServers: async () => ({
+      ok: true as const, value: { servers: [MCP_SERVER], applied: mcpApplied },
+    }),
+    saveMcpServer,
+    forgetMcpServer,
     // Ascending by id, the order `list_session_heads` returns.
     sessionList: async () => ({
       ok: true as const, value: { heads: [olderHead(), head()], nextAfter: null },
@@ -303,6 +374,7 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   };
   return {
     control, submit, sessionStart, sessionContinue, sessionRead,
-    saveProvider, forgetProvider, watch, unwatch, emit, event, launch, steer, desk,
+    saveProvider, forgetProvider, saveMcpServer, forgetMcpServer,
+    watch, unwatch, emit, event, launch, steer, desk,
   };
 }
