@@ -136,3 +136,53 @@ describe("a run of tool calls", () => {
     expect(screen.getByText(/中间说了一句/)).toBeTruthy();
   });
 });
+
+describe("what the runtime said in words", () => {
+  /// `model.reasoning` carries `summary` as a list -- the kernel emits
+  /// `Vec<String>` and `json!` writes an array. The client read it as a string
+  /// and, finding one absent, drew the hairline and dropped every word of it.
+  /// A reasoning summary reduced to its own type name is the same loss as not
+  /// drawing the event at all, which is the reason this path exists.
+  it("draws a reasoning summary the kernel sends as a list", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.reasoning", {
+      summary: ["先看一眼目录", "再决定改哪一个文件"],
+      has_private_state: true,
+    }, 30));
+
+    await waitFor(() => expect(screen.getByText(/先看一眼目录/)).toBeTruthy());
+    // Both parts, and each on its own: the runtime sent two, and joining them
+    // into one paragraph would report one thought where it reported two.
+    expect(screen.getByText(/再决定改哪一个文件/)).toBeTruthy();
+  });
+
+  /// The finder counts the marks standing in the column, and its own rule is
+  /// that everything the transcript draws which a person could search goes
+  /// through `Mark`. This prose did not: it was the one part of the column
+  /// ⌘F could never reach, and a summary the model wrote is exactly the kind
+  /// of thing someone comes back looking for.
+  it("lets the finder reach the words inside a reasoning summary", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.reasoning", {
+      summary: ["先看一眼目录"], has_private_state: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/先看一眼目录/)).toBeTruthy());
+
+    await user.keyboard("{Meta>}f{/Meta}");
+    await user.keyboard("目录");
+    await waitFor(() => expect(document.querySelectorAll("mark").length).toBeGreaterThan(0));
+  });
+
+  it("still draws a refusal, which arrives as a plain string", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.refusal", { text: "这个我不能做" }, 30));
+    await waitFor(() => expect(screen.getByText(/这个我不能做/)).toBeTruthy());
+  });
+});

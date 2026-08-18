@@ -184,11 +184,22 @@ const EVENT_WORDS: Record<string, string> = {
   "model.reasoning": "summary",
 };
 
-export function eventWords(type: string, payload: Record<string, unknown>): string | null {
+/// A list rather than a string, because one of the two is a list.
+///
+/// `ModelStreamEvent::Reasoning` carries `summary: Vec<String>` and the kernel
+/// writes it through `json!` unchanged, so what arrives is an array. Read as a
+/// string it was never present, and the client drew the hairline and dropped
+/// every word the runtime had reported -- which is the loss this path was added
+/// to prevent. A refusal is one string and becomes a list of one; the caller
+/// draws each part on its own line, because two summary parts are two things
+/// the model said and joining them would report one.
+export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
   const field = EVENT_WORDS[type];
   if (!field) return null;
   const words = payload[field];
-  return typeof words === "string" && words.trim() !== "" ? words : null;
+  const parts = (Array.isArray(words) ? words : [words])
+    .filter((part): part is string => typeof part === "string" && part.trim() !== "");
+  return parts.length > 0 ? parts : null;
 }
 
 /// Bookkeeping the conversation does not need to carry.

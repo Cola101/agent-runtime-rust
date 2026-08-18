@@ -324,7 +324,9 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
       if (words) {
         blocks.push(
           <div className="rep said" key={`w-${event.event_id || event.sequence}`}>
-            <p>{words}</p>
+            {words.map((part, index) => (
+              <p key={index}><Mark text={part} query={query} /></p>
+            ))}
           </div>,
         );
       }
