@@ -50,10 +50,17 @@ function payloadOf(event: RunEvent): Record<string, unknown> {
   return event.payload ?? {};
 }
 
+/// `SubagentBudgetUsage`, which is two numbers and not a pair of token counts.
+///
+/// This read `input_tokens + output_tokens` -- the shape of `model.usage`,
+/// which is a different event, about the parent. Neither field has ever been on
+/// a subagent event, so every child on screen reported 0 tokens no matter what
+/// it spent, and the test that covered it asserted the sum of a fixture nobody
+/// had checked against the runtime.
 function usageOf(payload: Record<string, unknown>): { tokens: number; costMicros: number } {
   const usage = (payload.usage ?? {}) as Record<string, unknown>;
   return {
-    tokens: Number(usage.input_tokens ?? 0) + Number(usage.output_tokens ?? 0),
+    tokens: Number(usage.tokens ?? 0),
     costMicros: Number(usage.cost_micros ?? 0),
   };
 }

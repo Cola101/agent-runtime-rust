@@ -53,7 +53,13 @@ describe("what a Run delegated", () => {
   });
 
   it("counts one delegation's usage once, not once per event that carries it", () => {
-    const usage = { input_tokens: 900, output_tokens: 120, cost_micros: 4200 };
+    // `SubagentBudgetUsage`, field for field: two numbers, and `tokens` is one
+    // of them rather than a pair to add up. The fixture used to carry
+    // `input_tokens`/`output_tokens` -- the shape of `model.usage`, which is a
+    // different event about the parent -- so this file asserted a sum of two
+    // fields no subagent event has ever had, and every child on screen showed
+    // 0 tokens with the guard green.
+    const usage = { tokens: 1020, cost_micros: 4200 };
     const [view] = subagentsOf([
       requested(A, "reviewer", "读一遍"),
       event("subagent.spawned", { agent_id: A, role: "reviewer", status: "running" }),
