@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { all, byId } from "./surfaces/registry";
+import { all, byId, type KeyBinding } from "./surfaces/registry";
 import { DeskContext, useDesk, type Desk } from "./desk";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
@@ -83,6 +83,14 @@ function Identity() {
   );
 }
 
+/// How a binding's key is written down. The ⌘ comes off the same declaration
+/// the dispatcher matches on, so a hint cannot promise a modifier the
+/// dispatcher does not require, or drop one it does.
+function keyLabel(key: KeyBinding): string {
+  const name = key.key === " " ? "空格" : key.key;
+  return key.meta ? `⌘${name.toUpperCase()}` : name;
+}
+
 /// The keys the surface on screen is claiming right now, rendered from the
 /// same declarations the dispatcher reads. A hint here is a key that works.
 function KeyHints({ desk, surfaceId }: { desk: Desk; surfaceId: string }) {
@@ -92,8 +100,8 @@ function KeyHints({ desk, surfaceId }: { desk: Desk; surfaceId: string }) {
   return (
     <span className="keys">
       {keys.map((key) => (
-        <span key={key.key}>
-          <kbd>{key.key === " " ? "空格" : key.key}</kbd> {key.hint}
+        <span key={`${key.meta ? "⌘" : ""}${key.key}`}>
+          <kbd>{keyLabel(key)}</kbd> {key.hint}
         </span>
       ))}
     </span>
@@ -167,14 +175,24 @@ export function App() {
         setDrawer((open) => !open);
         return;
       }
-      if (typing(event.target) || meta || event.altKey) return;
+      if (event.altKey) return;
 
-      const surface = byId(latest.current.active);
-      const binding = (surface?.keys ?? []).find((key) => key.key === event.key);
-      if (binding && (binding.when?.(latest.current.desk) ?? true)) {
+      const keys = byId(latest.current.active)?.keys ?? [];
+      const fire = (binding: KeyBinding | undefined) => {
+        if (!binding || !(binding.when?.(latest.current.desk) ?? true)) return;
         event.preventDefault();
         binding.run(latest.current.desk);
+      };
+      // A ⌘-key the surface claims runs even while a sentence is being typed.
+      // That is the point of one: the composer holds the focus almost all the
+      // time here, and a finder you have to click out of the box to open is a
+      // finder nobody opens.
+      if (meta) {
+        fire(keys.find((key) => key.meta && key.key === event.key.toLowerCase()));
+        return;
       }
+      if (typing(event.target)) return;
+      fire(keys.find((key) => !key.meta && key.key === event.key));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

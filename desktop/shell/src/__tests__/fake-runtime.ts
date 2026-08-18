@@ -118,7 +118,26 @@ const TURNS = [
   },
 ];
 
-export function installFakeRuntime({ activeRunId = null }: { activeRunId?: string | null } = {}) {
+export function installFakeRuntime(
+  /// `gap` is the runtime saying the earlier events of a log are gone. It is a
+  /// field on the cursor page, not something a client can work out, and what a
+  /// transcript is allowed to claim about itself depends on it.
+  ///
+  /// `capped` is the other half of the same question and a different fact: the
+  /// log is whole, and this client stopped paging before the end of it. Both
+  /// mean "you are looking at part of a Run", and a client that only handled
+  /// one of them would be silent in exactly the other case.
+  ///
+  /// `unreadable` is a run whose log the daemon will not return at all.
+  {
+    activeRunId = null, gap = false, capped = false, unreadable = null,
+  }: {
+    activeRunId?: string | null;
+    gap?: boolean;
+    capped?: boolean;
+    unreadable?: string | null;
+  } = {},
+) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
   const head = () => ({
@@ -212,14 +231,51 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     }),
     startRuntime: async () => ({ ok: true as const, value: true }),
     shutdown: async () => ({ ok: true as const, value: {} }),
-    events: async ({ runId, limit = 256 }: { runId: string; limit?: number }) => {
+    events: async (
+      { runId, afterSequence = 0, limit = 256 }:
+      { runId: string; afterSequence?: number; limit?: number },
+    ) => {
       // The daemon rejects an oversized page rather than clamping it. A test
       // that clamped here would hide exactly the bug this caught in practice.
       if (limit > 256) {
         return { ok: true as const, value: { ok: false as const, error: { code: "invalid_request" } } };
       }
-      const log = LOGS[runId];
+      const log = runId === unreadable ? undefined : LOGS[runId];
       if (!log) return { ok: true as const, value: { ok: false as const, error: { code: "not_found" } } };
+      if (capped) {
+        // A log longer than this client will walk. Every page comes back full
+        // and says there is more behind it, and the cursor keeps moving --
+        // which is what the daemon does over a run that outran the client's
+        // page budget. A page that claimed more and returned nothing would be
+        // a different thing (a runtime bug), and a fake that served one would
+        // send the reader down the loop's defensive break instead.
+        const events = [];
+        for (let sequence = afterSequence + 1; events.length < limit; sequence += 1) {
+          events.push(
+            sequence <= log.events.length
+              ? log.events[sequence - 1]
+              : event(sequence, "model.usage", {
+                input_tokens: 0, output_tokens: 0, cost_micros: 0,
+              }, 30),
+          );
+        }
+        const next = afterSequence + events.length;
+        return {
+          ok: true as const,
+          value: {
+            ok: true as const,
+            page: {
+              run_id: runId, requested_after_sequence: afterSequence,
+              next_after_sequence: next,
+              earliest_available_sequence: 1,
+              // Strictly ahead of this page: there is more log than the client
+              // is going to read, which is the whole point of this branch.
+              highest_committed_sequence: next + 1,
+              history_gap: gap, has_more: true, state: log.state, events,
+            },
+          },
+        };
+      }
       return {
         ok: true as const,
         value: {
@@ -229,7 +285,7 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
             next_after_sequence: log.events.length,
             earliest_available_sequence: 1,
             highest_committed_sequence: log.events.length,
-            history_gap: false, has_more: false, state: log.state, events: log.events,
+            history_gap: gap, has_more: false, state: log.state, events: log.events,
           },
         },
       };

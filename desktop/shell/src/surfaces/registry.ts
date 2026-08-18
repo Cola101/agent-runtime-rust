@@ -8,8 +8,14 @@ import type { Desk } from "../desk";
 /// A hint drawn from one place and a binding registered in another is how a
 /// screen ends up promising keys that do nothing.
 export type KeyBinding = {
-  /// `KeyboardEvent.key`, matched verbatim.
+  /// `KeyboardEvent.key`, matched verbatim — lowercased first when the binding
+  /// is held with ⌘, since the shift state of ⌘F is not what it is about.
   key: string;
+  /// Held with ⌘ (Ctrl elsewhere). A modified key runs while a sentence is
+  /// being typed, where a bare letter cannot: a modifier and a text field can
+  /// share the keyboard, which is the only reason a surface can claim one at
+  /// all from a composer that owns the focus.
+  meta?: boolean;
   /// Shown next to the action it performs. The shell renders these; a surface
   /// never writes a key hint by hand.
   hint: string;
