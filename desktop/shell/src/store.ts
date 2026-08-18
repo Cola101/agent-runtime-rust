@@ -762,6 +762,15 @@ export type Store = {
   rollback(throughTurnOrdinal: number): Promise<string | null>;
   submit(input: string): Promise<string | null>;
   decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
+  /// Why the last decision on this Run did not land, if it did not.
+  ///
+  /// A decision can be refused -- a binding the runtime has moved past, a
+  /// socket that is not there any more -- and both surfaces that offer one
+  /// dropped the reason on the floor. What that looks like is a button that
+  /// does nothing: the gate stays up, the person presses again, and the app
+  /// has said nothing at all. Kept here rather than in either component
+  /// because the keys are dispatched by the shell, outside both of them.
+  decisionRefusal(runId: string): string | null;
   /// Answer the MCP input request a suspended run is parked on.
   ///
   /// `responses` must answer every pending key and no others — the runtime
@@ -1182,15 +1191,36 @@ export function useRuntime(): Store {
     return null;
   }, [load]);
 
+  const [refusals, setRefusals] = useState<Record<string, string>>({});
   const decide = useCallback(
     async (runId: string, action: "approve" | "deny" | "cancel" | "resume") => {
       const api = bridge();
-      if (!api) return "not running in the desktop host";
-      const reply = await api.control({ action, runId });
+      const said = await (async () => {
+        const api2 = api;
+        if (!api2) return "这个窗口没有连到宿主";
+        const reply = await api2.control({ action, runId });
+        return reply.ok ? null : reply.error;
+      })();
+      // Cleared on the way in as well as set on the way out: a refusal left
+      // standing after the next press succeeded would say the opposite of
+      // what happened.
+      setRefusals((held) => {
+        if (said === null) {
+          if (!(runId in held)) return held;
+          const next = { ...held };
+          delete next[runId];
+          return next;
+        }
+        return { ...held, [runId]: said };
+      });
       void load();
-      return reply.ok ? null : reply.error;
+      return said;
     },
     [load],
+  );
+  const decisionRefusal = useCallback(
+    (runId: string) => refusals[runId] ?? null,
+    [refusals],
   );
 
   const answerMcpInput = useCallback(
@@ -1230,6 +1260,6 @@ export function useRuntime(): Store {
     selectSession, newConversation, send, steer, fork, rollback,
     providers, saveProvider, forgetProvider,
     budget, mcp, mcpFailures: readMcpFailures(merged), saveMcpServer, forgetMcpServer,
-    submit, decide, answerMcpInput, refresh: () => void load(),
+    submit, decide, decisionRefusal, answerMcpInput, refresh: () => void load(),
   };
 }

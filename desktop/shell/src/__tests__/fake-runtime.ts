@@ -459,7 +459,12 @@ export function installFakeRuntime(
     pending?: PendingCall;
   } = {},
 ) {
-  const control = vi.fn(async () => ({ ok: true as const, value: {} }));
+  /// Typed as the real call is -- a `Reply`, either half. The host refuses a
+  /// decision whose binding the runtime has moved past, and a mock that could
+  /// only succeed made that case unwritable.
+  const control = vi.fn(
+    async (): Promise<Reply<Record<string, unknown>>> => ({ ok: true, value: {} }),
+  );
   /// Answers as the system dialog would when a folder was picked. A test that
   /// wants the cancel or the environment-held case says so with
   /// `mockResolvedValueOnce` -- those replies are what the client has to read

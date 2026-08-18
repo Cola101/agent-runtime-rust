@@ -44,24 +44,35 @@ export function Decisions({ run }: { run: RunView }) {
     setArmed(decision.key);
   };
 
+  // A refused decision is the one case where pressing again is the wrong
+  // thing to do, and it was also the only case that looked like nothing
+  // happening. The reason is read from the store rather than held here: the
+  // digit keys are dispatched by the shell, outside this component, and a
+  // refusal that only appeared when the button was clicked would be missing
+  // from the half of the interface people actually use.
+  const refused = desk.decisionRefusal(run.id);
+
   return (
-    <ol className="picks">
-      {DECISIONS.map((decision) => (
-        <li key={decision.key}>
-          <button
-            type="button"
-            className={decision.lead ? "pick on" : "pick"}
-            onClick={() => choose(decision)}
-          >
-            <kbd>{decision.key}</kbd>
-            <span>
-              {decision.label}
-              {armed === decision.key && <b className="arm">　再按一次确认</b>}
-            </span>
-          </button>
-        </li>
-      ))}
-    </ol>
+    <>
+      <ol className="picks">
+        {DECISIONS.map((decision) => (
+          <li key={decision.key}>
+            <button
+              type="button"
+              className={decision.lead ? "pick on" : "pick"}
+              onClick={() => choose(decision)}
+            >
+              <kbd>{decision.key}</kbd>
+              <span>
+                {decision.label}
+                {armed === decision.key && <b className="arm">　再按一次确认</b>}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ol>
+      {refused && <div className="err">这个决定没有生效：{refused}</div>}
+    </>
   );
 }
 

@@ -156,6 +156,40 @@ describe("approvals", () => {
     expect(decide).not.toHaveBeenCalled();
   });
 
+  /// A decision the runtime refuses must say so.
+  ///
+  /// `decide` has always returned the reason and both surfaces that offer a
+  /// decision threw it away, so a binding the runtime has moved past or a
+  /// socket that is gone looked exactly like a button that does nothing --
+  /// and the one case where pressing again is the wrong move was the one case
+  /// with nothing on screen to say so.
+  it("says why a decision did not land, instead of looking like nothing happened", async () => {
+    const { user, bridge } = await open("待决定");
+    bridge.control.mockResolvedValueOnce({
+      ok: false as const, error: "tool approval binding no longer matches",
+    });
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    await user.click(screen.getAllByText(/shell\.exec/)[0]);
+    await user.keyboard("1");
+    await waitFor(() =>
+      expect(screen.getByText(/tool approval binding no longer matches/)).toBeTruthy());
+    // The gate is still up: a refused decision decided nothing.
+    expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0);
+  });
+
+  /// And it goes away when the next one works, or it would be saying the
+  /// opposite of what just happened.
+  it("clears the refusal once a decision lands", async () => {
+    const { user, bridge } = await open("待决定");
+    bridge.control.mockResolvedValueOnce({ ok: false as const, error: "socket 不在了" });
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    await user.click(screen.getAllByText(/shell\.exec/)[0]);
+    await user.keyboard("1");
+    await waitFor(() => expect(screen.getByText(/socket 不在了/)).toBeTruthy());
+    await user.keyboard("1");
+    await waitFor(() => expect(screen.queryByText(/socket 不在了/)).toBeNull());
+  });
+
   it("does not fire a digit while a sentence is being typed", async () => {
     const { user, bridge } = await open("对话");
     const box = await screen.findByRole("textbox");
