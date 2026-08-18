@@ -2,4 +2,9 @@
 /// app only ever runs in Chromium — shimmed here rather than guarded in the
 /// product, because a guard in the product would be dead code written for a
 /// browser this app never runs in.
-Element.prototype.scrollIntoView = function scrollIntoView() {};
+///
+/// The check is for this file's other environment, not for the browser: the
+/// host-process tests run under node, where there is no `Element` at all.
+if (typeof Element !== "undefined") {
+  Element.prototype.scrollIntoView = function scrollIntoView() {};
+}

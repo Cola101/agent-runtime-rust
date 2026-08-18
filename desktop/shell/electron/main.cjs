@@ -9,6 +9,7 @@ const { app, BrowserWindow, ipcMain, shell } = require("electron");
 const path = require("node:path");
 const grpcRuntime = require("./runtime.cjs");
 const { LocalRuntime } = require("./localRuntime.cjs");
+const { RuntimeProcess } = require("./runtimeProcess.cjs");
 
 /// Where the shell expects to find a Runtime.
 ///
@@ -33,7 +34,15 @@ const endpoint = process.env.RUNTIME_DESK_ENDPOINT ?? null;
 /// credential that transcript was fetched with.
 const token = process.env.RUNTIME_DESK_TOKEN ?? null;
 
+/// The runtime-host binary this app may start for itself.
+///
+/// Without it the app only ever attaches to a runtime someone else started,
+/// which is the development setup. With it the app owns a process, and owning
+/// one is what obliges it to stop it again on the way out.
+const runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
+
 const local = new LocalRuntime(stateRoot);
+const runtime = new RuntimeProcess();
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -132,17 +141,80 @@ ipcMain.handle("remote:readEvents", guarded((request) => grpcRuntime.readEvents(
 ipcMain.handle("remote:submit", guarded((request) => grpcRuntime.submit(request, token)));
 ipcMain.handle("remote:control", guarded((request) => grpcRuntime.control(request, token)));
 
-app.whenReady().then(async () => {
-  if (stateRoot) {
-    const status = await local.probe();
-    console.log(
-      status.connected
-        ? `runtime-desk: local runtime at ${status.socketPath}`
-        : `runtime-desk: no local runtime at ${status.socketPath} — ${status.error}`,
-    );
-  } else {
+/// Brings a runtime up, or attaches to the one already there.
+///
+/// The order matters: probe first, and only start when nothing answers. A
+/// state root with a runtime already on it belongs to whoever started it, and
+/// this app has to know which of the two cases it is in before it can promise
+/// anything about quitting.
+async function openRuntime() {
+  if (!stateRoot) {
     console.log("runtime-desk: no RUNTIME_DESK_STATE_ROOT set — no local runtime");
+    return;
   }
+  const first = await local.probe();
+  if (first.connected) {
+    runtime.attach();
+    console.log(`runtime-desk: attached to a runtime already at ${first.socketPath}`);
+    return;
+  }
+  if (!runtimeBinary) {
+    console.log(`runtime-desk: no local runtime at ${first.socketPath} — ${first.error}`);
+    return;
+  }
+  try {
+    const pid = runtime.start({ binary: runtimeBinary, stateRoot });
+    console.log(`runtime-desk: started runtime-host (pid ${pid})`);
+  } catch (error) {
+    console.error(`runtime-desk: could not start a runtime — ${error.message}`);
+    return;
+  }
+  // The socket appears a moment after the process does. Waiting here rather
+  // than letting the window open onto "unreachable" and correct itself keeps
+  // the first thing on screen true.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const status = await local.probe();
+    if (status.connected) {
+      console.log(`runtime-desk: local runtime at ${status.socketPath}`);
+      return;
+    }
+    if (!runtime.running) {
+      console.error(
+        `runtime-desk: runtime-host exited before it listened — ${runtime.log.slice(-3).join(" / ")}`,
+      );
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  console.error("runtime-desk: runtime-host did not begin listening");
+}
+
+/// Stops the runtime this app started, and says what that cost.
+///
+/// Only the one it started. `stop` refuses on an attached runtime, which is
+/// the case the development setup is in: quitting the window must not take
+/// down a host someone else is using.
+let stopping = null;
+function closeRuntime() {
+  if (!stopping) {
+    stopping = runtime.stop({ drain: () => local.shutdown() }).then((outcome) => {
+      if (!outcome.stopped) return outcome;
+      const report = outcome.report;
+      console.log(
+        `runtime-desk: runtime stopped${outcome.escalated ? " (forced)" : ""}` +
+          (report
+            ? ` — ${report.active_before_drain} active and ${report.queued_before_drain} queued before draining, ` +
+              `${report.completed_during_drain} finished, ${report.interrupted} interrupted`
+            : ""),
+      );
+      return outcome;
+    });
+  }
+  return stopping;
+}
+
+app.whenReady().then(async () => {
+  await openRuntime();
 
   if (endpoint) {
     try {
@@ -164,3 +236,25 @@ app.whenReady().then(async () => {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
+
+/// Quitting takes the runtime with it -- if this app started it.
+///
+/// The quit is held open for it. `before-quit` fires before the process tears
+/// down, and letting it proceed while a drain is in flight is how a Run that
+/// was one second from finishing becomes a Run that has to be recovered from a
+/// Checkpoint on the next launch.
+let quitting = false;
+app.on("before-quit", (event) => {
+  if (quitting || !runtime.owned) return;
+  event.preventDefault();
+  quitting = true;
+  void closeRuntime().then(() => app.quit());
+});
+
+// A terminal interrupt is a quit. Without this, the ordinary way this app is
+// stopped during development -- Ctrl+C where it was launched -- would leave the
+// runtime it started still running, and the next launch would attach to an
+// orphan instead of starting cleanly.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => app.quit());
+}
