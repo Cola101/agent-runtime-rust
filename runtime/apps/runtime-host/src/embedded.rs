@@ -818,7 +818,14 @@ impl EmbeddedRuntime {
     ) -> Result<RuntimeEventCursorPage, EmbeddedRuntimeError> {
         Self::validate_event_cursor_request(&request)?;
         let config = self.profile(request.invocation)?;
-        Self::read_event_cursor_page(&config.state_root, &request).map_err(Into::into)
+        let mut page = Self::read_event_cursor_page(&config.state_root, &request)?;
+        page.state = Self::state_after_execution_owner_release(
+            &self.active,
+            request.invocation,
+            request.run_id,
+            page.state,
+        );
+        Ok(page)
     }
 
     /// Compatibility shim for existing in-repository consumers that still
@@ -892,6 +899,32 @@ impl EmbeddedRuntime {
             LocalRunState::Cancelled { .. } => RuntimeEventCursorState::Terminal {
                 status: RunStatus::Cancelled,
             },
+        }
+    }
+
+    /// A pending control boundary promises that a caller can acquire the next
+    /// execution generation. The durable Run projection becomes visible just
+    /// before the previous in-process owner guard is dropped, so exposing it
+    /// during that interval turns a valid approval/input decision into an
+    /// internal active-owner failure. Keep both cursor surfaces on `Running`
+    /// until that owner has actually released the Run.
+    fn state_after_execution_owner_release(
+        active: &ActiveExecutionMap,
+        invocation: RuntimeInvocationContext,
+        run_id: Uuid,
+        state: RuntimeEventCursorState,
+    ) -> RuntimeEventCursorState {
+        if matches!(
+            state,
+            RuntimeEventCursorState::WaitingApproval | RuntimeEventCursorState::Suspended
+        ) && active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(invocation, run_id))
+        {
+            RuntimeEventCursorState::Running
+        } else {
+            state
         }
     }
 
@@ -1266,6 +1299,7 @@ impl EmbeddedRuntime {
         })?;
         let permit = self.event_subscriptions.reserve(capacity)?;
         let state_root = config.state_root.clone();
+        let active = Arc::clone(&self.active);
         let (sender, receiver) = mpsc::channel(capacity);
         let stop = CancellationToken::new();
         let stop_for_task = stop.clone();
@@ -1525,6 +1559,8 @@ impl EmbeddedRuntime {
                             return;
                         }
                     };
+                let state =
+                    Self::state_after_execution_owner_release(&active, invocation, run_id, state);
                 if matches!(
                     &state,
                     RuntimeEventCursorState::Running | RuntimeEventCursorState::Cancelling
@@ -3438,5 +3474,156 @@ impl EmbeddedRuntime {
         self.profiles
             .get(&invocation)
             .ok_or(EmbeddedRuntimeError::UnregisteredInvocation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        LOCAL_STORE_VERSION, LocalMcpLifecycleConfig, LocalModelRoutingConfig, LocalToolConsent,
+    };
+    use agent_protocol::{RunBudget, RuntimeExecutionPolicySnapshot};
+    use std::collections::BTreeSet;
+
+    fn invocation() -> RuntimeInvocationContext {
+        RuntimeInvocationContext {
+            schema_version: 1,
+            tenant_id: Uuid::now_v7(),
+            application_id: Uuid::now_v7(),
+            workload_identity_id: Uuid::now_v7(),
+            workspace_id: Uuid::now_v7(),
+            agent_version_id: Uuid::now_v7(),
+            model_policy_id: Uuid::now_v7(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_control_boundary_is_not_actionable_until_the_execution_owner_releases() {
+        let state = tempfile::tempdir().expect("state root");
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let invocation = invocation();
+        let runtime = EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: 1,
+                max_active_runs_per_tenant: 1,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: 1,
+                max_queued_runs_per_tenant: 1,
+            },
+            vec![RuntimeProfile {
+                invocation,
+                config: LocalRuntimeConfig {
+                    state_root: state.path().to_path_buf(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    agent_instructions: "Test one lifecycle boundary.".into(),
+                    delegated_scopes: BTreeSet::new(),
+                    subagent_roles: Vec::new(),
+                    model_routing: LocalModelRoutingConfig::single_openai_compatible(
+                        "http://127.0.0.1:1/v1/chat/completions",
+                        "test-model",
+                        "test-key",
+                    ),
+                    mcp_servers: Vec::new(),
+                    mcp_lifecycle: LocalMcpLifecycleConfig::default(),
+                    trusted_workspace_tool: None,
+                    process_session: None,
+                    consent: LocalToolConsent::Ask,
+                    budget: RunBudget {
+                        max_tokens: 1_000,
+                        max_cost_cents: 100,
+                        max_duration_seconds: 60,
+                    },
+                    runtime_policy: RuntimeExecutionPolicySnapshot::default(),
+                },
+            }],
+        )
+        .expect("embedded Runtime");
+        let run_id = Uuid::now_v7();
+        let record = LocalRunRecord {
+            store_version: LOCAL_STORE_VERSION,
+            tenant_id: invocation.tenant_id,
+            application_id: invocation.application_id,
+            workload_identity_id: invocation.workload_identity_id,
+            workspace_id: invocation.workspace_id,
+            agent_version_id: invocation.agent_version_id,
+            model_policy_id: invocation.model_policy_id,
+            run_id,
+            input: "wait for approval".into(),
+            state: LocalRunState::AwaitingApproval {
+                approval_id: Uuid::now_v7(),
+                binding_digest: "a".repeat(64),
+                target_run_id: Some(run_id),
+            },
+            owner_epoch: 1,
+        };
+        let state_root = runtime
+            .profile(invocation)
+            .expect("registered profile")
+            .state_root
+            .clone();
+        EmbeddedRuntime::write_run_record(&state_root, &record).expect("pending record");
+        let (_, owner) = runtime
+            .claim_execution(invocation, run_id, false)
+            .expect("active owner");
+        let request = RuntimeEventCursorRequest {
+            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+            invocation,
+            run_id,
+            after_sequence: 0,
+            limit: 1,
+        };
+
+        let premature = runtime.event_cursor(request.clone()).expect("event page");
+        assert_eq!(
+            premature.state,
+            RuntimeEventCursorState::Running,
+            "a pending boundary is not actionable while the previous owner is still active"
+        );
+        assert_eq!(
+            EmbeddedRuntime::state_after_execution_owner_release(
+                &runtime.active,
+                invocation,
+                run_id,
+                RuntimeEventCursorState::Suspended,
+            ),
+            RuntimeEventCursorState::Running,
+            "MCP input must obey the same owner-release boundary"
+        );
+
+        let mut subscription = runtime
+            .subscribe_events(invocation, run_id, 0, 1)
+            .expect("event subscription");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), subscription.recv())
+                .await
+                .is_err(),
+            "the streaming surface exposed a pending boundary before owner release"
+        );
+
+        drop(owner);
+        let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), subscription.recv())
+            .await
+            .expect("released boundary was not streamed")
+            .expect("subscription ended")
+            .expect("streamed boundary");
+        assert!(matches!(
+            streamed,
+            RuntimeEventStreamItem::Boundary {
+                state: RuntimeEventCursorState::WaitingApproval,
+                ..
+            }
+        ));
+        assert_eq!(
+            EmbeddedRuntime::state_after_execution_owner_release(
+                &runtime.active,
+                invocation,
+                run_id,
+                RuntimeEventCursorState::Suspended,
+            ),
+            RuntimeEventCursorState::Suspended
+        );
+        let actionable = runtime.event_cursor(request).expect("released event page");
+        assert_eq!(actionable.state, RuntimeEventCursorState::WaitingApproval);
     }
 }

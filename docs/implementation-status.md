@@ -1,6 +1,6 @@
 # 实施状态
 
-更新时间：2026-08-17
+更新时间：2026-08-18
 
 本文件区分“已实现并有证据”“仅有契约或骨架”“尚未实现”，避免把六个月目标误报为当前能力。
 
@@ -23,6 +23,14 @@
 
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
+
+2026-08-18 Runtime 控制边界竞态闭合（ADR-0141）：全工作区负载下曾出现事件页已公开
+`WaitingApproval`，网络决定却因旧 execution owner 尚未释放而返回 Internal。确定性 RED 直接建立
+`AwaitingApproval + active owner`，证明持久投影可见性早于控制可执行性。修复后分页与流式订阅在 owner
+存活时统一保持 `Running`，释放后才公开 `WaitingApproval`/`Suspended`；不修改 Event、Checkpoint、Run record
+或终态顺序，也不加入 sleep/retry。Host lib **33/33**、审批 **1/1 + 30/30 压力重跑**、MCP 输入 **1/1**、
+流式事件 **3/3**、多租户事件/恢复 **12/12** 通过。该阶段修复边界可靠性，不增加真实厂商、跨平台或生产
+持久层证据，总体仍为 70–75%。证据见 `docs/evidence/2026-08-18-actionable-runtime-control-boundaries.md`。
 
 2026-08-17 独立 Go MCP 实现门禁完成（ADR-0140）：`mark3labs/mcp-filesystem-server v0.11.1` 固定 commit
 `5646396f50ba144b9dd1ca9d088db0ac08cab3f8`，依赖非官方实现 `mcp-go v0.32.0`。首次真实 Agent Loop 得到

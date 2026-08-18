@@ -1,6 +1,6 @@
 # Codex CLI / OpenClaw 阶段对标
 
-更新时间：2026-08-17
+更新时间：2026-08-18
 
 本文件是每个实施阶段必须更新的偏差检查。结论只基于本地参考源码，不把产品介绍当作实现证据。
 
@@ -14,7 +14,27 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：显式旧版 MCP 修订与独立 Go 实现门禁
+## 当前阶段：可执行 Runtime 控制边界
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 请求可见顺序 | active turn 先注册 approval oneshot，再发送请求事件 | pending entry 先建立，再投递到 channel | 持久等待状态可先提交，但外部 typed boundary 等 owner 释放 | 三者均保证决定路径先于可操作请求 |
+| 提前决定 | 原 turn 持有 receiver 原地等待，无 generation 交接 | delivery 中到达的 resolution 暂存为 `pendingResolution` | active owner 存活时分页/流式仍报告 `Running` | 本项目适配 Host replacement，不复制内存等待模型 |
+| 恢复 | Turn/session 生命周期由 Codex 持有 | Gateway 可 replay pending approvals | 进程崩溃后 active map 为空，持久等待边界立即可见 | 无 Gateway/原进程也能恢复控制 |
+| 多租户围栏 | 主要绑定 turn/call id | 绑定 approval id、channel/account/session | invocation + Run + owner epoch + command digest + receipt | 多租户身份更显式；产品投递面仍较窄 |
+
+### 本阶段结论
+
+- 已确认：确定性 RED 证明 `AwaitingApproval + active owner` 曾错误公开 `WaitingApproval`；分页与流式修复后
+  owner 释放前保持 `Running`，释放后共同进入等待边界。网络审批连续 30/30 通过。
+- 相比 Codex，本项目保留“先注册决定通道，再公开请求”的顺序，但不让等待审批长期占用原 turn/Host；这是
+  为检查点恢复与多租户资源释放作出的有证据偏离，不是宣称产品能力领先。
+- 相比 OpenClaw，本项目吸收“resolution 与请求投递乱序不能丢”的原则；OpenClaw 的 Gateway replay、channel
+  路由、通知与运维仍明显更完整。
+- **未外推**：跨进程 active authority、硬件掉电、真实远端网络、Java/GUI 调用方和分布式 command ledger；
+  总体仍为 70–75%。
+
+## 上一阶段：显式旧版 MCP 修订与独立 Go 实现门禁
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

@@ -425,6 +425,12 @@ Server。真实 RED 暴露 `2025-03-26` 被旧客户端拒绝；RunExecution sch
 通过，Go 源码/依赖/构建缓存全在受控临时目录并原地删除。真实 OAuth、长稳公网流和三类真实 Provider
 兼容矩阵仍未完成。
 
+ADR-0141 收紧网络与嵌入调用方的生命周期承诺：持久 Run 已进入 `AwaitingApproval`/`AwaitingMcpInput`，但旧
+execution owner 尚未释放时，分页和流式事件继续公开 `Running`；只有下一代 owner 真正可取得后才公开
+`WaitingApproval`/`Suspended`。该规则关闭了负载下“已显示可审批、决定却返回 Internal”的窗口，并保留
+Codex 先注册决定通道再发事件、OpenClaw 对投递中提前 resolution 延后 finalize 的共同不变量；没有引入
+Gateway、客户端重试或第二套状态机。
+
 ## 本地运行边界
 
 - Mac 本地内核开发和验收禁止调用 Docker、虚拟机、Kubernetes、Java、PostgreSQL、NATS、Vault
