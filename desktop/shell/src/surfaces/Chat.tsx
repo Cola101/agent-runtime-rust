@@ -54,32 +54,85 @@ function Gate({ run }: { run: RunView }) {
   );
 }
 
+function toolName(event: RunEvent): string {
+  const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
+  return String(call.name ?? "");
+}
+
+/// A run of tool calls, folded.
+///
+/// A turn that calls a tool eleven times used to be eleven blocks between two
+/// sentences, and the sentences are what a person is reading. Folded, the row
+/// still says *which* tools -- a fold that only said "11 calls" would have
+/// replaced a wall of detail with no detail.
+///
+/// One call is not folded. Hiding a single line behind a control to reveal it
+/// is not a saving.
+function Acts({ events }: { events: RunEvent[] }) {
+  const [open, setOpen] = useState(false);
+  if (events.length === 1) return <Act event={events[0]} />;
+
+  const counted = new Map<string, number>();
+  for (const event of events) {
+    const name = toolName(event);
+    counted.set(name, (counted.get(name) ?? 0) + 1);
+  }
+  const named = [...counted.entries()]
+    .map(([name, count]) => (count > 1 ? `${name} ×${count}` : name))
+    .join("・");
+
+  return (
+    <div className="acts">
+      <button type="button" className="fold" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="caret">{open ? "▾" : "▸"}</span>
+        {events.length} 个工具调用
+        <span className="mono dim">{named}</span>
+      </button>
+      {open && events.map((event) => (
+        <Act event={event} key={event.event_id || event.sequence} />
+      ))}
+    </div>
+  );
+}
+
 /// The transcript, rendered from the durable log.
 ///
 /// Text deltas are joined into one block rather than drawn per event: the
-/// runtime streams a word at a time and a person reads paragraphs.
+/// runtime streams a word at a time and a person reads paragraphs. Consecutive
+/// tool calls are folded for the same reason at a larger scale.
 function Transcript({ run }: { run: RunView }) {
   const blocks: React.ReactNode[] = [];
   let text = "";
+  let acts: RunEvent[] = [];
 
-  const flush = (key: string) => {
+  const flushText = (key: string) => {
     if (!text) return;
     blocks.push(<div className="rep" key={`t-${key}`}><p>{text}</p></div>);
     text = "";
   };
+  const flushActs = (key: string) => {
+    if (acts.length === 0) return;
+    blocks.push(<Acts events={acts} key={`a-${key}`} />);
+    acts = [];
+  };
 
   for (const event of run.events) {
     if (event.type === "model.output.delta") {
+      // Text ends a run of calls: what the model says after using a tool is a
+      // new part of the conversation, not more of the same fold.
+      flushActs(String(event.sequence));
       text += String(event.payload.text ?? "");
       continue;
     }
-    flush(String(event.sequence));
     if (event.type === "model.tool_call") {
-      blocks.push(<Act event={event} key={event.event_id || event.sequence} />);
+      flushText(String(event.sequence));
+      acts.push(event);
       continue;
     }
+    flushText(String(event.sequence));
     const note = eventNote(event.type);
     if (note && event.type !== "approval.required") {
+      flushActs(String(event.sequence));
       blocks.push(
         <Note key={event.event_id || event.sequence}>
           {note} <span className="mono dim">{event.type}</span>
@@ -87,7 +140,8 @@ function Transcript({ run }: { run: RunView }) {
       );
     }
   }
-  flush("end");
+  flushText("end");
+  flushActs("end");
   return <>{blocks}</>;
 }
 

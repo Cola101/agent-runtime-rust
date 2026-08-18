@@ -129,6 +129,20 @@ body {
 .form > button:disabled { border-color: var(--rule); color: var(--ink-3); background: none; cursor: default; }
 .body > .err { margin-top: 12px; color: var(--accent); font-size: 12px; }
 
+/* A folded run of tool calls. The row reads as one line of the transcript, not
+   as a control panel: a border here would make eleven calls look like a more
+   important thing than the sentence above them. */
+.acts { margin: 2px 0; }
+.acts .fold {
+  display: flex; align-items: baseline; gap: 8px; width: 100%;
+  background: none; border: 0; padding: 3px 0; cursor: pointer;
+  font: inherit; font-size: 12.5px; color: var(--ink-2); text-align: left;
+}
+.acts .fold:hover { color: var(--ink); }
+.acts .caret { color: var(--ink-3); width: 1em; flex: none; }
+.acts .fold .dim { color: var(--ink-3); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acts .act { padding-left: calc(1em + 8px); }
+
 /* A file preview. Wraps rather than scrolls sideways: a line long enough to
    need horizontal scrolling is a line the reader has already lost. */
 pre.file {
