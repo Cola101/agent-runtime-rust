@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld("desk", {
       ipcRenderer.on("runtime:watchEnded", wrapped);
       return () => ipcRenderer.off("runtime:watchEnded", wrapped);
     },
+    workspace: () => ipcRenderer.invoke("workspace:status"),
+    listFiles: (relative) => ipcRenderer.invoke("workspace:list", relative),
+    readFile: (relative) => ipcRenderer.invoke("workspace:read", relative),
     providers: () => ipcRenderer.invoke("providers:list"),
     saveProvider: (request) => ipcRenderer.invoke("providers:save", request),
     forgetProvider: (id) => ipcRenderer.invoke("providers:forget", id),

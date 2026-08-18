@@ -12,6 +12,7 @@ const grpcRuntime = require("./runtime.cjs");
 const { LocalRuntime } = require("./localRuntime.cjs");
 const { RuntimeProcess } = require("./runtimeProcess.cjs");
 const { Credentials } = require("./credentials.cjs");
+const { Workspace } = require("./workspace.cjs");
 
 /// Where the shell expects to find a Runtime.
 ///
@@ -52,6 +53,11 @@ const runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
 const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
   ?? process.env.AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT
   ?? null;
+
+/// Set once the folder exists, which is why it is not built here: the default
+/// lives under `app.getPath("userData")` and that is not readable until Electron
+/// is ready.
+let workspace = new Workspace(null);
 
 const local = new LocalRuntime(stateRoot);
 const runtime = new RuntimeProcess();
@@ -190,6 +196,12 @@ ipcMain.handle("runtime:unwatch", (_event, runId) => {
   return { ok: true, value: {} };
 });
 
+// The workspace, read for the person. Every path is relative and contained;
+// see `workspace.cjs` for why the check happens after `realpath`.
+ipcMain.handle("workspace:status", guarded(() => workspace.status()));
+ipcMain.handle("workspace:list", guarded((relative) => workspace.list(relative ?? "")));
+ipcMain.handle("workspace:read", guarded((relative) => workspace.read(relative)));
+
 ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));
@@ -209,6 +221,22 @@ ipcMain.handle("remote:control", guarded((request) => grpcRuntime.control(reques
 /// state root with a runtime already on it belongs to whoever started it, and
 /// this app has to know which of the two cases it is in before it can promise
 /// anything about quitting.
+/// Which folder the window may show.
+///
+/// Set from configuration when there is any, and otherwise only when this app
+/// starts a runtime -- because then the folder is one it made. Attached to a
+/// runtime someone else started, with no configuration, this app genuinely does
+/// not know where that runtime's workspace is, and the surface says exactly
+/// that rather than showing a plausible folder.
+function openWorkspace({ mayDefault }) {
+  const folder = workspaceRoot
+    ?? (mayDefault ? path.join(app.getPath("userData"), "workspace") : null);
+  if (!folder) return null;
+  fs.mkdirSync(folder, { recursive: true });
+  workspace = new Workspace(folder);
+  return folder;
+}
+
 async function openRuntime() {
   if (!stateRoot) {
     console.log("runtime-desk: no RUNTIME_DESK_STATE_ROOT set — no local runtime");
@@ -217,7 +245,11 @@ async function openRuntime() {
   const first = await local.probe();
   if (first.connected) {
     runtime.attach();
-    console.log(`runtime-desk: attached to a runtime already at ${first.socketPath}`);
+    const known = openWorkspace({ mayDefault: false });
+    console.log(
+      `runtime-desk: attached to a runtime already at ${first.socketPath}` +
+        (known ? ` (workspace ${known})` : " (its workspace is not known to this app)"),
+    );
     return;
   }
   if (!runtimeBinary) {
@@ -232,8 +264,7 @@ async function openRuntime() {
     console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
     return;
   }
-  const workspace = workspaceRoot ?? path.join(app.getPath("userData"), "workspace");
-  fs.mkdirSync(workspace, { recursive: true });
+  const folder = openWorkspace({ mayDefault: true });
   try {
     const pid = runtime.start({
       binary: runtimeBinary,
@@ -241,7 +272,7 @@ async function openRuntime() {
       env: {
         ...routing.env,
         AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
-        AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: workspace,
+        AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: folder,
         // The runtime binary is also the trusted workspace tool -- it re-execs
         // itself for that role. Pointing at the binary this app just spawned
         // means the two can never be different builds.

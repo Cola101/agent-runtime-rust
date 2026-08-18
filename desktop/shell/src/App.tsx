@@ -5,6 +5,7 @@ import { useRuntime } from "./store";
 import { Palette } from "./Palette";
 import "./surfaces/Chat";
 import "./surfaces/Conversations";
+import "./surfaces/Workspace";
 import "./surfaces/Runs";
 import "./surfaces/Approvals";
 import "./surfaces/Settings";

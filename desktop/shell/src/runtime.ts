@@ -115,6 +115,25 @@ export type ProviderView = {
   secretSetAt: string | null;
 };
 
+export type WorkspaceStatus = { root: string | null; configured: boolean };
+
+export type WorkspaceEntry = {
+  name: string;
+  kind: "folder" | "file" | "link";
+  size: number | null;
+  modified: string | null;
+};
+
+export type WorkspaceListing = { path: string; entries: WorkspaceEntry[]; truncated: boolean };
+
+export type WorkspaceFile = {
+  path: string;
+  binary: boolean;
+  size: number;
+  truncated?: boolean;
+  text?: string;
+};
+
 export type RuntimeLifecycle = {
   lifecycle: string;
   recovery: { completed_profiles: number; total_profiles: number };
@@ -156,6 +175,9 @@ type Bridge = {
   unwatch(runId: string): Promise<Reply<unknown>>;
   onEvent(handler: (payload: { runId: string; event: RunEvent }) => void): () => void;
   onWatchEnded(handler: (payload: { runId: string; reason: Record<string, unknown> }) => void): () => void;
+  workspace(): Promise<Reply<WorkspaceStatus>>;
+  listFiles(relative: string): Promise<Reply<WorkspaceListing>>;
+  readFile(relative: string): Promise<Reply<WorkspaceFile>>;
   providers(): Promise<Reply<ProviderView[]>>;
   saveProvider(request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;

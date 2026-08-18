@@ -82,8 +82,8 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
    没有 stream、也拿不到 token。非回环地址无 mTLS 直接拒绝，但窗口仍会打开——好过一个直接退出的进程
 3. ~~**Profile / credential**~~ ✅ 密钥进登录钥匙串，配置文件只留环境变量名；桥接上不存在能取回密钥的调用。
    **仍缺**：workspace 目录选择器（现在是 `<userData>/workspace` 默认值）、改配置后自动重启 Runtime
-4. **真实 Session 闭环**：~~创建/继续~~ ✅、~~转录（Turn 级）~~ ✅、Runs 与审批/拒绝/取消 ✅；
-   **仍缺会话列表与切换**、基础 Workspace 交互
+4. ~~**真实 Session 闭环**~~ ✅ 创建/继续、Turn 级转录、会话列表与切换、审批/拒绝/取消、
+   基础 Workspace 交互（目录、文件预览、代理动过的路径）全部接真数据
 5. **干净分发验收**：干净 state root + 仅钥匙串凭据启动、跑通一轮、退出后无残留 —— 已验证；
    **仍缺**打包成可分发 artifact（现在还是 `pnpm app`）
 6. **Alpha 后对标交互**：命令面板、文件引用、diff 审阅、待办清单、排队输入、子代理树和 PTY

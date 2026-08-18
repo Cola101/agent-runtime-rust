@@ -42,7 +42,11 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       event(1, "run.started", { status: "running" }),
       event(2, "model.output.delta", { text: "I need to run a command." }),
       event(3, "model.usage", { input_tokens: 180, output_tokens: 24, cost_micros: 0 }),
-      event(4, "model.tool_call", { call: { name: "shell.exec", arguments: { command: "ls -la" } } }),
+      // Flat, which is what the runtime actually writes -- copied from a real
+      // dev-runtime log. It nests the call inside `approval.required` and not
+      // here, and a fake that nested both would let this client pass against a
+      // shape the runtime does not emit.
+      event(4, "model.tool_call", { name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-1" }),
       event(5, "approval.required", { approval: APPROVAL, status: "waiting_approval" }),
     ],
   },
@@ -58,7 +62,12 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
     events: [
       event(1, "run.started", { status: "running" }),
       event(2, "model.output.delta", { text: "done" }),
-      event(3, "run.succeeded", { status: "succeeded" }),
+      // A tool call that names a path, which is what the workspace surface
+      // reads to say what the agent was asked to touch.
+      event(3, "model.tool_call", {
+        name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
+      }),
+      event(4, "run.succeeded", { status: "succeeded" }),
     ],
   },
 };
@@ -147,6 +156,20 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     ok: true as const, value: { watching: true },
   }));
   const unwatch = vi.fn(async (_runId: string) => ({ ok: true as const, value: {} }));
+  /// A small workspace, shaped like `workspace.cjs` answers. The escape is not
+  /// simulated here -- containment is the host's, and it is tested against a
+  /// real filesystem in `workspace.test.ts`.
+  const FILES: Record<string, { entries: unknown[] }> = {
+    "": {
+      entries: [
+        { name: "src", kind: "folder", size: null, modified: "2026-08-18T09:00:00.000Z" },
+        { name: "notes.txt", kind: "file", size: 56, modified: "2026-08-18T09:30:00.000Z" },
+      ],
+    },
+    src: {
+      entries: [{ name: "main.rs", kind: "file", size: 30, modified: "2026-08-18T09:10:00.000Z" }],
+    },
+  };
   const saveProvider = vi.fn(async (_request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }) => ({ ok: true as const, value: { id: "local-stub" } }));
@@ -231,6 +254,20 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
       return () => listeners.delete(handler);
     },
     onWatchEnded: () => () => {},
+    workspace: async () => ({ ok: true as const, value: { root: "/tmp/workspace", configured: true } }),
+    listFiles: async (relative: string) => (
+      FILES[relative]
+        ? { ok: true as const, value: { path: relative, entries: FILES[relative].entries, truncated: false } }
+        : { ok: false as const, error: "no such path in the workspace" }
+    ),
+    readFile: async (relative: string) => (
+      relative === "notes.txt"
+        ? {
+          ok: true as const,
+          value: { path: relative, binary: false, size: 56, truncated: false, text: "扫描每个 run 目录" },
+        }
+        : { ok: false as const, error: "that path is outside the workspace" }
+    ),
     saveProvider,
     forgetProvider,
     // Ascending by id, the order `list_session_heads` returns.
