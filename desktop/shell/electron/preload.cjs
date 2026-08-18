@@ -26,6 +26,21 @@ contextBridge.exposeInMainWorld("desk", {
     // One way in. There is no `providers:get` and there is not meant to be:
     // the renderer can set a secret and can be told one exists, and has no
     // call that would hand it back.
+    watch: (request) => ipcRenderer.invoke("runtime:watch", request),
+    unwatch: (runId) => ipcRenderer.invoke("runtime:unwatch", runId),
+    /// Returns its own unsubscribe. A renderer that could only add listeners
+    /// would leak one per mount, and the leak would look like a transcript
+    /// that gets faster and then wrong.
+    onEvent: (handler) => {
+      const wrapped = (_event, payload) => handler(payload);
+      ipcRenderer.on("runtime:event", wrapped);
+      return () => ipcRenderer.off("runtime:event", wrapped);
+    },
+    onWatchEnded: (handler) => {
+      const wrapped = (_event, payload) => handler(payload);
+      ipcRenderer.on("runtime:watchEnded", wrapped);
+      return () => ipcRenderer.off("runtime:watchEnded", wrapped);
+    },
     providers: () => ipcRenderer.invoke("providers:list"),
     saveProvider: (request) => ipcRenderer.invoke("providers:save", request),
     forgetProvider: (id) => ipcRenderer.invoke("providers:forget", id),

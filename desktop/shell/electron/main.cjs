@@ -152,6 +152,44 @@ ipcMain.handle("session:history", guarded((request) => local.sessionHistory(requ
 // deliberately no call that returns a secret, because a bridge method that
 // could return one is a bridge method that will one day be called by a surface
 // rendering someone else's transcript.
+/// Held-open streams, one per run being followed.
+///
+/// Not `guarded`, because these need the sender: an event has to go back to the
+/// window that asked for it, and the handler owns a connection rather than
+/// answering once. Everything else on this bridge is request/response, and
+/// keeping these visibly different is better than widening `guarded` until it
+/// covers two shapes.
+const watchers = new Map();
+
+ipcMain.handle("runtime:watch", (event, { runId, afterSequence = 0 } = {}) => {
+  if (!runId) return { ok: false, error: "no run to watch" };
+  if (watchers.has(runId)) return { ok: true, value: { watching: true } };
+  const sender = event.sender;
+  try {
+    const watcher = local.watchRun({
+      runId,
+      afterSequence,
+      onEvent: (streamed) => {
+        if (!sender.isDestroyed()) sender.send("runtime:event", { runId, event: streamed });
+      },
+      onEnd: (reason) => {
+        watchers.delete(runId);
+        if (!sender.isDestroyed()) sender.send("runtime:watchEnded", { runId, reason });
+      },
+    });
+    watchers.set(runId, watcher);
+    return { ok: true, value: { watching: true } };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+});
+
+ipcMain.handle("runtime:unwatch", (_event, runId) => {
+  watchers.get(runId)?.stop();
+  watchers.delete(runId);
+  return { ok: true, value: {} };
+});
+
 ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));
@@ -242,6 +280,10 @@ async function openRuntime() {
 /// down a host someone else is using.
 let stopping = null;
 function closeRuntime() {
+  // Held-open connections first. A drain that races sockets still reading the
+  // log is a drain reporting on a Runtime that has clients attached to it.
+  for (const watcher of watchers.values()) watcher.stop();
+  watchers.clear();
   if (!stopping) {
     stopping = runtime.stop({ drain: () => local.shutdown() }).then((outcome) => {
       if (!outcome.stopped) return outcome;

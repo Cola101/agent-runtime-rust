@@ -139,6 +139,14 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   }) => ({
     ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
   }));
+  /// The stream, as the host delivers it: a subscription plus a way to push.
+  /// Tests drive `emit` to make an event arrive between polls, which is the
+  /// only way to tell a streamed transcript from a polled one.
+  const listeners = new Set<(payload: { runId: string; event: unknown }) => void>();
+  const watch = vi.fn(async (_request: { runId: string; afterSequence?: number }) => ({
+    ok: true as const, value: { watching: true },
+  }));
+  const unwatch = vi.fn(async (_runId: string) => ({ ok: true as const, value: {} }));
   const saveProvider = vi.fn(async (_request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }) => ({ ok: true as const, value: { id: "local-stub" } }));
@@ -216,6 +224,13 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
         secretSetAt: "2026-08-18T09:00:00.000Z",
       }],
     }),
+    watch,
+    unwatch,
+    onEvent: (handler: (payload: { runId: string; event: unknown }) => void) => {
+      listeners.add(handler);
+      return () => listeners.delete(handler);
+    },
+    onWatchEnded: () => () => {},
     saveProvider,
     forgetProvider,
     // Ascending by id, the order `list_session_heads` returns.
@@ -240,8 +255,11 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   });
   const desk = { mounted: vi.fn(), drew: vi.fn(), runtime };
   (window as unknown as { desk: typeof desk }).desk = desk;
+  const emit = (runId: string, event: Record<string, unknown>) => {
+    for (const listener of listeners) listener({ runId, event });
+  };
   return {
     control, submit, sessionStart, sessionContinue, sessionRead,
-    saveProvider, forgetProvider, desk,
+    saveProvider, forgetProvider, watch, unwatch, emit, event, desk,
   };
 }

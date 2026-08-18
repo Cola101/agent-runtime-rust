@@ -197,6 +197,44 @@ function project(
   };
 }
 
+/// Folds streamed events into a Run already read from the cursor.
+///
+/// The split is the point. Events are appended as the runtime writes them, so a
+/// reply appears while it is being produced instead of at the next poll. The
+/// *boundary* -- running, waiting on a person, terminal, retired -- is left
+/// exactly as the cursor reported it, because concluding a run is over from the
+/// last event that happened to arrive is wrong precisely when it matters.
+///
+/// Merged by sequence rather than appended: the poll and the stream overlap by
+/// design, and the sequence is what makes that harmless.
+function withStreamed(run: RunView, streamed: RunEvent[]): RunView {
+  if (streamed.length === 0) return run;
+  const bySequence = new Map(run.events.map((event) => [event.sequence, event]));
+  let added = false;
+  for (const event of streamed) {
+
+    if (bySequence.has(event.sequence)) continue;
+    bySequence.set(event.sequence, event);
+    added = true;
+  }
+  if (!added) return run;
+  const events = [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+  const projected = project(run.id, run.asked, {
+    run_id: run.id,
+    requested_after_sequence: 0,
+    next_after_sequence: 0,
+    earliest_available_sequence: run.earliestSequence,
+    highest_committed_sequence: Math.max(run.highestSequence, events[events.length - 1].sequence),
+    history_gap: run.historyGap,
+    has_more: false,
+    // The cursor's, not re-derived. Everything below keeps the boundary the
+    // runtime typed for this run.
+    state: {},
+    events,
+  }, events, run.truncated);
+  return { ...projected, lifecycle: run.lifecycle, approval: run.approval, error: run.error };
+}
+
 function failed(id: string, asked: string, error: CursorError): RunView {
   return {
     id, asked, lifecycle: { kind: "unrecognised" }, events: [], text: "",
@@ -356,6 +394,13 @@ export function useRuntime(): Store {
   const [listedAt, setListedAt] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [providers, setProviders] = useState<ProviderView[]>([]);
+  /// Events that arrived on the stream ahead of the poll.
+  ///
+  /// Dropped per run once the poll's own read has reached them, so this stays a
+  /// short lead rather than growing into a second copy of the log this client
+  /// would then have to keep agreeing with.
+  const [streamed, setStreamed] = useState<Map<string, RunEvent[]>>(new Map());
+  const watching = useRef<string | null>(null);
   const [current, setCurrent] = useState<string | null>(null);
   const busy = useRef(false);
   /// Read inside the poll, which must not be rebuilt every time the selection
@@ -393,6 +438,18 @@ export function useRuntime(): Store {
         }),
       );
       setRuns(views);
+      // What the poll has now read needs no lead. Keeping it would mean holding
+      // every event of every followed run for as long as the window is open.
+      setStreamed((previous) => {
+        if (previous.size === 0) return previous;
+        const next = new Map<string, RunEvent[]>();
+        for (const [runId, events] of previous) {
+          const read = views.find((view) => view.id === runId)?.highestSequence ?? 0;
+          const ahead = events.filter((event) => event.sequence > read);
+          if (ahead.length > 0) next.set(runId, ahead);
+        }
+        return next;
+      });
 
       const heads = await api.sessionList();
       if (heads.ok) {
@@ -475,6 +532,46 @@ export function useRuntime(): Store {
     return reply.ok ? null : reply.error;
   }, [refreshProviders]);
 
+  /// One subscription for the window, for the run on screen.
+  ///
+  /// Following every run at once would hold a connection per run and deliver
+  /// events nobody is looking at. The transcript shows one run, so one is
+  /// followed -- and it is dropped as soon as the cursor moves.
+  useEffect(() => {
+    const api = bridge();
+    if (!api?.onEvent) return;
+    const offEvent = api.onEvent(({ runId, event }) => {
+      setStreamed((previous) => {
+        const next = new Map(previous);
+        next.set(runId, [...(next.get(runId) ?? []), event]);
+        return next;
+      });
+    });
+    const offEnded = api.onWatchEnded(({ runId }) => {
+      if (watching.current === runId) watching.current = null;
+      // The boundary is the cursor's to report, so the end of a stream is a
+      // reason to read it now rather than something to render.
+      void load();
+    });
+    return () => { offEvent(); offEnded(); };
+  }, [load]);
+
+  /// Follows the Turn in flight, and nothing else.
+  ///
+  /// The store knows one run is live without guessing: the open conversation's
+  /// head names it. Following every run instead would hold a connection each
+  /// for logs nobody is reading, and following "the selected run" would follow
+  /// finished runs that have nothing left to say.
+  const live = sessions.find((session) => session.sessionId === current)?.activeRunId ?? null;
+  useEffect(() => {
+    const api = bridge();
+    if (!api?.watch) return;
+    if (watching.current === live) return;
+    if (watching.current) void api.unwatch(watching.current);
+    watching.current = live;
+    if (live) void api.watch({ runId: live, afterSequence: 0 });
+  }, [live]);
+
   const selectSession = useCallback((sessionId: string | null) => {
     opened.current = true;
     currentRef.current = sessionId;
@@ -534,8 +631,13 @@ export function useRuntime(): Store {
     [load],
   );
 
+  // Streamed events are folded in here rather than into `runs`, so the poll's
+  // reading of the durable log stays the thing this client holds, and the
+  // stream stays an accelerator on top of it.
+  const merged = runs.map((run) => withStreamed(run, streamed.get(run.id) ?? []));
+
   return {
-    link, runs, policies: readPolicies(runs), loading, listedAt,
+    link, runs: merged, policies: readPolicies(merged), loading, listedAt,
     sessions,
     current: sessions.find((session) => session.sessionId === current) ?? null,
     selectSession, newConversation, send,

@@ -120,6 +120,64 @@ function call(socketPath, request, { collectUntil = null } = {}) {
 /// Nothing is guessed. If the shell was not told where the runtime keeps its
 /// state, it has no connection — it does not go looking in likely directories,
 /// for the same reason it does not guess a network endpoint.
+/// A held-open connection, one line per event.
+///
+/// Distinct from `call` on purpose: `call` has a deadline, because a request
+/// that never answers is a broken runtime. A watch has none, because a run that
+/// says nothing for a minute is a run that is thinking. The two would be one
+/// function only by making the deadline optional, and an optional deadline is
+/// how a request ends up waiting forever.
+///
+/// The daemon ends the stream itself -- on the terminal boundary, on a retired
+/// history, or on an error -- so this never has to decide when a run is over.
+/// Which matters: deciding that from the events is exactly the mistake the
+/// cursor's typed boundary exists to prevent.
+function watch(socketPath, request, { onEvent, onEnd }) {
+  const socket = net.createConnection(socketPath);
+  let buffer = "";
+  let ended = false;
+
+  const finish = (reason) => {
+    if (ended) return;
+    ended = true;
+    socket.destroy();
+    onEnd(reason);
+  };
+
+  socket.setTimeout(CONNECT_TIMEOUT_MS, () => {
+    if (!socket.readable) finish({ error: "timed out connecting to the runtime socket" });
+  });
+  socket.on("connect", () => {
+    socket.setTimeout(0);
+    socket.write(`${JSON.stringify(request)}\n`);
+  });
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let index;
+    while ((index = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (line.trim() === "") continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        finish({ error: "runtime sent a line that is not JSON" });
+        return;
+      }
+      if (parsed.type === "event") onEvent(parsed.event);
+      else if (parsed.type === "finished") finish({ status: parsed.status });
+      else if (parsed.type === "error") finish({ error: parsed.message });
+      else finish({ error: `unexpected line on the stream: ${parsed.type}` });
+      if (ended) return;
+    }
+  });
+  socket.on("end", () => finish({ closed: true }));
+  socket.on("error", (error) => finish({ error: error.message }));
+
+  return { stop: () => finish({ stopped: true }) };
+}
+
 class LocalRuntime {
   constructor(stateRoot) {
     this.stateRoot = stateRoot;
@@ -335,6 +393,22 @@ class LocalRuntime {
     });
     if (reply.type !== "session_history") throw new Error(`unexpected reply: ${reply.type}`);
     return { turns: reply.page.turns, nextAfterTurnOrdinal: reply.page.next_after_turn_ordinal ?? null };
+  }
+
+  /// Follows one run's durable log as it is written.
+  ///
+  /// The events arrive; the *lifecycle* does not, and deliberately. A boundary
+  /// ends the stream but the state a surface renders still comes from the
+  /// cursor, because concluding a run is over from the last event received is
+  /// wrong exactly when it matters -- a retired log, a replaced host, a run
+  /// parked on a person.
+  watchRun({ runId, afterSequence = 0, onEvent, onEnd }) {
+    if (!this.socketPath) throw new Error("no runtime configured");
+    return watch(
+      this.socketPath,
+      { type: "attach", run_id: runId, after_sequence: afterSequence },
+      { onEvent, onEnd },
+    );
   }
 
   async submit(input) {

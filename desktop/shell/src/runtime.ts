@@ -150,6 +150,12 @@ type Bridge = {
     sessionId: string; branchId: string; generation: number;
     afterTurnOrdinal?: number; limit?: number | null;
   }): Promise<Reply<{ turns: SessionTurn[]; nextAfterTurnOrdinal: number | null }>>;
+  /// Follows one run's log as it is written. The events arrive through
+  /// `onEvent`; the lifecycle does not, and must keep coming from the cursor.
+  watch(request: { runId: string; afterSequence?: number }): Promise<Reply<{ watching: boolean }>>;
+  unwatch(runId: string): Promise<Reply<unknown>>;
+  onEvent(handler: (payload: { runId: string; event: RunEvent }) => void): () => void;
+  onWatchEnded(handler: (payload: { runId: string; reason: Record<string, unknown> }) => void): () => void;
   providers(): Promise<Reply<ProviderView[]>>;
   saveProvider(request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
