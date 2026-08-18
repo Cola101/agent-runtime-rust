@@ -78,6 +78,212 @@ pub enum LocalRequest {
     },
 }
 
+/// What a Run looks like to whoever owns this state root.
+///
+/// Deliberately not `LocalRunRecord`: that carries owner epochs and the exact
+/// shape of a parked approval, which are the host's business. This is the
+/// question a person asks of a list -- what was it asked to do, and where did
+/// it get to.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OwnerRunSummary {
+    pub run_id: Uuid,
+    pub invocation: RuntimeInvocationContext,
+    pub input: String,
+    pub state: OwnerRunState,
+}
+
+/// A Run's state as an owner sees it.
+///
+/// One variant per durable state, deliberately. Folding "a decision has been
+/// acknowledged but not yet consumed" into `Running` would read as work in
+/// flight when the Run is actually owed a replay, and folding an MCP input
+/// wait into an approval wait would send a person looking for a button that
+/// is not there. Nothing here is a summary of two things.
+///
+/// `Cancelling` drops the operator's reason text on purpose -- that is prose
+/// somebody typed, and a status field is not where it belongs. `Interrupted`
+/// keeps its reason because the Runtime wrote it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum OwnerRunState {
+    Running,
+    Cancelling,
+    WaitingApproval,
+    WaitingInput,
+    /// A decision is durable but the exact Checkpoint-bound call has not
+    /// consumed it yet. Still owed work, and never resumed by asking the model.
+    Decided,
+    Interrupted {
+        reason: String,
+    },
+    Finished {
+        status: String,
+    },
+}
+
+impl OwnerRunState {
+    fn of(state: &LocalRunState) -> Self {
+        match state {
+            LocalRunState::Running => Self::Running,
+            LocalRunState::Cancelling { .. } => Self::Cancelling,
+            LocalRunState::AwaitingApproval { .. } => Self::WaitingApproval,
+            LocalRunState::AwaitingMcpInput { .. } => Self::WaitingInput,
+            LocalRunState::ApprovalDecided { .. } | LocalRunState::McpInputDecided { .. } => {
+                Self::Decided
+            }
+            LocalRunState::Interrupted { reason } => Self::Interrupted {
+                reason: reason.clone(),
+            },
+            LocalRunState::Cancelled { .. } => Self::Finished {
+                status: "cancelled".into(),
+            },
+            LocalRunState::Finished { status } => Self::Finished {
+                status: status.clone(),
+            },
+        }
+    }
+}
+
+/// Requests only the owner of this state root may issue.
+///
+/// Separate from `LocalRequest` because the two ask different kinds of thing:
+/// a workload asks the Runtime to do work, an owner asks it to be running, to
+/// report itself, or to stop. The privilege boundary already exists -- the
+/// socket is created `0o600`, so connecting at all is the credential -- and
+/// splitting the enum is what keeps the two surfaces legible and lets a test
+/// assert that neither namespace can reach the other.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OwnerRequest {
+    /// Every Run on disk, newest first.
+    ///
+    /// Distinct from `LocalRequest::List`, which reports the order this daemon
+    /// has started things in since it came up and is therefore empty after a
+    /// restart while the Runs are still there. The difference is declared, not
+    /// accidental: one answers "what has this host done", the other "what does
+    /// this state root hold".
+    ListRuns {
+        #[serde(default)]
+        after_run_id: Option<Uuid>,
+        #[serde(default = "default_owner_page")]
+        limit: usize,
+    },
+    // Session operations carry no invocation. This daemon owns exactly one
+    // state root and one built-in local identity, so asking a caller to supply
+    // it would only invite it to supply the wrong one -- and would force every
+    // client to mirror seven constants it has no way to choose between.
+    SessionStart {
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+        input: String,
+    },
+    SessionContinue {
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: String,
+    },
+    SessionFork {
+        session_id: Uuid,
+        source_branch_id: Uuid,
+        source_generation: u64,
+        through_turn_ordinal: u64,
+        target_branch_id: Uuid,
+    },
+    SessionRollback {
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        through_turn_ordinal: u64,
+    },
+    SessionRead {
+        session_id: Uuid,
+        branch_id: Uuid,
+    },
+    SessionList {
+        #[serde(default)]
+        after_session_id: Option<Uuid>,
+        #[serde(default)]
+        after_branch_id: Option<Uuid>,
+        #[serde(default = "default_owner_page")]
+        limit: usize,
+    },
+    SessionHistory {
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        #[serde(default)]
+        after_turn_ordinal: u64,
+        #[serde(default = "default_owner_history_page")]
+        limit: usize,
+    },
+}
+
+const OWNER_MAX_PAGE: usize = 256;
+const OWNER_MAX_HISTORY_PAGE: usize = 128;
+
+fn default_owner_page() -> usize {
+    OWNER_MAX_PAGE
+}
+
+fn default_owner_history_page() -> usize {
+    OWNER_MAX_HISTORY_PAGE
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OwnerResponse {
+    Runs {
+        runs: Vec<OwnerRunSummary>,
+        next_after_run_id: Option<Uuid>,
+    },
+    SessionTurn {
+        receipt: Box<crate::embedded::EmbeddedSessionTurnReceipt>,
+    },
+    SessionHead {
+        head: Box<crate::LocalSessionHead>,
+    },
+    SessionList {
+        page: Box<crate::embedded::EmbeddedSessionListPage>,
+    },
+    SessionHistory {
+        page: Box<crate::embedded::EmbeddedSessionHistoryPage>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Which surface a line on the socket is addressed to.
+///
+/// A line without a scope is a workload request, so every existing client keeps
+/// working unchanged. A line that names a scope is only ever parsed as that
+/// scope: there is no fallback from one namespace into the other, because a
+/// fallback is exactly how an owner operation would become reachable by
+/// something that did not ask for one.
+// Debug adds nothing `LocalRequest` and `OwnerRequest` do not already derive;
+// it exists so a test can say which namespace it got.
+#[derive(Debug)]
+enum WireRequest {
+    Workload(LocalRequest),
+    Owner(OwnerRequest),
+}
+
+fn parse_wire_request(line: &str) -> Result<WireRequest, String> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+    match value.get("scope").and_then(serde_json::Value::as_str) {
+        Some("owner") => serde_json::from_value(value)
+            .map(WireRequest::Owner)
+            .map_err(|error| error.to_string()),
+        Some(other) if other != "workload" => Err(format!("unknown request scope {other}")),
+        _ => serde_json::from_value(value)
+            .map(WireRequest::Workload)
+            .map_err(|error| error.to_string()),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalResponse {
@@ -279,6 +485,63 @@ impl LocalRuntimeDaemon {
         }
     }
 
+    /// Every Run this state root holds, newest first, from disk.
+    ///
+    /// `LocalRequest::List` answers a different question -- what this daemon
+    /// has started since it came up -- and is empty after a restart while the
+    /// Runs are still on disk. Both are useful and neither is a substitute for
+    /// the other, so they stay separate rather than one quietly changing
+    /// meaning.
+    fn list_owned_runs(
+        &self,
+        after_run_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<(Vec<OwnerRunSummary>, Option<Uuid>), LocalRuntimeError> {
+        if !(1..=OWNER_MAX_PAGE).contains(&limit) {
+            return Err(LocalRuntimeError::Execution(format!(
+                "owner page limit must be between 1 and {OWNER_MAX_PAGE}"
+            )));
+        }
+        let mut records = LocalRuntimeHost::list_run_records(&self.config.state_root)?;
+        // Run ids are UUIDv7, so descending id is newest first and is also a
+        // stable paging order -- no timestamp to tie-break and no scan state to
+        // keep between pages.
+        records.sort_by(|left, right| right.run_id.cmp(&left.run_id));
+        let start = match after_run_id {
+            Some(cursor) => records
+                .iter()
+                .position(|record| record.run_id == cursor)
+                .map(|at| at + 1)
+                .ok_or_else(|| {
+                    LocalRuntimeError::Execution("owner page cursor is not a known Run".into())
+                })?,
+            None => 0,
+        };
+        let page: Vec<_> = records
+            .into_iter()
+            .skip(start)
+            .take(limit)
+            .map(|record| OwnerRunSummary {
+                run_id: record.run_id,
+                invocation: RuntimeInvocationContext {
+                    schema_version: agent_protocol::RUNTIME_INVOCATION_SCHEMA_VERSION,
+                    tenant_id: record.tenant_id,
+                    application_id: record.application_id,
+                    workload_identity_id: record.workload_identity_id,
+                    workspace_id: record.workspace_id,
+                    agent_version_id: record.agent_version_id,
+                    model_policy_id: record.model_policy_id,
+                },
+                state: OwnerRunState::of(&record.state),
+                input: record.input,
+            })
+            .collect();
+        let next = (page.len() == limit)
+            .then(|| page.last().map(|summary| summary.run_id))
+            .flatten();
+        Ok((page, next))
+    }
+
     async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
@@ -286,16 +549,153 @@ impl LocalRuntimeDaemon {
             if line.trim().is_empty() {
                 continue;
             }
-            let request = match serde_json::from_str::<LocalRequest>(&line) {
-                Ok(request) => request,
-                Err(error) => {
-                    write_response(
-                        &mut writer,
-                        &LocalResponse::Error {
-                            message: error.to_string(),
+            let request = match parse_wire_request(&line) {
+                Ok(WireRequest::Workload(request)) => request,
+                Ok(WireRequest::Owner(request)) => {
+                    let response = match request {
+                        OwnerRequest::ListRuns {
+                            after_run_id,
+                            limit,
+                        } => match self.list_owned_runs(after_run_id, limit) {
+                            Ok((runs, next_after_run_id)) => OwnerResponse::Runs {
+                                runs,
+                                next_after_run_id,
+                            },
+                            Err(error) => OwnerResponse::Error {
+                                message: error.to_string(),
+                            },
                         },
-                    )
-                    .await?;
+                        OwnerRequest::SessionStart {
+                            session_id,
+                            branch_id,
+                            run_id,
+                            input,
+                        } => owner_turn(
+                            self.runtime
+                                .start_session_turn_detached(
+                                    self.invocation,
+                                    session_id,
+                                    branch_id,
+                                    run_id,
+                                    input,
+                                )
+                                .await,
+                        ),
+                        OwnerRequest::SessionContinue {
+                            session_id,
+                            branch_id,
+                            generation,
+                            run_id,
+                            input,
+                        } => owner_turn(
+                            self.runtime
+                                .continue_session_turn_detached(
+                                    self.invocation,
+                                    session_id,
+                                    branch_id,
+                                    generation,
+                                    run_id,
+                                    input,
+                                )
+                                .await,
+                        ),
+                        OwnerRequest::SessionFork {
+                            session_id,
+                            source_branch_id,
+                            source_generation,
+                            through_turn_ordinal,
+                            target_branch_id,
+                        } => owner_head(
+                            self.runtime
+                                .fork_session(
+                                    self.invocation,
+                                    session_id,
+                                    source_branch_id,
+                                    source_generation,
+                                    through_turn_ordinal,
+                                    target_branch_id,
+                                )
+                                .await,
+                        ),
+                        OwnerRequest::SessionRollback {
+                            session_id,
+                            branch_id,
+                            generation,
+                            through_turn_ordinal,
+                        } => owner_head(
+                            self.runtime
+                                .rollback_session(
+                                    self.invocation,
+                                    session_id,
+                                    branch_id,
+                                    generation,
+                                    through_turn_ordinal,
+                                )
+                                .await,
+                        ),
+                        OwnerRequest::SessionRead {
+                            session_id,
+                            branch_id,
+                        } => owner_head(self.runtime.read_session_head(
+                            self.invocation,
+                            session_id,
+                            branch_id,
+                        )),
+                        OwnerRequest::SessionList {
+                            after_session_id,
+                            after_branch_id,
+                            limit,
+                        } => {
+                            // Both halves of the cursor or neither. A Session
+                            // named without its branch is an incomplete cursor,
+                            // not a shorthand for "any branch".
+                            match (after_session_id, after_branch_id) {
+                                (Some(session_id), Some(branch_id)) => {
+                                    owner_list(self.runtime.list_session_heads(
+                                        self.invocation,
+                                        Some((session_id, branch_id)),
+                                        limit,
+                                    ))
+                                }
+                                (None, None) => owner_list(self.runtime.list_session_heads(
+                                    self.invocation,
+                                    None,
+                                    limit,
+                                )),
+                                _ => OwnerResponse::Error {
+                                    message: "a Session list cursor needs both its Session and \
+                                              its branch, or neither"
+                                        .into(),
+                                },
+                            }
+                        }
+                        OwnerRequest::SessionHistory {
+                            session_id,
+                            branch_id,
+                            generation,
+                            after_turn_ordinal,
+                            limit,
+                        } => match self.runtime.read_session_history(
+                            self.invocation,
+                            session_id,
+                            branch_id,
+                            generation,
+                            after_turn_ordinal,
+                            limit,
+                        ) {
+                            Ok(page) => OwnerResponse::SessionHistory {
+                                page: Box::new(page),
+                            },
+                            Err(error) => OwnerResponse::Error {
+                                message: error.to_string(),
+                            },
+                        },
+                    };
+                    write_owner_response(&mut writer, &response).await?;
+                    continue;
+                }
+                Err(message) => {
+                    write_response(&mut writer, &LocalResponse::Error { message }).await?;
                     continue;
                 }
             };
@@ -813,6 +1213,56 @@ async fn write_response(
     writer.flush().await
 }
 
+fn owner_turn(
+    result: Result<crate::embedded::EmbeddedSessionTurnReceipt, EmbeddedRuntimeError>,
+) -> OwnerResponse {
+    match result {
+        Ok(receipt) => OwnerResponse::SessionTurn {
+            receipt: Box::new(receipt),
+        },
+        Err(error) => OwnerResponse::Error {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn owner_head(result: Result<crate::LocalSessionHead, EmbeddedRuntimeError>) -> OwnerResponse {
+    match result {
+        Ok(head) => OwnerResponse::SessionHead {
+            head: Box::new(head),
+        },
+        Err(error) => OwnerResponse::Error {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn owner_list(
+    result: Result<crate::embedded::EmbeddedSessionListPage, EmbeddedRuntimeError>,
+) -> OwnerResponse {
+    match result {
+        Ok(page) => OwnerResponse::SessionList {
+            page: Box::new(page),
+        },
+        Err(error) => OwnerResponse::Error {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// The owner namespace answers on the same connection and in the same framing,
+/// but with its own response type -- an owner reply is never mistaken for a
+/// workload one by a client reading either.
+async fn write_owner_response(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &OwnerResponse,
+) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(response)?;
+    line.push(b'\n');
+    writer.write_all(&line).await?;
+    writer.flush().await
+}
+
 /// Longest usable Unix socket path. `sockaddr_un.sun_path` holds 104 bytes on
 /// macOS and 108 on Linux, including the trailing NUL; 100 is safe on both.
 const MAX_SOCKET_PATH_BYTES: usize = 100;
@@ -833,4 +1283,64 @@ pub fn default_socket_path(state_root: &Path) -> PathBuf {
     }
     let digest = hex::encode(Sha256::digest(state_root.as_os_str().as_encoded_bytes()));
     std::env::temp_dir().join(format!("agent-runtime-host-{}.sock", &digest[..16]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two namespaces do not reach each other, in either direction.
+    ///
+    /// This is the whole point of splitting the enum. The socket is already
+    /// `0o600`, so this is not what keeps a stranger out -- it is what keeps
+    /// the two surfaces from quietly becoming one, which is how an owner
+    /// operation ends up reachable from a request that never asked to be one.
+    #[test]
+    fn a_scope_is_never_parsed_as_the_other_one() {
+        // Every existing client sends no scope at all and must keep working.
+        assert!(matches!(
+            parse_wire_request(r#"{"type":"list"}"#).expect("unscoped is workload"),
+            WireRequest::Workload(LocalRequest::List)
+        ));
+        assert!(matches!(
+            parse_wire_request(r#"{"scope":"workload","type":"list"}"#).expect("explicit workload"),
+            WireRequest::Workload(LocalRequest::List)
+        ));
+        assert!(matches!(
+            parse_wire_request(r#"{"scope":"owner","type":"list_runs"}"#).expect("owner"),
+            WireRequest::Owner(OwnerRequest::ListRuns { .. })
+        ));
+
+        // A workload operation named under the owner scope is not a workload
+        // operation. There is no fallback out of the namespace it named.
+        parse_wire_request(r#"{"scope":"owner","type":"list"}"#)
+            .expect_err("a workload operation must not be reachable through the owner scope");
+        parse_wire_request(r#"{"scope":"owner","type":"submit","input":"hello"}"#)
+            .expect_err("submit is not an owner operation");
+
+        // And an owner operation is not reachable by omitting the scope, which
+        // is the direction that matters: every existing client omits it.
+        parse_wire_request(r#"{"type":"list_runs"}"#)
+            .expect_err("an owner operation must not be reachable without naming the owner scope");
+
+        // A scope nobody defined is refused rather than guessed at.
+        parse_wire_request(r#"{"scope":"admin","type":"list"}"#)
+            .expect_err("an unknown scope must be refused");
+    }
+
+    /// A page ceiling the caller can read is a ceiling the caller can plan
+    /// against; one it discovers by being refused is a surprise.
+    #[test]
+    fn the_owner_page_defaults_to_its_published_ceiling() {
+        let request = parse_wire_request(r#"{"scope":"owner","type":"list_runs"}"#).expect("owner");
+        let WireRequest::Owner(OwnerRequest::ListRuns {
+            limit,
+            after_run_id,
+        }) = request
+        else {
+            panic!("expected ListRuns");
+        };
+        assert_eq!(limit, OWNER_MAX_PAGE);
+        assert_eq!(after_run_id, None);
+    }
 }

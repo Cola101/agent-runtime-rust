@@ -55,6 +55,21 @@ Submit / Attach / EventCursor / List / Approve / Deny
 
 Electron 客户端能通过 socket 完成 Session 全链并驱动生命周期。**这一条不过，后两个阶段的产出桌面依旧用不上。**
 
+### 状态：Session 全链已达成（2026-08-18）
+
+`owner_socket_contract` 4/4。主链 `session_start → session_read → session_continue → session_fork →
+session_list → session_history → session_rollback` 全程由一个**不提供任何身份**的调用方完成。
+
+作用域隔离双向验证，且**验证过守卫会失败**：故意加上 owner→workload 的回退后，断言当场转红并报出
+`Workload(List)` 从 owner scope 到达。
+
+**顺带收益**：owner 面不要求送 invocation，所以桌面客户端现在镜像的 7 个 UUID 与
+`desktop/scripts/check-local-invocation.sh` 在接入后**可以一并删除**——少一处会漂的东西，好过多一个守卫。
+（`EventCursor` 仍在工作负载面、仍需要 invocation；是否给 owner 面加事件读取，按桌面接入时的实际需要再定，
+不预先扩面。）
+
+生命周期部分尚未开始。
+
 ## 阶段 1：应用生命周期
 
 沿用既定设计：状态机 `Created → Recovering → Ready → Draining → Stopped`、单次转换、多等待者结果一致、
@@ -129,7 +144,7 @@ Run 多时每次启动都先报故障，然后突然好了。**用户看到的�
 
 ## 阶段 2：桌面看得见
 
-### 2.1 持久 Run 列表
+### 2.1 持久 Run 列表 —— 已完成（2026-08-18）
 
 `LocalRequest::List` 走守护进程内存里的 `order: Arc<Mutex<Vec<Uuid>>>`，**host 一重启就空**，
 而磁盘上 Run 还在。客户端现在只能诚实地写：
@@ -140,12 +155,27 @@ Run 多时每次启动都先报故障，然后突然好了。**用户看到的�
 `list_run_records(state_root)` 已存在且为 `pub`。owner 面 `ListRuns` 直接暴露它，
 分页与上限沿用 Session 列表的既有约定（256）。
 
-### 2.2 Run 的输入进日志
+已验证：替换守护进程后，工作负载 `List` 为空而 owner `ListRuns` 仍返回磁盘上的 Run——**差异是声明的**。
+越界的 limit 与未知游标一律拒绝，不静默钳位、不悄悄从头开始。
 
-`run.started` 的 payload 只有 `{"status":"running"}`。**日志里没有 Run 被要求做什么**，
-所以任何不是本客户端发起的 Run，"问的是什么"永远显示不出来 —— 客户端只能自己记一份，重装即失。
+`OwnerRunState` 对九个持久状态做**无损**映射，一个都不折叠：把"决定已落盘但尚未被消费"折进 `Running`
+会读成工作在途，而它其实欠着一次重放；把 MCP input 等待折进审批等待，会让人去找一个并不存在的按钮。
+`Cancelling` 刻意丢弃操作者填的 reason 文本——那是人写的散文，状态字段不是它该待的地方；
+`Interrupted` 保留 reason，因为那是 Runtime 自己写的。
 
-在 `run.started` 中带上输入（受既有 32,000 字节上限约束）。这是恢复与审计都需要的信息，不只是 UI 需要。
+### 2.2 Run 的输入进日志 —— 撤销（2026-08-18）
+
+原文写的是：`run.started` 的 payload 只有 `{"status":"running"}`，所以日志里没有 Run 被要求做什么。
+
+**这句对事件流成立，对持久记录不成立。** `LocalRunRecord` 一直带着 `input` 字段，
+`owner_socket_contract` 里这条断言现在是绿的：
+
+```rust
+// 输入在持久记录上，所以没发起过这个 Run 的客户端也能说出它被要求做什么
+assert_eq!(run.input, asked);
+```
+
+桌面要的"问的是什么"由 `ListRuns` 直接满足。**改事件 schema 这件事不做**，本条从计划中撤销。
 
 ## 不做
 
