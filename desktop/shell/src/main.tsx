@@ -5,6 +5,7 @@ import { all } from "./surfaces/registry";
 import "./app.css";
 import "./runtime";
 import "./surfaces/Chat";
+import "./surfaces/Conversations";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html is missing #root");

@@ -4,6 +4,7 @@ import { DeskContext, useDesk, type Desk } from "./desk";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
 import "./surfaces/Chat";
+import "./surfaces/Conversations";
 import "./surfaces/Runs";
 import "./surfaces/Approvals";
 import "./surfaces/Settings";

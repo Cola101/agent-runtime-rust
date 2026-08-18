@@ -70,6 +70,23 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
 /// renderer pass against a transcript the runtime does not have.
 export const SESSION = "01a01430-0000-7000-8000-000000000001";
 export const SESSION_BRANCH = "01a01430-0000-7000-8000-000000000002";
+/// An older conversation. Its id sorts *below* SESSION, which is the whole
+/// point: this client mints v7 ids and the runtime returns heads in id order,
+/// so "older" is a property of the id rather than a label the test asserts.
+export const OLDER_SESSION = "01a0142f-0000-7000-8000-000000000001";
+export const OLDER_BRANCH = "01a0142f-0000-7000-8000-000000000002";
+
+const OLDER_TURNS = [
+  {
+    turn_ordinal: 1,
+    run_id: RUN_DONE,
+    transcript: [
+      { role: "user", content: [{ type: "text", text: "上礼拜那段对话" }] },
+      { role: "assistant", content: [{ type: "text", text: "还在这儿。" }] },
+    ],
+    digest: "e".repeat(64),
+  },
+];
 
 const TURNS = [
   {
@@ -103,6 +120,15 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     history_digest: "c".repeat(64),
     active_run_id: activeRunId,
   });
+  const olderHead = () => ({
+    session_id: OLDER_SESSION,
+    branch_id: OLDER_BRANCH,
+    generation: 1,
+    turn_count: OLDER_TURNS.length,
+    history_digest: "f".repeat(64),
+    active_run_id: null,
+  });
+  const turnsFor = (sessionId: string) => (sessionId === OLDER_SESSION ? OLDER_TURNS : TURNS);
   const sessionStart = vi.fn(async (_request: {
     sessionId: string; branchId: string; runId: string; input: string;
   }) => ({
@@ -113,8 +139,9 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   }) => ({
     ok: true as const, value: { head: head(), run_id: RUN_LIVE, owner_epoch: 1, state: { state: "running" } },
   }));
-  const sessionRead = vi.fn(async (_request: { sessionId: string; branchId: string }) => ({
-    ok: true as const, value: head(),
+  const sessionRead = vi.fn(async (request: { sessionId: string; branchId: string }) => ({
+    ok: true as const,
+    value: request.sessionId === OLDER_SESSION ? olderHead() : head(),
   }));
   const runtime = {
     status: async () => ({ ok: true as const, value: status() }),
@@ -173,16 +200,21 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     sessionStart,
     sessionContinue,
     sessionRead,
-    sessionList: async () => ({ ok: true as const, value: { heads: [head()], nextAfter: null } }),
+    // Ascending by id, the order `list_session_heads` returns.
+    sessionList: async () => ({
+      ok: true as const, value: { heads: [olderHead(), head()], nextAfter: null },
+    }),
     // The daemon pages history and answers `limit: 1` with exactly one Turn,
     // which is what the list rows ask for and all they need.
-    sessionHistory: async ({ limit = null }: { limit?: number | null }) => ({
-      ok: true as const,
-      value: {
-        turns: limit === 1 ? TURNS.slice(0, 1) : TURNS,
-        nextAfterTurnOrdinal: null,
-      },
-    }),
+    sessionHistory: async (
+      { sessionId, limit = null }: { sessionId: string; limit?: number | null },
+    ) => {
+      const turns = turnsFor(sessionId);
+      return {
+        ok: true as const,
+        value: { turns: limit === 1 ? turns.slice(0, 1) : turns, nextAfterTurnOrdinal: null },
+      };
+    },
   };
   const status = () => ({
     transport: "local", stateRoot: "/tmp/state", socketPath: "/tmp/state/runtime-host.sock",

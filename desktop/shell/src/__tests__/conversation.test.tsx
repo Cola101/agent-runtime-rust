@@ -14,6 +14,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { installFakeRuntime, RUN_LIVE } from "./fake-runtime";
+import { all } from "../surfaces/registry";
 import { uuidv7 } from "../ids";
 
 async function openChat(options?: { activeRunId?: string | null }) {
@@ -80,6 +81,45 @@ describe("a conversation", () => {
     expect((box as HTMLTextAreaElement).placeholder).toContain("这轮还在跑");
     await user.type(box, "插一句");
     expect((box as HTMLTextAreaElement).value).toBe("");
+  });
+});
+
+describe("the conversation list", () => {
+  async function openList(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(
+      screen.getAllByRole("button", { name: /^会话/ }).find((n) => n.classList.contains("r"))!,
+    );
+  }
+
+  it("opens the newest conversation on launch, not an arbitrary one", async () => {
+    await openChat();
+    // Both exist; the newest is the one on screen. With v4 ids the runtime's
+    // order would be arbitrary and this would pass or fail by luck.
+    await waitFor(() => expect(screen.getByText("我叫小林，请记住")).toBeTruthy());
+    expect(screen.queryByText("上礼拜那段对话")).toBeNull();
+  });
+
+  it("switches back to an older conversation", async () => {
+    const { user } = await openChat();
+    await waitFor(() => expect(screen.getByText("小林。")).toBeTruthy());
+    await openList(user);
+    await waitFor(() => expect(screen.getByText("上礼拜那段对话")).toBeTruthy());
+    await user.click(screen.getByText("上礼拜那段对话"));
+    await user.click(
+      screen.getAllByRole("button", { name: /^对话/ }).find((n) => n.classList.contains("r"))!,
+    );
+    // The transcript follows the list. Before the list existed there was no
+    // way back here at all.
+    await waitFor(() => expect(screen.getByText("还在这儿。")).toBeTruthy());
+    expect(screen.queryByText("小林。")).toBeNull();
+  });
+
+  it("puts nothing irreversible on a bare key", () => {
+    const surface = all().find((candidate) => candidate.id === "conversations");
+    expect(surface).toBeTruthy();
+    for (const key of surface!.keys ?? []) {
+      expect(["j", "k", "Enter", "n"]).toContain(key.key);
+    }
   });
 });
 

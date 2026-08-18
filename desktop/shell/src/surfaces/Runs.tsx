@@ -18,12 +18,16 @@ function RunsToolbar() {
   );
 }
 
-/// Everything the host has started since it came up.
+/// Every Run this state root holds.
 ///
-/// Not "every run that exists": the daemon's List is an in-memory order, so a
-/// restarted host reports nothing while the runs are still on disk. The empty
-/// state says which of those it is, because a person who reads "没有 Run" about
-/// a directory full of runs has been told something false.
+/// This used to read the daemon's in-memory order, which reported nothing
+/// after a restart while the runs were still on disk. It reads the owner
+/// surface now, so "没有 Run" means the directory is empty rather than that
+/// this host has not started one yet.
+///
+/// A Run is not a conversation: a Session Turn executes as a Run, so Turns
+/// appear here too. The 会话 surface is where they are grouped back into the
+/// conversations they belong to.
 function RunsView() {
   const desk = useDesk();
   const rows = byRecency(desk);
