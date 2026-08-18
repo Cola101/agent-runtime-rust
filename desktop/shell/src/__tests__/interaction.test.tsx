@@ -48,6 +48,19 @@ async function openParkedTranscript() {
   return opened;
 }
 
+/// Opens the process surface on the run that has the recorded PTY session.
+///
+/// It gets there with `j`, which is the binding the surface advertises for
+/// exactly this — the default cursor is the most recently touched run, and that
+/// one has no `process.*` call at all.
+async function openSession() {
+  const opened = await open("进程会话");
+  await waitFor(() => expect(screen.getByText(/另外 2 个 Run 里有会话/)).toBeTruthy());
+  await opened.user.keyboard("j");
+  await waitFor(() => expect(screen.getByText(/process\.start/)).toBeTruthy());
+  return opened;
+}
+
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -314,5 +327,88 @@ describe("the page ceiling", () => {
     // A limit above RUNTIME_EVENT_CURSOR_MAX_EVENTS is rejected outright, so
     // the transcript would be empty rather than truncated. It happened.
     await waitFor(() => expect(screen.getByText(/I need to run a command/)).toBeTruthy());
+  });
+});
+
+/// The process surface, which renders bytes a real PTY session produced.
+///
+/// The risk being guarded here is specific: a screen that shows program output
+/// will be read as a terminal, and a terminal is trusted to be complete. Every
+/// test below is about a place where the log is *not* the session — a stretch
+/// the agent never read, a tail read twice, an escape sequence that was never
+/// executed. Shown without saying so, each one turns a faithful replay into a
+/// convincing fake.
+describe("the process session surface", () => {
+  it("draws the bytes one read returned, and where in the stream they sit", async () => {
+    await openSession();
+    // The label is the claim: these bytes are stdout 25 through 46 of this
+    // session's own log, not "some output".
+    expect(screen.getByText("stdout 25–46")).toBeTruthy();
+    const written = [...document.querySelectorAll("pre.ps-bytes")]
+      .map((node) => node.textContent);
+    // CRLF is the PTY's line ending and is decoded. Nothing else is.
+    expect(written).toContain("printf 'line-two\\n'\n");
+  });
+
+  it("says how many bytes never reached the log", async () => {
+    await openSession();
+    // A 19-byte tail read starting at 512 leaves 46–512 nowhere a client can
+    // see. Two reads drawn next to each other without this would be a stretch
+    // of output that never existed.
+    expect(screen.getByText(/第 46–512 字节没有进日志/)).toBeTruthy();
+    expect(screen.getByText(/这 466 个字节 Agent 没读过/)).toBeTruthy();
+  });
+
+  it("marks a re-read instead of passing it off as new output", async () => {
+    await openSession();
+    // Two identical bounded attaches. The first brought bytes the log did not
+    // have; the second covered ground it already had, and only that one may
+    // carry the mark.
+    expect(screen.getAllByText("重读了已有的字节").length).toBe(1);
+    expect(screen.getAllByText("只读到尾部").length).toBe(2);
+  });
+
+  it("prints an escape sequence instead of obeying it", async () => {
+    await openSession();
+    const drawn = [...document.querySelectorAll("pre.ps-bytes")]
+      .map((node) => node.textContent);
+    expect(drawn).toContain("␛[32mline-two␛[0m\n");
+  });
+
+  it("says a read came back empty rather than leaving a blank", async () => {
+    await openSession();
+    // The poll and the close each returned zero new bytes.
+    expect(screen.getAllByText("没有新字节").length).toBe(2);
+  });
+
+  it("reports the runtime's own words for how the session ended", async () => {
+    await openSession();
+    expect(screen.getByText("terminated")).toBeTruthy();
+    expect(screen.getByText("closed")).toBeTruthy();
+  });
+
+  it("only points at j when j would move somewhere", async () => {
+    await open("进程会话");
+    // The empty state tells people to press j. The shell draws key hints from
+    // the same declarations it dispatches, so the hint being on screen is the
+    // proof that the key is live — and the sentence is only allowed while it is.
+    await waitFor(() => expect(screen.getByText(/按 j \/ k 换过去/)).toBeTruthy());
+    const hints = [...document.querySelectorAll(".keys kbd")].map((n) => n.textContent);
+    expect(hints).toContain("j");
+  });
+
+  it("does not turn a run that never called a process tool into 'no such tools'", async () => {
+    await open("进程会话");
+    // The durable log carries no inventory of installed tools, so "this run
+    // never called one" is the whole of what can be said.
+    await waitFor(() =>
+      expect(screen.getByText(/这不等于这台 Runtime 没有这些工具/)).toBeTruthy());
+  });
+
+  it("names what it cannot reach in the drawer", async () => {
+    const { user } = await openSession();
+    await user.keyboard("{Meta>}i{/Meta}");
+    await waitFor(() => expect(screen.getByText(/不能往里打字/)).toBeTruthy());
+    expect(screen.getByText(/不知道跑的是什么程序/)).toBeTruthy();
   });
 });

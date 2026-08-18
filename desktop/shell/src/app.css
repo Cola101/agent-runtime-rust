@@ -657,3 +657,65 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
 .ask-input .answer:disabled { color: var(--ink-3); cursor: default; }
 .ask-input .err { margin-top: 5px; color: var(--accent); font-size: 11.5px; }
 .field .err { margin-top: 4px; color: var(--accent); font-size: 11.5px; }
+/* ---------- 进程会话 ---------- */
+/* Reads as a log of reads, not as a terminal. There is no black rectangle and
+   no blinking caret: both would promise a live stream and a place to type, and
+   this screen has neither. What it has is byte ranges, so the gutter is the
+   part that carries the weight. */
+.ps { max-width: 96ch; }
+.ps + .ps { margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--rule); }
+
+.ps-head { margin-bottom: 18px; }
+.ps-id { color: var(--ink); margin-bottom: 9px; }
+
+.ps-caption { margin: 0 0 20px; max-width: 74ch; color: var(--ink-3); font-size: 11.5px; }
+.ps-head .ps-caption { margin: 12px 0 0; }
+
+.ps-call { padding-left: 13px; border-left: 1px solid var(--rule-2); }
+.ps-call + .ps-call { margin-top: 14px; }
+.ps-call-hd {
+  display: flex; align-items: baseline; gap: 10px;
+  color: var(--ink-2); font-size: 11.5px;
+}
+.ps-call-hd b { color: var(--ink); font-weight: 600; }
+.ps-call-hd .ps-when { margin-left: auto; color: var(--ink-3); }
+.ps-shape { color: var(--ink-3); }
+
+.ps-note { margin-top: 5px; color: var(--ink-2); font-size: 11.5px; }
+.ps-none { margin-top: 4px; color: var(--ink-3); font-size: 11.5px; }
+
+/* What the agent sent in. The caret is the only mark that hints at a prompt,
+   and it points at bytes that were genuinely written to the session's stdin. */
+.ps-wrote { display: flex; gap: 8px; margin-top: 6px; }
+.ps-wrote .ps-caret { color: var(--accent); }
+.ps-wrote pre {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  color: var(--ink); font-size: 12px;
+}
+
+.ps-read { margin-top: 8px; }
+.ps-meta { display: flex; align-items: center; color: var(--ink-3); font-size: 10.5px; }
+.ps-meta .flag { margin-left: 8px; }
+.ps-bytes {
+  margin: 3px 0 0; padding: 7px 10px; border-radius: 4px;
+  background: var(--rule-2); color: var(--ink);
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+  font-size: 12px; line-height: 1.6;
+}
+
+/* A hole in the record, drawn as a hole. Loud enough to notice, because a
+   missing stretch of output that looks like continuous output is the exact
+   mistake this screen exists to avoid. */
+.ps-gap {
+  margin-bottom: 5px; padding: 3px 9px; border-left: 2px solid var(--accent);
+  background: var(--accent-wash); color: var(--accent); font-size: 11px;
+}
+
+/* The drawer is 232px and one of these names is 39 characters with no break
+   opportunity in it. Left alone it runs off the panel, which is how the reason
+   a person came here to read gets cut in half. */
+.ps-cannot p {
+  margin: 0 0 14px; color: var(--ink-2); font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.ps-cannot b { color: var(--ink); font-weight: 600; }

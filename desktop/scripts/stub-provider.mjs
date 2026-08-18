@@ -36,11 +36,107 @@ function usage(input, output) {
   };
 }
 
+function callChunk(name, args) {
+  return {
+    choices: [{
+      index: 0,
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: `stub-call-${name}`,
+          function: { name, arguments: JSON.stringify(args) },
+        }],
+      },
+    }],
+  };
+}
+
+/// Where the last `process.*` result left the session.
+///
+/// The tools are cursor-driven: every call but `start` and `attach` takes the
+/// `stdout_cursor` the previous result ended at, and passing a stale one is how
+/// a real agent re-reads bytes it already has. Reading them back out of the
+/// transcript is what makes this stub drive a session rather than replay a
+/// fixed script at one.
+function lastSession(messages) {
+  const results = messages.filter((message) => message.role === "tool");
+  for (let at = results.length - 1; at >= 0; at -= 1) {
+    try {
+      const body = JSON.parse(results[at].content);
+      if (typeof body?.session_id === "string") {
+        return {
+          count: results.length,
+          session_id: body.session_id,
+          stdout_cursor: body.stdout_cursor ?? 0,
+          stderr_cursor: body.stderr_cursor ?? 0,
+        };
+      }
+    } catch {
+      // A tool result that is not this shape belongs to another tool.
+    }
+  }
+  return { count: results.length, session_id: null, stdout_cursor: 0, stderr_cursor: 0 };
+}
+
+/// One durable process session, driven the way an agent drives one.
+///
+/// Worth doing here rather than describing in a README: the process surface
+/// cannot be looked at without a session in a durable log, and this is the only
+/// way to get one on a machine with no vendor account.
+function processScript(messages) {
+  const at = lastSession(messages);
+  const cursors = {
+    session_id: at.session_id,
+    stdout_cursor: at.stdout_cursor,
+    stderr_cursor: at.stderr_cursor,
+  };
+  switch (at.count) {
+    case 0:
+      return [
+        ...textChunks("Starting a session on a terminal."),
+        callChunk("process.start", {
+          initial_stdin: "echo hello-from-session\n",
+          tty: true, cols: 100, rows: 30, yield_time_ms: 2000,
+        }),
+        usage(210, 30), done("tool_calls"),
+      ];
+    case 1:
+      return [
+        callChunk("process.write", { ...cursors, stdin: "date +%Y\n", yield_time_ms: 2000 }),
+        usage(240, 26), done("tool_calls"),
+      ];
+    case 2:
+      return [callChunk("process.poll", cursors), usage(260, 22), done("tool_calls")];
+    // A bounded tail read. Small on purpose: when the session has written more
+    // than this, the result starts past the cursor the polls reached, and the
+    // client has to say that the bytes in between never entered the log.
+    case 3:
+      return [
+        callChunk("process.attach", { session_id: at.session_id, max_bytes: 64 }),
+        usage(280, 22), done("tool_calls"),
+      ];
+    case 4:
+      return [callChunk("process.close", cursors), usage(300, 22), done("tool_calls")];
+    default:
+      return [
+        ...textChunks(
+          "Session closed. Everything above is what the process tools actually returned.",
+        ),
+        usage(320, 30), done("stop"),
+      ];
+  }
+}
+
 /// Picks a reply from the prompt, so a developer can drive the client into a
 /// specific lifecycle state on purpose instead of waiting for one to happen.
-function script(prompt, tools) {
+function script(prompt, tools, messages) {
   const asked = prompt.toLowerCase();
   const has = (name) => tools.some((tool) => tool?.function?.name === name);
+
+  if ((asked.includes("process") || asked.includes("进程") || asked.includes("会话"))
+      && has("process.start")) {
+    return processScript(messages);
+  }
 
   if ((asked.includes("shell") || asked.includes("命令")) && has("shell.exec")) {
     return [
@@ -110,7 +206,7 @@ const server = http.createServer((request, response) => {
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const last = [...messages].reverse().find((message) => message.role === "user");
     const prompt = typeof last?.content === "string" ? last.content : "";
-    const parts = script(prompt, Array.isArray(body.tools) ? body.tools : []);
+    const parts = script(prompt, Array.isArray(body.tools) ? body.tools : [], messages);
     const payload = sse(parts);
     response.writeHead(200, {
       "content-type": "text/event-stream",

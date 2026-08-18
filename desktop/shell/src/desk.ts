@@ -56,13 +56,22 @@ export function blocked(desk: Desk) {
   );
 }
 
+/// The runs whose log contains at least one `process.*` call.
+///
+/// Used for the cursor on the process surface, so j/k there steps between runs
+/// that have something to show rather than through every run in the list.
+export function withProcessSessions(desk: Desk) {
+  return byRecency(desk).filter((run) => run.processSessions.length > 0);
+}
+
 /// The same queue, named for the host.
 ///
-/// Two kinds of waiting, and each is named by the thing the runtime already
+/// Three kinds of waiting, and each is named by the thing the runtime already
 /// gives a durable identity to. An approval carries its own id, so two
-/// questions on one Run stay two. A Run that ended `indeterminate` has no
-/// approval to name it by and needs none: a Run reaches a terminal boundary
-/// once and never leaves it, so the Run's own id names that question exactly.
+/// questions on one Run stay two. An MCP round carries an id and a version, so
+/// a server that asks again is asking again. A Run that ended `indeterminate`
+/// has neither and needs neither: a Run reaches a terminal boundary once and
+/// never leaves it, so the Run's own id names that question exactly.
 ///
 /// An approval whose payload carried no id falls back to its Run rather than
 /// to an empty string — otherwise every such approval would share one name and

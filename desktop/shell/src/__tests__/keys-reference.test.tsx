@@ -109,6 +109,15 @@ describe("the reference is generated, not written", () => {
     const { user } = await open("键位");
     const said = row(section("外壳"), DRAWER_KEY.hint).querySelector(".where")?.textContent ?? "";
 
+    // The line is a list, so it is read as one. `includes` on the whole string
+    // is what this guard did first, and it reported the conversation surface as
+    // having a drawer for the whole time the process surface existed: `会话` is
+    // inside `进程会话`. A label that is a prefix of another label is ordinary,
+    // and a substring test cannot tell the two apart.
+    const named = new Set(
+      said.replace("只有这些面有：", "").split("、").map((item) => item.split("（")[0]),
+    );
+
     // Checked in both directions from the registry. A line that named every
     // surface contains every label a correct line contains, so looking only
     // for the surfaces that do have a drawer would pass on it — which is how
@@ -116,7 +125,7 @@ describe("the reference is generated, not written", () => {
     expect(all().some((surface) => surface.drawer)).toBe(true);
     expect(all().some((surface) => !surface.drawer)).toBe(true);
     for (const surface of all()) {
-      expect(said.includes(surface.label), `${surface.id} in "${said}"`)
+      expect(named.has(surface.label), `${surface.id} in "${said}"`)
         .toBe(Boolean(surface.drawer));
     }
 
@@ -126,7 +135,7 @@ describe("the reference is generated, not written", () => {
       await rail(user, surface.label);
       await user.keyboard("{Meta>}i{/Meta}");
       expect(Boolean(document.querySelector("aside.drawer")), `⌘I on ${surface.id}`)
-        .toBe(said.includes(surface.label));
+        .toBe(named.has(surface.label));
       // The drawer is window state, not surface state; leave it as found.
       await user.keyboard("{Meta>}i{/Meta}");
     }

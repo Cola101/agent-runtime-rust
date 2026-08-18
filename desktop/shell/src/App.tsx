@@ -9,6 +9,7 @@ import "./surfaces/Conversations";
 import "./surfaces/Workspace";
 import "./surfaces/Runs";
 import "./surfaces/Approvals";
+import "./surfaces/ProcessSessions";
 import "./surfaces/Settings";
 import "./surfaces/Keys";
 
