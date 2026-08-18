@@ -22,8 +22,8 @@ const fs = require("node:fs");
 ///
 /// `tool:process.session` covers all eight `process.*` tools -- the host uses
 /// one scope for the family -- and is added beside these rather than listed
-/// among them, because it belongs with the executable that turns those tools
-/// on. Neither is conditional: a shell is always found.
+/// among them, because it goes with the executable that turns those tools on
+/// and neither is set without the other.
 const BASE_SCOPES = [
   "tool:workspace.read",
   "tool:workspace.write",
@@ -38,23 +38,38 @@ const BASE_SCOPES = [
 
 const PROCESS_SESSION_SCOPE = "tool:process.session";
 
-/// The shell a persistent process session runs.
+/// Whether the runtime would accept this path as a process executable.
 ///
-/// The person's own login shell when it is an absolute path that exists, so a
-/// session behaves like their terminal; `/bin/sh` otherwise. Not taken on
-/// trust: `SHELL` is an environment variable, and a relative or missing path
-/// would become a runtime that starts and then fails every `process.start`.
+/// `TrustedNativeExecutor::new` reads it with `symlink_metadata` and refuses a
+/// symlink, a non-regular file, or one with no execute bit. Checked the same
+/// way here rather than approximated: `statSync` follows symlinks, so a
+/// homebrew shell -- which is usually a link into the Cellar -- would pass a
+/// check written with it and then be refused by the host it was named to.
+function usableExecutable(candidate) {
+  try {
+    const stats = fs.lstatSync(candidate);
+    return stats.isFile() && (stats.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/// The shell a persistent process session runs, or null when this machine has
+/// none the runtime would accept.
+///
+/// The person's own login shell first, so a session behaves like their
+/// terminal; `/bin/sh` after it, which is a regular file on macOS and usually
+/// a symlink to dash on Linux. Null rather than a guess: naming a path the
+/// runtime refuses gives a host that starts and then fails every
+/// `process.start`, which is worse than a host that says it has no process
+/// tools -- something the process-session surface already knows how to say.
 function loginShell(environment = process.env) {
   const named = environment.SHELL;
-  if (typeof named === "string" && named.startsWith("/")) {
-    try {
-      if (fs.statSync(named).isFile()) return named;
-    } catch {
-      // Falls through to the portable one rather than naming a path that is not
-      // there. A session that cannot start is worse than a plainer shell.
-    }
-  }
-  return "/bin/sh";
+  const candidates = [
+    ...(typeof named === "string" && named.startsWith("/") ? [named] : []),
+    "/bin/sh",
+  ];
+  return candidates.find(usableExecutable) ?? null;
 }
 
 /// What the agent is told about where it is.
@@ -95,11 +110,15 @@ function runtimeEnv({
   subagentRoles = true,
   environment = process.env,
 }) {
-  // Always found -- `loginShell` falls back rather than returning nothing -- so
-  // the scope and the executable are not conditional. Writing them as though
-  // they were would read as a decision this makes and does not.
+  // Both or neither. A scope for a tool family the host will not install grants
+  // nothing while reading as though it grants something, and an executable the
+  // host refuses is a runtime that starts and then fails every `process.start`.
   const shell = loginShell(environment);
-  const scopes = [...BASE_SCOPES, PROCESS_SESSION_SCOPE, ...(mcp?.scopes ?? [])];
+  const scopes = [
+    ...BASE_SCOPES,
+    ...(shell ? [PROCESS_SESSION_SCOPE] : []),
+    ...(mcp?.scopes ?? []),
+  ];
   return {
     ...routing.env,
     AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
@@ -114,9 +133,12 @@ function runtimeEnv({
     // rather than by this app. Setting the executable is the whole of what
     // turns the eight `process.*` tools on; without it the host installs none
     // of them and the process-session surface can only ever be empty.
-    AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE: shell,
+    ...(shell ? { AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE: shell } : {}),
     AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES: scopes.join(","),
-    AGENT_RUNTIME_LOCAL_INSTRUCTIONS: instructions({ workspace, processSession: true }),
+    AGENT_RUNTIME_LOCAL_INSTRUCTIONS: instructions({
+      workspace,
+      processSession: Boolean(shell),
+    }),
     ...(subagentRoles ? { AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG: rolesFile } : {}),
     // Explicit rather than inherited from the host's default. A security
     // boundary that holds because nobody set a variable is a boundary that

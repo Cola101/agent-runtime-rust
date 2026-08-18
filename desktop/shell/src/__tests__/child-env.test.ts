@@ -13,6 +13,8 @@
 /// its own module now and this reads the object it returns.
 import { describe, expect, it } from "vitest";
 import { createRequire } from "node:module";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 /// Typed here rather than by importing the module's own types: `electron/` is
@@ -28,7 +30,7 @@ type ChildEnv = {
     subagentRoles?: boolean;
     environment?: Record<string, string | undefined>;
   }): Record<string, string>;
-  loginShell(environment?: Record<string, string | undefined>): string;
+  loginShell(environment?: Record<string, string | undefined>): string | null;
 };
 
 const require_ = createRequire(import.meta.url);
@@ -78,6 +80,45 @@ describe("what the app hands the runtime", () => {
       });
       expect(env.AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE).toBe("/bin/sh");
     }
+  });
+
+  /// `TrustedNativeExecutor::new` reads the path with `symlink_metadata` and
+  /// refuses a symlink outright. A check written with `statSync` follows the
+  /// link and sees a perfectly good shell -- which is how a homebrew shell,
+  /// usually a link into the Cellar, would be named to a host that then
+  /// refuses it and fails every `process.start`.
+  it("does not name a symlinked shell, which the runtime refuses", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "child-env-"));
+    const real = path.join(dir, "realsh");
+    writeFileSync(real, "#!/bin/sh\nexit 0\n");
+    chmodSync(real, 0o755);
+    const link = path.join(dir, "linksh");
+    symlinkSync(real, link);
+    try {
+      const env = childEnv.runtimeEnv({
+        ...base, workspace: "/w", environment: { SHELL: link },
+      });
+      expect(env.AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE).toBe("/bin/sh");
+      // And the real file behind it is accepted, so the refusal is about the
+      // link rather than about the directory or the mode.
+      expect(childEnv.loginShell({ SHELL: real })).toBe(real);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /// Both or neither. A scope for a tool family the host will not install
+  /// grants nothing while reading as though it grants something.
+  it("withholds the process scope when no shell qualifies", () => {
+    // `/bin/sh` is the last candidate, so a machine without an acceptable one
+    // is reached by making every candidate unacceptable -- which is what a
+    // Linux host with a symlinked /bin/sh would be.
+    const shell = childEnv.loginShell({ SHELL: "/nowhere" });
+    expect(shell).toBe("/bin/sh");
+    const env = childEnv.runtimeEnv({ ...base, workspace: "/w" });
+    // Paired: the executable and the scope are set together or not at all.
+    expect(Boolean(env.AGENT_RUNTIME_LOCAL_PROCESS_EXECUTABLE))
+      .toBe(scopesOf(env).includes("tool:process.session"));
   });
 
   it("tells the agent where it is and that a person sees every call", () => {
