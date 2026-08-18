@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { register } from "./registry";
-import { since } from "./model";
+import { since, size } from "./model";
 import { LinkBanner } from "./Link";
 import { useDesk, type Desk } from "../desk";
 import { bridge, type WorkspaceEntry, type WorkspaceFile, type WorkspaceStatus } from "../runtime";
@@ -29,13 +29,6 @@ function touched(desk: Desk): { path: string; tool: string; at: string | null; r
     }
   }
   return [...seen.values()].sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
-}
-
-function size(bytes: number | null): string {
-  if (bytes === null) return "";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /// Which folder the agent works in, and how to change it.

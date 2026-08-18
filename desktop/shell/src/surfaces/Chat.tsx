@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState, useSyncExternalStore } from "rea
 import { register } from "./registry";
 import {
   belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote, eventWords,
+  size,
   knownEvent, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
 } from "./model";
 import { LinkBanner } from "./Link";
@@ -43,29 +44,35 @@ function callSpans(event: RunEvent): [string, string] {
   return [String(call.name ?? ""), args ? JSON.stringify(args) : ""];
 }
 
-/// What a finished call printed, when it printed in the shape a shell does.
+/// What a finished call answered with.
 ///
-/// `exit_code`, `stdout` and `stderr` are what the trusted workspace tool
-/// returns, and they are the reason someone approved the call in the first
-/// place. Other tools answer in other shapes; those stay in the raw-event
-/// drawer rather than being guessed at here.
+/// The trusted workspace tool speaks two shapes and this reads both: a shell
+/// call answers with `exit_code`, `stdout` and `stderr`; a file read or write
+/// answers with `path`, `text` and `bytes`. Between them they are every tool
+/// this app installs, and they are the reason someone approved the call in the
+/// first place. A tool that answers in some third shape says nothing here
+/// rather than having its content guessed at -- the raw-event drawer has it.
 ///
 /// A non-zero exit is not an error event -- the call ran and the command said
 /// no -- so it is drawn as the command's own answer rather than as a failure
 /// of the runtime.
 function said(result: RunEvent | undefined): {
-  exit: number | null; out: string; err: string; cut: boolean;
+  exit: number | null; out: string; err: string; cut: boolean; bytes: number | null;
 } | null {
   if (!result) return null;
   const content = (result.payload.content ?? {}) as Record<string, unknown>;
-  const out = typeof content.stdout === "string" ? content.stdout : "";
+  const out = typeof content.stdout === "string"
+    ? content.stdout
+    : typeof content.text === "string" ? content.text : "";
   const err = typeof content.stderr === "string" ? content.stderr : "";
   const exit = typeof content.exit_code === "number" ? content.exit_code : null;
-  if (!out && !err && exit === null) return null;
+  const bytes = typeof content.bytes === "number" ? content.bytes : null;
+  if (!out && !err && exit === null && bytes === null) return null;
   return {
     exit,
     out,
     err,
+    bytes,
     cut: content.stdout_truncated === true || content.stderr_truncated === true,
   };
 }
@@ -92,6 +99,9 @@ function Act(
               <span className={answer.exit === 0 ? "" : "warn"}>
                 <Mark text={`退出码 ${answer.exit}`} query={query} />
               </span>
+            )}
+            {answer.bytes !== null && (
+              <span><Mark text={size(answer.bytes)} query={query} /></span>
             )}
             {answer.cut && <span><Mark text="输出被截断了" query={query} /></span>}
           </div>

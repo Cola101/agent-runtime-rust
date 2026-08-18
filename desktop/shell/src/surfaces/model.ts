@@ -245,6 +245,18 @@ function toolResultNote(payload: Record<string, unknown>): string | null {
   return error.code === "approval_denied" ? "你没让它执行" : null;
 }
 
+/// A byte count, for a person rather than for a machine.
+///
+/// Here rather than on the workspace surface, because the transcript shows the
+/// size of a file the agent read and the listing shows the size of a file on
+/// disk, and two implementations of one format is two answers to one question.
+export function size(bytes: number | null): string {
+  if (bytes === null) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 /// What one event says, in words.
 ///
 /// Takes the payload as well as the type because one type is not always one

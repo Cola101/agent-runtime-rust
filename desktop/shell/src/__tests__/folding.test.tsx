@@ -304,6 +304,27 @@ describe("what the runtime said in words", () => {
     expect(screen.getByText(/退出码 1/)).toBeTruthy();
   });
 
+  /// Reading a file is the other commonest thing an agent does, and the trusted
+  /// workspace tool answers it with `{path, text, bytes}` rather than the shell
+  /// shape. Showing one and not the other would mean the transcript carries
+  /// what a command printed and not what a file said.
+  it("shows what a file said, and how much of it there was", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "workspace.read_text", arguments: { path: "notes.txt" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: false,
+      content: { path: "notes.txt", text: "扫描每个 run 目录\n", bytes: 26 },
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/扫描每个 run 目录/)).toBeTruthy());
+    // The byte count, because a file the agent read is a file it spent context
+    // on, and 26 bytes and 26 kilobytes read very differently.
+    expect(screen.getByText(/26 B/)).toBeTruthy();
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

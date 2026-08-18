@@ -202,11 +202,11 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
         text: "改好了。注意 `notes.txt` 原来是空的，现在有一行。",
       }, RUN_DONE),
       ev("model.tool_call", {
-        name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
+        name: "workspace.read_text", arguments: { path: "notes.txt" }, id: "stub-call-2",
       }, RUN_DONE),
       ev("tool.result", {
         tool_call_id: "stub-call-2", binding_digest: "b".repeat(64), is_error: false,
-        content: { exit_code: 0, stdout: "", stdout_truncated: false, stderr: "", stderr_truncated: false },
+        content: { path: "notes.txt", text: "扫描每个 run 目录，把结论写下来。\n", bytes: 46 },
       }, RUN_DONE),
       ev("model.tool_call", {
         name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-3",
