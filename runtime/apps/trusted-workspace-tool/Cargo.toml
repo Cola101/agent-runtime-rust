@@ -12,6 +12,10 @@ path = "src/main.rs"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# Already a workspace dependency used by the host and the tool runtime, so this
+# adds no new supply-chain surface to the most security-sensitive binary here.
+sha2.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile = "3.23.0"

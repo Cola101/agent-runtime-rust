@@ -203,3 +203,66 @@ fn a_write_refuses_to_replace_a_file_that_changed_after_it_was_read() {
         "the edit made while the approval was on screen must survive",
     );
 }
+
+/// The check itself, driven directly: a write that carries what it expected to
+/// find is refused when the file no longer holds it.
+///
+/// Separate from the ignored test above, which is about the whole sequence a
+/// desktop session produces. This one is about the tool's half of it, and it
+/// is the half that has to be right for any of the three fixes to work.
+#[test]
+fn a_write_carrying_an_expected_digest_is_refused_when_the_file_moved_under_it() {
+    let workspace = workspace("expected");
+    let path = workspace.path().join("notes.txt");
+    std::fs::write(&path, "one\n").expect("seed");
+    // The digest of what the agent read, which the executor recorded.
+    let expected = sha256_of("one\n");
+
+    // Nothing changed: the write lands.
+    let ok = invoke(
+        workspace.path(),
+        "workspace.write_text",
+        json!({ "path": "notes.txt", "text": "two\n", "expected_sha256": expected }),
+    );
+    assert_eq!(ok["is_error"], false, "an unchanged file must still be writable: {ok}");
+    assert_eq!(std::fs::read_to_string(&path).expect("read back"), "two\n");
+
+    // Someone edits it, and the same expectation no longer holds.
+    std::fs::write(&path, "edited by hand\n").expect("edit under it");
+    let refused = invoke(
+        workspace.path(),
+        "workspace.write_text",
+        json!({ "path": "notes.txt", "text": "three\n", "expected_sha256": sha256_of("two\n") }),
+    );
+    assert_eq!(refused["is_error"], true, "a changed file must be refused: {refused}");
+    assert_eq!(
+        refused["content"]["error"]["code"], "file_changed_since_read",
+        "the refusal must say which rule stopped it: {refused}",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "edited by hand\n",
+        "the hand edit must survive the refusal",
+    );
+}
+
+/// A write with no expectation is unchanged: creating a file, or deliberately
+/// replacing one the Run never read, is a different act and stays possible.
+#[test]
+fn a_write_without_an_expectation_still_writes() {
+    let workspace = workspace("no-expectation");
+    std::fs::write(workspace.path().join("notes.txt"), "one\n").expect("seed");
+    let wrote = invoke(
+        workspace.path(),
+        "workspace.write_text",
+        json!({ "path": "notes.txt", "text": "two\n" }),
+    );
+    assert_eq!(wrote["is_error"], false, "{wrote}");
+}
+
+fn sha256_of(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
+}

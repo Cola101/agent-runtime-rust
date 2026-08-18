@@ -41,6 +41,17 @@ struct PathArguments {
     /// Present only for `workspace.write_text`.
     #[serde(default)]
     text: Option<String>,
+    /// What the caller believes the file holds right now, when it believes
+    /// anything. The executor records this from the read that produced the
+    /// contents being written; absent when the Run never read the file, which
+    /// is an ordinary create or a deliberate replacement rather than a
+    /// blind one.
+    ///
+    /// Checked here rather than by the caller because containment is checked
+    /// here: the caller does not resolve paths inside the workspace and must
+    /// not start, so it also cannot be the one to read what is there.
+    #[serde(default)]
+    expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +111,7 @@ fn run() -> Result<(), &'static str> {
             .map_err(|_| "invalid_arguments")?;
         let outcome = if request.tool_call.name == "workspace.write_text" {
             let text = arguments.text.as_deref().ok_or("missing_text")?;
-            write_text(&arguments.path, text)
+            write_text(&arguments.path, text, arguments.expected_sha256.as_deref())
         } else {
             read_text(&arguments.path)
         };
@@ -202,6 +213,13 @@ fn shell_exec(command: &str) -> Result<Value, &'static str> {
     }))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
 /// Truncates on a character boundary so the result is always valid UTF-8 and
 /// always bounded, whatever the command emitted.
 fn bounded(raw: &[u8]) -> (String, bool) {
@@ -245,11 +263,25 @@ fn resolve_within_workspace(requested: &str) -> Result<PathBuf, &'static str> {
     Ok(candidate)
 }
 
-fn write_text(requested: &str, text: &str) -> Result<(String, String, usize), &'static str> {
+fn write_text(
+    requested: &str,
+    text: &str,
+    expected: Option<&str>,
+) -> Result<(String, String, usize), &'static str> {
     if text.len() as u64 > MAX_FILE_BYTES {
         return Err("file_too_large");
     }
     let candidate = resolve_within_workspace(requested)?;
+    // Before anything is opened for writing. A write that would replace
+    // something other than what the caller read is refused whole: the point is
+    // that the edit which arrived in between survives, so nothing may be
+    // truncated first.
+    if let Some(expected) = expected {
+        let held = fs::read(&candidate).map_err(|_| "file_changed_since_read")?;
+        if sha256_hex(&held) != expected {
+            return Err("file_changed_since_read");
+        }
+    }
     // Refuse to replace anything that is not already a regular file, so a write
     // cannot clobber a directory or a device node.
     if let Ok(metadata) = fs::symlink_metadata(&candidate)
