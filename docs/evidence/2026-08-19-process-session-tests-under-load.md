@@ -111,3 +111,15 @@ state root /var/folders/…/.tmpFdiekh held ["runtime-state.lock", "retention", 
 - `a_network_caller_starts_continues_forks_and_reads_a_real_session`：长期挂着的
   `Session storage is unavailable`，被客户端契约边界**有意脱敏**。要查清得先在
   host 侧留未脱敏诊断，而不是放宽边界——和这次一样，先让失败会说话。
+
+## 补记：这台机器上的环境负载（2026-08-19 晚）
+
+追 `close_cancels_only_...` 时顺带查清了一件一直在影响这些墙钟界限的事：
+这台机器上常驻着**别的项目、别的会话**的 dev server。停掉我自己那个之后，
+还有六个 vite 在跑（`ipm-deploy` 的几个 worktree）。**没有去动它们。**
+
+这对本文档记的两条都成立：`one_thousand_runs_...` 单独跑 161.7 秒、门禁里 198 秒，
+那 22% 的差距里有一部分不是门禁自己的并行，是旁边的会话。
+
+所以「这条测试在干净机器上是绿的」这句话，在这台机器上**没法验证**——
+能验证的只有「在当时的环境负载下是绿还是红」。记下来，免得下次把环境当成回归。
