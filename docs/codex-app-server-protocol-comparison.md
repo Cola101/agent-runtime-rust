@@ -128,7 +128,7 @@ MCP 在他们那里对客户端**完全打开**：能列状态、能直接调工
 3. 优先级应该重排。会话命名/归档、模型枚举、MCP 状态读取——这三样都是
    "Runtime 侧要开一个读面"，而不是界面工作。
 
-## 服务端通知：**69 条**，以及一处比数量更深的分歧
+## 服务端通知：**71 条**，以及一处比数量更深的分歧
 
 `common.rs:1642` 的 `server_notification_definitions!`。读完之后，最重要的发现不是缺哪几条，
 而是**两边给客户端的东西根本不是同一类**。
@@ -173,6 +173,64 @@ Codex 的通知围绕 **item** 组织：`item/started`、`item/completed`，以�
 - 每条事件带 **digest**，且事件日志本身是持久权威；他们的通知是投影，`rawResponse/*` 才是原始层。
 - `run.indeterminate`——结果无法判定是一个**一等终止状态**，需要人裁决。
   他们的 `turn/completed` 没有对应物（待证：可能在 turn 的 status 字段里）。
+
+## 一处我们明确更强的：漏了一条，客户端知不知道
+
+自己读过并确认（`common.rs:1749-1764`）：
+
+```rust
+pub struct ServerNotificationEnvelope {
+    #[serde(flatten)]
+    pub notification: ServerNotification,
+    pub emitted_at_ms: Option<i64>,   // 全部
+}
+```
+
+**信封里只有一个时间戳。** 71 条通知，没有序号、没有游标、没有缺口标记。
+一个 Codex 客户端如果因为断连或消费太慢漏掉一条通知，**它无从知道自己漏了**。
+
+我们的（`embedded.rs:86-95`）：
+
+```rust
+pub struct RuntimeEventCursorPage {
+    pub requested_after_sequence: u64,
+    pub next_after_sequence: u64,
+    pub earliest_available_sequence: Option<u64>,
+    pub highest_committed_sequence: u64,
+    pub history_gap: bool,
+    ...
+}
+```
+
+每条事件有 `sequence` 和 `digest`；页里带最早可读序号、已提交最高序号、以及**历史是否有缺口**。
+界面上就是那句「更早的事件已被回收，这段转录不完整 —— 最早还能读到第 N 条」。
+
+这不是小差别。它决定了「转录是完整的」这句话能不能被证明。
+
+## 服务端反向请求客户端：9 个方法
+
+`common.rs:1487` 起（自己读过）：
+
+```
+item/commandExecution/requestApproval   item/fileChange/requestApproval
+item/tool/requestUserInput              mcpServer/elicitation/request
+item/permissions/requestApproval        item/tool/call
+account/chatgptAuthTokens/refresh       attestation/generate
+currentTime/read
+```
+
+两点值得注意：
+
+**`item/tool/call`** —— 服务端调用**客户端实现的工具**。客户端不只是显示器，它可以是能力提供方。
+我们完全没有这个方向；`ResolveMcpInput` 是我们最接近的东西，但那是客户端**回答**一个请求，
+不是客户端**提供**一个工具。
+
+**审批是一个阻塞的服务端请求**，等客户端的类型化回答。我们的审批是
+「事件 + 控制命令 + 持久收据」。子代理查到他们的 pending 映射是进程内的、
+请求 id 由进程全局 `AtomicI64` 生成（`app-server/src/outgoing_message.rs`）——
+**这意味着 app-server 进程一死，在途审批无法重建**。我们的控制收据是落盘的，
+重启后 `list_control_receipts` 还在。这条我只核实了他们的 id 是进程全局，
+**「无法重建」是子代理的推论，我没有亲自验证**，标在这里等复核。
 
 ## 下一步该做什么（按这份对照，不按截图）
 
