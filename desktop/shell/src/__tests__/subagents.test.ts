@@ -123,6 +123,22 @@ describe("what a Run delegated", () => {
     expect(view.queued).toBe(1);
   });
 
+  /// The runtime says which kind of acceptance it was, and only one of them
+  /// ever queues.
+  ///
+  /// A message accepted as `active` went straight into the child's turn and is
+  /// never followed by `input.activated` -- so counting every acceptance left
+  /// it in the queue for the rest of the Run, and the card said a child was
+  /// waiting on work it had already been handed.
+  it("does not count a message that went straight in as waiting", () => {
+    const [view] = subagentsOf([
+      requested(A, "reviewer", "读一遍"),
+      event("subagent.spawned", { agent_id: A, role: "reviewer", status: "running" }),
+      event("subagent.input.accepted", { agent_id: A, message_sequence: 1, child_run_id: A, status: "active" }),
+    ]);
+    expect(view.queued).toBe(0);
+  });
+
   /// A number of tokens spent means nothing without the number it was allowed.
   /// `RunBudget` rides on the spawn request the client already parses and on
   /// the fork event beside it, so this is the runtime's own cap rather than a

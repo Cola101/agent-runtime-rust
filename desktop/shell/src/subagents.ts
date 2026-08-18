@@ -155,6 +155,13 @@ export function subagentsOf(events: RunEvent[]): SubagentView[] {
       case "subagent.input.accepted": {
         const id = String(payload.agent_id ?? "");
         if (!id) break;
+        // Accepted is not the same as queued. The runtime says which it was --
+        // `queued` waits for the child's next turn, `active` went straight in
+        // -- and only a queued one is ever followed by `input.activated`. So
+        // counting every acceptance left the ones that started immediately in
+        // the queue for ever, and the card said a child was waiting on work it
+        // had already been given.
+        if (String(payload.status ?? "") !== "queued") break;
         at(id, event.timestamp).queued += 1;
         break;
       }

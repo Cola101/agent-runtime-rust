@@ -10,10 +10,21 @@ import { Mark } from "./Mark";
 /// question being asked had to be answered on another surface, from memory.
 ///
 /// The comparison is read through the same bridge call the workspace surface
-/// uses, so it is the file the runtime would actually write to. When it cannot
-/// be read the card says which of the two that is: a file that is not there
-/// yet, or a file this window could not open. A diff against an assumption
-/// would be wrong with authority.
+/// uses -- this window's own filesystem. That is the file the runtime would
+/// write to **because the runtime is this machine's**, which is a fact about
+/// how this app is deployed and not a property of the card. Point it at a
+/// worker somewhere else and the same code would draw a confident diff against
+/// the wrong filesystem; the fix then is to have the worker compute it, the way
+/// Codex puts a `unified_diff` in the FileChange item it sends.
+///
+/// The other gap is time: this is read when the card is drawn, and the write
+/// happens when the person decides. What closes that is not here -- the
+/// executor now hands the tool the digest of what the Run read, and the write
+/// is refused if the file moved underneath it.
+///
+/// When it cannot be read the card says which of the two that is: a file that
+/// is not there yet, or a file this window could not open. A diff against an
+/// assumption would be wrong with authority.
 export function WriteReview({ path, text, query }: { path: string; text: string; query: string }) {
   const [before, setBefore] = useState<{ text: string } | { missing: string } | null>(null);
 
