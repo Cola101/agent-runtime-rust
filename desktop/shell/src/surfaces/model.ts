@@ -96,6 +96,7 @@ const EVENT_NOTE: Record<string, string> = {
   "run.indeterminate": "结果无法判定",
   "run.resumed": "已批准，继续执行",
   "run.restored": "从 Checkpoint 恢复",
+  "run.steer.applied": "已改向",
   "model.provider.selected": "选定 Provider",
   "model.provider.failed": "Provider 失败",
   "model.tool_call": "模型请求调用工具",
@@ -107,6 +108,38 @@ const EVENT_NOTE: Record<string, string> = {
 
 export function eventNote(type: string): string | null {
   return EVENT_NOTE[type] ?? null;
+}
+
+/// Bookkeeping the conversation does not need to carry.
+///
+/// These are state, not content. "Run 开始" says what the status line already
+/// says in a word, and which Provider answered is not something a person is
+/// reading a conversation to find out -- until it fails, which is a different
+/// event and stays visible.
+///
+/// They are also the events that only exist while a Turn is running: once it
+/// commits, the Session's frozen transcript has the exchange and none of this,
+/// so leaving them in made the same exchange look like two different things
+/// depending on when you looked.
+///
+/// Not hidden. `⌘I` opens the raw log -- every event, with sequence, payload
+/// and digest -- and that drawer is the authority. This is about what the
+/// conversation column carries, not about what the client will show.
+const ROUTINE: ReadonlySet<string> = new Set([
+  "run.started",
+  "model.provider.selected",
+  "model.turn.completed",
+  "model.usage",
+]);
+
+/// Whether an event belongs in the conversation column.
+///
+/// The rule is whether it changes what a person should believe about the
+/// exchange. A Provider failing, a Run restored from a Checkpoint, a tool
+/// denied, a redirect applied -- each of those changes the reading of what
+/// follows it, and each stays. Starting and finishing normally does not.
+export function belongsInConversation(type: string): boolean {
+  return !ROUTINE.has(type);
 }
 
 /// Relative time, in the granularity a person actually reads. Absolute

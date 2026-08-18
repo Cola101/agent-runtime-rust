@@ -60,7 +60,11 @@ describe("a conversation", () => {
   it("starts a new branch after 新对话, instead of continuing the old one", async () => {
     const { user, bridge } = await openChat();
     await waitFor(() => expect(screen.getByText("小林。")).toBeTruthy());
-    await user.click(screen.getByRole("button", { name: "新对话" }));
+    // Through the declared key rather than a button in the composer: the shell
+    // renders `n 新对话` from the key registry, and a second button beside the
+    // input was the same affordance twice.
+    await user.click(screen.getByText("小林。"));
+    await user.keyboard("n");
     const box = await screen.findByRole("textbox");
     await user.click(box);
     await user.type(box, "另开一段");
@@ -96,11 +100,19 @@ describe("a conversation", () => {
     expect(bridge.sessionContinue).not.toHaveBeenCalled();
   });
 
-  it("says a steer only lands between tool calls, rather than claiming it applied", async () => {
+  it("never claims a steer was applied", async () => {
     await openChat({ activeRunId: RUN_LIVE });
-    // The Runtime refuses to redirect while a tool call or approval is
-    // unresolved, and acceptance by the socket is not evidence it was applied.
-    await waitFor(() => expect(screen.getByText(/改向只在两次工具调用之间生效/)).toBeTruthy());
+    const box = await screen.findByRole("textbox");
+    // The box says what it will do with what you type, and the button says the
+    // same word. Neither says it worked -- the Runtime refuses to redirect
+    // while a tool call or approval is unresolved, and the only evidence is
+    // `run.steer.applied` appearing in the transcript.
+    await waitFor(() =>
+      expect((box as HTMLTextAreaElement).placeholder).toContain("会拿去改向"));
+    expect(screen.getByRole("button", { name: "改向" })).toBeTruthy();
+    for (const claim of [/已改向/, /改向成功/, /已生效/]) {
+      expect(screen.queryByText(claim)).toBeNull();
+    }
   });
 });
 

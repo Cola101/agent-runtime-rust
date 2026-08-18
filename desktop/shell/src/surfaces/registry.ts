@@ -73,8 +73,16 @@ export type Surface = {
 
 const surfaces: Surface[] = [];
 
+/// Registering an id twice replaces it rather than adding a second entry.
+///
+/// Two surfaces with one id is never what anyone meant. It happens during
+/// development, where a hot reload re-runs a module that already registered --
+/// the rail grows a second 对话 and both render. Replacing keeps the newly
+/// loaded definition, which is the one the reload was for.
 export function register(surface: Surface): void {
-  surfaces.push(surface);
+  const existing = surfaces.findIndex((candidate) => candidate.id === surface.id);
+  if (existing === -1) surfaces.push(surface);
+  else surfaces[existing] = surface;
 }
 
 export function all(): readonly Surface[] {

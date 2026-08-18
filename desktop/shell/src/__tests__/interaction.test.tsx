@@ -45,6 +45,15 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+describe("the surface registry", () => {
+  it("holds one surface per id", () => {
+    const ids = all().map((surface) => surface.id);
+    // A hot reload re-runs a module that already registered. Appending gave the
+    // rail a second 对话 and rendered both.
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
 describe("every advertised key is bound", () => {
   it("declares a hint for each binding and a binding for each hint", () => {
     for (const surface of all()) {

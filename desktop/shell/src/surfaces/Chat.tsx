@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
 import {
-  costLabel, doing, effectLabel, elapsed, eventNote, lifecycleLabel, lifecycleTone,
-  sandboxLabel, shortId, since,
+  belongsInConversation, costLabel, doing, effectLabel, elapsed, eventNote,
+  lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
@@ -102,14 +102,25 @@ function Acts({ events }: { events: RunEvent[] }) {
 /// Text deltas are joined into one block rather than drawn per event: the
 /// runtime streams a word at a time and a person reads paragraphs. Consecutive
 /// tool calls are folded for the same reason at a larger scale.
-function Transcript({ run }: { run: RunView }) {
+function Transcript({ run, writing }: { run: RunView; writing: boolean }) {
   const blocks: React.ReactNode[] = [];
   let text = "";
   let acts: RunEvent[] = [];
 
-  const flushText = (key: string) => {
+  const flushText = (key: string, last = false) => {
     if (!text) return;
-    blocks.push(<div className="rep" key={`t-${key}`}><p>{text}</p></div>);
+    blocks.push(
+      <div className="rep" key={`t-${key}`}>
+        <p>
+          {text}
+          {/* Only on the block still being written, and only while the Run is
+              producing text. A sentence that stops mid-clause reads the same
+              whether more is coming or the model finished there, and the
+              status line is too far from the words to answer it. */}
+          {last && writing && <span className="writing" aria-label="还在写" />}
+        </p>
+      </div>,
+    );
     text = "";
   };
   const flushActs = (key: string) => {
@@ -133,7 +144,11 @@ function Transcript({ run }: { run: RunView }) {
     }
     flushText(String(event.sequence));
     const note = eventNote(event.type);
-    if (note && event.type !== "approval.required") {
+    // Routine bookkeeping stays out of the column. It is state, and the status
+    // line and the raw-event drawer are where state belongs -- leaving it here
+    // made a running Turn read as a machine log and a committed one as a
+    // conversation, which is the same exchange rendered two ways.
+    if (note && event.type !== "approval.required" && belongsInConversation(event.type)) {
       flushActs(String(event.sequence));
       blocks.push(
         <Note key={event.event_id || event.sequence}>
@@ -142,7 +157,7 @@ function Transcript({ run }: { run: RunView }) {
       );
     }
   }
-  flushText("end");
+  flushText("end", true);
   flushActs("end");
   return <>{blocks}</>;
 }
@@ -309,7 +324,16 @@ function ChatView() {
               {run.error.message ? ` —— ${run.error.message}` : ""}
             </div>
           ) : (
-            <Transcript run={run} />
+            <Transcript
+              run={run}
+              // The Run is producing text right now: it is moving, and the last
+              // thing it wrote was text rather than a tool call or a question.
+              // Both come from the log; neither is a guess about the model.
+              writing={
+                (run.lifecycle.kind === "running")
+                && run.events[run.events.length - 1]?.type === "model.output.delta"
+              }
+            />
           )}
           <Delegations run={run} />
           <Gate run={run} />
@@ -428,22 +452,18 @@ export function Composer() {
           {sending ? "发送中" : turning ? "改向" : "发送"}
         </button>
       </div>
+      {/* Key hints only. A paragraph of explanation used to live here -- what a
+          steer is, when it applies, where its evidence shows up -- which wrapped
+          onto a second line and glued itself to the 新对话 button beside it. The
+          placeholder and the button already say which of the two things this box
+          is about; a caveat that is true whether or not anyone reads it does not
+          earn a permanent row under the input.
+
+          There is no 新对话 button here either: the shell renders `n 新对话`
+          from the key registry, and one affordance in two places is one of them
+          being noise. */}
       <div className="write-hint">
         <kbd>↵</kbd> {turning ? "改向" : "发送"} ・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
-        {turning && (
-          <span className="dim">
-            ・改向只在两次工具调用之间生效；成功了转录里会出现一条改向记录
-          </span>
-        )}
-        {desk.current && (
-          <button
-            type="button"
-            className="flat new"
-            onClick={() => { desk.newConversation(); box.current?.focus(); }}
-          >
-            新对话
-          </button>
-        )}
       </div>
       {error && <div className="err">{error}</div>}
     </div>
