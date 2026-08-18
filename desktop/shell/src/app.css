@@ -407,6 +407,18 @@ table.rows tbody tr:hover td { background: var(--rule-2); }
 table.rows tbody tr.on td { background: var(--accent-wash); }
 table.rows th.num { text-align: right; }
 table.rows td.num { text-align: right; }
+/* A settings table sits in a grid track narrower than its own content wants to
+   be, and an auto-layout table does not shrink below `min-content`: it runs
+   past the pane and takes the last column with it. The right-hand column is
+   where the row's own control lives, so what fell off the edge was the only
+   way to remove the thing the row describes.
+
+   The table scrolls rather than wrapping. Letting the cells break fits the
+   columns at any width but breaks `tool:mcp:filesystem` across two lines in the
+   middle of the word, and a scope read in halves is worse than a scope you
+   scroll to. At a window this app is actually used at, nothing scrolls. */
+.body .wide { overflow-x: auto; max-width: 100%; }
+.body .wide table.rows { min-width: max-content; }
 table.rows td.ask {
   color: var(--ink-2); max-width: 34ch; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap;

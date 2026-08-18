@@ -8,6 +8,14 @@ import "./surfaces/Chat";
 import "./surfaces/Conversations";
 import "./surfaces/Workspace";
 
+// A dev-server-only bridge, so every surface can be looked at in a browser with
+// content in it. Never reached by a packaged build: `import.meta.env.DEV` is
+// false there and vite drops the branch, so the module is not in the bundle.
+if (import.meta.env.DEV && new URLSearchParams(location.search).has("fake")) {
+  const { installDevBridge } = await import("./dev/bridge");
+  installDevBridge();
+}
+
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html is missing #root");
 

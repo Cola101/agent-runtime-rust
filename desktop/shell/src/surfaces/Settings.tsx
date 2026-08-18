@@ -65,24 +65,26 @@ function Tools() {
   }
   return (
     <>
-      <table className="rows">
-        <thead>
-          <tr><th>工具</th><th>副作用</th><th>隔离</th><th>是否询问</th><th className="num">最近一次</th></tr>
-        </thead>
-        <tbody>
-          {desk.policies.map((policy) => (
-            <tr key={policy.toolName}>
-              <td className="p mono">{policy.toolName}</td>
-              <td>{effectLabel(policy.effect)}</td>
-              <td className={policy.sandbox === "trusted_native" ? "warn" : ""}>
-                {sandboxLabel(policy.sandbox)}
-              </td>
-              <td>{policy.approval === "ask" ? "每次问" : policy.approval}</td>
-              <td className="num" title={policy.seenAt}>{since(policy.seenAt)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="wide">
+        <table className="rows">
+          <thead>
+            <tr><th>工具</th><th>副作用</th><th>隔离</th><th>是否询问</th><th className="num">最近一次</th></tr>
+          </thead>
+          <tbody>
+            {desk.policies.map((policy) => (
+              <tr key={policy.toolName}>
+                <td className="p mono">{policy.toolName}</td>
+                <td>{effectLabel(policy.effect)}</td>
+                <td className={policy.sandbox === "trusted_native" ? "warn" : ""}>
+                  {sandboxLabel(policy.sandbox)}
+                </td>
+                <td>{policy.approval === "ask" ? "每次问" : policy.approval}</td>
+                <td className="num" title={policy.seenAt}>{since(policy.seenAt)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
       <p className="note">
         这是 Runtime 冻结进某一次调用的策略快照，不是一份可编辑的设置。
         已经在跑的 Run 保留它被准入时的策略，所以恢复会重放同样的决定。
@@ -132,30 +134,32 @@ function Models() {
   return (
     <>
       {desk.providers.length > 0 && (
-        <table className="rows">
-          <thead>
-            <tr><th>名字</th><th>协议</th><th>模型</th><th>密钥</th><th className="num" /></tr>
-          </thead>
-          <tbody>
-            {desk.providers.map((provider) => (
-              <tr key={provider.id}>
-                <td className="p mono" title={provider.endpoint}>{provider.id}</td>
-                <td>{PROTOCOLS.find((entry) => entry.id === provider.protocol)?.label ?? provider.protocol}</td>
-                <td className="mono">{provider.model}</td>
-                <td className={provider.hasSecret ? "" : "warn"}>
-                  {provider.hasSecret
-                    ? <>在钥匙串里{provider.secretSetAt && ` ・ ${since(provider.secretSetAt)}存的`}</>
-                    : "缺密钥 —— Runtime 起不来"}
-                </td>
-                <td className="num">
-                  <button type="button" className="flat" onClick={() => void desk.forgetProvider(provider.id)}>
-                    删掉
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="wide">
+          <table className="rows">
+            <thead>
+              <tr><th>名字</th><th>协议</th><th>模型</th><th>密钥</th><th className="num" /></tr>
+            </thead>
+            <tbody>
+              {desk.providers.map((provider) => (
+                <tr key={provider.id}>
+                  <td className="p mono" title={provider.endpoint}>{provider.id}</td>
+                  <td>{PROTOCOLS.find((entry) => entry.id === provider.protocol)?.label ?? provider.protocol}</td>
+                  <td className="mono">{provider.model}</td>
+                  <td className={provider.hasSecret ? "" : "warn"}>
+                    {provider.hasSecret
+                      ? <>在钥匙串里{provider.secretSetAt && ` ・ ${since(provider.secretSetAt)}存的`}</>
+                      : "缺密钥 —— Runtime 起不来"}
+                  </td>
+                  <td className="num">
+                    <button type="button" className="flat" onClick={() => void desk.forgetProvider(provider.id)}>
+                      删掉
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       <div className="form">
@@ -241,38 +245,40 @@ function Mcp() {
   return (
     <>
       {desk.mcp.servers.length > 0 && (
-        <table className="rows">
-          <thead>
-            <tr>
-              <th>名字</th><th>命令</th><th>工具</th><th>授权</th><th>必需</th>
-              <th>配置</th><th className="num" />
-            </tr>
-          </thead>
-          <tbody>
-            {desk.mcp.servers.map((server) => (
-              <tr key={server.name}>
-                <td className="p mono">{server.name}</td>
-                <td className="mono" title={[server.command, ...server.args].join(" ")}>
-                  {server.command.split("/").pop()}
-                </td>
-                <td className="mono">{server.toolNames.join("・")}</td>
-                <td className="mono">{server.scope}</td>
-                <td>{server.required ? "必需" : "可选"}</td>
-                <td className={live?.has(server.digest) ? "" : "warn"}>
-                  {live === null
-                    ? "不知道有没有生效"
-                    : live.has(server.digest) ? "Runtime 启动时拿到了" : "还没生效"}
-                </td>
-                <td className="num">
-                  <button type="button" className="flat"
-                    onClick={() => void desk.forgetMcpServer(server.name)}>
-                    删掉
-                  </button>
-                </td>
+        <div className="wide">
+          <table className="rows">
+            <thead>
+              <tr>
+                <th>名字</th><th>命令</th><th>工具</th><th>授权</th><th>必需</th>
+                <th>配置</th><th className="num" />
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {desk.mcp.servers.map((server) => (
+                <tr key={server.name}>
+                  <td className="p mono">{server.name}</td>
+                  <td className="mono" title={[server.command, ...server.args].join(" ")}>
+                    {server.command.split("/").pop()}
+                  </td>
+                  <td className="mono">{server.toolNames.join("・")}</td>
+                  <td className="mono">{server.scope}</td>
+                  <td>{server.required ? "必需" : "可选"}</td>
+                  <td className={live?.has(server.digest) ? "" : "warn"}>
+                    {live === null
+                      ? "不知道有没有生效"
+                      : live.has(server.digest) ? "Runtime 启动时拿到了" : "还没生效"}
+                  </td>
+                  <td className="num">
+                    <button type="button" className="flat"
+                      onClick={() => void desk.forgetMcpServer(server.name)}>
+                      删掉
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {applied === null && (
@@ -291,20 +297,22 @@ function Mcp() {
       {desk.mcpFailures.length > 0 && (
         <>
           <div className="note"><span>这些是 Run 日志里真的报过起不来的服务</span></div>
-          <table className="rows">
-            <thead>
-              <tr><th>服务</th><th>Run</th><th className="num">时间</th></tr>
-            </thead>
-            <tbody>
-              {desk.mcpFailures.map((failure) => (
-                <tr key={`${failure.runId}-${failure.server}`}>
-                  <td className="p mono warn">{failure.server}</td>
-                  <td className="mono">{shortId(failure.runId)}</td>
-                  <td className="num" title={failure.at}>{since(failure.at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="wide">
+            <table className="rows">
+              <thead>
+                <tr><th>服务</th><th>Run</th><th className="num">时间</th></tr>
+              </thead>
+              <tbody>
+                {desk.mcpFailures.map((failure) => (
+                  <tr key={`${failure.runId}-${failure.server}`}>
+                    <td className="p mono warn">{failure.server}</td>
+                    <td className="mono">{shortId(failure.runId)}</td>
+                    <td className="num" title={failure.at}>{since(failure.at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </>
       )}
 

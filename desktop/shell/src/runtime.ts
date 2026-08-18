@@ -215,7 +215,10 @@ export type Waiting =
   /// they can answer.
   | { kind: "mcp-input"; key: string; runId: string; serverName: string; toolName?: never };
 
-type Bridge = {
+/// Exported so anything standing in for the preload is checked against it
+/// rather than against a guess. The dev bridge is typed by this, which is how a
+/// method it forgot becomes a compile error instead of a blank screen.
+export type Bridge = {
   status(): Promise<Reply<RuntimeStatus>>;
   probe(): Promise<Reply<RuntimeStatus>>;
   list(): Promise<Reply<{ runs: RunSummary[]; nextAfterRunId: string | null }>>;
