@@ -4,6 +4,7 @@
 /// approval queue are three views of the same event log, and giving each its
 /// own poller would let them disagree about the state of the same run.
 import { createContext, useContext } from "react";
+import type { Waiting } from "./runtime";
 import type { Store } from "./store";
 
 export type Desk = Store & {
@@ -53,6 +54,43 @@ export function blocked(desk: Desk) {
       ((run.lifecycle.kind === "terminal" || run.lifecycle.kind === "retired") &&
         run.lifecycle.status === "indeterminate"),
   );
+}
+
+/// The same queue, named for the host.
+///
+/// Two kinds of waiting, and each is named by the thing the runtime already
+/// gives a durable identity to. An approval carries its own id, so two
+/// questions on one Run stay two. A Run that ended `indeterminate` has no
+/// approval to name it by and needs none: a Run reaches a terminal boundary
+/// once and never leaves it, so the Run's own id names that question exactly.
+///
+/// An approval whose payload carried no id falls back to its Run rather than
+/// to an empty string — otherwise every such approval would share one name and
+/// only the first would ever be heard.
+export function waiting(desk: Desk): Waiting[] {
+  return blocked(desk).map((run): Waiting => {
+    if (run.approval) {
+      return {
+        kind: "approval",
+        key: `approval:${run.approval.approvalId || run.id}`,
+        runId: run.id,
+        toolName: run.approval.toolName,
+      };
+    }
+    // Before the indeterminate branch, because a suspended Run has reached no
+    // boundary and calling it unjudgeable would be describing the wrong thing.
+    // Keyed by the input's own id and version: a server that asks again about
+    // the same round asks a new question, and a person should hear about it.
+    if (run.mcpInput) {
+      return {
+        kind: "mcp-input",
+        key: `mcp:${run.mcpInput.inputId}:${run.mcpInput.inputVersion}`,
+        runId: run.id,
+        serverName: run.mcpInput.serverName,
+      };
+    }
+    return { kind: "indeterminate", key: `run:${run.id}`, runId: run.id };
+  });
 }
 
 /// The run the transcript should show: the chosen one, or the most recently

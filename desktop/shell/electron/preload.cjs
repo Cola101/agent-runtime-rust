@@ -8,6 +8,19 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("desk", {
   mounted: (surfaces) => ipcRenderer.send("shell:mounted", surfaces),
   drew: (summary) => ipcRenderer.send("shell:drew", summary),
+  /// Everything the window can see waiting on a person, reported whole every
+  /// time that changes. Reporting rather than requesting: the host decides
+  /// what to raise, so the window cannot talk it into repeating itself.
+  waiting: (items) => ipcRenderer.send("shell:waiting", items),
+  /// The host asking for one waiting Run to be put in front of the person,
+  /// because they clicked its notification.
+  onAttend: (handler) => {
+    // The IPC event never crosses the bridge: it carries a handle to the
+    // sender, and a renderer that can reach one can reach every channel.
+    const listener = (_event, runId) => handler(runId);
+    ipcRenderer.on("host:attend", listener);
+    return () => ipcRenderer.removeListener("host:attend", listener);
+  },
   runtime: {
     status: () => ipcRenderer.invoke("runtime:status"),
     probe: () => ipcRenderer.invoke("runtime:probe"),

@@ -27,9 +27,14 @@ export const RUN_INPUT = "01a0122e-4c11-7b90-9d63-1f8ac4b57e20";
 /// mode. Two of them in one round because that is the part of the contract a
 /// client gets wrong: a resolution must answer the exact pending key set, so
 /// answering one of these is not answering the request.
+/// The pending round's own id and version, which is how the host is told to
+/// remember one question by. Exported for the same reason `APPROVAL_ID` is.
+export const MCP_INPUT_ID = "01a0122e-4c11-7b90-9d63-1f8ac4b57e21";
+export const MCP_INPUT_VERSION = 1;
+
 const MCP_INPUT = {
   schema_version: 1,
-  input_id: "01a0122e-4c11-7b90-9d63-1f8ac4b57e21",
+  input_id: MCP_INPUT_ID,
   server_id: "01a0122e-4c11-7b90-9d63-1f8ac4b57e22",
   server_name: "docs",
   tool_call_id: "stub-call-7",
@@ -58,8 +63,18 @@ const MCP_INPUT = {
   },
 };
 
+/// A Run that reached a terminal boundary nobody can judge: the tool was cut
+/// off mid-execution and the runtime will not guess whether the effect landed.
+/// It blocks a person exactly as an approval does, and it is the one kind of
+/// waiting that has no approval to name it by — which is the whole reason the
+/// second branch of `waiting()` exists.
+export const RUN_UNJUDGED = "01a01230-7c1d-70f4-9a63-5f2e8b0d41aa";
+/// The approval's own id, as the runtime wrote it into the log. Exported
+/// because it is what the host is told to remember one question by.
+export const APPROVAL_ID = "01a0122b-217e-7e72-bec8-ad3273f16cd2";
+
 const APPROVAL = {
-  approval_id: "01a0122b-217e-7e72-bec8-ad3273f16cd2",
+  approval_id: APPROVAL_ID,
   execution: {
     binding_digest: "3be24149daa5170d4f45345772146ab599c5044abfae3e1daf546f03bb1591b9",
     call: { arguments: { command: "ls -la" }, id: "stub-call-1", name: "shell.exec" },
@@ -121,7 +136,21 @@ function logs(mcpRequests: Record<string, unknown>): Record<string, Log> {
         }, 10, RUN_INPUT),
       ],
     },
-    [RUN_LIVE]: {
+    [RUN_UNJUDGED]: {
+    state: { state: "terminal", status: "indeterminate" },
+    events: [
+      event(1, "run.started", { status: "running" }, 15, RUN_UNJUDGED),
+      // Flat, like the parked Run's above: that is the shape the runtime
+      // actually writes, and this fixture is the one place that claim is
+      // held. Written nested first, which passed only because the reader
+      // accepts both -- exactly the drift the note on RUN_WAITING warns of.
+      event(2, "model.tool_call",
+        { name: "shell.exec", arguments: { command: "rm -rf build" }, id: "stub-call-3" },
+        15, RUN_UNJUDGED),
+      event(3, "run.indeterminate", { status: "indeterminate" }, 15, RUN_UNJUDGED),
+    ],
+  },
+  [RUN_LIVE]: {
       state: { state: "running" },
       events: [
         event(1, "run.started", { status: "running" }, 30),
@@ -474,6 +503,11 @@ export function installFakeRuntime(
         runs: [
           { run_id: RUN_WAITING, input: "run a shell command", state: { state: "waiting_approval" } },
           { run_id: RUN_INPUT, input: "search the docs", state: { state: "suspended" } },
+          {
+            run_id: RUN_UNJUDGED,
+            input: "delete the build directory",
+            state: { state: "terminal", status: "indeterminate" },
+          },
           { run_id: RUN_LIVE, input: "something still going", state: { state: "running" } },
           { run_id: RUN_DONE, input: "something finished", state: { state: "finished", status: "succeeded" } },
         ],
@@ -628,7 +662,19 @@ export function installFakeRuntime(
     transport: "local", stateRoot: "/tmp/state", socketPath: "/tmp/state/runtime-host.sock",
     connected: true, error: null,
   });
-  const desk = { mounted: vi.fn(), drew: vi.fn(), runtime };
+  // The host side of the notification: what the window reports, and the way
+  // back in when someone clicks one. `attend` stands in for that click.
+  // Named apart from the event `listeners` above: that set is the runtime's
+  // stream, this one is the host asking for a Run to be put in front of a
+  // person, and the two arrive over different channels.
+  const waiting = vi.fn();
+  let attendee: ((runId: string) => void) | null = null;
+  const onAttend = (handler: (runId: string) => void) => {
+    attendee = handler;
+    return () => { attendee = null; };
+  };
+
+  const desk = { mounted: vi.fn(), drew: vi.fn(), waiting, onAttend, runtime };
   (window as unknown as { desk: typeof desk }).desk = desk;
   const emit = (runId: string, event: Record<string, unknown>) => {
     for (const listener of listeners) listener({ runId, event });
@@ -636,6 +682,6 @@ export function installFakeRuntime(
   return {
     control, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
     resolveMcpInput, saveProvider, forgetProvider, watch, unwatch, emit, event, launch, steer,
-    desk, elsewhere,
+    desk, elsewhere, waiting, attend: (runId: string) => attendee?.(runId),
   };
 }

@@ -143,6 +143,47 @@ export type RuntimeLifecycle = {
   previous_shutdown: Record<string, unknown> | null;
 };
 
+/// One Run that cannot go on without a person, named so the host can tell two
+/// reports of the same thing apart from two things.
+///
+/// The key is durable: it comes out of the log, not out of the clock. The
+/// store polls, so the host is told about the same approval again and again,
+/// and anything derived from when it was seen would make each read look new.
+///
+/// Discriminated on the kind of waiting rather than carrying a nullable tool
+/// name. The two kinds are different shapes, and the difference decides what a
+/// person is told: "等你决定" and "结果无法判定" are not the same sentence. As
+/// `toolName: string | null` the rule lived in a comment, and the host had to
+/// infer the kind from whether a field was empty — which quietly made an
+/// approval whose log carried no call name indistinguishable from a Run nobody
+/// can judge, and announced the wrong one of those two things.
+export type Waiting =
+  /// The runtime stopped and asked. `toolName` is the tool it stopped on,
+  /// verbatim; it is empty only when the logged call carried no name.
+  | { kind: "approval"; key: string; runId: string; toolName: string }
+  /// The Run reached a terminal boundary nobody can judge. `indeterminate` is
+  /// the runtime's own word for it. There is no call to name here, so there is
+  /// no field to leave null.
+  ///
+  /// `toolName?: never` is not decoration. Without it TypeScript accepts a
+  /// tool name on this member anyway — for a union target it only rejects a
+  /// property no member declares — and the thing being ruled out here is
+  /// precisely a Run nobody can judge that arrived carrying one.
+  | { kind: "indeterminate"; key: string; runId: string; toolName?: never }
+  /// An MCP server asked a person for content, and the Run is suspended until
+  /// it gets an answer.
+  ///
+  /// Its own kind because the other two would each be a lie: nothing is
+  /// waiting on a *decision about a tool call*, and the Run has reached no
+  /// boundary at all. It arrived when two branches each extended what counts
+  /// as blocked -- one adding this Run, one adding the queue -- and their
+  /// composition labelled it `indeterminate`, which reads as "nobody can judge
+  /// the result" about a Run that has simply been asked a question.
+  ///
+  /// `serverName` is who is asking, which is the thing a person needs before
+  /// they can answer.
+  | { kind: "mcp-input"; key: string; runId: string; serverName: string; toolName?: never };
+
 type Bridge = {
   status(): Promise<Reply<RuntimeStatus>>;
   probe(): Promise<Reply<RuntimeStatus>>;
@@ -218,6 +259,11 @@ declare global {
     desk?: {
       mounted(surfaces: number): void;
       drew?(summary: Record<string, unknown>): void;
+      /// Optional for the same reason `runtime` is: in a browser tab there is
+      /// no host to tell, and no notification to raise.
+      waiting?(items: Waiting[]): void;
+      /// Returns the way to stop listening.
+      onAttend?(handler: (runId: string) => void): () => void;
       runtime?: Bridge;
     };
   }
