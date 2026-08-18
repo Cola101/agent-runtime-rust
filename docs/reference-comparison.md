@@ -2511,6 +2511,78 @@ outbound reconnect 和 capability discovery，建设 Rust Edge Node 最小闭环
   这次哪几种决定可用，`codex-rs/protocol/src/approvals.rs`）我们同意但**没有做**，记在这里。
 
 
+
+## 2026-08-19（二）：一轮被打断之后，下一句怎么发得出去
+
+读的是源码。
+
+### Codex：人什么都不用修，历史自己带着标记
+
+| 位置 | 内容 |
+| --- | --- |
+| `codex-rs/core/src/thread_manager.rs:2145-2180` | `append_interrupted_boundary` 往耐久历史里推两样东西 |
+| 同上 `:2151-2157` | 一条 `TurnAborted` 事件（`reason: Interrupted`，`completed_at: None`） |
+| `codex-rs/core/src/tasks/mod.rs:102-125` | 一条**模型可见**的消息（V2 是 `developer` 角色，否则是 contextual user） |
+| `codex-rs/core/src/context/turn_aborted.rs:9` | 那句话本身 |
+
+原话（`:9`）：
+
+> "The user interrupted the previous turn on purpose. Any running unified exec
+> processes may still be running in the background. If any tools/commands were
+> aborted, they may have partially executed."
+
+**理由**：被打断不是失败，是一个模型必须知道的事实——尤其是「你刚才那些工具可能只执行了一半」。
+把它写进历史，下一句就照常发，人不用做任何修复动作。
+
+**我们同意这个方向**，并且实测确认我们**已经**满足了它的第一半：
+两个进程的验收（`restart_during_a_turn.rs`）证明重启打断一轮之后对话接得上，
+恢复会放开分支（有 checkpoint 就把它跑完，没有就清掉活跃 Turn），窗口约 100ms。
+
+**我们还没有的是第二半**：我们的历史里**不留**任何「上一轮被打断过」的痕迹——
+`commit_session_turn` 只在 `Succeeded` 时推历史，其余情况只清 `active_turn`。
+也就是说模型看不到「刚才那一轮被砍了，工具可能执行了一半」。
+Codex 那句警告正是为这种情况写的，而**我们这边它更要紧**：
+我们的工具审批把 `shell.exec` 和 `workspace.write_text` 交出去，半执行是真实存在的。
+
+**没有做**，因为往冻结转录里塞一条不是模型说的消息是一个契约决定：
+它会进 `SessionConversationTurn` 的 `transcript`，而那份东西的每一条现在都来自真实往返。
+记在这里等你定。
+
+### 但真正承重的不是那句话
+
+`codex-rs/core/src/context_manager/normalize.rs:20-130` —— `ensure_call_outputs_present`
+扫过历史，给**每一个没有对应结果的工具调用**补一条合成结果，正文就是 `"aborted"`
+（`:58`、`:93`、`:112` 三处）。它由 `history.rs:143` 的 `for_prompt` 调用，
+也就是**每一次构建 prompt 都跑**，不是恢复时跑一次。
+
+理由很硬：Provider 的 API 会拒绝一份「有工具调用、没有对应结果」的历史。
+没有这一步，被打断的一轮**永远发不出去**。
+
+那句 `<turn_aborted>` 是叙述，这一条才是让下一轮**合法**的东西。
+
+**我们这边的状况（只说量到的）**：`repair_imported_history`
+（`runtime/crates/protocol/src/lib.rs:2764`）做的是同一件事，有**两个**调用点——
+`HistoryImport` 校验（`protocol/src/lib.rs:1732`）和 Worker 接受执行时
+（`worker/src/lib.rs:3037-3041`）。而下一轮的转录还有另一个来源：
+`branch.history`（`worker/src/lib.rs:3086-3089`），那一段**不过这个修复**。
+
+**没有确定的**：`branch.history` 里到底能不能出现悬空的工具调用。
+按目前读到的，`commit_session_turn` 只在 `Succeeded` 时推历史，
+而成功的转录来自一次完成的 checkpoint——所以大概率不能。
+**但我没有测过，所以不声称。** 这是下一轮该拿一个测试去问的问题，
+不是一句可以写进结论的话。
+
+（顺带记一条**并行审计给错的**结论：它说我们这边 `repair_imported_history`
+「唯一调用点是 HistoryImport 校验」——不对，Worker 那处也在调。
+自己 grep 出来的。）
+
+### 推翻了什么
+
+推翻的是我自己这一轮的假设，不是文档里的旧结论：我以为
+「被 Runtime 重启打断的对话再也接不上」，两进程实测**不成立**，
+详见 `docs/evidence/2026-08-19-restart-during-a-turn.md`。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`
