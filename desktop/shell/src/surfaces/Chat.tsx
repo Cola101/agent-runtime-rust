@@ -7,9 +7,10 @@ import {
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
 import { closeFind, findOpened, has, openFind, split, watchFind } from "./find";
+import { mentionAt, narrow, withMention } from "../mentions";
 import { McpInputForm } from "./McpInput";
 import { currentRun, useDesk, type Desk } from "../desk";
-import type { RunEvent } from "../runtime";
+import { bridge, type RunEvent } from "../runtime";
 import type { RunView } from "../store";
 import { textOf, type SessionView } from "../session";
 import { lineage, subagentsOf, type SubagentState } from "../subagents";
@@ -819,6 +820,13 @@ function ChatDrawer() {
 export function Composer() {
   const desk = useDesk();
   const [draft, setDraft] = useState("");
+  /// The workspace, read once and narrowed locally. Read once because it is
+  /// the folder the runtime was started on and does not change under this
+  /// window; narrowed locally because a listing call per keystroke would put
+  /// the filesystem between someone and their own typing.
+  const [files, setFiles] = useState<string[] | null>(null);
+  const [mention, setMention] = useState<{ at: number; query: string } | null>(null);
+  const [pick, setPick] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
@@ -829,6 +837,38 @@ export function Composer() {
   /// the head and disabling the box is the difference between a rule the
   /// person can see and a rule they discover by being refused.
   const turning = desk.current?.activeRunId != null;
+
+  useEffect(() => {
+    const api = bridge();
+    if (!api?.listFiles) return;
+    void api.listFiles("").then((reply) => {
+      if (reply.ok) setFiles(reply.value.entries.map((entry) => entry.name));
+    });
+  }, []);
+
+  /// Reads the caret rather than the text alone: a mention is where the caret
+  /// is, and someone who moves back into an earlier `@` is editing that one.
+  const readMention = (value: string, caret: number) => {
+    const found = files ? mentionAt(value, caret) : null;
+    setMention(found);
+    setPick(0);
+  };
+
+  const offered = mention && files ? narrow(files, mention.query) : [];
+
+  const choose = (name: string) => {
+    const box_ = box.current;
+    if (!mention || !box_) return;
+    const next = withMention(draft, mention, name, box_.selectionStart ?? draft.length);
+    setDraft(next.text);
+    setMention(null);
+    // The caret goes after the path this put in, not to the end of a line the
+    // person may have been typing in the middle of.
+    requestAnimationFrame(() => {
+      box_.focus();
+      box_.setSelectionRange(next.caret, next.caret);
+    });
+  };
 
   const send = async () => {
     const input = draft.trim();
@@ -852,6 +892,21 @@ export function Composer() {
 
   return (
     <div className="write">
+      {offered.length > 0 && (
+        <ul className="mentions" role="listbox">
+          {offered.map((name, index) => (
+            <li key={name}>
+              <button
+                type="button"
+                className={index === pick ? "on" : ""}
+                onMouseDown={(event) => { event.preventDefault(); choose(name); }}
+              >
+                {name}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="write-row">
         <textarea
           ref={box}
@@ -864,8 +919,38 @@ export function Composer() {
               : turning ? "这轮还在跑 —— 现在说的话会拿去改向"
                 : desk.current ? "接着说" : "说一句话，就开始一段对话"
           }
-          onChange={(event) => { setDraft(event.target.value); setAt(-1); }}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setAt(-1);
+            readMention(event.target.value, event.target.selectionStart ?? event.target.value.length);
+          }}
           onKeyDown={(event) => {
+            // While the list is open it owns the keys that would otherwise
+            // send or move the history. Enter is the one that matters: it is
+            // the commonest key in this box, and taking it would send a
+            // half-written mention.
+            if (offered.length > 0) {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                choose(offered[Math.min(pick, offered.length - 1)]!);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMention(null);
+                return;
+              }
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setPick((chosen) => Math.min(chosen + 1, offered.length - 1));
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setPick((chosen) => Math.max(chosen - 1, 0));
+                return;
+              }
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
