@@ -43,6 +43,30 @@ fs::write(&candidate, text.as_bytes())                  // 然后无条件写
 我倾向 2 或 3：它们不要求模型多做对的事，而 1 要求模型自觉。
 但这是契约决定，**没有动手**。
 
+## 钉住它的那条测试
+
+`apps/trusted-workspace-tool/tests/write_text.rs::a_write_refuses_to_replace_a_file_that_changed_after_it_was_read`
+
+它跑的正是桌面会话真实产生的那个顺序：读 → 有人在旁边改 → 写。
+断言的是**想要的**行为（拒绝，且手改的内容还在）。
+
+标了 `#[ignore]` 而不是让套件红着：它陈述的是想要什么，不是一处回归，
+让门禁变红等于说"有个改动弄坏了东西"。
+
+```
+cargo test -p agent-trusted-workspace-tool --test write_text -- --ignored
+```
+
+现在跑它是红的，红在正确的地方：
+
+```
+assertion `left == right` failed: a write over a changed file must be refused
+  left: Bool(false)     ← 写成功了
+ right: true
+```
+
+修好之后把 `#[ignore]` 去掉，这条测试就从"记录"变成"守卫"。
+
 ## 已经量到的
 
 - `write_text` 的实现读过，三处检查如上，没有第四处。
