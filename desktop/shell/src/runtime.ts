@@ -274,7 +274,12 @@ export type Bridge = {
     Reply<{ ok: true; page: CursorPage } | { ok: false; error: CursorError }>
   >;
   submit(input: string): Promise<Reply<string>>;
-  control(request: { action: string; runId: string }): Promise<Reply<unknown>>;
+  /// `reason` is read only for `deny`, and only when it is not blank: it is
+  /// what the person said, and it reaches the model as the refused Tool's own
+  /// result rather than as a note on the side.
+  control(request: {
+    action: string; runId: string; reason?: string;
+  }): Promise<Reply<unknown>>;
   steer(request: {
     runId: string; steeringId: string; input: string;
   }): Promise<Reply<unknown>>;

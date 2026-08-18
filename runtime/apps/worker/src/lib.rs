@@ -2410,6 +2410,25 @@ pub enum WorkloadIdentityRenewalOutcome {
     Duplicate,
 }
 
+/// What a refused Tool call tells the model beyond the refusal itself.
+///
+/// A gate the model can walk around is not a gate. "Denied" alone reads as a
+/// transient failure, and the cheapest next move from there is the same
+/// outcome through a different door -- a shell redirect instead of a write, a
+/// subshell instead of a direct exec. Naming the constraint turns one refusal
+/// into a constraint that outlives it, and naming the acceptable exits stops
+/// the model from simply stalling.
+///
+/// Taken from Codex, which appends the same kind of standing instruction to
+/// every risk denial (`codex-rs/core/src/guardian/review.rs:51-57`, composed
+/// at `:620-622`). Their wording is the part worth copying; who supplies the
+/// reason is where we differ, and that is argued where the reason is entered.
+const REFUSAL_CONSTRAINT: &str = concat!(
+    "不要用别的办法达到同样的效果，也不要绕开这次拒绝。",
+    "只有在换成一个明显更安全的做法，或者把风险说清楚之后对方明确同意时，才继续；",
+    "否则就停下来问。",
+);
+
 impl WorkerProcessor {
     pub fn verify_execution_workload_identity(
         command: &RunExecutionCommand,
@@ -7440,7 +7459,9 @@ impl WorkerProcessor {
                 let content = serde_json::json!({
                     "error": {
                         "code": "tool_policy_denied",
-                        "message": "tool execution is denied by runtime policy"
+                        "message": format!(
+                            "tool execution is denied by runtime policy. {REFUSAL_CONSTRAINT}"
+                        ),
                     }
                 });
                 let result = execution
@@ -7570,12 +7591,29 @@ impl WorkerProcessor {
             }
             ToolApprovalDecision::Deny => {
                 let tool_call_id = approval.execution.call.id;
-                let content = serde_json::json!({
-                    "error": {
-                        "code": "approval_denied",
-                        "message": "tool execution was denied by a reviewer"
-                    }
-                });
+                // The reason goes in the message the model reads, and the code
+                // stays what it was: a client keying off `approval_denied` has
+                // to keep working, and it is the code that says "a person
+                // refused this" rather than the sentence.
+                let content = match command.decision_reason.as_deref() {
+                    Some(said) => serde_json::json!({
+                        "error": {
+                            "code": "approval_denied",
+                            "message": format!(
+                                "tool execution was denied by a reviewer: {said} {REFUSAL_CONSTRAINT}"
+                            ),
+                            "reason": said,
+                        }
+                    }),
+                    None => serde_json::json!({
+                        "error": {
+                            "code": "approval_denied",
+                            "message": format!(
+                                "tool execution was denied by a reviewer. {REFUSAL_CONSTRAINT}"
+                            ),
+                        }
+                    }),
+                };
                 let denied = execution
                     .machine
                     .record_tool_result(

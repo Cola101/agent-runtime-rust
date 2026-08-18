@@ -1598,6 +1598,7 @@ async fn worker_consumes_bound_approval_decision_and_publishes_resume_before_ack
         approval_version: 2,
         binding_digest: approval.execution.binding_digest.clone(),
         decision: ToolApprovalDecision::AllowOnce,
+        decision_reason: None,
         issued_at,
         expires_at: issued_at + chrono::Duration::seconds(30),
     };

@@ -1,6 +1,6 @@
 use agent_protocol::{
-    TOOL_APPROVAL_DECISION_SCHEMA_VERSION, ToolApprovalDecision, ToolApprovalDecisionCommand,
-    ToolApprovalDecisionValidationError,
+    TOOL_APPROVAL_DECISION_REASON_MAX_CHARS, TOOL_APPROVAL_DECISION_SCHEMA_VERSION,
+    ToolApprovalDecision, ToolApprovalDecisionCommand, ToolApprovalDecisionValidationError,
 };
 use chrono::{Duration, Utc};
 use uuid::Uuid;
@@ -22,6 +22,7 @@ fn command() -> ToolApprovalDecisionCommand {
         approval_version: 2,
         binding_digest: "a".repeat(64),
         decision: ToolApprovalDecision::AllowOnce,
+        decision_reason: None,
         issued_at,
         expires_at: issued_at + Duration::minutes(5),
     }
@@ -81,4 +82,69 @@ fn published_approval_decision_example_decodes_and_validates() {
     );
     assert!(!decoded.worker_incarnation_id.is_nil());
     assert!(decoded.validate().is_ok());
+}
+
+/// A refusal may carry what the person said; nothing else may.
+///
+/// An approval with an explanation has nowhere to go -- the model is about to
+/// be handed the Tool's real output -- so a command that carries one is a
+/// caller that has misunderstood the shape, and saying so here is cheaper than
+/// a sentence that silently never appears.
+#[test]
+fn only_a_refusal_carries_a_reason() {
+    let mut refused = command();
+    refused.decision = ToolApprovalDecision::Deny;
+    refused.decision_reason = Some("这个文件不该读".into());
+    assert_eq!(refused.validate(), Ok(()));
+
+    let mut allowed = command();
+    allowed.decision_reason = Some("这个文件不该读".into());
+    assert_eq!(
+        allowed.validate(),
+        Err(ToolApprovalDecisionValidationError::ReasonWithoutRefusal),
+    );
+}
+
+/// The reason rides into every later model turn as a Tool result, so it is
+/// paid for again on each one. A sentence is what this is for.
+#[test]
+fn a_refusal_reason_is_bounded_and_not_blank() {
+    let mut empty = command();
+    empty.decision = ToolApprovalDecision::Deny;
+    empty.decision_reason = Some("   ".into());
+    assert_eq!(
+        empty.validate(),
+        Err(ToolApprovalDecisionValidationError::InvalidReason),
+    );
+
+    let mut long = command();
+    long.decision = ToolApprovalDecision::Deny;
+    long.decision_reason = Some("不".repeat(TOOL_APPROVAL_DECISION_REASON_MAX_CHARS + 1));
+    assert_eq!(
+        long.validate(),
+        Err(ToolApprovalDecisionValidationError::InvalidReason),
+    );
+
+    // Counted in characters, not bytes: this is 512 characters and 1536 bytes,
+    // and a byte bound would cut a Chinese sentence at a third of an English
+    // one for no reason a person could see.
+    let mut exact = command();
+    exact.decision = ToolApprovalDecision::Deny;
+    exact.decision_reason = Some("不".repeat(TOOL_APPROVAL_DECISION_REASON_MAX_CHARS));
+    assert_eq!(exact.validate(), Ok(()));
+}
+
+/// A command recorded before this field existed still reads.
+#[test]
+fn a_decision_written_without_a_reason_still_decodes() {
+    let mut without = serde_json::to_value(command()).expect("serializable");
+    let object = without.as_object_mut().expect("an object");
+    assert!(
+        !object.contains_key("decision_reason"),
+        "a command with no reason must not write the key at all",
+    );
+    object.remove("decision_reason");
+    let decoded: ToolApprovalDecisionCommand =
+        serde_json::from_value(without).expect("an older command still decodes");
+    assert_eq!(decoded.decision_reason, None);
 }

@@ -1644,6 +1644,18 @@ pub enum LocalRunState {
         approval_id: Uuid,
         binding_digest: String,
         decision: LocalApprovalDecision,
+        /// What the person said when they refused.
+        ///
+        /// Durable because recovery rebuilds the control command from this
+        /// record: without it, a host that died between recording the refusal
+        /// and applying it would resume with a bare denial, and the model
+        /// would be told less than the person said -- silently, and only
+        /// after a crash.
+        ///
+        /// Defaulted because every record already on disk was written without
+        /// it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AwaitingMcpInput {
         input: McpInputRequired,
@@ -1729,6 +1741,11 @@ pub(crate) struct LocalApprovalResolution {
     approval_id: Option<Uuid>,
     binding_digest: Option<String>,
     decision: LocalApprovalDecision,
+    /// What the person said when they refused. Beside the decision rather than
+    /// inside it, so that the idempotency comparison further up -- which asks
+    /// whether this is the same decision resent -- is still a comparison of
+    /// two decisions and not of two sentences.
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7734,6 +7751,9 @@ impl LocalRuntimeHost {
                 approval_id: None,
                 binding_digest: None,
                 decision,
+                // This entry point takes a bare decision and has no caller who
+                // could have written a sentence.
+                reason: None,
             },
         )
         .await
@@ -8684,6 +8704,14 @@ impl LocalRuntimeHost {
                         LocalApprovalDecision::AllowOnce => ToolApprovalDecision::AllowOnce,
                         LocalApprovalDecision::Deny => ToolApprovalDecision::Deny,
                     },
+                    // Only a refusal carries one, and the contract refuses a
+                    // command that says otherwise -- so this drops a reason
+                    // that arrived with an approval rather than letting
+                    // `validate` reject the whole decision.
+                    decision_reason: match resolution.decision {
+                        LocalApprovalDecision::Deny => resolution.reason.clone(),
+                        LocalApprovalDecision::AllowOnce => None,
+                    },
                     issued_at,
                     expires_at: issued_at + ChronoDuration::minutes(5),
                 },
@@ -8849,6 +8877,7 @@ impl LocalRuntimeHost {
                                 approval_version: 2,
                                 binding_digest: approval.execution.binding_digest.clone(),
                                 decision: ToolApprovalDecision::AllowOnce,
+                                decision_reason: None,
                                 issued_at,
                                 expires_at: issued_at + ChronoDuration::minutes(5),
                             },
@@ -8941,6 +8970,7 @@ impl LocalRuntimeHost {
                                 approval_version: 2,
                                 binding_digest: approval.execution.binding_digest.clone(),
                                 decision: ToolApprovalDecision::AllowOnce,
+                                decision_reason: None,
                                 issued_at,
                                 expires_at: issued_at + ChronoDuration::minutes(5),
                             },

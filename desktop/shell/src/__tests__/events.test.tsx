@@ -45,6 +45,70 @@ describe("events the runtime reports about the exchange", () => {
     expect(screen.getByText("这件事我不做。")).toBeTruthy();
   });
 
+  /// Every model-originated ending said "a reason this build does not
+  /// recognise", because the three literals it knew are the three the *kernel*
+  /// writes and none of the eight a *provider* failure carries.
+  it("names a provider failure that ended the Run, instead of calling it unrecognised", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "run.failed", {
+      status: "failed", kind: "authentication", retryable: false,
+      message: "401 from the endpoint",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/密钥不对/)).toBeTruthy());
+    expect(screen.queryByText(/这个版本不认识/)).toBeNull();
+  });
+
+  /// And a kind this build genuinely has not seen still says what the runtime
+  /// said, rather than only naming the kind.
+  it("prints the runtime's own sentence for a failure kind it does not know", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "run.failed", {
+      status: "failed", kind: "something_new", retryable: false,
+      message: "the upstream refused the handshake",
+    }, 30));
+    await waitFor(() =>
+      expect(screen.getByText(/the upstream refused the handshake/)).toBeTruthy());
+  });
+
+  /// A Run that ran out of time said only its own type: `failureReason` was
+  /// reached for `run.failed` alone, and the branch that named a duration
+  /// budget matched a string the kernel writes nowhere.
+  it("says which clock ran out on a Run that timed out", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "run.timed_out", {
+      status: "timed_out", kind: "duration_budget_exhausted", retryable: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText("时长预算用完了")).toBeTruthy());
+  });
+
+  /// The one ending a person is expected to act on. It carries the answer to
+  /// "is running this again safe" and the client read neither field.
+  it("says what an unjudgeable ending means for running it again", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "run.indeterminate", {
+      status: "indeterminate", effect: "non_idempotent", replay_safe: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/重复执行会重复生效/)).toBeTruthy());
+    expect(screen.getByText(/再跑一次可能会重复它的副作用/)).toBeTruthy();
+  });
+
+  /// The sentence a person typed when refusing has to appear where they can
+  /// see it later, or explaining a refusal is a thing only the model receives.
+  it("shows the reason a refusal was given, in the transcript", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "tool.result", {
+      is_error: true,
+      content: {
+        error: {
+          code: "approval_denied",
+          message: "tool execution was denied by a reviewer: 这个目录不要动 …",
+          reason: "这个目录不要动",
+        },
+      },
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/你没让它执行：这个目录不要动/)).toBeTruthy());
+  });
+
   /// A configured MCP server that never came up.
   ///
   /// The Run carries on without those Tools, so the only observable difference

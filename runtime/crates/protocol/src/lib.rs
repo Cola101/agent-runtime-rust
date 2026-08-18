@@ -2168,9 +2168,26 @@ pub struct ToolApprovalDecisionCommand {
     pub approval_version: u32,
     pub binding_digest: String,
     pub decision: ToolApprovalDecision,
+    /// What the person said when they refused, carried to the model.
+    ///
+    /// Beside the decision rather than inside it: `ToolApprovalDecision` is a
+    /// closed two-value enum that every recorded command on disk is already
+    /// serialized against, and turning `deny` from a string into an object
+    /// would make every stored decision unreadable. A reason belongs to a
+    /// refusal only, which `validate` enforces rather than leaving to whoever
+    /// builds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
+
+/// The longest refusal this contract carries.
+///
+/// It goes into the model's next turn as a Tool result, so it is charged for
+/// as input on every turn after it. A sentence is what this is for; a pasted
+/// document is a different feature and would arrive here disguised as one.
+pub const TOOL_APPROVAL_DECISION_REASON_MAX_CHARS: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ToolApprovalDecisionValidationError {
@@ -2186,6 +2203,10 @@ pub enum ToolApprovalDecisionValidationError {
     InvalidValidityWindow,
     #[error("v2 tool approval decision must target one worker incarnation")]
     MissingWorkerIncarnation,
+    #[error("only a refusal carries a reason")]
+    ReasonWithoutRefusal,
+    #[error("tool approval refusal reason must be non-empty and at most 512 characters")]
+    InvalidReason,
 }
 
 impl ToolApprovalDecisionCommand {
@@ -2227,6 +2248,19 @@ impl ToolApprovalDecisionCommand {
             || self.expires_at - self.issued_at > chrono::Duration::minutes(5)
         {
             return Err(ToolApprovalDecisionValidationError::InvalidValidityWindow);
+        }
+        if let Some(reason) = &self.decision_reason {
+            if self.decision != ToolApprovalDecision::Deny {
+                return Err(ToolApprovalDecisionValidationError::ReasonWithoutRefusal);
+            }
+            // Counted in characters rather than bytes: the bound is about how
+            // much a person wrote, and a byte bound would cut a Chinese
+            // sentence at a third of an English one.
+            if reason.trim().is_empty()
+                || reason.chars().count() > TOOL_APPROVAL_DECISION_REASON_MAX_CHARS
+            {
+                return Err(ToolApprovalDecisionValidationError::InvalidReason);
+            }
         }
         Ok(())
     }

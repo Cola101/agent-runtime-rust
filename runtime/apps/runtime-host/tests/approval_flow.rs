@@ -594,7 +594,14 @@ async fn denying_over_ipc_never_executes_the_tool() {
     })
     .await;
 
-    request(&socket, &LocalRequest::Deny { run_id }).await;
+    request(
+        &socket,
+        &LocalRequest::Deny {
+            run_id,
+            reason: None,
+        },
+    )
+    .await;
     let probe = state_root.clone();
     wait_for("the denied run to finish", move || {
         matches!(
@@ -622,6 +629,92 @@ async fn denying_over_ipc_never_executes_the_tool() {
     assert!(
         !types.iter().any(|event| event == "tool.execution.started"),
         "a denied Tool must never execute: {types:?}"
+    );
+}
+
+/// A denial the person explained says so to the model.
+///
+/// Without this the model is told only "denied by a reviewer", so the obvious
+/// next move is the same call again -- and the person is asked the same
+/// question twice for a reason they already gave once. Codex carries the same
+/// string for the same reason (`codex-rs/protocol/src/protocol.rs:4131`,
+/// reaching the model at `codex-rs/core/src/tools/events.rs:455`).
+#[tokio::test]
+async fn a_denial_carries_the_reason_the_person_gave_to_the_model() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let (socket, _serving) = start(config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider().await,
+    ))
+    .await;
+
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+    let probe = state_root.clone();
+    wait_for("the approval to be recorded", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+        )
+    })
+    .await;
+
+    request(
+        &socket,
+        &LocalRequest::Deny {
+            run_id,
+            reason: Some("这个文件不该读，先问我".into()),
+        },
+    )
+    .await;
+    let probe = state_root.clone();
+    wait_for("the denied run to finish", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::Finished { .. })
+        )
+    })
+    .await;
+
+    let events = LocalRuntimeHost::replay_events(&state_root, run_id, 0).expect("events");
+    let denial = events
+        .iter()
+        .find(|event| event.event_type == "tool.result")
+        .expect("a denial is recorded as the tool's result");
+    let message = denial.payload["result"]["content"]["error"]["message"]
+        .as_str()
+        .or_else(|| denial.payload["content"]["error"]["message"].as_str())
+        .unwrap_or_else(|| panic!("no denial message in {}", denial.payload));
+    assert!(
+        message.contains("这个文件不该读，先问我"),
+        "the reason a person gave must reach the model: {message}",
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == "tool.execution.started"),
+        "an explained denial is still a denial",
+    );
+    // A gate the model can walk around is not a gate. Codex appends the same
+    // kind of standing instruction to every risk denial
+    // (`codex-rs/core/src/guardian/review.rs:51-57`, composed at `:620-622`)
+    // for the same reason: "denied" alone reads as a transient failure, and
+    // the cheapest next move from there is the same outcome through a
+    // different door.
+    assert!(
+        message.contains("不要绕开"),
+        "a refusal must say it is not to be routed around: {message}",
     );
 }
 
@@ -895,7 +988,10 @@ async fn two_approvals_in_one_run_are_two_decisions_and_not_a_replay_of_the_firs
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(decided.len(), 2, "both commands answered one approval");
-    assert!(decided.contains(&first), "the first approval was not decided");
+    assert!(
+        decided.contains(&first),
+        "the first approval was not decided"
+    );
 
     // And the tool ran once per approval, which is the point of approving twice.
     let starts = LocalRuntimeHost::replay_events(&state_root, run_id, 0)
@@ -958,6 +1054,7 @@ async fn full_control_request_rejects_stale_epoch_then_returns_its_exact_receipt
             approval_id: *approval_id,
             binding_digest: binding_digest.clone(),
             decision: agent_runtime_host::LocalApprovalDecision::AllowOnce,
+            reason: None,
         },
     };
     let mut stale = command.clone();

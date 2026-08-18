@@ -433,7 +433,14 @@ async fn a_child_tool_approval_routes_through_the_parent_and_survives_a_daemon_r
             );
             assert!(
                 matches!(
-                    request(&replacement_socket, &LocalRequest::Deny { run_id }).await,
+                    request(
+                        &replacement_socket,
+                        &LocalRequest::Deny {
+                            run_id,
+                            reason: None
+                        }
+                    )
+                    .await,
                     LocalResponse::Error { .. }
                 ),
                 "a conflicting second decision must fail closed"

@@ -232,10 +232,29 @@ function failureReason(payload: Record<string, unknown>): string | null {
         ? `必需的 MCP 服务起不来：${servers}`
         : "必需的 MCP 服务起不来";
     }
-    case "duration_budget":
+    // The kernel's spelling, from `record_duration_timed_out`
+    // (`runtime/crates/kernel/src/lib.rs:696-709`). It was `duration_budget`
+    // here, which the kernel writes nowhere -- so this branch matched nothing,
+    // and the case it was written for fell through to "a reason this build
+    // does not recognise".
+    case "duration_budget_exhausted":
       return "时长预算用完了";
-    default:
-      return `这个版本不认识的失败原因：${kind}`;
+    default: {
+      // Every model-originated ending arrives with a `ModelErrorKind`
+      // (`runtime/crates/kernel/src/lib.rs:560-579`), and this build has words
+      // for all of them already -- they were only ever reached through the
+      // provider-failure path. Without this, an authentication failure and a
+      // rate limit both read as "a reason this build does not recognise".
+      const named = PROVIDER_FAILURE[kind];
+      if (named) return named;
+      // The runtime also writes the provider's own sentence, which nothing
+      // read. It is the only thing that can say anything about a kind this
+      // build genuinely has never seen.
+      const said = typeof payload.message === "string" ? payload.message.trim() : "";
+      return said
+        ? `这个版本不认识的失败原因：${kind} —— ${said}`
+        : `这个版本不认识的失败原因：${kind}`;
+    }
   }
 }
 
@@ -248,7 +267,15 @@ function toolResultNote(payload: Record<string, unknown>): string | null {
   if (payload.is_error !== true) return null;
   const content = (payload.content ?? {}) as Record<string, unknown>;
   const error = (content.error ?? {}) as Record<string, unknown>;
-  return error.code === "approval_denied" ? "你没让它执行" : null;
+  if (error.code !== "approval_denied") return null;
+  // What the person typed when they refused, if they typed anything. The
+  // runtime puts it on its own key beside the message it builds for the model,
+  // precisely so this does not have to pick a sentence apart -- and without
+  // reading it the transcript would show "你没让它执行" for a refusal the
+  // person had explained, which is the reading a person would then have to
+  // remember rather than see.
+  const said = typeof error.reason === "string" ? error.reason.trim() : "";
+  return said ? `你没让它执行：${said}` : "你没让它执行";
 }
 
 /// A byte count, for a person rather than for a machine.
@@ -342,20 +369,31 @@ export function mcpDiscoveryNote(payload: Record<string, unknown>): string | nul
 /// overflow is a shorter sentence. "Provider 失败" is none of those and was all
 /// the transcript said. A kind this build has never seen is printed as it
 /// arrived, for the same reason an unknown `run.failed` kind is.
+/// The eight `ModelErrorKind` the runtime writes
+/// (`runtime/crates/protocol/src/lib.rs`, `ModelErrorKind`), each said as the
+/// thing to do about it.
+///
+/// Its own map rather than a switch inside `providerFailure`, because two
+/// callers need to ask two different questions of it: "what does this kind
+/// mean" and "is this a kind this build knows at all". The second one used to
+/// be unanswerable -- `providerFailure` returned a sentence for every kind,
+/// including the ones it did not know -- so a caller that wanted to fall back
+/// to something better could never tell that it should.
+const PROVIDER_FAILURE: Record<string, string> = {
+  authentication: "密钥不对，或者没有权限",
+  billing: "账上不让再调了",
+  rate_limited: "调得太快，被限流了",
+  timeout: "等太久没回应",
+  protocol: "回复的格式不对",
+  context_overflow: "这轮的上文超过它能接受的长度",
+  capability_mismatch: "这个 Provider 给不了这次要用的能力",
+  unavailable: "连不上，或者对面不可用",
+};
+
 function providerFailure(payload: Record<string, unknown>): string | null {
   const kind = typeof payload.kind === "string" ? payload.kind : null;
   if (!kind) return null;
-  const named: Record<string, string> = {
-    authentication: "密钥不对，或者没有权限",
-    billing: "账上不让再调了",
-    rate_limited: "调得太快，被限流了",
-    timeout: "等太久没回应",
-    protocol: "回复的格式不对",
-    context_overflow: "这轮的上文超过它能接受的长度",
-    capability_mismatch: "这个 Provider 给不了这次要用的能力",
-    unavailable: "连不上，或者对面不可用",
-  };
-  const said = named[kind] ?? `这个版本不认识的原因：${kind}`;
+  const said = PROVIDER_FAILURE[kind] ?? `这个版本不认识的原因：${kind}`;
   const provider = typeof payload.provider_id === "string" ? payload.provider_id : "";
   return provider ? `${provider}：${said}` : said;
 }
@@ -393,9 +431,28 @@ export function eventWords(type: string, payload: Record<string, unknown>): stri
     const waiting = providerRetry(payload);
     return waiting ? [waiting] : null;
   }
-  if (type === "run.failed") {
+  // `run.timed_out` as well: the kernel writes one of these two depending on
+  // the kind (`runtime/crates/kernel/src/lib.rs:565-568`), and the timed-out
+  // half carried `kind`, `retryable` and `message` into a branch that did not
+  // exist -- so a Run that ran out of time said only its type.
+  if (type === "run.failed" || type === "run.timed_out") {
     const reason = failureReason(payload);
     return reason ? [reason] : null;
+  }
+  // The one ending a person is expected to act on, and it said only that it
+  // could not be judged. `effect` and `replay_safe` are both on the event
+  // (`runtime/crates/kernel/src/lib.rs:443-448`) and neither was read -- so
+  // the question the boundary exists to raise, "is running this again safe",
+  // had its answer in the log and nowhere on screen.
+  if (type === "run.indeterminate") {
+    const effect = typeof payload.effect === "string" ? payload.effect : null;
+    const said = effect ? `工具的副作用是「${effectLabel(effect)}」` : null;
+    // `replay_safe` is written `false` and only `false`: an ending that could
+    // be judged would not be this event. Printed as the sentence it means
+    // rather than as a field name.
+    const again = payload.replay_safe === false ? "再跑一次可能会重复它的副作用" : null;
+    const parts = [said, again].filter((part): part is string => part !== null);
+    return parts.length > 0 ? parts : null;
   }
   const field = EVENT_WORDS[type];
   if (!field) return null;

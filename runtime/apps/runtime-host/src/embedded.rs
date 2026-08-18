@@ -188,6 +188,16 @@ pub enum RuntimeControlAction {
         approval_id: Uuid,
         binding_digest: String,
         decision: LocalApprovalDecision,
+        /// What the person said when they refused.
+        ///
+        /// Defaulted rather than required: every command already recorded on
+        /// disk was written without it, and recovery reads those. A refusal
+        /// resent under the same command id replays what was recorded, so the
+        /// reason a Run carries is the one given the first time -- one
+        /// approval is one decision, and that was already true of the
+        /// decision itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Cancel {
         reason: String,
@@ -2850,11 +2860,13 @@ impl EmbeddedRuntime {
                     approval_id,
                     binding_digest,
                     decision,
+                    reason,
                 } => RuntimeControlAction::DecideApproval {
                     target_run_id: *target_run_id,
                     approval_id: *approval_id,
                     binding_digest: binding_digest.clone(),
                     decision: *decision,
+                    reason: reason.clone(),
                 },
                 LocalRunState::McpInputDecided { resolution } => {
                     RuntimeControlAction::ResolveMcpInput {
@@ -3083,12 +3095,14 @@ impl EmbeddedRuntime {
                 approval_id,
                 binding_digest,
                 decision,
+                reason,
             } => {
                 let resolution = LocalApprovalResolution {
                     target_run_id,
                     approval_id: Some(approval_id),
                     binding_digest: Some(binding_digest),
                     decision,
+                    reason,
                 };
                 self.apply_resume(
                     command,
@@ -3198,6 +3212,11 @@ impl EmbeddedRuntime {
                         approval_id: expected_id,
                         binding_digest: expected_digest,
                         decision,
+                        // Deliberately not compared: the same refusal resent is
+                        // the same decision, and a person who retyped their
+                        // sentence differently did not make a second decision.
+                        // What is applied is what was recorded first.
+                        reason: _,
                     } if *target_run_id == resolution.target_run_id
                         && *expected_id == approval_id
                         && expected_digest == &binding_digest
@@ -3219,6 +3238,7 @@ impl EmbeddedRuntime {
                         approval_id,
                         binding_digest,
                         decision: resolution.decision,
+                        reason: resolution.reason.clone(),
                     },
                     RecordedOperation::Approval(resolution),
                 )

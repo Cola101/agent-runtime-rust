@@ -483,11 +483,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "approve" | "deny" | "cancel" | "resume" => {
             let run_id: Uuid = args
                 .next()
-                .ok_or("usage: runtime-host <approve|deny|cancel|resume> <run-id>")?
+                .ok_or("usage: runtime-host <approve|deny|cancel|resume> <run-id> [reason]")?
                 .parse()?;
+            // Only `deny` reads it, and only as the whole of the rest of the
+            // line: a refusal is a sentence, not a flag.
+            let reason = args.next().filter(|said| !said.trim().is_empty());
             let request = match command.as_str() {
                 "approve" => LocalRequest::Approve { run_id },
-                "deny" => LocalRequest::Deny { run_id },
+                "deny" => LocalRequest::Deny { run_id, reason },
                 "cancel" => LocalRequest::Cancel { run_id },
                 _ => LocalRequest::Resume { run_id },
             };
@@ -559,7 +562,10 @@ mod tests {
         let refusal = parse_budget_dimension(name, Some("many"), 8_192)
             .expect_err("must refuse")
             .to_string();
-        assert!(refusal.contains(name), "the refusal must name the variable: {refusal}");
+        assert!(
+            refusal.contains(name),
+            "the refusal must name the variable: {refusal}"
+        );
     }
 
     /// The production break this catches is exposing stdio only through the Rust

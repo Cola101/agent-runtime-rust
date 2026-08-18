@@ -319,6 +319,7 @@ async fn execute_case(
                     } else {
                         LocalApprovalDecision::Deny
                     },
+                    reason: None,
                 },
             };
             let applied = runtime

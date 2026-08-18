@@ -13,6 +13,11 @@ import type { RunView } from "../store";
 /// the shell dispatches come from the same place. A key hint written by hand
 /// beside a handler bound somewhere else is how a screen ends up promising
 /// keys that do nothing.
+/// The runtime's own bound on a refusal, mirrored so the box cannot be filled
+/// past what the contract will take: `TOOL_APPROVAL_DECISION_REASON_MAX_CHARS`
+/// in `runtime/crates/protocol/src/lib.rs`. Counted in characters there too.
+const REASON_MAX = 512;
+
 export const DECISIONS = [
   { key: "1", label: "执行", action: "approve" as const, lead: true, destructive: false },
   { key: "2", label: "不执行，让它换个做法", action: "deny" as const, lead: false, destructive: false },
@@ -27,18 +32,22 @@ export const DECISIONS = [
 export function Decisions({ run }: { run: RunView }) {
   const desk = useDesk();
   const [armed, setArmed] = useState<string | null>(null);
+  // What to tell the model when refusing. Only 不执行 reads it, which is why
+  // the field says so rather than sitting above the three choices unlabelled.
+  const [because, setBecause] = useState("");
 
   // Any other choice disarms: an armed destructive key must not survive the
   // person deciding to do something else.
   const choose = (decision: (typeof DECISIONS)[number]) => {
+    const said = decision.action === "deny" && because.trim() ? because.trim() : undefined;
     if (!decision.destructive) {
       setArmed(null);
-      void desk.decide(run.id, decision.action);
+      void desk.decide(run.id, decision.action, said);
       return;
     }
     if (armed === decision.key) {
       setArmed(null);
-      void desk.decide(run.id, decision.action);
+      void desk.decide(run.id, decision.action, said);
       return;
     }
     setArmed(decision.key);
@@ -71,6 +80,23 @@ export function Decisions({ run }: { run: RunView }) {
           </li>
         ))}
       </ol>
+      {/*
+        Refusing and saying nothing leaves the model with "denied" and no idea
+        what to do differently, so the obvious next move is the same call
+        again -- and the person answers the same question twice for a reason
+        they already had. Optional, because a refusal that needs no explanation
+        should not cost a sentence.
+      */}
+      <label className="why">
+        <span>不执行的话，告诉它为什么</span>
+        <input
+          type="text"
+          value={because}
+          maxLength={REASON_MAX}
+          placeholder="可不填。写了就作为这次工具调用的结果交给模型"
+          onChange={(event) => setBecause(event.target.value)}
+        />
+      </label>
       {refused && <div className="err">这个决定没有生效：{refused}</div>}
     </>
   );

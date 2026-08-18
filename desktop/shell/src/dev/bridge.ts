@@ -142,8 +142,13 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       ev("model.tool_call", {
         name: "shell.exec", arguments: { command: "make release" }, id: "c-9",
       }, RUN_UNJUDGED, 15),
-      ev("run.terminated", {
-        status: "indeterminate", reason: "duration_budget",
+      // The kernel's own event and fields. This said `run.terminated` with a
+      // `reason` of `duration_budget` -- an event type and a field name the
+      // runtime writes nowhere, so the fixture stood for a shape that does not
+      // exist and the surface it exercised was fiction.
+      // `runtime/crates/kernel/src/lib.rs:424` and `:443-448`.
+      ev("run.indeterminate", {
+        status: "indeterminate", effect: "non_idempotent", replay_safe: false,
       }, RUN_UNJUDGED, 15),
     ],
   },

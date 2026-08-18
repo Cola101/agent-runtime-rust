@@ -761,7 +761,14 @@ export type Store = {
   /// back, and the next Turn is given the shorter history.
   rollback(throughTurnOrdinal: number): Promise<string | null>;
   submit(input: string): Promise<string | null>;
-  decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
+  /// `reason` is what the person said when refusing, and it reaches the model
+  /// as the refused Tool's own result. Read only for `deny`: the other three
+  /// have nothing to tell a model that is about to be told something else.
+  decide(
+    runId: string,
+    action: "approve" | "deny" | "cancel" | "resume",
+    reason?: string,
+  ): Promise<string | null>;
   /// Why the last decision on this Run did not land, if it did not.
   ///
   /// A decision can be refused -- a binding the runtime has moved past, a
@@ -1193,12 +1200,16 @@ export function useRuntime(): Store {
 
   const [refusals, setRefusals] = useState<Record<string, string>>({});
   const decide = useCallback(
-    async (runId: string, action: "approve" | "deny" | "cancel" | "resume") => {
+    async (
+      runId: string,
+      action: "approve" | "deny" | "cancel" | "resume",
+      reason?: string,
+    ) => {
       const api = bridge();
       const said = await (async () => {
         const api2 = api;
         if (!api2) return "这个窗口没有连到宿主";
-        const reply = await api2.control({ action, runId });
+        const reply = await api2.control({ action, runId, reason });
         return reply.ok ? null : reply.error;
       })();
       // Cleared on the way in as well as set on the way out: a refusal left

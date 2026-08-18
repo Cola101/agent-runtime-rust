@@ -229,7 +229,10 @@ describe("what the reference says about a key right now", () => {
     expect(marked(row(group("对话"), key.hint))).toBe(false);
 
     await rail(user, "对话");
-    const box = await screen.findByRole("textbox");
+    // The composer specifically. The gate drawn in the transcript has a text
+    // box of its own now -- the one a refusal is explained in -- and "the only
+    // text box on this surface" stopped being true the moment it landed.
+    const box = await screen.findByPlaceholderText(/接着说|说一句话/);
     await user.click(box);
     await user.keyboard(key.key);
     expect(bridge.control).not.toHaveBeenCalled();

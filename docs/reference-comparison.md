@@ -2448,6 +2448,69 @@ flowchart LR
 outbound reconnect 和 capability discovery，建设 Rust Edge Node 最小闭环，同时保持当前 claims v4 为任务
 授权根。Codex 仍是执行内核、Tool/审批/恢复语义的主要成熟度基准。
 
+
+## 2026-08-19：拒绝一次工具调用，模型被告知了什么
+
+读的是源码，不是印象。
+
+### 一、Codex 的拒绝**带自由文本**，而且那段文本就是模型看到的工具结果
+
+| 位置 | 内容 |
+| --- | --- |
+| `codex-rs/protocol/src/protocol.rs:4131` | `Denied { rejection: String }` |
+| `codex-rs/protocol/src/protocol.rs:4141-4147` | `Default` 就是 `Denied { rejection: "denied" }` |
+| `codex-rs/core/src/tools/approvals.rs:181` | `ReviewDecision::Denied { rejection } => Err(ToolError::Rejected(rejection))` |
+| `codex-rs/core/src/tools/events.rs:430-455` | 归一化、截断，然后 `FunctionCallError::RespondToModel(normalized)` |
+| `codex-rs/core/src/tools/events.rs:548-559` | 被拒的 exec 变成 `exit_code: -1`、`status: Declined`、stderr 就是那句话 |
+
+**理由**：拒绝是下一轮的输入，不只是一次状态变化。只说"不行"不给理由，模型要么原样重试要么卡住。
+
+**我们同意**，并且已经做了：`decision_reason` 走到 `tool.result`。
+
+### 二、但 Codex **不给人一个输入框** —— 这条我们不同意
+
+| 位置 | 内容 |
+| --- | --- |
+| `codex-rs/app-server-protocol/src/protocol/v2/item.rs:75-76` | `Decline` 是**裸变体**，客户端传不了任何文字 |
+| `codex-rs/app-server/src/bespoke_event_handling.rs:2008-2010` | app-server 替换成固定常量 `ReviewDecision::denied("rejected by user")` |
+
+也就是说：`rejection` 那个自由文本字段是给 **hook / guardian / execpolicy** 用的**机器通道**，
+不是给弹窗前那个人用的。他们的理由是：人正被打断，框很小，而且**打进去的话事后在转录里看不见**。
+人要说"为什么"，走的是下一条普通消息。
+
+**我们不同意，理由是两条里有一条对我们不成立：**
+
+1. 「事后看不见」对我们不成立。我们的理由进的是**耐久事件日志的 `tool.result`**，
+   转录会画出来，⌘F 找得到，回放也带着。它不是一个转瞬即逝的模态框输入。
+2. 「人要说为什么就走下一条消息」对我们不成立。**Run 是停在审批上的**——
+   在它恢复之前没有"下一条消息"这个通道，steering 也只在两次工具调用之间生效。
+   等 Run 恢复，模型已经拿着一句光秃秃的"被拒绝了"行动过了。
+
+所以我们保留输入框，**可不填**。不填时的行为和以前完全一样。
+
+### 三、最该抄的是这一条：拒绝要说"不许绕过"
+
+| 位置 | 内容 |
+| --- | --- |
+| `codex-rs/core/src/guardian/review.rs:51-57` | `GUARDIAN_REJECTION_INSTRUCTIONS` |
+| `codex-rs/core/src/guardian/review.rs:620-622` | 每一次风险拒绝都把它附在后面 |
+
+原话大意：不许用变通、间接执行或绕过策略去达到同样的结果；只有换成明显更安全的做法、
+或者把风险讲清楚之后对方明确同意，才继续；否则停下来问。
+
+**这不是措辞问题，是安全属性。** 只说"被拒绝了"读起来像一次暂时的失败，
+而从那里出发最省事的下一步就是换一扇门做同一件事——用 shell 重定向代替写文件、
+用子 shell 代替直接 exec。**一个模型能绕过去的门不是门。**
+
+已抄：`REFUSAL_CONSTRAINT`，加在 `approval_denied`（两个分支）和 `tool_policy_denied` 上。
+
+### 因此改动的差距清单行
+
+- 第 6 行（Diff 逐块接受/拒绝）：补记拒绝可以带一句话。
+- 第 28 行（每工具审批策略）：不变——`available_decisions` 那条（Codex 让**服务端**告诉客户端
+  这次哪几种决定可用，`codex-rs/protocol/src/approvals.rs`）我们同意但**没有做**，记在这里。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`

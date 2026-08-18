@@ -184,7 +184,10 @@ async fn a_run_that_exhausts_its_budget_ends_rather_than_erroring() {
     // point of the failure when this regresses.
     let outcome = outcome.expect("a Run that ran out of budget ended; it did not fail to execute");
     assert!(
-        outcome.event_types.iter().any(|event| event == "run.failed"),
+        outcome
+            .event_types
+            .iter()
+            .any(|event| event == "run.failed"),
         "the Run must carry its own terminal: {:?}",
         outcome.event_types,
     );
@@ -433,6 +436,7 @@ async fn exact_approval_command_is_durable_idempotent_and_executes_the_tool_once
             approval_id: approval.approval_id,
             binding_digest: approval.binding_digest,
             decision: LocalApprovalDecision::AllowOnce,
+            reason: None,
         },
     };
     let applied = runtime.control(command.clone()).await.expect("approve");
@@ -523,6 +527,7 @@ async fn accepted_approval_storage_failure_keeps_recoverable_state_without_fake_
             approval_id: approval.approval_id,
             binding_digest: approval.binding_digest,
             decision: LocalApprovalDecision::AllowOnce,
+            reason: None,
         },
     };
     let accepted = runtime
@@ -706,6 +711,7 @@ async fn control_rejects_stale_epoch_wrong_binding_and_command_id_reuse_before_m
             approval_id: approval.approval_id,
             binding_digest: approval.binding_digest.clone(),
             decision: LocalApprovalDecision::AllowOnce,
+            reason: None,
         },
     };
 
@@ -727,6 +733,7 @@ async fn control_rejects_stale_epoch_wrong_binding_and_command_id_reuse_before_m
         approval_id: approval.approval_id,
         binding_digest: "0".repeat(64),
         decision: LocalApprovalDecision::AllowOnce,
+        reason: None,
     };
     assert!(runtime.control(wrong_binding).await.is_err());
     assert!(matches!(
@@ -806,6 +813,7 @@ async fn concurrent_approval_commands_have_one_owner_and_one_durable_receipt() {
             approval_id: approval.approval_id,
             binding_digest: approval.binding_digest.clone(),
             decision: LocalApprovalDecision::AllowOnce,
+            reason: None,
         },
     };
     let first_command = command(Uuid::now_v7());

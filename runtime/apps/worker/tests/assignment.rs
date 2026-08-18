@@ -5327,6 +5327,7 @@ fn signed_allow_once_decision_resumes_the_exact_attempt_and_is_idempotent() {
         approval_version: 2,
         binding_digest: approval.execution.binding_digest.clone(),
         decision: ToolApprovalDecision::AllowOnce,
+        decision_reason: None,
         issued_at,
         expires_at: issued_at + Duration::minutes(5),
     };
@@ -5362,6 +5363,7 @@ fn denial_resumes_with_a_bound_error_result_and_never_exposes_execution() {
                 approval_version: 2,
                 binding_digest: approval.execution.binding_digest,
                 decision: ToolApprovalDecision::Deny,
+                decision_reason: None,
                 issued_at,
                 expires_at: issued_at + Duration::minutes(5),
             },

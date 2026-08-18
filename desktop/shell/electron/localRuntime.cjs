@@ -504,10 +504,21 @@ class LocalRuntime {
     return reply;
   }
 
-  async control({ action, runId }) {
+  async control({ action, runId, reason }) {
     const allowed = new Set(["approve", "deny", "cancel", "resume"]);
     if (!allowed.has(action)) throw new Error(`unsupported control action: ${action}`);
-    const reply = await this.#request({ type: action, run_id: runId });
+    // Only a refusal carries one, and the daemon refuses a decision that says
+    // otherwise. Dropped here rather than passed on, so a caller that attaches
+    // a sentence to an approval gets the approval it asked for instead of an
+    // error about a field it did not mean to set.
+    const said = action === "deny" && typeof reason === "string" && reason.trim()
+      ? reason.trim()
+      : undefined;
+    const reply = await this.#request({
+      type: action,
+      run_id: runId,
+      ...(said ? { reason: said } : {}),
+    });
     return reply;
   }
 

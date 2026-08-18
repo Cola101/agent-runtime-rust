@@ -156,6 +156,45 @@ describe("approvals", () => {
     expect(decide).not.toHaveBeenCalled();
   });
 
+  /// Refusing can now carry a sentence, and that sentence is typed into a text
+  /// box sitting directly under the three digits.
+  ///
+  /// So the box has to swallow them: a person explaining why they will not run
+  /// `rm -rf` must be able to type the digit 1 without approving it.
+  it("does not decide on a digit typed into the refusal box", async () => {
+    const { user, bridge } = await open("待决定");
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    const why = screen.getAllByPlaceholderText(/可不填/)[0] as HTMLInputElement;
+    await user.click(why);
+    await user.keyboard("1 号文件不能动");
+    expect(bridge.control).not.toHaveBeenCalled();
+    expect(why.value).toBe("1 号文件不能动");
+  });
+
+  /// And what was typed reaches the runtime with the refusal, not beside it.
+  it("sends the reason with the refusal, and nothing with an approval", async () => {
+    const { user, bridge } = await open("待决定");
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    await user.click(screen.getAllByText(/shell\.exec/)[0]);
+    const why = screen.getAllByPlaceholderText(/可不填/)[0] as HTMLInputElement;
+    await user.click(why);
+    await user.keyboard("这个目录不要动");
+    await user.click(screen.getAllByRole("button", { name: /不执行/ })[0]);
+    await waitFor(() => expect(bridge.control).toHaveBeenCalledWith({
+      action: "deny", runId: RUN_WAITING, reason: "这个目录不要动",
+    }));
+  });
+
+  it("carries no reason when the box was left empty", async () => {
+    const { user, bridge } = await open("待决定");
+    await waitFor(() => expect(screen.getAllByText(/等你决定/).length).toBeGreaterThan(0));
+    await user.click(screen.getAllByText(/shell\.exec/)[0]);
+    await user.click(screen.getAllByRole("button", { name: /不执行/ })[0]);
+    await waitFor(() => expect(bridge.control).toHaveBeenCalledWith({
+      action: "deny", runId: RUN_WAITING, reason: undefined,
+    }));
+  });
+
   /// A decision the runtime refuses must say so.
   ///
   /// `decide` has always returned the reason and both surfaces that offer a

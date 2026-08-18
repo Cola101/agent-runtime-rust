@@ -57,6 +57,10 @@ pub enum LocalRequest {
     },
     Deny {
         run_id: Uuid,
+        /// What to tell the model. Optional, and absent is the old behaviour:
+        /// the model is told it was refused and nothing more.
+        #[serde(default)]
+        reason: Option<String>,
     },
     ResolveMcpInput {
         run_id: Uuid,
@@ -1005,11 +1009,15 @@ impl LocalRuntimeDaemon {
                     write_response(&mut writer, &response).await?;
                 }
                 LocalRequest::Approve { run_id } => {
-                    let response = self.decide(run_id, LocalApprovalDecision::AllowOnce).await;
+                    let response = self
+                        .decide(run_id, LocalApprovalDecision::AllowOnce, None)
+                        .await;
                     write_response(&mut writer, &response).await?;
                 }
-                LocalRequest::Deny { run_id } => {
-                    let response = self.decide(run_id, LocalApprovalDecision::Deny).await;
+                LocalRequest::Deny { run_id, reason } => {
+                    let response = self
+                        .decide(run_id, LocalApprovalDecision::Deny, reason)
+                        .await;
                     write_response(&mut writer, &response).await?;
                 }
                 LocalRequest::ResolveMcpInput {
@@ -1162,6 +1170,7 @@ impl LocalRuntimeDaemon {
         self: &Arc<Self>,
         run_id: Uuid,
         decision: LocalApprovalDecision,
+        reason: Option<String>,
     ) -> LocalResponse {
         let kind = match decision {
             LocalApprovalDecision::AllowOnce => "approve",
@@ -1195,6 +1204,10 @@ impl LocalRuntimeDaemon {
                 approval_id,
                 binding_digest,
                 decision: recorded,
+                // A retry of one refusal is one refusal. What reaches the model
+                // is what was recorded the first time, so a second sentence is
+                // not a second decision and is not a conflict either.
+                reason: _,
             } if *recorded == decision => (*target_run_id, *approval_id, binding_digest.clone()),
             LocalRunState::ApprovalDecided { .. } => {
                 return LocalResponse::Error {
@@ -1263,6 +1276,7 @@ impl LocalRuntimeDaemon {
                 approval_id,
                 binding_digest,
                 decision,
+                reason,
             },
         })
         .await
