@@ -270,7 +270,54 @@ export function eventNote(type: string, payload: Record<string, unknown> = {}): 
   return EVENT_NOTE[type] ?? null;
 }
 
+/// What a Provider failure means for the person reading it.
+///
+/// Eight kinds, and what to do about them is different for each: a key that is
+/// wrong is a trip to the settings page, a rate limit is a wait, a context
+/// overflow is a shorter sentence. "Provider 失败" is none of those and was all
+/// the transcript said. A kind this build has never seen is printed as it
+/// arrived, for the same reason an unknown `run.failed` kind is.
+function providerFailure(payload: Record<string, unknown>): string | null {
+  const kind = typeof payload.kind === "string" ? payload.kind : null;
+  if (!kind) return null;
+  const named: Record<string, string> = {
+    authentication: "密钥不对，或者没有权限",
+    billing: "账上不让再调了",
+    rate_limited: "调得太快，被限流了",
+    timeout: "等太久没回应",
+    protocol: "回复的格式不对",
+    context_overflow: "这轮的上文超过它能接受的长度",
+    capability_mismatch: "这个 Provider 给不了这次要用的能力",
+    unavailable: "连不上，或者对面不可用",
+  };
+  const said = named[kind] ?? `这个版本不认识的原因：${kind}`;
+  const provider = typeof payload.provider_id === "string" ? payload.provider_id : "";
+  return provider ? `${provider}：${said}` : said;
+}
+
+/// A wait a person can see is a wait they can decide to sit through.
+function providerRetry(payload: Record<string, unknown>): string | null {
+  const delay = typeof payload.delay_ms === "number" ? payload.delay_ms : null;
+  const attempt = typeof payload.provider_attempt === "number" ? payload.provider_attempt : null;
+  if (delay === null && attempt === null) return null;
+  const parts: string[] = [];
+  if (delay !== null) {
+    parts.push(delay >= 1000 ? `${(delay / 1000).toFixed(1)} 秒后再试` : `${delay} 毫秒后再试`);
+  }
+  if (attempt !== null) parts.push(`第 ${attempt} 次`);
+  const because = providerFailure(payload);
+  return because ? `${parts.join("・")}（${because}）` : parts.join("・");
+}
+
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
+  if (type === "model.provider.failed") {
+    const why = providerFailure(payload);
+    return why ? [why] : null;
+  }
+  if (type === "model.provider.retry_scheduled") {
+    const waiting = providerRetry(payload);
+    return waiting ? [waiting] : null;
+  }
   if (type === "run.failed") {
     const reason = failureReason(payload);
     return reason ? [reason] : null;

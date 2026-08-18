@@ -365,6 +365,46 @@ describe("what the runtime said in words", () => {
     await waitFor(() => expect(screen.getByText(/image/)).toBeTruthy());
   });
 
+  /// Eight failure kinds, and what a person should do about them is different
+  /// for each: authentication means go and fix the key, rate limiting means
+  /// wait, context overflow means say it shorter. "Provider 失败" means none of
+  /// those, and it was all the transcript said.
+  it("says why a provider failed and which one", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.failed", {
+      provider_id: "local-stub", kind: "authentication", retryable: false, status: "running",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/密钥不对/)).toBeTruthy());
+    expect(screen.getByText(/local-stub/)).toBeTruthy();
+  });
+
+  it("says how long a retry waits and which attempt it is", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.retry_scheduled", {
+      provider_id: "local-stub", provider_attempt: 2, delay_ms: 1500,
+      kind: "rate_limited", status: "running",
+    }, 30));
+    // A wait a person can see is a wait they can decide to sit through.
+    await waitFor(() => expect(screen.getByText(/1\.5 秒后/)).toBeTruthy());
+    expect(screen.getByText(/第 2 次/)).toBeTruthy();
+  });
+
+  /// A kind this build has never seen is printed as it arrived, for the same
+  /// reason an unknown `run.failed` kind is.
+  it("prints a provider failure kind it does not recognise", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.failed", {
+      provider_id: "p1", kind: "moon_phase", retryable: true, status: "running",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/moon_phase/)).toBeTruthy());
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);
