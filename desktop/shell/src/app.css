@@ -372,6 +372,19 @@ p.note {
   border-left: 2px solid var(--rule); padding-left: 11px; max-width: 74ch;
 }
 
+/* A control whose cost is stated beside it rather than in a dialog after it.
+   The sentence sits on the same line so the two are read together. */
+.restart { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+.restart button {
+  font: inherit; font-size: 12px; padding: 3px 13px;
+  border: 1px solid var(--rule); border-radius: 4px; background: none;
+  color: var(--ink-2); cursor: pointer;
+}
+.restart button:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+.restart button:disabled { color: var(--ink-3); cursor: default; }
+.restart .note-inline { color: var(--ink-3); font-size: 11.5px; max-width: 62ch; }
+.restart .err { color: var(--accent); font-size: 11.5px; max-width: 62ch; }
+
 /* ---------- drawer ---------- */
 .drawer { border-left: 1px solid var(--rule); background: var(--sunk, var(--paper)); padding: 14px 15px; overflow-y: auto; }
 

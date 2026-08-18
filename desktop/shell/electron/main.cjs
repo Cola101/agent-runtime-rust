@@ -355,6 +355,33 @@ ipcMain.handle("runtime:launch", guarded(async () => {
   return { started: runtime.running, owned: runtime.owned };
 }));
 
+/// Restarts the runtime this app started, so a provider change takes effect.
+///
+/// The routing file, the MCP config and the delegated scopes are read by
+/// `runtime-host` once, at startup. Changing a provider therefore needed the
+/// whole app quit and reopened -- which is the app asking a person to work
+/// around the fact that it already knows how to stop and start a runtime.
+///
+/// Refused rather than faked for a runtime this app did not start. `stop()`
+/// only ends its own child, so a restart here would drain someone else's
+/// runtime and then start a second host over the same state root.
+///
+/// It drains first: the report says what was still in flight, and the runtime
+/// comes back recovering from its own durable state rather than from nothing.
+ipcMain.handle("runtime:restart", guarded(async () => {
+  if (!runtime.owned) {
+    return { restarted: false, reason: "not this app's runtime", report: null };
+  }
+  const stopped = await runtime.stop({ drain: () => local.shutdown() });
+  await openRuntime();
+  return {
+    restarted: runtime.running,
+    reason: null,
+    report: stopped.report ?? null,
+    escalated: stopped.escalated === true,
+  };
+}));
+
 ipcMain.handle("providers:list", guarded(() => credentials.list()));
 ipcMain.handle("providers:save", guarded((request) => credentials.save(request)));
 ipcMain.handle("providers:forget", guarded((id) => credentials.forget(id)));

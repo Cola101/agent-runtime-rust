@@ -225,6 +225,17 @@ export type Bridge = {
   lifecycle(): Promise<Reply<RuntimeLifecycle>>;
   startRuntime(): Promise<Reply<boolean>>;
   shutdown(): Promise<Reply<Record<string, unknown>>>;
+  /// Ends this app's runtime and starts it again, so configuration the host
+  /// reads only at startup takes effect. `restarted` is false with a `reason`
+  /// for a runtime this app did not start -- it cannot stop what it did not
+  /// spawn, and starting a second host over one state root is worse than
+  /// saying so.
+  restart(): Promise<Reply<{
+    restarted: boolean;
+    reason: string | null;
+    report: Record<string, unknown> | null;
+    escalated?: boolean;
+  }>>;
   events(request: { runId: string; afterSequence?: number; limit?: number }): Promise<
     Reply<{ ok: true; page: CursorPage } | { ok: false; error: CursorError }>
   >;

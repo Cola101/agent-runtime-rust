@@ -183,12 +183,67 @@ function Models() {
         </button>
       </div>
       {error && <div className="err">{error}</div>}
+      <Restart />
       <p className="note">
         密钥存在登录钥匙串里，配置文件只留一个环境变量名 —— 这正是 runtime-host 路由配置要的形状。
-        保存后会立刻尝试启动 Runtime。已经在跑的 Runtime 不会重启：它是在启动时读这份配置的，
-        换 Provider 要退出应用再打开。
+        保存后会立刻尝试启动 Runtime。已经在跑的 Runtime <b>是在启动时读这份配置的</b>，
+        所以换了 Provider 要重启它才算数 —— 重启的是 Runtime，不是这个应用。
       </p>
     </>
+  );
+}
+
+/// Restarts the runtime so a provider change takes effect.
+///
+/// Separate from 保存 rather than folded into it. A restart drains whatever is
+/// in flight, and doing that silently because someone edited a field is a
+/// decision the person did not make. What it costs is said before it is asked
+/// for, and what it found is said afterwards.
+function Restart() {
+  const desk = useDesk();
+  const [busy, setBusy] = useState(false);
+  const [said, setSaid] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    setSaid(null);
+    setRefused(false);
+    const reply = await window.desk!.runtime!.restart();
+    setBusy(false);
+    if (!reply.ok) {
+      setRefused(true);
+      setSaid(reply.error);
+      return;
+    }
+    // `ok` is about the request reaching the host. Whether it restarted is a
+    // separate field, and reading only the first would report a restart that
+    // did not happen -- after which the next Run is still answered by the old
+    // provider, with nothing on screen to say so.
+    if (!reply.value.restarted) {
+      setRefused(true);
+      setSaid("这个 Runtime 不是这个应用启动的，只能停掉它自己启动的那个。要换配置就退出应用再打开。");
+      return;
+    }
+    const report = reply.value.report ?? {};
+    const active = Number(report.active_runs ?? 0);
+    const queued = Number(report.queued_runs ?? 0);
+    const cut = active > 0 || queued > 0
+      ? `停的时候还有 ${active} 个在跑、${queued} 个排队，它们是被这次重启打断的。`
+      : "停的时候没有 Run 在跑。";
+    setSaid(
+      `${cut}${reply.value.escalated ? "它没有按时退出，是被强制结束的：下次启动要从 Checkpoint 恢复。" : ""}`,
+    );
+    desk.refresh();
+  };
+
+  return (
+    <div className="restart">
+      <button type="button" onClick={() => void run()} disabled={busy}>
+        {busy ? "重启中" : "重启 Runtime"}
+      </button>
+      {said && <span className={refused ? "err" : "note-inline"}>{said}</span>}
+    </div>
   );
 }
 

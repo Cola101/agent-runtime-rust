@@ -440,6 +440,18 @@ export function installFakeRuntime(
   } = {},
 ) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
+  /// Answers as a runtime this app started and could restart. A test that wants
+  /// the other case says so with `mockResolvedValueOnce` -- that reply is the
+  /// one the client has to read rather than assume.
+  const restart = vi.fn(async (): Promise<Reply<{
+    restarted: boolean;
+    reason: string | null;
+    report: Record<string, unknown> | null;
+    escalated?: boolean;
+  }>> => ({
+    ok: true,
+    value: { restarted: true, reason: null, report: null, escalated: false },
+  }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
   // Built per install, so a test can hand the MCP round a request set of its
   // own -- including one this build does not understand.
@@ -708,6 +720,7 @@ export function installFakeRuntime(
     }),
     startRuntime: async () => ({ ok: true as const, value: true }),
     shutdown: async () => ({ ok: true as const, value: {} }),
+    restart,
     events: async (
       { runId, afterSequence = 0, limit = 256 }:
       { runId: string; afterSequence?: number; limit?: number },
@@ -868,7 +881,7 @@ export function installFakeRuntime(
     for (const listener of listeners) listener({ runId, event });
   };
   return {
-    control, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
+    control, restart, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
     resolveMcpInput, saveProvider, forgetProvider, saveMcpServer, forgetMcpServer,
     watch, unwatch, emit, event, launch, steer,
     desk, elsewhere, waiting, attend: (runId: string) => attendee?.(runId),
