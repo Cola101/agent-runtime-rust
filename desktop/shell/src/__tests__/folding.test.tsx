@@ -325,6 +325,46 @@ describe("what the runtime said in words", () => {
     expect(screen.getByText(/26 B/)).toBeTruthy();
   });
 
+  /// An MCP tool answers in the shape the MCP protocol specifies: a `content`
+  /// array of parts. That is a third shape, and unlike a tool nobody has heard
+  /// of it is written down -- so reading it is not guessing. MCP servers are
+  /// configurable from this app, so a person can install one and then watch it
+  /// answer with nothing on screen.
+  it("shows what an MCP tool answered, from the array the protocol specifies", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "mcp:docs/search", arguments: { query: "retention" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: false,
+      content: [
+        { type: "text", text: "第一条结果" },
+        { type: "text", text: "第二条结果" },
+      ],
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/第一条结果/)).toBeTruthy());
+    expect(screen.getByText(/第二条结果/)).toBeTruthy();
+  });
+
+  /// A part this build cannot render is named rather than dropped. An MCP
+  /// server may answer with an image or a resource link, and a transcript that
+  /// showed only the text parts would be quietly hiding half an answer.
+  it("names an MCP part it cannot draw instead of dropping it", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "mcp:docs/shot", arguments: {}, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: false,
+      content: [{ type: "image", data: "…", mimeType: "image/png" }],
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/image/)).toBeTruthy());
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

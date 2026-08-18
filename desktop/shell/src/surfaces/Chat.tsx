@@ -56,10 +56,30 @@ function callSpans(event: RunEvent): [string, string] {
 /// A non-zero exit is not an error event -- the call ran and the command said
 /// no -- so it is drawn as the command's own answer rather than as a failure
 /// of the runtime.
+/// One MCP `content` array, as text.
+///
+/// The MCP protocol says a tool answers with a list of parts, each with a
+/// `type`. Text parts are the answer; a part this build cannot draw is named
+/// rather than dropped, because a transcript showing only the text of a reply
+/// that also carried an image is quietly hiding half of it.
+function mcpParts(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      const shape = (part ?? {}) as Record<string, unknown>;
+      if (typeof shape.text === "string") return shape.text;
+      const kind = typeof shape.type === "string" ? shape.type : "未知";
+      return `（这个版本画不了的 ${kind} 部分）`;
+    })
+    .join("\n");
+}
+
 function said(result: RunEvent | undefined): {
   exit: number | null; out: string; err: string; cut: boolean; bytes: number | null;
 } | null {
   if (!result) return null;
+  const parts = mcpParts(result.payload.content);
+  if (parts) return { exit: null, out: parts, err: "", cut: false, bytes: null };
   const content = (result.payload.content ?? {}) as Record<string, unknown>;
   const out = typeof content.stdout === "string"
     ? content.stdout
