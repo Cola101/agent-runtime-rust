@@ -59,6 +59,19 @@ let runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
 /// build cannot ask a person to set an environment variable before it will
 /// start. The override exists for development, where the workspace is a
 /// checkout rather than a folder this app made.
+/// What the runtime this app starts may be asked to do.
+///
+/// Each of these still stops on a person: the runtime asks before every call
+/// whose effect it cannot take back, and this window renders that question.
+/// Withholding the scopes does not make the app safer -- it makes the agent
+/// unable to do the work while the approval machinery it would have gone
+/// through sits unused.
+const DELEGATED_SCOPES = [
+  "tool:workspace.read",
+  "tool:workspace.write",
+  "tool:shell.exec",
+];
+
 const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
   ?? process.env.AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT
   ?? null;
@@ -299,6 +312,20 @@ async function openRuntime() {
         // itself for that role. Pointing at the binary this app just spawned
         // means the two can never be different builds.
         AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN: runtimeBinary,
+        // What the agent may be *asked* to do. Without this the host falls back
+        // to `tool:workspace.read` alone, and an app that had passed its own
+        // acceptance shipped an agent that could read a folder and nothing
+        // else: no shell, no writes. The tools were compiled, sandboxed and
+        // approval-gated, and never offered to the model at all.
+        //
+        // Granting a scope is not granting a use. `AGENT_RUNTIME_LOCAL_TOOL_CONSENT`
+        // below keeps every call stopping on a person, which is the boundary
+        // that matters and the one this window is built to show.
+        AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES: DELEGATED_SCOPES.join(","),
+        // Explicit rather than inherited from the host's default. A security
+        // boundary that holds because nobody set a variable is a boundary that
+        // moves the first time someone does.
+        AGENT_RUNTIME_LOCAL_TOOL_CONSENT: "ask",
       },
     });
     console.log(`runtime-desk: started runtime-host (pid ${pid})`);

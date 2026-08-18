@@ -140,6 +140,25 @@ describe("what the packaged app expects to find beside it", () => {
     expect(script).toContain("contracts/proto/runtime.proto");
   });
 
+  /// The app once started a runtime with only `tool:workspace.read` delegated,
+  /// because the host falls back to that when the variable is unset and the
+  /// launcher never set it. Everything else -- shell, writes, the approval
+  /// machinery this window is built around -- was compiled, sandboxed, and
+  /// never offered to the model. The acceptance run passed anyway: a turn ran,
+  /// and the agent could not do anything.
+  it("delegates the scopes an agent needs, with consent left explicit", () => {
+    const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
+    expect(main).toContain("AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES");
+    for (const scope of ["tool:workspace.read", "tool:workspace.write", "tool:shell.exec"]) {
+      expect(main, `${scope} must be delegated or the agent cannot be asked to use it`)
+        .toContain(scope);
+    }
+    // Granting a scope is not granting a use. Consent is set here rather than
+    // inherited: a boundary that holds because nobody set a variable is one
+    // that moves the first time someone does.
+    expect(main).toMatch(/AGENT_RUNTIME_LOCAL_TOOL_CONSENT:\s*"ask"/);
+  });
+
   it("ships only what the host process needs, not the whole tree", () => {
     const script = readFileSync(
       path.join(root, "..", "scripts", "package-app.sh"), "utf8",
