@@ -422,6 +422,11 @@ ipcMain.handle("runtime:launch", guarded(async () => {
 /// only ends its own child, so a restart here would drain someone else's
 /// runtime and then start a second host over the same state root.
 ///
+/// The reopen is `mustOwn`: this app has just stopped its own runtime and
+/// waited for the exit, so it must start another rather than attach to
+/// whatever answers. Attaching would hand ownership away and quitting would
+/// then leave the runtime running -- the one thing the quit path is for.
+///
 /// It drains first: the report says what was still in flight, and the runtime
 /// comes back recovering from its own durable state rather than from nothing.
 ipcMain.handle("runtime:restart", guarded(async () => {
@@ -429,7 +434,7 @@ ipcMain.handle("runtime:restart", guarded(async () => {
     return { restarted: false, reason: "not this app's runtime", report: null };
   }
   const stopped = await runtime.stop({ drain: () => local.shutdown() });
-  await openRuntime();
+  await openRuntime({ mustOwn: true });
   return {
     restarted: runtime.running,
     reason: null,
@@ -489,12 +494,27 @@ function openWorkspace({ mayDefault }) {
   return folder;
 }
 
-async function openRuntime() {
+/// `mustOwn` is for the restart, and it exists to remove a state rather than to
+/// report one. Attaching hands ownership away, and the quit path stops only what
+/// this app owns -- so an app that attached to whatever answered on the state
+/// root it had just cleared would leave the next runtime running when a person
+/// closed the window. After a restart there is nothing this app should attach
+/// to: it stopped its own runtime a moment ago and waited for the exit, so
+/// anything answering is a stranger over the same state root, which is worth
+/// saying rather than joining.
+async function openRuntime({ mustOwn = false } = {}) {
   if (!stateRoot) {
     console.log("runtime-desk: no RUNTIME_DESK_STATE_ROOT set — no local runtime");
     return;
   }
   const first = await local.probe();
+  if (first.connected && mustOwn) {
+    console.log(
+      `runtime-desk: something is already answering at ${first.socketPath} after a restart` +
+        " — not attaching, because this app could not then stop it on quit",
+    );
+    return;
+  }
   if (first.connected) {
     runtime.attach();
     const known = openWorkspace({ mayDefault: false });

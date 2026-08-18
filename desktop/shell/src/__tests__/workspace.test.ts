@@ -157,6 +157,30 @@ describe("what the packaged app expects to find beside it", () => {
   /// Checked by running a turn and reading the tool list the provider received:
   /// roles-only produced `shell.exec, workspace.read_text, workspace.write_text`
   /// and nothing else. This file owns the first half; the scope is the second.
+  /// A restart must not attach. Attaching hands ownership away, and the quit
+  /// path stops only what this app owns -- so an app that attached to whatever
+  /// answered on the state root it had just cleared would leave the next
+  /// runtime running when someone closed the window, which is the single thing
+  /// that path exists to prevent.
+  ///
+  /// Read from the source, because `main.cjs` requires Electron at import time
+  /// and this decision lives inside a handler rather than in a module a test
+  /// can call. That is a weaker check than the ones in `child-env.test.ts`, and
+  /// it is here because a weaker check on this is better than the nothing that
+  /// covered it before.
+  it("reopens after a restart without attaching to whatever answers", () => {
+    const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
+    const at = main.indexOf("runtime:restart");
+    expect(at).toBeGreaterThan(-1);
+    const handler = main.slice(at, at + 900);
+    expect(handler, "the reopen after a restart must refuse to attach")
+      .toContain("openRuntime({ mustOwn: true })");
+    // And the flag has to actually stop the attach, not merely be accepted.
+    const guard = main.indexOf("if (first.connected && mustOwn)");
+    expect(guard).toBeGreaterThan(-1);
+    expect(main.slice(guard, guard + 400)).toContain("return");
+  });
+
   it("writes the roles file that is one half of the delegation gate", () => {
     const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
     // Roles narrower than the parent. A reviewer that can write the workspace
