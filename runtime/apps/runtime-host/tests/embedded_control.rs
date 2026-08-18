@@ -110,6 +110,86 @@ async fn write_response(socket: &mut tokio::net::TcpStream, body: &str) {
     socket.write_all(response.as_bytes()).await.expect("reply");
 }
 
+/// Answers once with a stream whose usage line exhausts a one-token budget.
+///
+/// The order is the one a real provider uses and the one that matters: content,
+/// then usage, then the finish reason. The usage is what ends the attempt, so
+/// everything after it in the same batch is applied to an attempt that is
+/// already over.
+async fn spawn_budget_burning_provider() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("address")
+    );
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut request).await;
+            // A tool call in the same batch as the usage that ends the
+            // attempt. Without it the batch has nothing left to do once the
+            // terminal lands, and the reproduction on a real host had one:
+            // its prompt reached the stub's read branch.
+            write_response(
+                &mut socket,
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"spending\"}}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_budget_1\",\"type\":\"function\",\"function\":{\"name\":\"workspace.read_text\",\"arguments\":\"{\\\"path\\\":\\\"README.txt\\\"}\"}}]}}]}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":100}}\n\n\
+                 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                 data: [DONE]\n\n",
+            )
+            .await;
+        }
+    });
+    endpoint
+}
+
+/// A Run that runs out of budget ends, rather than becoming a host error.
+///
+/// Measured on a real host first: the Run writes `run.failed` correctly as the
+/// last event in its log, and the execution *also* returns
+/// `execution attempt is already terminal`. At the top level that error is
+/// dropped and nothing is lost. Under a delegation the same error leaves
+/// `execute_subagent` and destroys the parent, which ends with neither a
+/// result nor a terminal of its own -- see
+/// `docs/evidence/2026-08-19-delegation-end-to-end.md`.
+///
+/// This asserts the top-level half, because that is where the behaviour lives:
+/// a Run that reached its own terminal has not failed to execute.
+#[tokio::test]
+async fn a_run_that_exhausts_its_budget_ends_rather_than_erroring() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let identity = invocation();
+    let endpoint = spawn_budget_burning_provider().await;
+    std::fs::write(workspace.path().join("README.txt"), "budget evidence\n").unwrap();
+    let mut profile_config = config(
+        state.path().to_path_buf(),
+        workspace.path().canonicalize().unwrap(),
+        endpoint,
+        Some(trusted_tool_binary().expect("agent-trusted-workspace-tool must be built")),
+    );
+    profile_config.consent = LocalToolConsent::AllowOnce;
+    profile_config.budget.max_tokens = 1;
+    let runtime = runtime(RuntimeProfile {
+        invocation: identity,
+        config: profile_config,
+    });
+    let run_id = Uuid::now_v7();
+
+    let outcome = runtime.execute(identity, run_id, "Spend the budget.").await;
+
+    // The terminal is written either way; the guard is that nothing was raised
+    // after it. `expect` rather than a match, because the message is the whole
+    // point of the failure when this regresses.
+    let outcome = outcome.expect("a Run that ran out of budget ended; it did not fail to execute");
+    assert!(
+        outcome.event_types.iter().any(|event| event == "run.failed"),
+        "the Run must carry its own terminal: {:?}",
+        outcome.event_types,
+    );
+}
+
 async fn spawn_approval_provider() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!(

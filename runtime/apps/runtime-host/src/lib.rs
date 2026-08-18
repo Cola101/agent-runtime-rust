@@ -8470,6 +8470,26 @@ impl LocalRuntimeHost {
             };
 
             for event in events {
+                // One batch can carry the event that ends the attempt and more
+                // events after it: a usage line that exhausts the token budget
+                // arrives in the middle of the same stream as the tool call
+                // ahead of it and the finish reason behind it. Applying those
+                // is refused -- `execution attempt is already terminal` -- and
+                // that refusal used to become the Run's error even though the
+                // Run had ended correctly a moment earlier. At the top level
+                // the error was dropped; under a delegation it left the parent
+                // with neither a result nor a terminal of its own.
+                //
+                // Nothing is lost by stopping here. The terminal is emitted,
+                // and an attempt that has reached one cannot be changed by
+                // what the provider said next in the same breath.
+                if self
+                    .processor
+                    .attempt_is_terminal(attempt_id)
+                    .map_err(|error| LocalRuntimeError::Execution(error.to_string()))?
+                {
+                    break;
+                }
                 match &event {
                     ModelStreamEvent::TextDelta { text, .. }
                     | ModelStreamEvent::Refusal { text } => output.push_str(text),
