@@ -28,7 +28,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 5 | 推理过程显示（默认折叠） | 未做 | Runtime 已有 typed reasoning item，UI 无入口 |
 | 6 | Diff 逐块接受 / 拒绝 | 未做 | 现在只渲染 diff，不能审阅 |
 | 7 | 运行中排队输入 | 未做 | 边跑边打字，跑完依次生效 |
-| 8 | 中途改向（steer） | **阻塞** | `runtime-host` 无 steer 动作，见下 |
+| 8 | 中途改向（steer） | 已接入 | 轮次在跑时输入框改发 steer；只在两次工具调用之间生效，界面说明了这一点 |
 | 9 | 转录搜索（⌘F） | 未做 | |
 | 9.4 | 工具调用折叠 | 已接入 | 连续调用折成一行，行上按工具计数；单次调用不折 |
 | 9.5 | 流式转录 | 已接入 | 主进程持连接推送，事件即写即到；边界仍只来自 cursor |
@@ -71,7 +71,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 
 | 能力 | 阻塞原因 |
 | --- | --- |
-| 中途改向（#8） | steering 在 `crates/protocol`、`crates/kernel`、`apps/worker` 里**已经完整**，本地 host 持有的正是实现它的 `WorkerProcessor`。缺 `RuntimeControlAction::Steer` 与本地调用；真正的工作是取消拓扑——绑进 processor 的 token 与模型调用用的 token 是**兄弟**，取消前者打不断后者。定位与设计见 `docs/evidence/2026-08-18-local-steer-blocker.md` |
+| ~~中途改向（#8）~~ | ✅ 已解除。取消拓扑、`select!` 安全时机、重绑、控制面四步落地并实测；`docs/evidence/2026-08-18-local-steer-blocker.md` 记录了定位、设计与三条守卫 |
 | 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
 
 ## 五、推进顺序

@@ -74,13 +74,33 @@ describe("a conversation", () => {
     expect(new Set([sent.sessionId, sent.branchId, sent.runId]).size).toBe(3);
   });
 
-  it("shuts the box while a Turn is in flight rather than letting it be refused", async () => {
-    const { user } = await openChat({ activeRunId: RUN_LIVE });
+  /// This used to assert the opposite -- the box was shut while a Turn ran,
+  /// because the Runtime had no way to redirect one and the only honest thing
+  /// was to refuse. It has one now, so the same box does a different thing
+  /// depending on what the Run is doing, and the person is told which.
+  it("redirects the Turn in flight instead of queueing a next one", async () => {
+    const { user, bridge } = await openChat({ activeRunId: RUN_LIVE });
     const box = await screen.findByRole("textbox");
-    await waitFor(() => expect((box as HTMLTextAreaElement).disabled).toBe(true));
-    expect((box as HTMLTextAreaElement).placeholder).toContain("这轮还在跑");
-    await user.type(box, "插一句");
-    expect((box as HTMLTextAreaElement).value).toBe("");
+    await waitFor(() => expect((box as HTMLTextAreaElement).disabled).toBe(false));
+    expect((box as HTMLTextAreaElement).placeholder).toContain("改向");
+
+    await user.click(box);
+    await user.type(box, "换个方向");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(bridge.steer).toHaveBeenCalled());
+    const sent = bridge.steer.mock.calls[0][0];
+    expect(sent.input).toBe("换个方向");
+    expect(sent.runId).toBe(RUN_LIVE);
+    // A steer is not a Turn. Sending one as a continuation would queue work
+    // the person meant to replace.
+    expect(bridge.sessionContinue).not.toHaveBeenCalled();
+  });
+
+  it("says a steer only lands between tool calls, rather than claiming it applied", async () => {
+    await openChat({ activeRunId: RUN_LIVE });
+    // The Runtime refuses to redirect while a tool call or approval is
+    // unresolved, and acceptance by the socket is not evidence it was applied.
+    await waitFor(() => expect(screen.getByText(/改向只在两次工具调用之间生效/)).toBeTruthy());
   });
 });
 

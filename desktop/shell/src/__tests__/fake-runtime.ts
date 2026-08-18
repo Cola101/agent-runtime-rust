@@ -170,6 +170,9 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
       entries: [{ name: "main.rs", kind: "file", size: 30, modified: "2026-08-18T09:10:00.000Z" }],
     },
   };
+  const steer = vi.fn(async (_request: { runId: string; steeringId: string; input: string }) => ({
+    ok: true as const, value: {},
+  }));
   const launch = vi.fn(async () => ({ ok: true as const, value: { started: true, owned: true } }));
   const saveProvider = vi.fn(async (_request: {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
@@ -233,6 +236,7 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
     },
     submit,
     control,
+    steer,
     sessionStart,
     sessionContinue,
     sessionRead,
@@ -299,6 +303,6 @@ export function installFakeRuntime({ activeRunId = null }: { activeRunId?: strin
   };
   return {
     control, submit, sessionStart, sessionContinue, sessionRead,
-    saveProvider, forgetProvider, watch, unwatch, emit, event, launch, desk,
+    saveProvider, forgetProvider, watch, unwatch, emit, event, launch, steer, desk,
   };
 }

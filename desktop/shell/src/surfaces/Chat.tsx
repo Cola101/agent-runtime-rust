@@ -354,12 +354,16 @@ export function Composer() {
 
   const send = async () => {
     const input = draft.trim();
-    if (!input || !live || sending || turning) return;
+    if (!input || !live || sending) return;
     setSending(true);
     setDraft("");
     setHistory((past) => [input, ...past]);
     setAt(-1);
-    const failure = await desk.send(input);
+    // While a Turn is running the same box redirects it instead of queueing a
+    // next Turn. Two different things, and which one happens is decided by
+    // what the Run is doing rather than by a mode the person has to hold in
+    // their head.
+    const failure = turning ? await desk.steer(input) : await desk.send(input);
     setError(failure);
     setSending(false);
     // A new run is the one you want to watch. Clearing the cursor rather than
@@ -376,10 +380,10 @@ export function Composer() {
           className="in"
           rows={1}
           value={draft}
-          disabled={!live || sending || turning}
+          disabled={!live || sending}
           placeholder={
             !live ? "没有连上 Runtime"
-              : turning ? "这轮还在跑，跑完再说下一句"
+              : turning ? "这轮还在跑 —— 现在说的话会拿去改向"
                 : desk.current ? "接着说" : "说一句话，就开始一段对话"
           }
           onChange={(event) => { setDraft(event.target.value); setAt(-1); }}
@@ -403,12 +407,17 @@ export function Composer() {
             }
           }}
         />
-        <button type="button" className="send" disabled={!live || sending || turning || !draft.trim()} onClick={() => void send()}>
-          {sending ? "发送中" : "发送"}
+        <button type="button" className="send" disabled={!live || sending || !draft.trim()} onClick={() => void send()}>
+          {sending ? "发送中" : turning ? "改向" : "发送"}
         </button>
       </div>
       <div className="write-hint">
-        <kbd>↵</kbd> 发送 ・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
+        <kbd>↵</kbd> {turning ? "改向" : "发送"} ・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
+        {turning && (
+          <span className="dim">
+            ・改向只在两次工具调用之间生效；成功了转录里会出现一条改向记录
+          </span>
+        )}
         {desk.current && (
           <button
             type="button"

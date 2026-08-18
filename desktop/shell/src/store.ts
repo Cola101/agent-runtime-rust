@@ -352,6 +352,13 @@ export type Store = {
   /// carries no history: every sentence sent that way is the first sentence of
   /// its own conversation, and the model is never told what was said before.
   send(input: string): Promise<string | null>;
+  /// Redirect the Turn in flight.
+  ///
+  /// Returns null when the steer reached the Run -- which is not the same as
+  /// it having been applied. The Runtime refuses to redirect while a tool call
+  /// or an approval is unresolved, and the only honest evidence is
+  /// `run.steer.applied` appearing in that Run's log.
+  steer(input: string): Promise<string | null>;
   submit(input: string): Promise<string | null>;
   decide(runId: string, action: "approve" | "deny" | "cancel" | "resume"): Promise<string | null>;
   refresh(): void;
@@ -580,6 +587,21 @@ export function useRuntime(): Store {
     if (live) void api.watch({ runId: live, afterSequence: 0 });
   }, [live]);
 
+  const steer = useCallback(async (input: string) => {
+    const api = bridge();
+    if (!api?.steer) return "not running in the desktop host";
+    const runId = currentRef.current
+      ? sessions.find((session) => session.sessionId === currentRef.current)?.activeRunId ?? null
+      : null;
+    if (!runId) return "这轮已经结束了，直接说下一句";
+    // One id per steer, minted here so a retry of the same call is idempotent
+    // and two different redirects are two commands.
+    const reply = await api.steer({ runId, steeringId: uuidv7(), input });
+    if (!reply.ok) return reply.error;
+    void load();
+    return null;
+  }, [sessions, load]);
+
   const selectSession = useCallback((sessionId: string | null) => {
     opened.current = true;
     currentRef.current = sessionId;
@@ -648,7 +670,7 @@ export function useRuntime(): Store {
     link, runs: merged, policies: readPolicies(merged), loading, listedAt,
     sessions,
     current: sessions.find((session) => session.sessionId === current) ?? null,
-    selectSession, newConversation, send,
+    selectSession, newConversation, send, steer,
     providers, saveProvider, forgetProvider,
     submit, decide, refresh: () => void load(),
   };

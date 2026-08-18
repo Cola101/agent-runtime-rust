@@ -155,6 +155,9 @@ type Bridge = {
   >;
   submit(input: string): Promise<Reply<string>>;
   control(request: { action: string; runId: string }): Promise<Reply<unknown>>;
+  steer(request: {
+    runId: string; steeringId: string; input: string;
+  }): Promise<Reply<unknown>>;
   sessionStart(request: {
     sessionId: string; branchId: string; runId: string; input: string;
   }): Promise<Reply<SessionTurnReceipt>>;

@@ -69,6 +69,17 @@ pub enum LocalRequest {
     Cancel {
         run_id: Uuid,
     },
+    /// Redirect a Run that is already moving.
+    ///
+    /// `steering_id` is the caller's, and it is what makes this idempotent:
+    /// resending the same id is answered from what was recorded rather than
+    /// redirecting twice. Two different steers on one Run are two commands,
+    /// which is why the command id derives from this rather than from the Run.
+    Steer {
+        run_id: Uuid,
+        steering_id: Uuid,
+        input: String,
+    },
     Resume {
         run_id: Uuid,
     },
@@ -372,6 +383,7 @@ impl LocalRequest {
             | Self::Deny { .. }
             | Self::ResolveMcpInput { .. }
             | Self::Cancel { .. }
+            | Self::Steer { .. }
             | Self::Resume { .. }
             | Self::Control { .. } => true,
             Self::Attach { .. } | Self::EventCursor { .. } | Self::List => false,
@@ -1024,6 +1036,14 @@ impl LocalRuntimeDaemon {
                     let response = self.cancel(run_id).await;
                     write_response(&mut writer, &response).await?;
                 }
+                LocalRequest::Steer {
+                    run_id,
+                    steering_id,
+                    input,
+                } => {
+                    let response = self.steer(run_id, steering_id, input).await;
+                    write_response(&mut writer, &response).await?;
+                }
                 LocalRequest::Resume { run_id } => {
                     let response = self.resume(run_id).await;
                     write_response(&mut writer, &response).await?;
@@ -1314,6 +1334,53 @@ impl LocalRuntimeDaemon {
             action: RuntimeControlAction::Cancel {
                 reason: "cancelled by the local operator".into(),
             },
+        })
+        .await
+    }
+
+    async fn steer(
+        self: &Arc<Self>,
+        run_id: Uuid,
+        steering_id: Uuid,
+        input: String,
+    ) -> LocalResponse {
+        let command_id = Self::legacy_command_id(run_id, "steer", Some(steering_id));
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command)) if matches!(command.action, RuntimeControlAction::Steer { .. }) => {
+                return self.dispatch_legacy_control(command).await;
+            }
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "this steering id is bound to another action".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
+        }
+        let record = match self.read_owned_record(run_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return LocalResponse::Error {
+                    message: "unknown run".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        self.dispatch_legacy_control(RuntimeControlCommand {
+            schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
+            command_id,
+            invocation: self.invocation,
+            run_id,
+            expected_owner_epoch: record.owner_epoch,
+            action: RuntimeControlAction::Steer { steering_id, input },
         })
         .await
     }

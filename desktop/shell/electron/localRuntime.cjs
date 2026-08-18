@@ -421,6 +421,26 @@ class LocalRuntime {
   /// the full `RuntimeControlCommand`, including the owner epoch and the
   /// binding digest, which is why the client does not construct one: a client
   /// that guessed an epoch would be racing the host for authority over a run.
+  /// Redirects a Run that is already moving.
+  ///
+  /// `steeringId` is the caller's idempotency key, minted per attempt rather
+  /// than per keystroke: resending the same one is answered from what the
+  /// Runtime recorded instead of redirecting twice.
+  ///
+  /// Acceptance here means the steer reached the Run, not that it was applied.
+  /// The Runtime refuses to redirect while a tool call or an approval is
+  /// unresolved, and the only honest evidence that it took is
+  /// `run.steer.applied` in the Run's own log.
+  async steer({ runId, steeringId, input }) {
+    const reply = await this.#request({
+      type: "steer",
+      run_id: runId,
+      steering_id: steeringId,
+      input,
+    });
+    return reply;
+  }
+
   async control({ action, runId }) {
     const allowed = new Set(["approve", "deny", "cancel", "resume"]);
     if (!allowed.has(action)) throw new Error(`unsupported control action: ${action}`);
