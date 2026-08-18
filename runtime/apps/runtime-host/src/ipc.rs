@@ -115,6 +115,7 @@ pub enum OwnerRunState {
     Decided,
     Interrupted {
         reason: String,
+        cause: crate::RunInterruptCause,
     },
     Finished {
         status: String,
@@ -131,8 +132,9 @@ impl OwnerRunState {
             LocalRunState::ApprovalDecided { .. } | LocalRunState::McpInputDecided { .. } => {
                 Self::Decided
             }
-            LocalRunState::Interrupted { reason } => Self::Interrupted {
+            LocalRunState::Interrupted { reason, cause } => Self::Interrupted {
                 reason: reason.clone(),
+                cause: *cause,
             },
             LocalRunState::Cancelled { .. } => Self::Finished {
                 status: "cancelled".into(),
@@ -228,6 +230,28 @@ pub enum OwnerRequest {
     },
 }
 
+impl OwnerRequest {
+    /// Same rule as the workload surface, and the lifecycle operations are not
+    /// mutations of work: `start` is what makes the Runtime ready, and
+    /// `shutdown` has to be reachable from a Runtime that never became ready.
+    #[must_use]
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Self::SessionStart { .. }
+            | Self::SessionContinue { .. }
+            | Self::SessionFork { .. }
+            | Self::SessionRollback { .. } => true,
+            Self::ListRuns { .. }
+            | Self::SessionRead { .. }
+            | Self::SessionList { .. }
+            | Self::SessionHistory { .. }
+            | Self::Start
+            | Self::Snapshot
+            | Self::Shutdown => false,
+        }
+    }
+}
+
 const OWNER_MAX_PAGE: usize = 256;
 const OWNER_MAX_HISTORY_PAGE: usize = 128;
 
@@ -259,6 +283,11 @@ pub enum OwnerResponse {
         page: Box<crate::embedded::EmbeddedSessionHistoryPage>,
     },
     Started,
+    /// Same fact as `LocalResponse::NotReady`, for the owner surface.
+    NotReady {
+        lifecycle: crate::controller::RuntimeLifecycle,
+        recovery: crate::controller::RuntimeRecoveryProgress,
+    },
     Snapshot {
         lifecycle: crate::controller::RuntimeLifecycle,
         recovery: crate::controller::RuntimeRecoveryProgress,
@@ -303,17 +332,66 @@ fn parse_wire_request(line: &str) -> Result<WireRequest, String> {
     }
 }
 
+impl LocalRequest {
+    /// Whether this asks the Runtime to change something.
+    ///
+    /// Written out per variant rather than as a default-plus-exceptions: a
+    /// mutation that is added later and forgotten here would be accepted while
+    /// the Runtime is still recovering or already draining, which is the exact
+    /// window this exists to close.
+    #[must_use]
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Self::Submit { .. }
+            | Self::Approve { .. }
+            | Self::Deny { .. }
+            | Self::ResolveMcpInput { .. }
+            | Self::Cancel { .. }
+            | Self::Resume { .. }
+            | Self::Control { .. } => true,
+            Self::Attach { .. } | Self::EventCursor { .. } | Self::List => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalResponse {
-    Accepted { run_id: Uuid },
-    Event { event: Box<LocalEvent> },
-    Finished { run_id: Uuid, status: String },
-    Runs { run_ids: Vec<Uuid> },
-    ControlReceipt { receipt: Box<RuntimeControlReceipt> },
-    EventCursor { page: Box<RuntimeEventCursorPage> },
-    EventCursorError { error: RuntimeEventCursorError },
-    Error { message: String },
+    Accepted {
+        run_id: Uuid,
+    },
+    Event {
+        event: Box<LocalEvent>,
+    },
+    Finished {
+        run_id: Uuid,
+        status: String,
+    },
+    Runs {
+        run_ids: Vec<Uuid>,
+    },
+    ControlReceipt {
+        receipt: Box<RuntimeControlReceipt>,
+    },
+    EventCursor {
+        page: Box<RuntimeEventCursorPage>,
+    },
+    EventCursorError {
+        error: RuntimeEventCursorError,
+    },
+    /// The Runtime is not open for work yet, and this is not a failure.
+    ///
+    /// Its own reply rather than an error string: recovering and not running
+    /// are different states, and a client that cannot tell them apart reports
+    /// a healthy startup as a fault. Carrying the progress is what lets it say
+    /// "restoring 12 of 40" instead of "cannot connect".
+    NotReady {
+        lifecycle: crate::controller::RuntimeLifecycle,
+        recovery: crate::controller::RuntimeRecoveryProgress,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub struct LocalRuntimeDaemon {
@@ -498,7 +576,19 @@ impl LocalRuntimeDaemon {
         Ok(listener)
     }
 
+    /// Accepts connections, and brings the Runtime up while it does.
+    ///
+    /// Recovery runs concurrently with accepting rather than before it. The
+    /// constraint that matters -- no window in which new work is admitted
+    /// before recovery finishes -- is held by the mutation gate, not by
+    /// refusing to answer the door. A socket that does not answer during
+    /// startup makes a client report a healthy Runtime as unreachable, and a
+    /// desktop application with Runs to restore would do that on every launch.
     pub async fn serve(self: Arc<Self>, listener: UnixListener) {
+        let starting = Arc::clone(&self);
+        tokio::spawn(async move {
+            let _ = starting.controller.start().await;
+        });
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -509,6 +599,42 @@ impl LocalRuntimeDaemon {
                 let _ = daemon.handle_connection(stream).await;
             });
         }
+    }
+
+    /// Stops taking work, drains within the deadline, and reports.
+    ///
+    /// The single closing path. A signal, the owner socket and a test all call
+    /// this, because a second implementation of "stop" is a second set of rules
+    /// about what a stopped Runtime leaves behind.
+    pub async fn shutdown(&self) -> crate::controller::RuntimeShutdownReport {
+        self.controller.shutdown().await
+    }
+
+    /// Blocks until the Runtime is open for work, or has stopped trying.
+    ///
+    /// For callers that genuinely need to wait -- a test, or a launcher that
+    /// wants to report readiness. A client on the socket does not need this:
+    /// it is told `NotReady` and can decide for itself.
+    pub async fn wait_until_ready(&self) {
+        let _ = self.controller.start().await;
+    }
+
+    /// Whether work may be accepted right now.
+    ///
+    /// Reads stay available throughout: a client watching a Runtime come up, or
+    /// looking at what a stopped one left behind, is not asking it to do
+    /// anything. Only mutations wait for `Ready`.
+    async fn accepting_work(
+        &self,
+    ) -> Option<(
+        crate::controller::RuntimeLifecycle,
+        crate::controller::RuntimeRecoveryProgress,
+    )> {
+        let snapshot = self.controller.snapshot().await;
+        if snapshot.lifecycle == crate::controller::RuntimeLifecycle::Ready {
+            return None;
+        }
+        Some((snapshot.lifecycle, snapshot.recovery))
     }
 
     /// Every Run this state root holds, newest first, from disk.
@@ -578,6 +704,19 @@ impl LocalRuntimeDaemon {
             let request = match parse_wire_request(&line) {
                 Ok(WireRequest::Workload(request)) => request,
                 Ok(WireRequest::Owner(request)) => {
+                    if request.is_mutation()
+                        && let Some((lifecycle, recovery)) = self.accepting_work().await
+                    {
+                        write_owner_response(
+                            &mut writer,
+                            &OwnerResponse::NotReady {
+                                lifecycle,
+                                recovery,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
                     let response = match request {
                         OwnerRequest::ListRuns {
                             after_run_id,
@@ -749,6 +888,19 @@ impl LocalRuntimeDaemon {
                     continue;
                 }
             };
+            if request.is_mutation()
+                && let Some((lifecycle, recovery)) = self.accepting_work().await
+            {
+                write_response(
+                    &mut writer,
+                    &LocalResponse::NotReady {
+                        lifecycle,
+                        recovery,
+                    },
+                )
+                .await?;
+                continue;
+            }
             match request {
                 LocalRequest::Submit { input } => {
                     let response = match self.spawn_run(input).await {

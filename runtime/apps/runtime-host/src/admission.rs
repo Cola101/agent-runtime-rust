@@ -74,6 +74,10 @@ impl Drop for QueuedRequestGuard {
 
 #[derive(Default)]
 struct AdmissionState {
+    /// Set once, by `close`. A closed controller never admits again: the
+    /// Runtime it fronts is going away, and a slot granted after that is a slot
+    /// for work nothing will finish.
+    closed: bool,
     active_runs: usize,
     queued_runs: usize,
     active_by_tenant: HashMap<Uuid, usize>,
@@ -141,6 +145,12 @@ impl RuntimeAdmissionController {
         let tenant_id = invocation.tenant_id;
         let (receiver, mut guard) = {
             let mut state = self.lock_state();
+            // Checked before anything is counted. A request refused here has
+            // taken nothing and left nothing -- which is what lets the accept
+            // path put admission before its first durable write.
+            if state.closed {
+                return Err(RuntimeAdmissionError::Closed);
+            }
             let tenant_active = state.active_by_tenant.get(&tenant_id).copied().unwrap_or(0);
             let workspace_active = state
                 .active_by_workspace
@@ -195,6 +205,33 @@ impl RuntimeAdmissionController {
         let permit = receiver.await.map_err(|_| RuntimeAdmissionError::Closed)?;
         guard.armed = false;
         Ok(permit)
+    }
+
+    /// Stops admitting and releases everyone still waiting.
+    ///
+    /// Runs that already hold a permit keep it: they are executing, and taking
+    /// their slot away would not stop them, only lose count of them. Everyone
+    /// still queued is woken with `Closed` rather than left to wait out a
+    /// Runtime that is leaving -- their grant senders are dropped, which is the
+    /// same path `acquire` already treats as the Runtime having stopped.
+    ///
+    /// Returns how many waiters were released. Idempotent.
+    pub fn close(&self) -> usize {
+        let mut state = self.lock_state();
+        state.closed = true;
+        let released = state.queued_runs;
+        // Dropping each `WaitingRun` drops its grant sender, and the waiter's
+        // `receiver.await` resolves to `Closed`.
+        state.queues.clear();
+        state.rotation.clear();
+        state.queued_runs = 0;
+        released
+    }
+
+    /// Whether admission has been stopped.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.lock_state().closed
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AdmissionState> {

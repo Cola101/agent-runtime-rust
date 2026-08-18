@@ -44,6 +44,36 @@ fn runtime_with_provider(
     runtime_for(state_root, workspace_root, endpoint, invocation())
 }
 
+fn local_config(
+    state_root: &std::path::Path,
+    workspace_root: &std::path::Path,
+    endpoint: &str,
+) -> LocalRuntimeConfig {
+    LocalRuntimeConfig {
+        state_root: state_root.to_path_buf(),
+        workspace_root: workspace_root.to_path_buf(),
+        agent_instructions: "Answer briefly.".into(),
+        delegated_scopes: BTreeSet::from([WORKSPACE_READ_SCOPE.to_owned()]),
+        subagent_roles: Vec::new(),
+        model_routing: LocalModelRoutingConfig::single_openai_compatible(
+            endpoint,
+            "test-model",
+            "test-key",
+        ),
+        mcp_servers: Vec::new(),
+        mcp_lifecycle: agent_runtime_host::LocalMcpLifecycleConfig::default(),
+        trusted_workspace_tool: None,
+        process_session: None,
+        consent: LocalToolConsent::Ask,
+        budget: RunBudget {
+            max_tokens: 1_000,
+            max_cost_cents: 100,
+            max_duration_seconds: 60,
+        },
+        runtime_policy: agent_protocol::RuntimeExecutionPolicySnapshot::default(),
+    }
+}
+
 fn runtime_for(
     state_root: &std::path::Path,
     workspace_root: &std::path::Path,
@@ -315,5 +345,109 @@ async fn stopping_the_runtime_is_not_cancelling_anybody_s_run() {
     assert!(
         receipts.is_empty(),
         "stopping the Runtime wrote a control receipt: {receipts:?}"
+    );
+}
+
+/// Closing admission releases the queue instead of leaving it to wait.
+///
+/// A request that never got a slot has taken nothing and left nothing -- which
+/// is precisely what lets the accept path put admission before its first
+/// durable write. So a refusal here must leave no Run, no Session Turn and no
+/// control receipt behind, and the caller must be told, not left holding a
+/// future against a Runtime that is going away.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutting_down_releases_the_queue_and_leaves_nothing_behind() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    // A Provider that accepts and never answers, so the admitted Run holds its
+    // only slot for the whole test rather than for a hopeful interval.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("addr")
+    );
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+
+    let invocation = invocation();
+    let runtime = Arc::new(
+        EmbeddedRuntime::new(
+            RuntimeAdmissionLimits {
+                max_active_runs: 1,
+                max_active_runs_per_tenant: 1,
+                max_active_runs_per_workspace: 1,
+                max_queued_runs: 4,
+                max_queued_runs_per_tenant: 4,
+            },
+            vec![RuntimeProfile {
+                invocation,
+                config: local_config(state.path(), workspace.path(), &endpoint),
+            }],
+        )
+        .expect("runtime"),
+    );
+    let controller =
+        RuntimeController::with_drain_deadline(Arc::clone(&runtime), Duration::from_millis(50));
+    controller.start().await.expect("start");
+
+    // One Run takes the only slot.
+    let holder = uuid::Uuid::now_v7();
+    runtime
+        .execute_detached(invocation, holder, "hold the only slot".into())
+        .await
+        .expect("admitted");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while runtime.runtime_snapshot().active_execution_owners == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Run never became active");
+
+    // A second one queues. It parks inside admission, so it is spawned; the
+    // queue depth is read from the snapshot rather than assumed.
+    let queued_run = uuid::Uuid::now_v7();
+    let queueing = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        async move {
+            runtime
+                .execute_detached(invocation, queued_run, "wait for a slot".into())
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while runtime.runtime_snapshot().admission.queued_runs == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second Run never reached the queue");
+
+    let report = controller.shutdown().await;
+    assert_eq!(
+        report.released_from_queue, 1,
+        "the queued Run was left waiting on a Runtime that is leaving"
+    );
+
+    // Woken, not left hanging.
+    let released = tokio::time::timeout(Duration::from_secs(20), queueing)
+        .await
+        .expect("the queued caller was never woken")
+        .expect("join");
+    released.expect_err("a released caller must be told, not admitted");
+
+    // And it left nothing behind: no Run record for work that never started.
+    assert!(
+        runtime
+            .read_run_record(invocation, queued_run)
+            .expect("record lookup")
+            .is_none(),
+        "a request refused at admission created a Run anyway"
     );
 }

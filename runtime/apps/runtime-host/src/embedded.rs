@@ -1888,6 +1888,78 @@ impl EmbeddedRuntime {
         handle
     }
 
+    /// The Runs that are detached right now.
+    ///
+    /// Taken before stopping them, because aborting a task drops its guard and
+    /// the map empties out behind us -- a shutdown that read this afterwards
+    /// would account for nothing.
+    #[must_use]
+    pub fn active_execution_keys(&self) -> Vec<(RuntimeInvocationContext, Uuid)> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Accounts for Runs the Runtime stopped, and records the ones that were
+    /// left with nothing to resume from.
+    ///
+    /// Returns `(recoverable, interrupted)`. A Run with a verifiable terminal
+    /// Checkpoint is left exactly as it is: a replacement picks it up, and
+    /// writing anything over it would only risk contradicting the authority
+    /// recovery reads. One without gets `Interrupted`, carrying the fact that
+    /// the Runtime was stopped rather than that it died -- the difference a
+    /// person needs when they reopen the application they just closed.
+    ///
+    /// Runs that reached a terminal state on their own in the meantime are not
+    /// touched: finishing in the last moment of a drain is finishing.
+    pub fn account_for_stopped_runs(
+        &self,
+        keys: &[(RuntimeInvocationContext, Uuid)],
+    ) -> (usize, usize) {
+        let (mut recoverable, mut interrupted) = (0_usize, 0_usize);
+        for (invocation, run_id) in keys {
+            let Ok(config) = self.profile(*invocation) else {
+                continue;
+            };
+            let state_root = config.state_root.clone();
+            let Ok(Some(mut record)) = LocalRuntimeHost::read_run_record(&state_root, *run_id)
+            else {
+                continue;
+            };
+            if Self::terminal_status(&record.state).is_some() {
+                continue;
+            }
+            let checkpoint = LocalRuntimeHost::checkpoint_path(&state_root, *run_id);
+            let resumable = checkpoint.is_file()
+                && LocalRuntimeHost::load_checkpoint(&checkpoint)
+                    .is_ok_and(|checkpoint| checkpoint.verify_digest());
+            if resumable {
+                recoverable += 1;
+                continue;
+            }
+            record.state = LocalRunState::Interrupted {
+                reason: "Runtime stopped before the Run produced a Checkpoint".into(),
+                cause: crate::RunInterruptCause::RuntimeStopped,
+            };
+            if LocalRuntimeHost::write_run_record(&state_root, &record).is_ok() {
+                interrupted += 1;
+            }
+        }
+        (recoverable, interrupted)
+    }
+
+    /// Stops admitting new work and releases everyone still queued.
+    ///
+    /// Separate from stopping execution, and done first: a Run that never got
+    /// a slot has nothing durable to unwind, while a Run that did is already
+    /// running and is dealt with by the drain.
+    pub fn close_admission(&self) -> usize {
+        self.admission.close()
+    }
+
     /// Stops detached execution without cancelling anything.
     ///
     /// A Run stopped this way was not cancelled: no `run.cancelled` is
@@ -2533,6 +2605,9 @@ impl EmbeddedRuntime {
                 });
                 record.state = LocalRunState::Interrupted {
                     reason: "Runtime stopped before the Session Turn produced a Checkpoint".into(),
+                    // Reached from startup recovery: whatever owned this Run
+                    // before is gone and did not stop cleanly.
+                    cause: crate::RunInterruptCause::HostEndedWithoutStopping,
                 };
                 Self::write_run_record(&config.state_root, &record)?;
                 LocalRuntimeHost::clear_active_session_turn(&config.state_root, &binding)?;
@@ -2658,6 +2733,7 @@ impl EmbeddedRuntime {
                     _ => (
                         LocalRunState::Interrupted {
                             reason: "Runtime stopped before the Run produced a Checkpoint".into(),
+                            cause: crate::RunInterruptCause::HostEndedWithoutStopping,
                         },
                         RunStatus::Failed,
                     ),

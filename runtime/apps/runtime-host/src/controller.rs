@@ -58,17 +58,20 @@ pub enum RuntimeControllerError {
 pub struct RuntimeShutdownReport {
     pub active_before_drain: usize,
     pub queued_before_drain: usize,
+    /// Woken with `Unavailable` when admission closed, rather than left waiting
+    /// on a Runtime that is leaving.
+    pub released_from_queue: usize,
     pub completed_during_drain: usize,
     /// Still running when the deadline arrived, and stopped by the Runtime.
     ///
     /// Stopped, not cancelled: no `run.cancelled` is published and no operator
     /// Cancel receipt is written, because nobody decided to cancel them.
-    ///
-    /// Splitting these into "left with a Checkpoint, recoverable" and "stopped
-    /// before one, interrupted" needs the durable records read back, which is
-    /// the next slice. Until then this is one number rather than two that
-    /// would both be guesses.
     pub stopped_at_deadline: usize,
+    /// Stopped with a verifiable Checkpoint, so a replacement picks them up.
+    pub left_for_recovery: usize,
+    /// Stopped before producing one, and recorded as interrupted by a Runtime
+    /// that was stopped -- not by one that died, and not by anybody cancelling.
+    pub interrupted: usize,
     pub deadline_reached: bool,
 }
 
@@ -239,6 +242,12 @@ impl RuntimeController {
         };
         self.changed.notify_waiters();
 
+        // Nothing new is admitted from here, and everyone still queued is told
+        // so rather than left to wait it out. Runs that already hold a permit
+        // keep it: they are executing, and taking the slot back would not stop
+        // them, only lose count of them.
+        let released_from_queue = self.runtime.close_admission();
+
         let active_before = before.active_execution_owners;
         let queued_before = before.admission.queued_runs;
         let deadline_reached = tokio::time::timeout(self.drain_deadline, async {
@@ -253,13 +262,21 @@ impl RuntimeController {
         // The two are different events and travel different paths: this one
         // never touches a `CancellationToken`, so nothing here decides that a
         // person asked for the Run to end.
+        // Taken before the abort: aborting drops each task's guard, so the
+        // active map empties behind us and there would be nothing left to
+        // account for.
+        let stopped_keys = self.runtime.active_execution_keys();
         let stopped_at_deadline = self.runtime.stop_background_executions();
+        let (left_for_recovery, interrupted) = self.runtime.account_for_stopped_runs(&stopped_keys);
         let remaining = self.runtime.runtime_snapshot().active_execution_owners;
         let report = RuntimeShutdownReport {
             active_before_drain: active_before,
             queued_before_drain: queued_before,
+            released_from_queue,
             completed_during_drain: active_before.saturating_sub(remaining),
             stopped_at_deadline,
+            left_for_recovery,
+            interrupted,
             deadline_reached,
         };
 

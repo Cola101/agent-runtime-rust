@@ -1602,7 +1602,32 @@ pub enum LocalRunState {
     /// nothing to resume from and re-running is not automatically safe.
     Interrupted {
         reason: String,
+        /// Why the Runtime was not there to finish it.
+        ///
+        /// "You closed the application" and "the process died" are different
+        /// facts about the same Run, and without this they read identically --
+        /// the reason string says only that no Checkpoint was produced, never
+        /// what happened to the Runtime. Defaulted so records written before
+        /// this existed still load, and they load as `Unknown` rather than as
+        /// a guess.
+        #[serde(default)]
+        cause: RunInterruptCause,
     },
+}
+
+/// What became of the Runtime that owed this Run work.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInterruptCause {
+    /// Written by a record that predates this field.
+    #[default]
+    Unknown,
+    /// The Runtime was asked to stop and did, while this Run was in flight.
+    /// Nobody cancelled it.
+    RuntimeStopped,
+    /// A replacement Runtime found this Run owed work and no Checkpoint to
+    /// resume from, so the previous one ended without stopping cleanly.
+    HostEndedWithoutStopping,
 }
 
 /// The durable record a restarted daemon reads to decide what to do.

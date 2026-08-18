@@ -17,6 +17,7 @@ use agent_runtime_host::{
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -83,7 +84,10 @@ async fn start_daemon(config: LocalRuntimeConfig) -> PathBuf {
         .await
         .expect("bind socket");
     let daemon = LocalRuntimeDaemon::new(config);
-    tokio::spawn(daemon.serve(listener));
+    tokio::spawn(Arc::clone(&daemon).serve(listener));
+    // A client is told `NotReady` and may retry; a test that wants to exercise
+    // work rather than the startup window waits here instead of racing it.
+    daemon.wait_until_ready().await;
     socket
 }
 

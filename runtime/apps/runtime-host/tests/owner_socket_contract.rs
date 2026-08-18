@@ -94,6 +94,10 @@ impl Daemon {
         let daemon = LocalRuntimeDaemon::new(config);
         let runtime = daemon.runtime();
         let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(listener));
+        daemon.wait_until_ready().await;
+        // What `runtime-host serve` does, so the test observes the real daemon
+        // rather than an artefact of how the test started one.
+        daemon.recover_unfinished().await.expect("recovery");
         Self {
             socket,
             daemon: Some(daemon),
@@ -203,10 +207,16 @@ async fn the_owner_and_workload_namespaces_do_not_reach_each_other() {
     assert!(matches!(refused, LocalResponse::Error { .. }));
 }
 
-/// The durable list survives a restart; the in-memory one does not, and that
-/// difference is declared rather than discovered.
+/// Both lists survive a restart. They differ in what they can answer.
+///
+/// An earlier version of this test asserted that the workload list comes back
+/// empty. That was true only of how the test started its daemon: `serve` is
+/// accompanied by `recover_unfinished`, which reseeds the order from owned
+/// records, so a real host does come back with its Runs. The difference worth
+/// asserting is the one the desktop actually needs -- the workload list hands
+/// back bare ids, and the owner list hands back what a person reads.
 #[tokio::test]
-async fn the_owner_list_reads_disk_where_the_workload_list_reads_memory() {
+async fn the_owner_list_answers_what_the_workload_list_cannot() {
     let state = tempfile::tempdir().expect("state");
     let workspace = tempfile::tempdir().expect("workspace");
     let endpoint = spawn_provider().await;
@@ -263,15 +273,21 @@ async fn the_owner_list_reads_disk_where_the_workload_list_reads_memory() {
         panic!("expected the workload list");
     };
     assert!(
-        run_ids.is_empty(),
-        "the workload list is this host's own order and a new host has none"
+        run_ids.contains(&run_id),
+        "a restarted host reseeds its order from the records it owns"
     );
 
+    // And the owner list answers the question the desktop actually has, which
+    // a list of ids cannot: what was this asked to do, and where did it get to.
     let runs = list_runs(&socket).await;
-    assert!(
-        runs.iter().any(|run| run.run_id == run_id),
-        "the owner list must still hold what the state root holds"
-    );
+    let restored = runs
+        .iter()
+        .find(|run| run.run_id == run_id)
+        .expect("the owner list holds what the state root holds");
+    assert_eq!(restored.input, asked);
+    assert!(matches!(restored.state, OwnerRunState::Finished { .. }));
+
+    host.stop().await;
 }
 
 /// Paging is bounded and its cursor is checked, not trusted.
@@ -573,6 +589,77 @@ async fn the_owner_socket_drives_the_lifecycle() {
         agent_runtime_host::controller::RuntimeLifecycle::Stopped
     );
     assert_eq!(previous_shutdown.as_ref(), Some(&*report));
+
+    host.stop().await;
+}
+
+/// Not open for work is a state, not a fault, and reading is still allowed.
+///
+/// A client that cannot tell "recovering" from "not running" reports a healthy
+/// startup as a failure -- and a desktop application with Runs to restore would
+/// do that on every launch. The same gate covers both ends: this exercises the
+/// stopped end, which is stable enough to assert without racing a recovery that
+/// finishes in microseconds on an empty state root.
+#[tokio::test]
+async fn a_runtime_that_is_not_open_for_work_says_so_and_still_answers_reads() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let host = Daemon::start(config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        spawn_provider().await,
+    ))
+    .await;
+    let socket = host.socket.clone();
+
+    let stopped = owner(
+        &socket,
+        serde_json::json!({"scope":"owner","type":"shutdown"}),
+    )
+    .await;
+    assert!(matches!(stopped, OwnerResponse::Shutdown { .. }));
+
+    // A workload mutation is told what is going on, in a shape it can act on
+    // rather than a string it would have to match.
+    let line = serde_json::to_string(&LocalRequest::Submit {
+        input: "work for a Runtime that is closing".into(),
+    })
+    .expect("encode");
+    let reply: LocalResponse =
+        serde_json::from_str(&round_trip(&socket, &line).await).expect("decode");
+    let LocalResponse::NotReady { lifecycle, .. } = reply else {
+        panic!("expected NotReady, got {reply:?}");
+    };
+    assert_eq!(
+        lifecycle,
+        agent_runtime_host::controller::RuntimeLifecycle::Stopped
+    );
+
+    // The owner surface says the same thing about its own mutations.
+    let refused = owner(
+        &socket,
+        serde_json::json!({
+            "scope": "owner", "type": "session_start",
+            "session_id": uuid::Uuid::now_v7(), "branch_id": uuid::Uuid::now_v7(),
+            "run_id": uuid::Uuid::now_v7(), "input": "too late",
+        }),
+    )
+    .await;
+    assert!(
+        matches!(refused, OwnerResponse::NotReady { .. }),
+        "expected NotReady, got {refused:?}"
+    );
+
+    // And reading is untouched. Looking at what a Runtime holds, or at what a
+    // stopped one left behind, asks it to do nothing.
+    let line = serde_json::to_string(&LocalRequest::List).expect("encode");
+    let reply: LocalResponse =
+        serde_json::from_str(&round_trip(&socket, &line).await).expect("decode");
+    assert!(
+        matches!(reply, LocalResponse::Runs { .. }),
+        "reads must survive a closed Runtime: {reply:?}"
+    );
+    let _ = list_runs(&socket).await;
 
     host.stop().await;
 }

@@ -72,15 +72,28 @@ async fn spawn_provider() -> String {
 
 /// A workspace with the fixture file the tool call reads, plus the trusted tool
 /// binary this test suite was built alongside.
-fn trusted_tool_binary() -> Option<PathBuf> {
-    let mut current = std::env::current_exe().ok()?;
+/// The Tool binary every test in this file needs, or an immediate explanation.
+///
+/// Returning `None` here used to leave the host with no Tools installed, so the
+/// model's Tool call had nothing to execute, so no approval was ever recorded,
+/// so every test in this file sat for sixty seconds and then reported that the
+/// approval had not arrived -- naming the approval chain for a failure that was
+/// nowhere near it. A full `cargo clean` removes this binary, which makes that
+/// hour cost recur.
+fn trusted_tool_binary() -> PathBuf {
+    let mut current = std::env::current_exe().expect("test executable path");
     while current.pop() {
         let candidate = current.join("agent-trusted-workspace-tool");
         if candidate.is_file() {
-            return Some(candidate);
+            return candidate;
         }
     }
-    None
+    panic!(
+        "agent-trusted-workspace-tool is not built, so no Tools can be installed and no \
+         approval will ever be recorded. Build it with:\n    \
+         cargo build --manifest-path runtime/Cargo.toml -p agent-trusted-workspace-tool\n\
+         A full `cargo clean` removes it."
+    )
 }
 
 fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> LocalRuntimeConfig {
@@ -97,7 +110,7 @@ fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> Loc
         ),
         mcp_servers: Vec::new(),
         mcp_lifecycle: agent_runtime_host::LocalMcpLifecycleConfig::default(),
-        trusted_workspace_tool: trusted_tool_binary(),
+        trusted_workspace_tool: Some(trusted_tool_binary()),
         process_session: None,
         // The gate under test.
         consent: LocalToolConsent::Ask,
@@ -166,9 +179,6 @@ fn fixture_workspace() -> tempfile::TempDir {
 
 #[tokio::test]
 async fn a_run_parked_on_an_approval_is_not_recorded_as_finished() {
-    let Some(_) = trusted_tool_binary() else {
-        panic!("agent-trusted-workspace-tool must be built for this test");
-    };
     let state = tempfile::tempdir().expect("state");
     let workspace = fixture_workspace();
     let state_root = state.path().to_path_buf();

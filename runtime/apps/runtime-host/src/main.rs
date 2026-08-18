@@ -374,7 +374,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
-            daemon.serve(listener).await;
+            // Serving and signals race; whichever finishes first, the close
+            // goes through the same Controller the owner socket uses. A signal
+            // handler with its own idea of how to stop would be a second set of
+            // rules about what a stopped Runtime leaves behind.
+            let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(listener));
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                _ = serving => {}
+                _ = interrupt.recv() => eprintln!("runtime-host: interrupted, draining"),
+                _ = terminate.recv() => eprintln!("runtime-host: terminated, draining"),
+            }
+            let report = daemon.shutdown().await;
+            eprintln!(
+                "runtime-host stopped: {} active and {} queued before draining, \
+                 {} finished, {} released from the queue, {} stopped at the deadline \
+                 ({} recoverable, {} interrupted)",
+                report.active_before_drain,
+                report.queued_before_drain,
+                report.completed_during_drain,
+                report.released_from_queue,
+                report.stopped_at_deadline,
+                report.left_for_recovery,
+                report.interrupted,
+            );
             Ok(())
         }
         "submit" => {
