@@ -1050,6 +1050,7 @@ async fn interrupt_reaches_the_registered_process_group_and_converges_terminal()
         ProcessSessionState::Indeterminate,
         "the registered identity vanished before SIGINT could be delivered"
     );
+    let mut last = None;
     for _ in 0..200 {
         let output = manager
             .interact(
@@ -1070,9 +1071,24 @@ async fn interrupt_reaches_the_registered_process_group_and_converges_terminal()
             assert_eq!(output.pid, None);
             return;
         }
+        last = Some(output);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("SIGINT never reached a terminal process-session state");
+    // Which of two different problems this is turns on one fact, and the
+    // message used to carry neither: if the leader is gone, the process died
+    // and nothing published it -- the reaper task that owns `child.wait()` is
+    // the only thing that ever does, and `interact(Poll)` does not check
+    // liveness, so one missed wake-up is a permanent wrong answer rather than
+    // a late one. If the leader is alive, SIGINT never reached it and the
+    // question is about signal delivery instead. Measured in isolation this
+    // converges in 12-24ms, so a failure here is a stall and not a tight
+    // bound; see docs/evidence/2026-08-19-process-session-tests-under-load.md.
+    let leader = last.as_ref().and_then(|output| output.pid);
+    panic!(
+        "SIGINT never reached a terminal process-session state; \
+         leader={leader:?} leader_alive={:?} last={last:?}",
+        leader.map(process_alive),
+    );
 }
 
 #[tokio::test]
