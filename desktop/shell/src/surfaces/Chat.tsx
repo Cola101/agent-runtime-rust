@@ -9,6 +9,7 @@ import { currentRun, useDesk, type Desk } from "../desk";
 import type { RunEvent } from "../runtime";
 import type { RunView } from "../store";
 import { textOf, type SessionView } from "../session";
+import { lineage, subagentsOf } from "../subagents";
 
 /// A tool call is two lines, not a card.
 ///
@@ -145,6 +146,67 @@ function Transcript({ run }: { run: RunView }) {
   return <>{blocks}</>;
 }
 
+/// What this Run delegated.
+///
+/// Drawn beside the transcript rather than inside it: a delegation is not a
+/// line the model said, it is work happening somewhere else. Each row links to
+/// the child's own Run, because that is where what the child actually did
+/// lives -- this side only knows what was asked, what came back, and what it
+/// cost.
+function Delegations({ run }: { run: RunView }) {
+  const desk = useDesk();
+  const rows = lineage(subagentsOf(run.events));
+  if (rows.length === 0) return null;
+
+  const running = rows.filter((row) => row.view.state.kind === "running").length;
+  return (
+    <div className="kids">
+      <div className="kids-hd">
+        子代理 {rows.length}
+        {running > 0 && <span className="live">{running} 个在跑</span>}
+      </div>
+      {rows.map(({ view, depth }) => (
+        <div className={`kid d${depth}`} key={view.id}>
+          <div className="kid-top">
+            <b>{view.role || "（未命名角色）"}</b>
+            <span className={`kid-state s-${view.state.kind}`}>
+              {view.state.kind === "requested" && "已请求"}
+              {view.state.kind === "running" && "在跑"}
+              {view.state.kind === "closed" && "被关掉"}
+              {view.state.kind === "finished"
+                && (view.state.error ? `失败・${view.state.status}` : lifecycleLabel({
+                  kind: "terminal", status: view.state.status,
+                }))}
+            </span>
+            {view.queued > 0 && <span className="kid-flag">{view.queued} 条排队</span>}
+            {view.generation > 1 && <span className="kid-flag">第 {view.generation} 代</span>}
+          </div>
+          {view.asked && <div className="kid-ask">{view.asked}</div>}
+          <div className="kid-facts mono">
+            {view.forkedFrom && <span>从 {shortId(view.forkedFrom.id)} 的第 {view.forkedFrom.generation} 代分叉</span>}
+            {view.tokens > 0 && <span>{view.tokens.toLocaleString()} token</span>}
+            {view.costMicros > 0 && <span>{costLabel(view.costMicros)}</span>}
+            {view.childRunId
+              ? (
+                <button
+                  type="button"
+                  className="flat"
+                  onClick={() => { desk.select(view.childRunId!); desk.go("chat"); }}
+                >
+                  看它的 Run
+                </button>
+              )
+              // Said rather than left blank: the id arrives with the terminal,
+              // so its absence means the child has not finished, not that this
+              // client lost it.
+              : <span className="dim">还没有子 Run 可看</span>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /// The committed conversation.
 ///
 /// Drawn from the Session's frozen transcripts rather than from the event log,
@@ -232,6 +294,7 @@ function ChatView() {
           ) : (
             <Transcript run={run} />
           )}
+          <Delegations run={run} />
           <Gate run={run} />
         </>
       )}

@@ -129,6 +129,38 @@ body {
 .form > button:disabled { border-color: var(--rule); color: var(--ink-3); background: none; cursor: default; }
 .body > .err { margin-top: 12px; color: var(--accent); font-size: 12px; }
 
+/* Delegations. A block set off from the transcript by one rule, because the
+   work is happening somewhere else and reading it as more transcript is the
+   mistake this is meant to prevent. */
+.kids { margin: 18px 0 4px; border-top: 1px solid var(--rule); padding-top: 12px; }
+.kids-hd {
+  font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-3); margin-bottom: 9px; display: flex; align-items: center; gap: 9px;
+}
+.kids-hd .live {
+  text-transform: none; letter-spacing: 0; color: var(--accent);
+  background: var(--accent-wash); border-radius: 3px; padding: 1px 7px; font-size: 11px;
+}
+.kid { padding: 7px 0; border-bottom: 1px solid var(--rule-2); }
+.kid:last-child { border-bottom: 0; }
+.kid.d1 { padding-left: 18px; border-left: 1px solid var(--rule); margin-left: 3px; }
+.kid-top { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+.kid-top b { color: var(--ink); font-weight: 600; font-size: 12.5px; }
+.kid-state { font-size: 11.5px; color: var(--ink-2); }
+.kid-state.s-running { color: var(--accent); }
+.kid-state.s-closed { color: var(--ink-3); }
+.kid-flag {
+  font-size: 11px; color: var(--ink-3); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 0 6px;
+}
+.kid-ask { font-size: 12.5px; color: var(--ink-2); margin: 3px 0 0; }
+.kid-facts {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  margin-top: 4px; font-size: 11.5px; color: var(--ink-3);
+}
+.kid-facts .dim { color: var(--ink-3); }
+.kid-facts button.flat { padding: 0; font-size: 11.5px; }
+
 /* A folded run of tool calls. The row reads as one line of the transcript, not
    as a control panel: a border here would make eleven calls look like a more
    important thing than the sentence above them. */
