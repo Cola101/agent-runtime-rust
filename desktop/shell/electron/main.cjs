@@ -9,6 +9,7 @@ const { app, BrowserWindow, Notification, ipcMain, shell } = require("electron")
 const path = require("node:path");
 const fs = require("node:fs");
 const grpcRuntime = require("./runtime.cjs");
+const childEnv = require("./childEnv.cjs");
 const { LocalRuntime } = require("./localRuntime.cjs");
 const { RuntimeProcess } = require("./runtimeProcess.cjs");
 const { Credentials } = require("./credentials.cjs");
@@ -62,25 +63,6 @@ let runtimeBinary = process.env.RUNTIME_DESK_RUNTIME_BIN ?? null;
 /// build cannot ask a person to set an environment variable before it will
 /// start. The override exists for development, where the workspace is a
 /// checkout rather than a folder this app made.
-/// What the runtime this app starts may be asked to do.
-///
-/// Each of these still stops on a person: the runtime asks before every call
-/// whose effect it cannot take back, and this window renders that question.
-/// Withholding the scopes does not make the app safer -- it makes the agent
-/// unable to do the work while the approval machinery it would have gone
-/// through sits unused.
-const DELEGATED_SCOPES = [
-  "tool:workspace.read",
-  "tool:workspace.write",
-  "tool:shell.exec",
-  // Delegation needs two things and the roles above are only one of them: the
-  // `agent.*` family is installed when the roles are non-empty *and* the parent
-  // holds this scope (`worker/src/lib.rs`, where the tool family is built).
-  // Configured roles alone offer the model no way to use them -- checked by
-  // running a turn and reading the tool list the provider was sent.
-  "agent:spawn",
-];
-
 /// Roles a Run may delegate to.
 ///
 /// Without this the host loads an empty role list, and a Run that tries to
@@ -467,38 +449,11 @@ async function openRuntime() {
     const pid = runtime.start({
       binary: runtimeBinary,
       stateRoot,
-      env: {
-        ...routing.env,
-        AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
-        ...(mcp ? { AGENT_RUNTIME_LOCAL_MCP_CONFIG: mcp.file } : {}),
-        AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: folder,
-        // The runtime binary is also the trusted workspace tool -- it re-execs
-        // itself for that role. Pointing at the binary this app just spawned
-        // means the two can never be different builds.
-        AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN: runtimeBinary,
-        // What the agent may be *asked* to do. Without this the host falls back
-        // to `tool:workspace.read` alone, and an app that had passed its own
-        // acceptance shipped an agent that could read a folder and nothing
-        // else: no shell, no writes. The tools were compiled, sandboxed and
-        // approval-gated, and never offered to the model at all.
-        //
-        // Granting a scope is not granting a use. `AGENT_RUNTIME_LOCAL_TOOL_CONSENT`
-        // below keeps every call stopping on a person, which is the boundary
-        // that matters and the one this window is built to show.
-        //
-        // Each configured MCP server adds its own `tool:mcp:<name>`, and that
-        // is not an enhancement: `valid_mcp_servers` requires the scope for
-        // every server the Run carries, so a runtime started with the config
-        // file and without these would refuse *every* Run -- including the ones
-        // that never mentioned MCP.
-        AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES:
-          [...DELEGATED_SCOPES, ...(mcp?.scopes ?? [])].join(","),
-        // Explicit rather than inherited from the host's default. A security
-        // boundary that holds because nobody set a variable is a boundary that
-        // moves the first time someone does.
-        AGENT_RUNTIME_LOCAL_TOOL_CONSENT: "ask",
-        AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG: rolesFile,
-      },
+      // Built in its own module so it can be required and read. It is the
+      // object that decides what the agent can do, and every mistake in it so
+      // far has been silent -- a missing scope, and the model was never offered
+      // a tool at all.
+      env: childEnv.runtimeEnv({ routing, mcp, workspace: folder, runtimeBinary, rolesFile }),
     });
     // Recorded only on the path that actually spawned. This is the whole basis
     // for the MCP section saying a server is live rather than merely saved.

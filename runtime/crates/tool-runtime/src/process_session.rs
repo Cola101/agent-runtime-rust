@@ -4225,6 +4225,20 @@ fn install_process_resource_limits(
     // uses only the async-signal-safe `setrlimit` syscall and captured scalars.
     unsafe {
         command.pre_exec(move || {
+            // A disposition of SIG_IGN is inherited across fork *and* across
+            // exec, unlike a handler. So a runtime-host started as a shell's
+            // background job -- POSIX has a non-interactive shell set SIGINT
+            // and SIGQUIT to SIG_IGN for one -- hands that ignore to every
+            // session leader it spawns, and `process.interrupt` becomes a
+            // silent no-op: `killpg` succeeds, the tool reports the signal
+            // sent, and the process runs on. Reset here rather than trusted,
+            // because the session leader's interruptibility is something this
+            // manager promises and nothing upstream of it can be asked about.
+            for signal in [libc::SIGINT, libc::SIGQUIT] {
+                if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             for (resource, limit) in [
                 (libc::RLIMIT_FSIZE, output_limit),
                 (libc::RLIMIT_CPU, cpu_limit),

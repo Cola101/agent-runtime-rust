@@ -225,17 +225,20 @@ describe("the boundary", () => {
     }
   });
 
-  it("starts the runtime with the scopes its own config file requires", () => {
-    // Checked against the source because `main.cjs` requires Electron at import
-    // time and cannot be loaded here. The failure it guards against is silent
-    // and total: the config file reaches the runtime, the scopes do not, and
-    // `valid_mcp_servers` refuses every Run while the window looks healthy.
-    const main = readFileSync(
-      path.join(import.meta.dirname, "..", "..", "electron", "main.cjs"), "utf8",
-    );
-    const at = main.indexOf("AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES:");
-    expect(at).toBeGreaterThan(-1);
-    expect(main.slice(at, at + 120)).toContain("mcp?.scopes");
-    expect(main).toContain("AGENT_RUNTIME_LOCAL_MCP_CONFIG: mcp.file");
+  /// The scope each configured server needs is checked where the environment is
+  /// built, in `child-env.test.ts`, which reads the object rather than the text
+  /// that produces it. What stays this file's business is the other half: that
+  /// `config()` reports a scope per server at all, since a config file without
+  /// its scopes makes `valid_mcp_servers` refuse every Run -- including the
+  /// ones that never mentioned MCP -- while the window looks healthy.
+  it("reports a scope for every server it puts in the config file", () => {
+    const servers = store();
+    const command = executable();
+    servers.save({ name: "filesystem", command, toolNames: ["read_file"] });
+    servers.save({ name: "docs", command, toolNames: ["search"] });
+    const config = servers.config();
+    expect(config.scopes.sort()).toEqual(["tool:mcp:docs", "tool:mcp:filesystem"]);
+    expect(config.applied.map((entry: { name: string }) => entry.name).sort())
+      .toEqual(["docs", "filesystem"]);
   });
 });

@@ -146,29 +146,19 @@ describe("what the packaged app expects to find beside it", () => {
   /// machinery this window is built around -- was compiled, sandboxed, and
   /// never offered to the model. The acceptance run passed anyway: a turn ran,
   /// and the agent could not do anything.
-  it("delegates the scopes an agent needs, with consent left explicit", () => {
-    const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
-    expect(main).toContain("AGENT_RUNTIME_LOCAL_DELEGATED_SCOPES");
-    for (const scope of ["tool:workspace.read", "tool:workspace.write", "tool:shell.exec"]) {
-      expect(main, `${scope} must be delegated or the agent cannot be asked to use it`)
-        .toContain(scope);
-    }
-    // Granting a scope is not granting a use. Consent is set here rather than
-    // inherited: a boundary that holds because nobody set a variable is one
-    // that moves the first time someone does.
-    expect(main).toMatch(/AGENT_RUNTIME_LOCAL_TOOL_CONSENT:\s*"ask"/);
-  });
-
+  /// The scopes and the consent mode moved to `childEnv.cjs`, where
+  /// `child-env.test.ts` reads the object the child is actually given rather
+  /// than matching text. What stays here is what still lives in `main.cjs`:
+  /// the roles file it derives and writes on every launch.
+  ///
   /// Delegation is gated on two things, not one. The `agent.*` tool family is
   /// installed when the configured roles are non-empty *and* the parent holds
   /// `agent:spawn`; with roles alone the model is offered no way to use them.
   /// Checked by running a turn and reading the tool list the provider received:
   /// roles-only produced `shell.exec, workspace.read_text, workspace.write_text`
-  /// and nothing else.
-  it("configures both halves of the delegation gate", () => {
+  /// and nothing else. This file owns the first half; the scope is the second.
+  it("writes the roles file that is one half of the delegation gate", () => {
     const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
-    expect(main).toContain("AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG");
-    expect(main).toContain("agent:spawn");
     // Roles narrower than the parent. A reviewer that can write the workspace
     // is not a reviewer, and a scope delegated cannot be taken back.
     expect(main).toMatch(/name:\s*"reader"/);

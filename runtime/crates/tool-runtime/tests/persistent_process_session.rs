@@ -1004,6 +1004,118 @@ async fn natural_leader_exit_also_reaps_a_stubborn_background_descendant() {
     panic!("background descendant {child_pid} survived natural leader exit");
 }
 
+/// A session leader must be interruptible however the runtime itself was
+/// started.
+///
+/// SIG_IGN is inherited across fork *and* across exec, unlike a handler. POSIX
+/// has a non-interactive shell set SIGINT and SIGQUIT to SIG_IGN for a command
+/// it runs in the background, so a `runtime-host` started as `... &` hands that
+/// ignore to every process session it spawns. `process.interrupt` then becomes
+/// a silent no-op: `killpg` succeeds, the tool reports the signal sent, and the
+/// shell runs on.
+///
+/// This ignores SIGINT in the test process itself rather than depending on how
+/// the test was launched -- which is the whole point, because that dependency
+/// is what hid it. Five workspace gates failed the test below and every one of
+/// them was started with `&`; run in the foreground it passed 37 times.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_leader_is_interruptible_even_when_the_runtime_inherited_an_ignored_sigint() {
+    let state = tempfile::tempdir().unwrap();
+    let trusted = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let executable = executable_script(trusted.path());
+    let tenant_id = Uuid::now_v7();
+    let session_id = Uuid::now_v7();
+    let access = ProcessSessionAccess {
+        tenant_id,
+        workspace_root: workspace.path().canonicalize().unwrap(),
+    };
+    let manager = PersistentProcessSessionManager::new(
+        state.path().to_path_buf(),
+        executor(trusted.path(), &executable),
+        16 * 1024,
+    )
+    .unwrap();
+
+    // SAFETY: sets this process's own disposition for one signal, and restores
+    // it before returning. Exactly what a shell does to a background job.
+    let previous = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    assert_ne!(previous, libc::SIG_ERR, "could not ignore SIGINT");
+    let restore = RestoreSignal { signal: libc::SIGINT, previous };
+
+    manager
+        .start(ProcessSessionStartRequest {
+            session_id,
+            request: request(),
+            context: context(tenant_id, access.workspace_root.clone()),
+            initial_stdin: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let ready = poll_until(&manager, &access, session_id, 0, "ready\n").await;
+    manager
+        .interact(
+            &access,
+            ProcessSessionInteraction {
+                session_id,
+                stdout_cursor: ready.stdout_cursor,
+                stderr_cursor: ready.stderr_cursor,
+                action: ProcessSessionAction::Interrupt,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut last = None;
+    for _ in 0..200 {
+        let output = manager
+            .interact(
+                &access,
+                ProcessSessionInteraction {
+                    session_id,
+                    stdout_cursor: ready.stdout_cursor,
+                    stderr_cursor: ready.stderr_cursor,
+                    action: ProcessSessionAction::Poll,
+                },
+            )
+            .await
+            .unwrap();
+        if matches!(
+            output.state,
+            ProcessSessionState::Exited | ProcessSessionState::Terminated
+        ) {
+            drop(restore);
+            return;
+        }
+        last = Some(output);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let leader = last.as_ref().and_then(|output| output.pid);
+    drop(restore);
+    panic!(
+        "an inherited SIG_IGN survived into the session leader; \
+         leader={leader:?} leader_alive={:?} last={last:?}",
+        leader.map(process_alive),
+    );
+}
+
+/// Puts a signal disposition back however the test leaves, so one test cannot
+/// decide what the rest of this binary inherits.
+#[cfg(unix)]
+struct RestoreSignal {
+    signal: libc::c_int,
+    previous: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreSignal {
+    fn drop(&mut self) {
+        // SAFETY: restores the disposition this process had a moment ago.
+        unsafe { libc::signal(self.signal, self.previous) };
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn interrupt_reaches_the_registered_process_group_and_converges_terminal() {
