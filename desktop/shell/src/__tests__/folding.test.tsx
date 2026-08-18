@@ -215,6 +215,42 @@ describe("what the runtime said in words", () => {
     await waitFor(() => expect(screen.getByText(/something_new/)).toBeTruthy());
   });
 
+  /// A person who pressed 不执行 stopped the call. The runtime records that as
+  /// a `tool.result` carrying `is_error` and `approval_denied`, the same shape
+  /// a tool that broke produces -- so a client that read only `is_error` tells
+  /// someone their own decision was a malfunction.
+  it("says a call was declined, not that the tool broke", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "rm -rf build" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: true,
+      content: {
+        error: { code: "approval_denied", message: "tool execution was denied by a reviewer" },
+      },
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/你没让它执行/)).toBeTruthy());
+    // And not the wording for a tool that failed on its own.
+    expect(screen.queryByText(/工具报错/)).toBeNull();
+  });
+
+  it("still calls a genuine tool failure a failure", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "ls" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: true,
+      content: { error: { code: "exit_status", message: "exit 1" } },
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/工具报错/)).toBeTruthy());
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

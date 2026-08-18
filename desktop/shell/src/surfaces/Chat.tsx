@@ -301,7 +301,7 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
       continue;
     }
     flushText(String(event.sequence));
-    const note = eventNote(event.type);
+    const note = eventNote(event.type, event.payload);
     // Two reasons an event that has a note still does not get a hairline here.
     // Routine bookkeeping stays out of the column: it is state, and the status
     // line and the raw-event drawer are where state belongs -- leaving it here

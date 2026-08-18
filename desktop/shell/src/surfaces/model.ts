@@ -147,10 +147,15 @@ const EVENT_NOTE: Record<string, string> = {
   /// taken against the digest that was on screen a moment ago no longer binds.
   "approval.rebound": "这次调用重新绑定了",
   "tool.denied": "已拒绝",
-  /// Only ever drawn for a call that failed -- `Chat` folds a successful result
-  /// in with the call it answers. A successful one said nothing this note could
-  /// carry, and it said it between every two calls, which is what kept the fold
-  /// from ever firing.
+  /// Only ever drawn for a call that did not run to a normal result -- `Chat`
+  /// folds a successful one in with the call it answers. A successful one said
+  /// nothing this note could carry, and it said it between every two calls,
+  /// which is what kept the fold from ever firing.
+  ///
+  /// This is the wording for a tool that failed on its own. A call a person
+  /// declined arrives in the same shape -- `is_error` with an
+  /// `approval_denied` code -- and gets its own words, because telling someone
+  /// their own decision was a malfunction is not a small thing to get wrong.
   "tool.result": "工具报错",
   /// The call's outcome was never observed, and its effect class made running
   /// it again safe. Whatever the tool touched, it may have touched twice.
@@ -168,9 +173,7 @@ const EVENT_NOTE: Record<string, string> = {
   "mcp.input.continuation.started": "带着你的回答继续调用",
 };
 
-export function eventNote(type: string): string | null {
-  return EVENT_NOTE[type] ?? null;
-}
+
 
 /// Events whose payload carries words rather than only a name.
 ///
@@ -228,6 +231,31 @@ function failureReason(payload: Record<string, unknown>): string | null {
     default:
       return `这个版本不认识的失败原因：${kind}`;
   }
+}
+
+/// What the runtime says went wrong with one tool call.
+///
+/// The code is the runtime's own: `approval_denied` is written when a reviewer
+/// says no, and it is the only way to tell that apart from a tool that broke,
+/// because both arrive as a `tool.result` with `is_error`.
+function toolResultNote(payload: Record<string, unknown>): string | null {
+  if (payload.is_error !== true) return null;
+  const content = (payload.content ?? {}) as Record<string, unknown>;
+  const error = (content.error ?? {}) as Record<string, unknown>;
+  return error.code === "approval_denied" ? "你没让它执行" : null;
+}
+
+/// What one event says, in words.
+///
+/// Takes the payload as well as the type because one type is not always one
+/// sentence: a `tool.result` that failed and one a person declined arrive in
+/// the same shape, and only the payload separates them.
+export function eventNote(type: string, payload: Record<string, unknown> = {}): string | null {
+  if (type === "tool.result") {
+    const declined = toolResultNote(payload);
+    if (declined) return declined;
+  }
+  return EVENT_NOTE[type] ?? null;
 }
 
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
