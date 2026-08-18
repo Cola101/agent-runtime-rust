@@ -131,6 +131,27 @@ Provider 在 `run.started` 之后失败时，这条原则已经被执行了；�
 至于有没有留下终局，交给 Run 自己的日志说。**一条断言了自己不知道的事的诊断，
 比没有诊断更坏。**
 
+### 一次失败的定位，以及它排除掉了什么
+
+读了 `lib.rs` 的驱动循环之后我以为找到了：终局检查 `attempt_is_terminal` 在
+`for event in events` **之外**，所以一批事件里如果中间那条让 attempt 变终局
+（`model.usage` 触发预算耗尽正是这种），同一批里剩下的还是会被喂进
+`apply_model_event`，于是被拒。stub 也确实是先发 `usage` 再发 `finish_reason`。
+
+**照这个写了守卫，它绿了。** 预算设成 1、usage 排在 finish_reason 前面，
+`LocalRuntimeHost::execute` 正常返回 `Failed`，没有任何错误。
+
+所以那个读法是错的，而这条不成立的守卫**排除掉了一整块**：缺陷不在
+`LocalRuntimeHost::execute` 这条直连路径上。真实复现走的是 socket →
+`EmbeddedRuntime::execute` → `claim_execution` → `drive_recorded` →
+`execute_as_at_epoch` → `drive`，中间多出 `claim_execution`、`accept`、
+`bind_cancellation_token`、`arm_duration_deadline` 这些直连路径不走的步骤——
+而 `accept` 和 `bind_cancellation_token` 正是另外两处会返回
+`AttemptAlreadyTerminal` 的地方。
+
+**那条守卫已经删掉了。** 一条不测任何东西的绿色测试，比没有测试更坏：
+它会让下一个人以为这里已经守住了。
+
 ### 还没确定的
 
 - 父的时长看门狗（默认 600 秒）会不会最终把它收掉。没等满十分钟，所以说不准是
