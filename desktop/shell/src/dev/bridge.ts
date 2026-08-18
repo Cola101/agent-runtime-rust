@@ -204,6 +204,21 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       ev("model.tool_call", {
         name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
       }, RUN_DONE),
+      ev("tool.result", {
+        tool_call_id: "stub-call-2", binding_digest: "b".repeat(64), is_error: false,
+        content: { exit_code: 0, stdout: "", stdout_truncated: false, stderr: "", stderr_truncated: false },
+      }, RUN_DONE),
+      ev("model.tool_call", {
+        name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-3",
+      }, RUN_DONE),
+      ev("tool.result", {
+        tool_call_id: "stub-call-3", binding_digest: "b".repeat(64), is_error: false,
+        content: {
+          exit_code: 0,
+          stdout: "total 16\ndrwxr-xr-x  4 cola staff  128 8 18 09:30 .\n-rw-r--r--  1 cola staff   56 8 18 09:30 notes.txt\n",
+          stdout_truncated: false, stderr: "", stderr_truncated: false,
+        },
+      }, RUN_DONE),
       ev("run.succeeded", { status: "succeeded" }, RUN_DONE),
     ],
   },

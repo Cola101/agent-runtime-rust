@@ -251,6 +251,59 @@ describe("what the runtime said in words", () => {
     await waitFor(() => expect(screen.getByText(/工具报错/)).toBeTruthy());
   });
 
+  /// You approve `ls -la`, it runs, and the listing is the thing you approved
+  /// it for. Folding a successful result away made the fold work and left the
+  /// output reachable only from the raw-event drawer -- so the transcript
+  /// showed that a command had been run and never what it said.
+  it("shows what a command printed, under the call that printed it", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    const call = (sequence: number, id: string, command: string) =>
+      bridge.emit(RUN_LIVE, bridge.event(sequence, "model.tool_call", {
+        name: "shell.exec", arguments: { command }, id,
+      }, 30));
+    const answer = (sequence: number, id: string, stdout: string) =>
+      bridge.emit(RUN_LIVE, bridge.event(sequence, "tool.result", {
+        tool_call_id: id, binding_digest: "b".repeat(64), is_error: false,
+        content: { exit_code: 0, stdout, stdout_truncated: false, stderr: "", stderr_truncated: false },
+      }, 30));
+    call(20, "c0", "ls -la");
+    answer(21, "c0", "total 8\ndrwxr-xr-x  notes.txt\n");
+    call(22, "c1", "wc -l notes.txt");
+    answer(23, "c1", "3 notes.txt\n");
+
+    // Still one fold: the results belong to the calls, not between them.
+    const row = await screen.findByText("2 个工具调用");
+    expect(screen.queryByText(/drwxr-xr-x/)).toBeNull();
+    await user.click(row);
+    // Opened, each call carries what it printed.
+    await waitFor(() => expect(screen.getByText(/drwxr-xr-x/)).toBeTruthy());
+    expect(screen.getByText(/3 notes\.txt/)).toBeTruthy();
+  });
+
+  it("says a command failed by its exit code, and shows what it wrote", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.tool_call", {
+      name: "shell.exec", arguments: { command: "cat missing" }, id: "c0",
+    }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(21, "tool.result", {
+      tool_call_id: "c0", binding_digest: "b".repeat(64), is_error: false,
+      content: {
+        exit_code: 1, stdout: "", stdout_truncated: false,
+        stderr: "cat: missing: No such file\n", stderr_truncated: false,
+      },
+    }, 30));
+    // A single call is not folded, so this is on screen without opening
+    // anything -- and a non-zero exit is not an error event, it is a command
+    // that ran and said no.
+    await waitFor(() => expect(screen.getByText(/No such file/)).toBeTruthy());
+    expect(screen.getByText(/退出码 1/)).toBeTruthy();
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

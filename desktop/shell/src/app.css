@@ -421,6 +421,20 @@ p.note {
   border-bottom: 1px solid var(--rule-2); margin-bottom: 3px;
 }
 
+/* What a command printed, under the call that printed it. Indented with the
+   arguments rather than boxed: it is the second half of one line of the
+   conversation, not a panel. */
+.act .said { margin: 3px 0 2px 14px; max-width: 92ch; }
+.act .said pre {
+  margin: 0; padding: 5px 9px; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--sunk, var(--panel)); border-radius: 4px;
+  font-size: 11.5px; color: var(--ink-2); max-height: 22em; overflow-y: auto;
+}
+.act .said pre.err { color: var(--accent); }
+.act .said pre + pre { margin-top: 4px; }
+.act .said .exit { display: flex; gap: 12px; margin-top: 3px; font-size: 10.5px; color: var(--ink-3); }
+.act .said .exit .warn { color: var(--accent); }
+
 /* ---------- drawer ---------- */
 .drawer { border-left: 1px solid var(--rule); background: var(--sunk, var(--paper)); padding: 14px 15px; overflow-y: auto; }
 

@@ -43,16 +43,60 @@ function callSpans(event: RunEvent): [string, string] {
   return [String(call.name ?? ""), args ? JSON.stringify(args) : ""];
 }
 
+/// What a finished call printed, when it printed in the shape a shell does.
+///
+/// `exit_code`, `stdout` and `stderr` are what the trusted workspace tool
+/// returns, and they are the reason someone approved the call in the first
+/// place. Other tools answer in other shapes; those stay in the raw-event
+/// drawer rather than being guessed at here.
+///
+/// A non-zero exit is not an error event -- the call ran and the command said
+/// no -- so it is drawn as the command's own answer rather than as a failure
+/// of the runtime.
+function said(result: RunEvent | undefined): {
+  exit: number | null; out: string; err: string; cut: boolean;
+} | null {
+  if (!result) return null;
+  const content = (result.payload.content ?? {}) as Record<string, unknown>;
+  const out = typeof content.stdout === "string" ? content.stdout : "";
+  const err = typeof content.stderr === "string" ? content.stderr : "";
+  const exit = typeof content.exit_code === "number" ? content.exit_code : null;
+  if (!out && !err && exit === null) return null;
+  return {
+    exit,
+    out,
+    err,
+    cut: content.stdout_truncated === true || content.stderr_truncated === true,
+  };
+}
+
 /// A tool call is two lines, not a card.
 ///
 /// Boxing each one puts a border around every third element and the column
 /// stops reading as a conversation.
-function Act({ event, query }: { event: RunEvent; query: string }) {
+function Act(
+  { event, result, query }: { event: RunEvent; result?: RunEvent; query: string },
+) {
   const [name, args] = callSpans(event);
+  const answer = said(result);
   return (
     <div className="act">
       <b><Mark text={name} query={query} /></b>
       <span className="out mono"><Mark text={args} query={query} /></span>
+      {answer && (
+        <div className="said mono">
+          {answer.out && <pre><Mark text={answer.out} query={query} /></pre>}
+          {answer.err && <pre className="err"><Mark text={answer.err} query={query} /></pre>}
+          <div className="exit">
+            {answer.exit !== null && (
+              <span className={answer.exit === 0 ? "" : "warn"}>
+                <Mark text={`退出码 ${answer.exit}`} query={query} />
+              </span>
+            )}
+            {answer.cut && <span><Mark text="输出被截断了" query={query} /></span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -112,9 +156,23 @@ function Gate({ run, query }: { run: RunView; query: string }) {
 ///
 /// One call is not folded. Hiding a single line behind a control to reveal it
 /// is not a saving.
-function Acts({ events, query }: { events: RunEvent[]; query: string }) {
+function Acts(
+  { events, results, query }:
+    { events: RunEvent[]; results: Map<string, RunEvent>; query: string },
+) {
   const [open, setOpen] = useState(false);
-  if (events.length === 1) return <Act event={events[0]} query={query} />;
+  /// The call's own id, from wherever this build of the runtime put it: flat
+  /// on the payload for `model.tool_call`, nested under `call` for the shapes
+  /// that carry an execution. `callSpans` reads the name and arguments the
+  /// same way, and a second rule here would be a second answer to "which call
+  /// is this".
+  const answer = (event: RunEvent) => {
+    const call = (event.payload.call ?? event.payload) as Record<string, unknown>;
+    return results.get(String(call.id ?? ""));
+  };
+  if (events.length === 1) {
+    return <Act event={events[0]} result={answer(events[0])} query={query} />;
+  }
 
   const counted = new Map<string, number>();
   for (const event of events) {
@@ -130,7 +188,13 @@ function Acts({ events, query }: { events: RunEvent[]; query: string }) {
   // otherwise the count in the finder would include lines the fold is hiding.
   // The summary row is left unmarked on purpose: it is a tally of the very
   // lines being counted, and marking it too would count each call twice.
-  const found = events.some((event) => callSpans(event).some((span) => has(span, query)));
+  // A hit inside what a call printed counts too: the output is in this column
+  // and the finder counts the marks standing in it, so a fold that stayed shut
+  // over a match in a command's output would be counting a line nobody can see.
+  const found = events.some((event) =>
+    callSpans(event).some((span) => has(span, query))
+    || [...Object.values((answer(event)?.payload.content ?? {}) as Record<string, unknown>)]
+      .some((value) => typeof value === "string" && has(value, query)));
   const showing = open || found;
 
   return (
@@ -141,7 +205,12 @@ function Acts({ events, query }: { events: RunEvent[]; query: string }) {
         <span className="mono dim">{named}</span>
       </button>
       {showing && events.map((event) => (
-        <Act event={event} key={event.event_id || event.sequence} query={query} />
+        <Act
+          event={event}
+          result={answer(event)}
+          key={event.event_id || event.sequence}
+          query={query}
+        />
       ))}
     </div>
   );
@@ -245,9 +314,10 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
     );
     text = "";
   };
+  const results = new Map<string, RunEvent>();
   const flushActs = (key: string) => {
     if (acts.length === 0) return;
-    blocks.push(<Acts events={acts} key={`a-${key}`} query={query} />);
+    blocks.push(<Acts events={acts} results={results} key={`a-${key}`} query={query} />);
     acts = [];
   };
   const flushUnheard = (key: string) => {
@@ -298,6 +368,11 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
     // failure the note is now worded for.
     if (event.type === "tool.result" && event.payload.is_error !== true) {
       flushText(String(event.sequence));
+      // Kept, keyed by the call it answers, so the fold can draw it under that
+      // call. Folding it away entirely is what made the fold work and left a
+      // transcript that said a command had been run and never what it said.
+      const answered = String(event.payload.tool_call_id ?? "");
+      if (answered) results.set(answered, event);
       continue;
     }
     flushText(String(event.sequence));
