@@ -14,10 +14,16 @@
 use crate::client::{
     InitializedRuntimeClient, RUNTIME_CAPABILITY_EVENTS_CURSOR, RUNTIME_CAPABILITY_EVENTS_WATCH,
     RUNTIME_CAPABILITY_RECOVERY_STARTUP, RUNTIME_CAPABILITY_RUN_CONTROL,
-    RUNTIME_CAPABILITY_RUN_SUBMIT, RUNTIME_CLIENT_CONTRACT_VERSION,
-    RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES, RUNTIME_CLIENT_MAX_INPUT_BYTES,
-    RUNTIME_CLIENT_SCHEMA_VERSION, RuntimeClient, RuntimeClientError, RuntimeClientErrorCode,
-    RuntimeClientEventCursorRequest, RuntimeClientHello, RuntimeSubmitRequest,
+    RUNTIME_CAPABILITY_RUN_SUBMIT, RUNTIME_CAPABILITY_SESSION_CONTINUE,
+    RUNTIME_CAPABILITY_SESSION_FORK, RUNTIME_CAPABILITY_SESSION_HISTORY,
+    RUNTIME_CAPABILITY_SESSION_LIST, RUNTIME_CAPABILITY_SESSION_READ,
+    RUNTIME_CAPABILITY_SESSION_ROLLBACK, RUNTIME_CAPABILITY_SESSION_START,
+    RUNTIME_CLIENT_CONTRACT_VERSION, RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES,
+    RUNTIME_CLIENT_MAX_INPUT_BYTES, RUNTIME_CLIENT_SCHEMA_VERSION, RuntimeClient,
+    RuntimeClientError, RuntimeClientErrorCode, RuntimeClientEventCursorRequest,
+    RuntimeClientHello, RuntimeSessionForkRequest, RuntimeSessionHistoryRequest,
+    RuntimeSessionListRequest, RuntimeSessionReadRequest, RuntimeSessionRollbackRequest,
+    RuntimeSessionTurnRequest, RuntimeSubmitRequest,
 };
 use crate::embedded::RuntimeEventStreamItem;
 use crate::embedded::{
@@ -27,10 +33,14 @@ use crate::embedded::{
 use agent_protocol::{RUNTIME_INVOCATION_SCHEMA_VERSION, RunStatus, RuntimeInvocationContext};
 use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocation;
 use agent_runtime_invocation_protocol::v1::{
-    ControlReceiptState, ControlRunRequest, ControlRunResponse, InitializeRuntimeRequest,
-    InitializeRuntimeResponse, ReadRunEventsRequest, ReadRunEventsResponse, RunEventBoundary,
-    RunEventStreamItem, RunLifecycleBoundary, RuntimeEvent, RuntimeInvocationRef, SubmitRunRequest,
-    SubmitRunResponse, WatchRunEventsRequest, run_event_stream_item, run_lifecycle_boundary,
+    ControlReceiptState, ControlRunRequest, ControlRunResponse, ForkSessionRequest,
+    InitializeRuntimeRequest, InitializeRuntimeResponse, ListSessionsRequest, ListSessionsResponse,
+    ReadRunEventsRequest, ReadRunEventsResponse, ReadSessionHistoryRequest,
+    ReadSessionHistoryResponse, ReadSessionRequest, RollbackSessionRequest, RunEventBoundary,
+    RunEventStreamItem, RunLifecycleBoundary, RuntimeEvent, RuntimeInvocationRef,
+    SessionConversationTurn as WireSessionConversationTurn, SessionHead, SessionTurnRequest,
+    SessionTurnResponse, SubmitRunRequest, SubmitRunResponse, WatchRunEventsRequest,
+    run_event_stream_item, run_lifecycle_boundary,
 };
 use agent_workload_identity::{
     RequiredCapability, WorkloadIdentityBinding, WorkloadTokenError, WorkloadTokenVerifier,
@@ -78,6 +88,13 @@ impl RuntimeInvocationGrpcService {
                     RUNTIME_CAPABILITY_EVENTS_CURSOR.into(),
                     RUNTIME_CAPABILITY_EVENTS_WATCH.into(),
                     RUNTIME_CAPABILITY_RECOVERY_STARTUP.into(),
+                    RUNTIME_CAPABILITY_SESSION_START.into(),
+                    RUNTIME_CAPABILITY_SESSION_CONTINUE.into(),
+                    RUNTIME_CAPABILITY_SESSION_FORK.into(),
+                    RUNTIME_CAPABILITY_SESSION_ROLLBACK.into(),
+                    RUNTIME_CAPABILITY_SESSION_READ.into(),
+                    RUNTIME_CAPABILITY_SESSION_LIST.into(),
+                    RUNTIME_CAPABILITY_SESSION_HISTORY.into(),
                 ]),
             })
             .expect("the gRPC adapter and Runtime client contract are compiled together");
@@ -198,6 +215,8 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
             max_action_json_bytes: descriptor.max_action_json_bytes,
             max_event_page_size: descriptor.max_event_page_size,
             max_event_stream_capacity: descriptor.max_event_stream_capacity,
+            max_session_list_size: descriptor.max_session_list_size,
+            max_session_history_turns: descriptor.max_session_history_turns,
         }))
     }
 
@@ -228,6 +247,196 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
             run_id: receipt.run_id.to_string(),
             owner_epoch: receipt.owner_epoch,
             status: boundary_status_token(&receipt.state),
+        }))
+    }
+
+    async fn start_session(
+        &self,
+        request: Request<SessionTurnRequest>,
+    ) -> Result<Response<SessionTurnResponse>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let receipt = self
+            .client
+            .start_session(RuntimeSessionTurnRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                branch_id: parse_uuid(&message.branch_id, "branch_id")?,
+                generation: message.generation,
+                run_id: parse_uuid(&message.run_id, "run_id")?,
+                input: message.input.clone(),
+            })
+            .await
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(SessionTurnResponse {
+            schema_version: receipt.schema_version,
+            head: Some(wire_session_head(&receipt.head)),
+            run_id: receipt.run_id.to_string(),
+            owner_epoch: receipt.owner_epoch,
+            boundary: Some(wire_boundary(&receipt.state)),
+        }))
+    }
+
+    async fn continue_session(
+        &self,
+        request: Request<SessionTurnRequest>,
+    ) -> Result<Response<SessionTurnResponse>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let receipt = self
+            .client
+            .continue_session(RuntimeSessionTurnRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                branch_id: parse_uuid(&message.branch_id, "branch_id")?,
+                generation: message.generation,
+                run_id: parse_uuid(&message.run_id, "run_id")?,
+                input: message.input.clone(),
+            })
+            .await
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(SessionTurnResponse {
+            schema_version: receipt.schema_version,
+            head: Some(wire_session_head(&receipt.head)),
+            run_id: receipt.run_id.to_string(),
+            owner_epoch: receipt.owner_epoch,
+            boundary: Some(wire_boundary(&receipt.state)),
+        }))
+    }
+
+    async fn fork_session(
+        &self,
+        request: Request<ForkSessionRequest>,
+    ) -> Result<Response<SessionHead>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let head = self
+            .client
+            .fork_session(RuntimeSessionForkRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                source_branch_id: parse_uuid(&message.source_branch_id, "source_branch_id")?,
+                source_generation: message.source_generation,
+                through_turn_ordinal: message.through_turn_ordinal,
+                target_branch_id: parse_uuid(&message.target_branch_id, "target_branch_id")?,
+            })
+            .await
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(wire_session_head(&head)))
+    }
+
+    async fn rollback_session(
+        &self,
+        request: Request<RollbackSessionRequest>,
+    ) -> Result<Response<SessionHead>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let head = self
+            .client
+            .rollback_session(RuntimeSessionRollbackRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                branch_id: parse_uuid(&message.branch_id, "branch_id")?,
+                generation: message.generation,
+                through_turn_ordinal: message.through_turn_ordinal,
+            })
+            .await
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(wire_session_head(&head)))
+    }
+
+    async fn read_session(
+        &self,
+        request: Request<ReadSessionRequest>,
+    ) -> Result<Response<SessionHead>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let head = self
+            .client
+            .read_session(RuntimeSessionReadRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                branch_id: parse_uuid(&message.branch_id, "branch_id")?,
+            })
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(wire_session_head(&head)))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let page = self
+            .client
+            .list_sessions(RuntimeSessionListRequest {
+                schema_version: message.schema_version,
+                invocation,
+                after_session_id: message
+                    .after_session_id
+                    .as_deref()
+                    .map(|value| parse_uuid(value, "after_session_id"))
+                    .transpose()?,
+                after_branch_id: message
+                    .after_branch_id
+                    .as_deref()
+                    .map(|value| parse_uuid(value, "after_branch_id"))
+                    .transpose()?,
+                limit: message.limit,
+            })
+            .map_err(runtime_client_status)?;
+        Ok(Response::new(ListSessionsResponse {
+            schema_version: page.schema_version,
+            heads: page.heads.iter().map(wire_session_head).collect(),
+            next_after_session_id: page.next_after_session_id.map(|id| id.to_string()),
+            next_after_branch_id: page.next_after_branch_id.map(|id| id.to_string()),
+        }))
+    }
+
+    async fn read_session_history(
+        &self,
+        request: Request<ReadSessionHistoryRequest>,
+    ) -> Result<Response<ReadSessionHistoryResponse>, Status> {
+        let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
+        let message = request.get_ref();
+        let page = self
+            .client
+            .read_session_history(RuntimeSessionHistoryRequest {
+                schema_version: message.schema_version,
+                invocation,
+                session_id: parse_uuid(&message.session_id, "session_id")?,
+                branch_id: parse_uuid(&message.branch_id, "branch_id")?,
+                generation: message.generation,
+                after_turn_ordinal: message.after_turn_ordinal,
+                limit: message.limit,
+            })
+            .map_err(runtime_client_status)?;
+        let turns = page
+            .turns
+            .iter()
+            .map(|turn| {
+                serde_json::to_vec(turn)
+                    .map(|turn_json| WireSessionConversationTurn {
+                        turn_ordinal: turn.turn_ordinal,
+                        run_id: turn.run_id.to_string(),
+                        turn_json,
+                    })
+                    .map_err(|_| Status::internal("Session Turn could not be encoded"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(ReadSessionHistoryResponse {
+            schema_version: page.schema_version,
+            session_id: page.session_id.to_string(),
+            branch_id: page.branch_id.to_string(),
+            generation: page.generation,
+            turns,
+            next_after_turn_ordinal: page.next_after_turn_ordinal,
         }))
     }
 
@@ -360,6 +569,17 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
             boundary: Some(wire_boundary(&page.state)),
             events: page.events.iter().map(wire_event).collect(),
         }))
+    }
+}
+
+fn wire_session_head(head: &crate::client::RuntimeSessionHead) -> SessionHead {
+    SessionHead {
+        session_id: head.session_id.to_string(),
+        branch_id: head.branch_id.to_string(),
+        generation: head.generation,
+        turn_count: head.turn_count,
+        history_digest: head.history_digest.clone(),
+        active_run_id: head.active_run_id.map(|id| id.to_string()),
     }
 }
 

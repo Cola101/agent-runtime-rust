@@ -22,9 +22,12 @@ use crate::retention::{
 use crate::{
     LOCAL_EVENT_LOG_LINE_MAX_BYTES, LocalApprovalDecision, LocalApprovalResolution, LocalEvent,
     LocalMcpInputResolution, LocalResumeResolution, LocalRunOutcome, LocalRunRecord, LocalRunState,
-    LocalRuntimeConfig, LocalRuntimeError, LocalRuntimeHost,
+    LocalRuntimeConfig, LocalRuntimeError, LocalRuntimeHost, LocalSessionHead,
+    LocalSessionTurnDecision, LocalSessionTurnPreparation,
 };
-use agent_protocol::{McpInputResponse, RunStatus, RuntimeInvocationContext};
+use agent_protocol::{
+    McpInputResponse, RunStatus, RuntimeInvocationContext, SessionConversationTurn,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +49,7 @@ pub const EMBEDDED_EVENT_SUBSCRIPTION_MAX_ACTIVE: usize = 256;
 pub const EMBEDDED_EVENT_SUBSCRIPTION_MAX_BUFFERED_EVENTS: usize = 1_024;
 const EMBEDDED_EVENT_LOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const CONTROL_RECONCILIATION_SHARDS: usize = 64;
+const SESSION_MUTATION_SHARDS: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +94,37 @@ pub struct RuntimeEventCursorPage {
     pub has_more: bool,
     pub state: RuntimeEventCursorState,
     pub events: Vec<LocalEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedSessionTurnReceipt {
+    pub invocation: RuntimeInvocationContext,
+    pub head: LocalSessionHead,
+    pub run_id: Uuid,
+    /// Absent only after hot Run state was retired; the terminal tombstone and
+    /// immutable Session Turn remain sufficient to prove an idempotent retry.
+    pub owner_epoch: Option<u64>,
+    pub state: RuntimeEventCursorState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedSessionListPage {
+    pub invocation: RuntimeInvocationContext,
+    pub heads: Vec<LocalSessionHead>,
+    pub next_after: Option<(Uuid, Uuid)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedSessionHistoryPage {
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub turns: Vec<SessionConversationTurn>,
+    pub next_after_turn_ordinal: Option<u64>,
 }
 
 struct CursorLogSummary {
@@ -445,6 +480,11 @@ impl Drop for ActiveExecutionGuard {
 
 enum RecordedOperation {
     Execute,
+    SessionTurn {
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+    },
     Resume,
     Approval(LocalApprovalResolution),
     McpInput(LocalMcpInputResolution),
@@ -492,6 +532,14 @@ pub struct EmbeddedRuntime {
     peak_active_execution_owners: AtomicUsize,
     event_subscriptions: Arc<EventSubscriptionCapacity>,
     control_reconciliation_gates: [Mutex<()>; CONTROL_RECONCILIATION_SHARDS],
+    session_mutation_gates: [AsyncMutex<()>; SESSION_MUTATION_SHARDS],
+    /// Serialises the read-path head projection.
+    ///
+    /// Separate from the mutation gate and synchronous on purpose: the
+    /// projection runs from `read_session_head`, which is not async and is not
+    /// under the mutation gate. It is always the innermost lock and is never
+    /// held across an await, so it cannot deadlock against the async gate.
+    session_projection_gates: [Mutex<()>; SESSION_MUTATION_SHARDS],
     retention_policy: RuntimeRetentionPolicy,
     retention_gates: HashMap<PathBuf, Arc<Mutex<()>>>,
     retired_runs: HashMap<PathBuf, Arc<Mutex<HashMap<Uuid, RuntimeTerminalTombstone>>>>,
@@ -631,6 +679,8 @@ impl EmbeddedRuntime {
             peak_active_execution_owners: AtomicUsize::new(0),
             event_subscriptions: Arc::new(EventSubscriptionCapacity::default()),
             control_reconciliation_gates: std::array::from_fn(|_| Mutex::new(())),
+            session_mutation_gates: std::array::from_fn(|_| AsyncMutex::new(())),
+            session_projection_gates: std::array::from_fn(|_| Mutex::new(())),
             retention_policy,
             retention_gates,
             retired_runs,
@@ -709,6 +759,35 @@ impl EmbeddedRuntime {
         let (execution, active_guard) = self.claim_execution(invocation, run_id, false)?;
         let permit = self.admission.acquire(invocation).await?;
         let record = Self::new_run_record(invocation, run_id, input, owner_epoch);
+        self.persist_new_run_record_with_capacity(&config, &record)?;
+        self.drive_recorded(
+            config,
+            invocation,
+            record,
+            RecordedOperation::Execute,
+            execution,
+            active_guard,
+            permit,
+            None,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    fn persist_new_run_record_with_capacity(
+        &self,
+        config: &LocalRuntimeConfig,
+        record: &LocalRunRecord,
+    ) -> Result<(), EmbeddedRuntimeError> {
+        let invocation = RuntimeInvocationContext {
+            schema_version: agent_protocol::RUNTIME_INVOCATION_SCHEMA_VERSION,
+            tenant_id: record.tenant_id,
+            application_id: record.application_id,
+            workload_identity_id: record.workload_identity_id,
+            workspace_id: record.workspace_id,
+            agent_version_id: record.agent_version_id,
+            model_policy_id: record.model_policy_id,
+        };
         {
             let tenant_gate = self.tenant_retention_gate(invocation.tenant_id)?;
             let _tenant_retention = tenant_gate
@@ -719,8 +798,13 @@ impl EmbeddedRuntime {
                 let _retention = retention_gate
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                self.reject_retired_run(&config.state_root, invocation, run_id, input)?;
-                if LocalRuntimeHost::read_run_record(&config.state_root, run_id)?.is_some() {
+                self.reject_retired_run(
+                    &config.state_root,
+                    invocation,
+                    record.run_id,
+                    &record.input,
+                )?;
+                if LocalRuntimeHost::read_run_record(&config.state_root, record.run_id)?.is_some() {
                     return Err(EmbeddedRuntimeError::Configuration(
                         "Run id already has durable state".into(),
                     ));
@@ -740,26 +824,15 @@ impl EmbeddedRuntime {
             // Maintenance may add tombstones for older Runs, never this absent
             // id. Recheck both authorities while the Workspace gate is held so
             // another invocation sharing the same root cannot reuse this id.
-            self.reject_retired_run(&config.state_root, invocation, run_id, input)?;
-            if LocalRuntimeHost::read_run_record(&config.state_root, run_id)?.is_some() {
+            self.reject_retired_run(&config.state_root, invocation, record.run_id, &record.input)?;
+            if LocalRuntimeHost::read_run_record(&config.state_root, record.run_id)?.is_some() {
                 return Err(EmbeddedRuntimeError::Configuration(
                     "Run id already has durable state".into(),
                 ));
             }
-            Self::write_run_record(&config.state_root, &record)?;
+            Self::write_run_record(&config.state_root, record)?;
         }
-        self.drive_recorded(
-            config,
-            invocation,
-            record,
-            RecordedOperation::Execute,
-            execution,
-            active_guard,
-            permit,
-            None,
-        )
-        .await
-        .map_err(Into::into)
+        Ok(())
     }
 
     pub async fn resume(
@@ -1752,6 +1825,429 @@ impl EmbeddedRuntime {
         }
     }
 
+    fn session_mutation_shard(invocation: RuntimeInvocationContext, session_id: Uuid) -> usize {
+        let mut shard = 0usize;
+        for byte in invocation
+            .tenant_id
+            .as_bytes()
+            .iter()
+            .chain(invocation.application_id.as_bytes())
+            .chain(invocation.workspace_id.as_bytes())
+            .chain(session_id.as_bytes())
+        {
+            shard = shard.wrapping_mul(31).wrapping_add(usize::from(*byte));
+        }
+        shard % SESSION_MUTATION_SHARDS
+    }
+
+    /// Finishes a head whose terminal Run already outran it, serialised per
+    /// Session so two concurrent readers cannot both append the same Turn.
+    fn project_session_head(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<(), EmbeddedRuntimeError> {
+        let config = self.profile(invocation)?;
+        let shard = Self::session_mutation_shard(invocation, session_id);
+        let _projection = self.session_projection_gates[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        LocalRuntimeHost::project_terminal_session_turn(
+            &config.state_root,
+            invocation,
+            session_id,
+            branch_id,
+        )?;
+        Ok(())
+    }
+
+    fn session_turn_receipt(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<EmbeddedSessionTurnReceipt, EmbeddedRuntimeError> {
+        let config = self.profile(invocation)?;
+        let head = LocalRuntimeHost::session_head_at(
+            &config.state_root,
+            invocation,
+            session_id,
+            branch_id,
+        )?;
+        let owner_epoch = self
+            .read_run_record(invocation, run_id)?
+            .map(|record| record.owner_epoch);
+        let state = self
+            .event_cursor(RuntimeEventCursorRequest {
+                schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                invocation,
+                run_id,
+                after_sequence: 0,
+                limit: 1,
+            })?
+            .state;
+        Ok(EmbeddedSessionTurnReceipt {
+            invocation,
+            head,
+            run_id,
+            owner_epoch,
+            state,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_session_turn_detached(
+        self: &Arc<Self>,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: String,
+        start: bool,
+    ) -> Result<EmbeddedSessionTurnReceipt, EmbeddedRuntimeError> {
+        let config = self.profile(invocation)?.clone();
+        if session_id.is_nil()
+            || branch_id.is_nil()
+            || run_id.is_nil()
+            || generation == 0
+            || input.trim().is_empty()
+            || input.len() > 32_000
+            || (start && generation != 1)
+        {
+            return Err(EmbeddedRuntimeError::Configuration(
+                "Session Turn request is invalid".into(),
+            ));
+        }
+        let shard = Self::session_mutation_shard(invocation, session_id);
+        let _session_mutation = self.session_mutation_gates[shard].lock().await;
+
+        // Before deciding anything about an active Turn, finish one whose Run
+        // has already reached a terminal Checkpoint. Otherwise a caller that
+        // watched its previous Turn to a terminal event and immediately
+        // continued would be refused for an active Turn that is, in fact, over.
+        self.project_session_head(invocation, session_id, branch_id)?;
+
+        if let Some(record) = self.read_run_record(invocation, run_id)? {
+            if record.input != input
+                || !LocalRuntimeHost::session_turn_binding_matches(
+                    &config.state_root,
+                    invocation,
+                    session_id,
+                    branch_id,
+                    run_id,
+                    &input,
+                )?
+            {
+                return Err(EmbeddedRuntimeError::Configuration(
+                    "Session Turn Run id is bound to another mutation".into(),
+                ));
+            }
+            return self.session_turn_receipt(invocation, session_id, branch_id, run_id);
+        }
+
+        // Decide before writing. A Turn that has already been accepted -- still
+        // running or long finished -- is answered from what exists, and takes
+        // no run capacity to answer: charging a retry for quota it already paid
+        // is how an idempotent call stops being idempotent under load.
+        let decision = if start {
+            LocalRuntimeHost::decide_session_start(
+                &config.state_root,
+                invocation,
+                session_id,
+                branch_id,
+                run_id,
+                &input,
+            )?
+        } else {
+            LocalRuntimeHost::decide_session_continue(
+                &config.state_root,
+                invocation,
+                session_id,
+                branch_id,
+                generation,
+                run_id,
+                &input,
+            )?
+        };
+        if matches!(decision, LocalSessionTurnDecision::Existing) {
+            return self.session_turn_receipt(invocation, session_id, branch_id, run_id);
+        }
+
+        // Ownership and admission first, so nothing durable claims a Turn is in
+        // flight until there is something to run it. Taken in this order, a
+        // refusal here leaves the branch exactly as it was found.
+        let (execution, active_guard) = self.claim_execution(invocation, run_id, false)?;
+        let permit = self.admission.acquire(invocation).await?;
+
+        let preparation = if start {
+            LocalRuntimeHost::prepare_session_start(
+                &config.state_root,
+                invocation,
+                session_id,
+                branch_id,
+                run_id,
+                &input,
+            )?
+        } else {
+            LocalRuntimeHost::prepare_session_continue(
+                &config.state_root,
+                invocation,
+                session_id,
+                branch_id,
+                generation,
+                run_id,
+                &input,
+            )?
+        };
+
+        if let LocalSessionTurnPreparation::Existing(head) = &preparation
+            && head.active_run_id != Some(run_id)
+        {
+            return self.session_turn_receipt(invocation, session_id, branch_id, run_id);
+        }
+
+        let record = Self::new_run_record(invocation, run_id, &input, 1);
+        // The active Turn is written; the Run record is not yet. If that write
+        // is refused, this call's own Session write has to go with it, or the
+        // branch is left pointing at a Run that will never exist -- unable to
+        // continue, with nothing to cancel or approve.
+        if let Err(error) = self.persist_new_run_record_with_capacity(&config, &record) {
+            let compensated = if start {
+                LocalRuntimeHost::rollback_prepared_session_start(
+                    &config.state_root,
+                    invocation,
+                    session_id,
+                    branch_id,
+                    run_id,
+                )
+            } else {
+                LocalRuntimeHost::rollback_prepared_session_continue(
+                    &config.state_root,
+                    invocation,
+                    session_id,
+                    branch_id,
+                    run_id,
+                )
+            };
+            compensated?;
+            return Err(error);
+        }
+        let runtime = Arc::clone(self);
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = runtime
+                .drive_recorded(
+                    config,
+                    invocation,
+                    record,
+                    RecordedOperation::SessionTurn {
+                        session_id,
+                        branch_id,
+                        generation,
+                    },
+                    execution,
+                    active_guard,
+                    permit,
+                    None,
+                )
+                .await;
+            let _ = finished_tx.send(result);
+        });
+        loop {
+            if let Ok(receipt) =
+                self.session_turn_receipt(invocation, session_id, branch_id, run_id)
+                && (!matches!(receipt.state, RuntimeEventCursorState::Running)
+                    || !self
+                        .event_cursor(RuntimeEventCursorRequest {
+                            schema_version: RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
+                            invocation,
+                            run_id,
+                            after_sequence: 0,
+                            limit: 1,
+                        })?
+                        .events
+                        .is_empty())
+            {
+                return Ok(receipt);
+            }
+            tokio::select! {
+                result = &mut finished_rx => {
+                    return match result {
+                        Ok(Ok(_)) => self.session_turn_receipt(
+                            invocation, session_id, branch_id, run_id,
+                        ),
+                        Ok(Err(error)) => Err(error.into()),
+                        Err(_) => Err(EmbeddedRuntimeError::Configuration(
+                            "detached Session Turn stopped before durable acceptance".into(),
+                        )),
+                    };
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+    }
+
+    pub async fn start_session_turn_detached(
+        self: &Arc<Self>,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+        input: String,
+    ) -> Result<EmbeddedSessionTurnReceipt, EmbeddedRuntimeError> {
+        self.accept_session_turn_detached(invocation, session_id, branch_id, 1, run_id, input, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn continue_session_turn_detached(
+        self: &Arc<Self>,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: String,
+    ) -> Result<EmbeddedSessionTurnReceipt, EmbeddedRuntimeError> {
+        self.accept_session_turn_detached(
+            invocation, session_id, branch_id, generation, run_id, input, false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fork_session(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        source_branch_id: Uuid,
+        source_generation: u64,
+        through_turn_ordinal: u64,
+        target_branch_id: Uuid,
+    ) -> Result<LocalSessionHead, EmbeddedRuntimeError> {
+        let config = self.profile(invocation)?;
+        let shard = Self::session_mutation_shard(invocation, session_id);
+        let _session_mutation = self.session_mutation_gates[shard].lock().await;
+        LocalRuntimeHost::fork_session_as(
+            &config.state_root,
+            invocation,
+            session_id,
+            source_branch_id,
+            source_generation,
+            through_turn_ordinal,
+            target_branch_id,
+        )
+        .map_err(Into::into)
+    }
+
+    pub async fn rollback_session(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        through_turn_ordinal: u64,
+    ) -> Result<LocalSessionHead, EmbeddedRuntimeError> {
+        let config = self.profile(invocation)?;
+        let shard = Self::session_mutation_shard(invocation, session_id);
+        let _session_mutation = self.session_mutation_gates[shard].lock().await;
+        LocalRuntimeHost::rollback_session_at(
+            &config.state_root,
+            invocation,
+            session_id,
+            branch_id,
+            generation,
+            through_turn_ordinal,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn read_session_head(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<LocalSessionHead, EmbeddedRuntimeError> {
+        self.project_session_head(invocation, session_id, branch_id)?;
+        let config = self.profile(invocation)?;
+        LocalRuntimeHost::session_head_at(&config.state_root, invocation, session_id, branch_id)
+            .map_err(Into::into)
+    }
+
+    pub fn list_session_heads(
+        &self,
+        invocation: RuntimeInvocationContext,
+        after: Option<(Uuid, Uuid)>,
+        limit: usize,
+    ) -> Result<EmbeddedSessionListPage, EmbeddedRuntimeError> {
+        if !(1..=256).contains(&limit) {
+            return Err(EmbeddedRuntimeError::Configuration(
+                "Session list limit must be between 1 and 256".into(),
+            ));
+        }
+        let config = self.profile(invocation)?;
+        let mut heads = LocalRuntimeHost::list_session_heads_at(&config.state_root, invocation)?
+            .into_iter()
+            .filter(|head| after.is_none_or(|cursor| (head.session_id, head.branch_id) > cursor))
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = heads.len() > limit;
+        heads.truncate(limit);
+        let next_after = has_more
+            .then(|| heads.last().map(|head| (head.session_id, head.branch_id)))
+            .flatten();
+        Ok(EmbeddedSessionListPage {
+            invocation,
+            heads,
+            next_after,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_session_history(
+        &self,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        after_turn_ordinal: u64,
+        limit: usize,
+    ) -> Result<EmbeddedSessionHistoryPage, EmbeddedRuntimeError> {
+        if !(1..=128).contains(&limit) {
+            return Err(EmbeddedRuntimeError::Configuration(
+                "Session history limit must be between 1 and 128".into(),
+            ));
+        }
+        let config = self.profile(invocation)?;
+        let mut turns = LocalRuntimeHost::session_history_at(
+            &config.state_root,
+            invocation,
+            session_id,
+            branch_id,
+            generation,
+        )?
+        .into_iter()
+        .filter(|turn| turn.turn_ordinal > after_turn_ordinal)
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+        let has_more = turns.len() > limit;
+        turns.truncate(limit);
+        let next_after_turn_ordinal = has_more
+            .then(|| turns.last().map(|turn| turn.turn_ordinal))
+            .flatten();
+        Ok(EmbeddedSessionHistoryPage {
+            invocation,
+            session_id,
+            branch_id,
+            generation,
+            turns,
+            next_after_turn_ordinal,
+        })
+    }
+
     /// Durably accepts a control command, then lets its execution continue
     /// independently of the client connection that delivered it.
     pub async fn control_detached(
@@ -1912,6 +2408,74 @@ impl EmbeddedRuntime {
         invocation: RuntimeInvocationContext,
     ) -> Result<VecDeque<PlannedRunRecovery>, EmbeddedRuntimeError> {
         let config = self.profile(invocation)?.clone();
+        let mut active_session_turns = HashMap::new();
+        for binding in LocalRuntimeHost::list_active_session_turns(&config.state_root)? {
+            if binding.invocation != invocation {
+                continue;
+            }
+            let checkpoint_path =
+                LocalRuntimeHost::checkpoint_path(&config.state_root, binding.run_id);
+            let existing = LocalRuntimeHost::read_run_record(&config.state_root, binding.run_id)?;
+            if let Some(record) = &existing
+                && (!Self::record_is_owned(invocation, record) || record.input != binding.input)
+            {
+                return Err(EmbeddedRuntimeError::Configuration(
+                    "active Session Turn conflicts with its durable Run identity".into(),
+                ));
+            }
+            if !checkpoint_path.is_file() {
+                if existing
+                    .as_ref()
+                    .is_some_and(|record| Self::terminal_status(&record.state).is_some())
+                    || Self::terminal_state_from_events(&config.state_root, binding.run_id)?
+                        .is_some()
+                {
+                    return Err(EmbeddedRuntimeError::Configuration(
+                        "terminal Session Turn has no durable Checkpoint".into(),
+                    ));
+                }
+                let mut record = existing.unwrap_or_else(|| {
+                    Self::new_run_record(invocation, binding.run_id, &binding.input, 1)
+                });
+                record.state = LocalRunState::Interrupted {
+                    reason: "Runtime stopped before the Session Turn produced a Checkpoint".into(),
+                };
+                Self::write_run_record(&config.state_root, &record)?;
+                LocalRuntimeHost::clear_active_session_turn(&config.state_root, &binding)?;
+                continue;
+            }
+            let mut record = existing.unwrap_or_else(|| {
+                Self::new_run_record(invocation, binding.run_id, &binding.input, 1)
+            });
+            if Self::terminal_status(&record.state).is_some() {
+                let checkpoint =
+                    LocalRuntimeHost::load_checkpoint(&checkpoint_path).map_err(|error| {
+                        EmbeddedRuntimeError::Configuration(format!(
+                            "terminal Session recovery Checkpoint is invalid: {error}"
+                        ))
+                    })?;
+                if !checkpoint.status.is_terminal() || !checkpoint.verify_digest() {
+                    return Err(EmbeddedRuntimeError::Configuration(
+                        "terminal Session recovery Checkpoint is not authoritative".into(),
+                    ));
+                }
+                // The terminal event may have advanced the Run projection just
+                // before the process died, while the Session head still owns
+                // the active Turn. Resume is the idempotent head-commit path;
+                // temporarily restore the runnable projection so the normal
+                // owner-epoch and receipt machinery can drive it.
+                record.state = LocalRunState::Running;
+            }
+            Self::write_run_record(&config.state_root, &record)?;
+            if active_session_turns
+                .insert(binding.run_id, binding)
+                .is_some()
+            {
+                return Err(EmbeddedRuntimeError::Configuration(
+                    "one Run is active in multiple Session branches".into(),
+                ));
+            }
+        }
         let records = LocalRuntimeHost::list_run_records(&config.state_root)?;
         let parent_owned_children =
             LocalRuntimeHost::managed_subagent_run_references(&config.state_root)?;
@@ -1940,8 +2504,10 @@ impl EmbeddedRuntime {
             if parent_owned_children.contains(&record.run_id) {
                 continue;
             }
-            if let Some(terminal) =
-                Self::terminal_state_from_events(&config.state_root, record.run_id)?
+            let active_session_turn = active_session_turns.get(&record.run_id);
+            if active_session_turn.is_none()
+                && let Some(terminal) =
+                    Self::terminal_state_from_events(&config.state_root, record.run_id)?
             {
                 record.state = terminal;
                 Self::write_run_record(&config.state_root, &record)?;
@@ -1958,13 +2524,14 @@ impl EmbeddedRuntime {
                 )?;
                 continue;
             }
-            if Self::terminal_status(&record.state).is_some()
-                || matches!(
-                    &record.state,
-                    LocalRunState::AwaitingApproval { .. }
-                        | LocalRunState::AwaitingMcpInput { .. }
-                        | LocalRunState::Interrupted { .. }
-                )
+            if active_session_turn.is_none()
+                && (Self::terminal_status(&record.state).is_some()
+                    || matches!(
+                        &record.state,
+                        LocalRunState::AwaitingApproval { .. }
+                            | LocalRunState::AwaitingMcpInput { .. }
+                            | LocalRunState::Interrupted { .. }
+                    ))
             {
                 continue;
             }
@@ -2682,6 +3249,21 @@ impl EmbeddedRuntime {
                 host.execute_as_at_epoch(record.run_id, &record.input, record.owner_epoch)
                     .await
             }
+            RecordedOperation::SessionTurn {
+                session_id,
+                branch_id,
+                generation,
+            } => host
+                .drive_prepared_session_turn(
+                    session_id,
+                    branch_id,
+                    generation,
+                    record.run_id,
+                    &record.input,
+                    record.owner_epoch,
+                )
+                .await
+                .map(|outcome| outcome.run),
             RecordedOperation::Resume => {
                 host.resume(record.run_id, &record.input, record.owner_epoch)
                     .await

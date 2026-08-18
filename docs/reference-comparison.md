@@ -34,8 +34,14 @@
   presence、Gateway 重连和 channel 路由仍明显更完整。
 - 本项目仅在多租户 invocation、owner epoch、持久 receipt 和客户端错误去敏上更适合共享 Runtime；
   不把这个窄面优势扩大为桌面产品领先。
-- **下一内核目标**：Session/Thread client contract→Profile/关闭生命周期→credential resolver→可分发
-  artifact；不进入 GUI。总体仍为 70–75%。
+- **Session 语义对标（2026-08-18，ADR-0143）**：Codex Thread 的 Start/Resume/Fork/Rollback/List/Read
+  公共语义已对齐；仍明确缺少其完整客户端、SQLite Thread 产品链与归档能力。OpenClaw Sessions 的
+  Create/Send/List/Fork/Rewind 重试与 revision 语义已对齐；本项目的多租户 invocation 绑定更严格——
+  分支绑定完整 `RuntimeInvocationContext`，跨租户/应用/工作区/Agent/模型策略不得互读——但缺少其
+  Gateway 运维与 Archive/Delete/Switch 等产品能力。
+- **下一内核目标**：~~Session/Thread client contract~~（已完成）→应用关闭/恢复生命周期→Profile 与
+  credential resolver→可分发 artifact；不进入 GUI。总体仍为 70–75%：本轮收口的是既有接口的语义，
+  不是新增能力。
 
 ## 上一阶段：可执行 Runtime 控制边界
 

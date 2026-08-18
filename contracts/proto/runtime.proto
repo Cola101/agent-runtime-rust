@@ -39,6 +39,17 @@ service RuntimeInvocation {
   // sequence seen -- there is no in-memory broadcaster to fall out of sync
   // with, and no best-effort queue that can silently lose a gap.
   rpc WatchEvents(WatchRunEventsRequest) returns (stream RunEventStreamItem);
+  // Create a stable Session and execute its first Turn.
+  rpc StartSession(SessionTurnRequest) returns (SessionTurnResponse);
+  // Append one Turn to the exact generation of a Session branch.
+  rpc ContinueSession(SessionTurnRequest) returns (SessionTurnResponse);
+  // Create an immutable sibling branch from a completed Turn prefix.
+  rpc ForkSession(ForkSessionRequest) returns (SessionHead);
+  // Move one branch head backwards while preserving the archived generation.
+  rpc RollbackSession(RollbackSessionRequest) returns (SessionHead);
+  rpc ReadSession(ReadSessionRequest) returns (SessionHead);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ReadSessionHistory(ReadSessionHistoryRequest) returns (ReadSessionHistoryResponse);
 }
 
 message InitializeRuntimeRequest {
@@ -57,6 +68,8 @@ message InitializeRuntimeResponse {
   uint64 max_action_json_bytes = 6;
   uint32 max_event_page_size = 7;
   uint32 max_event_stream_capacity = 8;
+  uint32 max_session_list_size = 9;
+  uint32 max_session_history_turns = 10;
 }
 
 // Selects a pre-registered invocation Profile.
@@ -85,6 +98,104 @@ message SubmitRunResponse {
   string run_id = 1;
   uint64 owner_epoch = 2;
   string status = 3;
+}
+
+message SessionTurnRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string session_id = 3;
+  string branch_id = 4;
+  uint64 generation = 5;
+  // Caller chosen; retries must reuse the same id and input.
+  string run_id = 6;
+  string input = 7;
+}
+
+message SessionHead {
+  string session_id = 1;
+  string branch_id = 2;
+  uint64 generation = 3;
+  uint64 turn_count = 4;
+  string history_digest = 5;
+  optional string active_run_id = 6;
+}
+
+message SessionTurnResponse {
+  uint32 schema_version = 1;
+  SessionHead head = 2;
+  string run_id = 3;
+  optional uint64 owner_epoch = 4;
+  RunLifecycleBoundary boundary = 5;
+}
+
+message ForkSessionRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string session_id = 3;
+  string source_branch_id = 4;
+  uint64 source_generation = 5;
+  uint64 through_turn_ordinal = 6;
+  // Caller chosen idempotency identity for the new branch.
+  string target_branch_id = 7;
+}
+
+message RollbackSessionRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string session_id = 3;
+  string branch_id = 4;
+  uint64 generation = 5;
+  uint64 through_turn_ordinal = 6;
+}
+
+message ReadSessionRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string session_id = 3;
+  string branch_id = 4;
+}
+
+message ListSessionsRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  optional string after_session_id = 3;
+  optional string after_branch_id = 4;
+  uint32 limit = 5;
+}
+
+message ListSessionsResponse {
+  uint32 schema_version = 1;
+  repeated SessionHead heads = 2;
+  optional string next_after_session_id = 3;
+  optional string next_after_branch_id = 4;
+}
+
+message ReadSessionHistoryRequest {
+  uint32 schema_version = 1;
+  RuntimeInvocationRef invocation = 2;
+  string session_id = 3;
+  string branch_id = 4;
+  uint64 generation = 5;
+  uint64 after_turn_ordinal = 6;
+  uint32 limit = 7;
+}
+
+message SessionConversationTurn {
+  uint64 turn_ordinal = 1;
+  string run_id = 2;
+  // Canonical JSON for the protocol-neutral typed transcript and its digest.
+  // It is bounded by the Runtime Session history contract and never contains
+  // provider credentials or host paths.
+  bytes turn_json = 3;
+}
+
+message ReadSessionHistoryResponse {
+  uint32 schema_version = 1;
+  string session_id = 2;
+  string branch_id = 3;
+  uint64 generation = 4;
+  repeated SessionConversationTurn turns = 5;
+  optional uint64 next_after_turn_ordinal = 6;
 }
 
 message ControlRunRequest {

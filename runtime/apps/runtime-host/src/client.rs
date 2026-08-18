@@ -14,7 +14,8 @@ use crate::embedded::{
     RuntimeEventCursorPage, RuntimeEventCursorRequest, RuntimeEventCursorState,
     RuntimeEventStreamItem,
 };
-use agent_protocol::RuntimeInvocationContext;
+use crate::{LocalRuntimeError, LocalSessionHead};
+use agent_protocol::{RuntimeInvocationContext, SessionConversationTurn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,12 +29,21 @@ pub const RUNTIME_CLIENT_MAX_INPUT_BYTES: usize = 32_000;
 pub const RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES: usize = 64 * 1024;
 pub const RUNTIME_CLIENT_MAX_REQUIRED_CAPABILITIES: usize = 32;
 pub const RUNTIME_CLIENT_MAX_CAPABILITY_BYTES: usize = 128;
+pub const RUNTIME_CLIENT_MAX_SESSION_LIST_SIZE: usize = 256;
+pub const RUNTIME_CLIENT_MAX_SESSION_HISTORY_TURNS: usize = 128;
 
 pub const RUNTIME_CAPABILITY_RUN_SUBMIT: &str = "run.submit.v1";
 pub const RUNTIME_CAPABILITY_RUN_CONTROL: &str = "run.control.v1";
 pub const RUNTIME_CAPABILITY_EVENTS_CURSOR: &str = "events.cursor.v1";
 pub const RUNTIME_CAPABILITY_EVENTS_WATCH: &str = "events.watch.v1";
 pub const RUNTIME_CAPABILITY_RECOVERY_STARTUP: &str = "recovery.startup.v1";
+pub const RUNTIME_CAPABILITY_SESSION_START: &str = "session.start.v1";
+pub const RUNTIME_CAPABILITY_SESSION_CONTINUE: &str = "session.continue.v1";
+pub const RUNTIME_CAPABILITY_SESSION_FORK: &str = "session.fork.v1";
+pub const RUNTIME_CAPABILITY_SESSION_ROLLBACK: &str = "session.rollback.v1";
+pub const RUNTIME_CAPABILITY_SESSION_READ: &str = "session.read.v1";
+pub const RUNTIME_CAPABILITY_SESSION_LIST: &str = "session.list.v1";
+pub const RUNTIME_CAPABILITY_SESSION_HISTORY: &str = "session.history.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +66,8 @@ pub struct RuntimeClientDescriptor {
     pub max_action_json_bytes: u64,
     pub max_event_page_size: u32,
     pub max_event_stream_capacity: u32,
+    pub max_session_list_size: u32,
+    pub max_session_history_turns: u32,
 }
 
 impl RuntimeClientDescriptor {
@@ -71,11 +83,20 @@ impl RuntimeClientDescriptor {
                 RUNTIME_CAPABILITY_EVENTS_CURSOR.into(),
                 RUNTIME_CAPABILITY_EVENTS_WATCH.into(),
                 RUNTIME_CAPABILITY_RECOVERY_STARTUP.into(),
+                RUNTIME_CAPABILITY_SESSION_START.into(),
+                RUNTIME_CAPABILITY_SESSION_CONTINUE.into(),
+                RUNTIME_CAPABILITY_SESSION_FORK.into(),
+                RUNTIME_CAPABILITY_SESSION_ROLLBACK.into(),
+                RUNTIME_CAPABILITY_SESSION_READ.into(),
+                RUNTIME_CAPABILITY_SESSION_LIST.into(),
+                RUNTIME_CAPABILITY_SESSION_HISTORY.into(),
             ]),
             max_input_bytes: RUNTIME_CLIENT_MAX_INPUT_BYTES as u64,
             max_action_json_bytes: RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES as u64,
             max_event_page_size: RUNTIME_EVENT_CURSOR_MAX_EVENTS as u32,
             max_event_stream_capacity: EMBEDDED_EVENT_SUBSCRIPTION_MAX_CAPACITY as u32,
+            max_session_list_size: RUNTIME_CLIENT_MAX_SESSION_LIST_SIZE as u32,
+            max_session_history_turns: RUNTIME_CLIENT_MAX_SESSION_HISTORY_TURNS as u32,
         }
     }
 
@@ -141,6 +162,129 @@ pub struct RuntimeSubmitReceipt {
     /// particular, a pending approval is not exposed until the old execution
     /// owner has released the Run.
     pub state: RuntimeEventCursorState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionHead {
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub turn_count: u64,
+    pub history_digest: String,
+    pub active_run_id: Option<Uuid>,
+}
+
+impl From<LocalSessionHead> for RuntimeSessionHead {
+    fn from(head: LocalSessionHead) -> Self {
+        Self {
+            session_id: head.session_id,
+            branch_id: head.branch_id,
+            generation: head.generation,
+            turn_count: head.turn_count,
+            history_digest: head.history_digest,
+            active_run_id: head.active_run_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionTurnRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub run_id: Uuid,
+    pub input: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionTurnReceipt {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub head: RuntimeSessionHead,
+    pub run_id: Uuid,
+    pub owner_epoch: Option<u64>,
+    pub state: RuntimeEventCursorState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionForkRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub source_branch_id: Uuid,
+    pub source_generation: u64,
+    pub through_turn_ordinal: u64,
+    pub target_branch_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionRollbackRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub through_turn_ordinal: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionReadRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionListRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub after_session_id: Option<Uuid>,
+    pub after_branch_id: Option<Uuid>,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionListPage {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub heads: Vec<RuntimeSessionHead>,
+    pub next_after_session_id: Option<Uuid>,
+    pub next_after_branch_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionHistoryRequest {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub after_turn_ordinal: u64,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSessionHistoryPage {
+    pub schema_version: u32,
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub turns: Vec<SessionConversationTurn>,
+    pub next_after_turn_ordinal: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -258,6 +402,41 @@ impl RuntimeClientError {
             ),
         }
     }
+
+    fn from_session_mutation(error: EmbeddedRuntimeError) -> Self {
+        match error {
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::Execution(_)) => Self::new(
+                RuntimeClientErrorCode::Conflict,
+                "Session head changed or is already active",
+            ),
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::Checkpoint(_)) => Self::new(
+                RuntimeClientErrorCode::DataLoss,
+                "Session history is inconsistent",
+            ),
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::StateRoot(_)) => Self::new(
+                RuntimeClientErrorCode::Unavailable,
+                "Session storage is unavailable",
+            ),
+            error => Self::from_embedded(error),
+        }
+    }
+
+    fn from_session_read(error: EmbeddedRuntimeError) -> Self {
+        match error {
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::Execution(_)) => {
+                Self::new(RuntimeClientErrorCode::NotFound, "no such Session branch")
+            }
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::Checkpoint(_)) => Self::new(
+                RuntimeClientErrorCode::DataLoss,
+                "Session history is inconsistent",
+            ),
+            EmbeddedRuntimeError::Runtime(LocalRuntimeError::StateRoot(_)) => Self::new(
+                RuntimeClientErrorCode::Unavailable,
+                "Session storage is unavailable",
+            ),
+            error => Self::from_embedded(error),
+        }
+    }
 }
 
 /// Bounded client stream that keeps the Embedded subscription implementation
@@ -320,6 +499,264 @@ impl InitializedRuntimeClient {
     #[must_use]
     pub fn descriptor(&self) -> &RuntimeClientDescriptor {
         &self.descriptor
+    }
+
+    fn validate_session_identity(
+        schema_version: u32,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<(), RuntimeClientError> {
+        if schema_version != RUNTIME_CLIENT_SCHEMA_VERSION
+            || invocation.validate().is_err()
+            || session_id.is_nil()
+            || branch_id.is_nil()
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session request",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn start_session(
+        &self,
+        request: RuntimeSessionTurnRequest,
+    ) -> Result<RuntimeSessionTurnReceipt, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.branch_id,
+        )?;
+        if request.generation != 1
+            || request.run_id.is_nil()
+            || request.input.trim().is_empty()
+            || request.input.len() > RUNTIME_CLIENT_MAX_INPUT_BYTES
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session start",
+            ));
+        }
+        let receipt = self
+            .runtime
+            .start_session_turn_detached(
+                request.invocation,
+                request.session_id,
+                request.branch_id,
+                request.run_id,
+                request.input,
+            )
+            .await
+            .map_err(RuntimeClientError::from_session_mutation)?;
+        Ok(RuntimeSessionTurnReceipt {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation: receipt.invocation,
+            head: receipt.head.into(),
+            run_id: receipt.run_id,
+            owner_epoch: receipt.owner_epoch,
+            state: receipt.state,
+        })
+    }
+
+    pub async fn continue_session(
+        &self,
+        request: RuntimeSessionTurnRequest,
+    ) -> Result<RuntimeSessionTurnReceipt, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.branch_id,
+        )?;
+        if request.generation == 0
+            || request.run_id.is_nil()
+            || request.input.trim().is_empty()
+            || request.input.len() > RUNTIME_CLIENT_MAX_INPUT_BYTES
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session continuation",
+            ));
+        }
+        let receipt = self
+            .runtime
+            .continue_session_turn_detached(
+                request.invocation,
+                request.session_id,
+                request.branch_id,
+                request.generation,
+                request.run_id,
+                request.input,
+            )
+            .await
+            .map_err(RuntimeClientError::from_session_mutation)?;
+        Ok(RuntimeSessionTurnReceipt {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation: receipt.invocation,
+            head: receipt.head.into(),
+            run_id: receipt.run_id,
+            owner_epoch: receipt.owner_epoch,
+            state: receipt.state,
+        })
+    }
+
+    pub async fn fork_session(
+        &self,
+        request: RuntimeSessionForkRequest,
+    ) -> Result<RuntimeSessionHead, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.source_branch_id,
+        )?;
+        if request.source_generation == 0
+            || request.target_branch_id.is_nil()
+            || request.target_branch_id == request.source_branch_id
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session Fork",
+            ));
+        }
+        self.runtime
+            .fork_session(
+                request.invocation,
+                request.session_id,
+                request.source_branch_id,
+                request.source_generation,
+                request.through_turn_ordinal,
+                request.target_branch_id,
+            )
+            .await
+            .map(RuntimeSessionHead::from)
+            .map_err(RuntimeClientError::from_session_mutation)
+    }
+
+    pub async fn rollback_session(
+        &self,
+        request: RuntimeSessionRollbackRequest,
+    ) -> Result<RuntimeSessionHead, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.branch_id,
+        )?;
+        if request.generation == 0 {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session Rollback",
+            ));
+        }
+        self.runtime
+            .rollback_session(
+                request.invocation,
+                request.session_id,
+                request.branch_id,
+                request.generation,
+                request.through_turn_ordinal,
+            )
+            .await
+            .map(RuntimeSessionHead::from)
+            .map_err(RuntimeClientError::from_session_mutation)
+    }
+
+    pub fn read_session(
+        &self,
+        request: RuntimeSessionReadRequest,
+    ) -> Result<RuntimeSessionHead, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.branch_id,
+        )?;
+        self.runtime
+            .read_session_head(request.invocation, request.session_id, request.branch_id)
+            .map(RuntimeSessionHead::from)
+            .map_err(RuntimeClientError::from_session_read)
+    }
+
+    pub fn list_sessions(
+        &self,
+        request: RuntimeSessionListRequest,
+    ) -> Result<RuntimeSessionListPage, RuntimeClientError> {
+        if request.schema_version != RUNTIME_CLIENT_SCHEMA_VERSION
+            || request.invocation.validate().is_err()
+            || !(1..=RUNTIME_CLIENT_MAX_SESSION_LIST_SIZE as u32).contains(&request.limit)
+            || request.after_session_id.is_some() != request.after_branch_id.is_some()
+            || request.after_session_id.is_some_and(|id| id.is_nil())
+            || request.after_branch_id.is_some_and(|id| id.is_nil())
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session list request",
+            ));
+        }
+        let page = self
+            .runtime
+            .list_session_heads(
+                request.invocation,
+                request.after_session_id.zip(request.after_branch_id),
+                request.limit as usize,
+            )
+            .map_err(RuntimeClientError::from_session_read)?;
+        let (next_after_session_id, next_after_branch_id) = page
+            .next_after
+            .map_or((None, None), |(session_id, branch_id)| {
+                (Some(session_id), Some(branch_id))
+            });
+        Ok(RuntimeSessionListPage {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation: page.invocation,
+            heads: page.heads.into_iter().map(Into::into).collect(),
+            next_after_session_id,
+            next_after_branch_id,
+        })
+    }
+
+    pub fn read_session_history(
+        &self,
+        request: RuntimeSessionHistoryRequest,
+    ) -> Result<RuntimeSessionHistoryPage, RuntimeClientError> {
+        Self::validate_session_identity(
+            request.schema_version,
+            request.invocation,
+            request.session_id,
+            request.branch_id,
+        )?;
+        if request.generation == 0
+            || !(1..=RUNTIME_CLIENT_MAX_SESSION_HISTORY_TURNS as u32).contains(&request.limit)
+        {
+            return Err(RuntimeClientError::new(
+                RuntimeClientErrorCode::InvalidRequest,
+                "invalid Runtime Session history request",
+            ));
+        }
+        let page = self
+            .runtime
+            .read_session_history(
+                request.invocation,
+                request.session_id,
+                request.branch_id,
+                request.generation,
+                request.after_turn_ordinal,
+                request.limit as usize,
+            )
+            .map_err(RuntimeClientError::from_session_read)?;
+        Ok(RuntimeSessionHistoryPage {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation: page.invocation,
+            session_id: page.session_id,
+            branch_id: page.branch_id,
+            generation: page.generation,
+            turns: page.turns,
+            next_after_turn_ordinal: page.next_after_turn_ordinal,
+        })
     }
 
     pub async fn submit(
@@ -454,6 +891,10 @@ mod tests {
         .expect("compatible client");
 
         assert_eq!(descriptor.contract_version, 1);
+        // Written out rather than derived from the constants on purpose. This
+        // list is the published surface: adding to it is a deliberate act that
+        // every other client has to be told about, and a rename is a break even
+        // when the constant still compiles.
         assert_eq!(
             descriptor.capabilities.into_iter().collect::<Vec<_>>(),
             vec![
@@ -462,6 +903,13 @@ mod tests {
                 "recovery.startup.v1",
                 "run.control.v1",
                 "run.submit.v1",
+                "session.continue.v1",
+                "session.fork.v1",
+                "session.history.v1",
+                "session.list.v1",
+                "session.read.v1",
+                "session.rollback.v1",
+                "session.start.v1",
             ]
         );
         assert_eq!(descriptor.max_input_bytes, 32_000);
@@ -469,6 +917,10 @@ mod tests {
             descriptor.max_event_page_size,
             RUNTIME_EVENT_CURSOR_MAX_EVENTS as u32
         );
+        // Bounded before a caller asks. A client that has to discover a page
+        // ceiling by being rejected will discover it in production.
+        assert_eq!(descriptor.max_session_list_size, 256);
+        assert_eq!(descriptor.max_session_history_turns, 128);
     }
 
     #[test]

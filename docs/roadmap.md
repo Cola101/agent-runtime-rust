@@ -118,9 +118,16 @@ adapter 的稳定无 UI 内核。
 gRPC 与进程内嵌入调用同一门面；无 UI 真实 Run 1/1、受影响 gRPC 26/26。同时修正
 对外 1 MiB/内核 32,000-byte 的 input 上限冲突，拒绝请求不留 durable Run。
 
+**已完成（2026-08-18，ADR-0143）。** Session 契约的语义收口：接受顺序改为"只读判定 → 重试免配额 →
+所有权与准入 → 持久化 → 失败补偿"，被拒绝的 Turn 不再留下不可继续的分支；终态 head 投影以 Checkpoint
+为权威，读路径与重启恢复同源，调用方观察到终态事件后可直接继续；"Session 不存在"归 `NotFound`，不再
+借道 `Unavailable`。gRPC 主链 Initialize→Start→Watch→Continue→Fork→Read/List/History 1/1；
+全工作区 854/854。
+
 **剩余出口标准。**
 
-1. Session/Thread 契约：创建、继续、分支/回滚、列表/恢复不泄漏 Local Host 内部类型。
+1. ~~Session/Thread 契约~~：已完成（ADR-0143）。仍缺独立覆盖：同一 `run_id` 携带不同输入、Rollback 重试
+   与回滚后重放旧请求、终态崩溃窗口且 Provider 请求次数不增、schema v1→v2 迁移、generation 溢出拒绝。
 2. 应用生命周期：停止接纳、有界 drain、安全关闭/下次启动恢复，不把“退出应用”伪造成“用户取消 Run”。
 3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令或持久配置。
 4. 可分发验收：一个无 UI artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、

@@ -1768,7 +1768,41 @@ pub struct LocalSessionRunOutcome {
     pub head: LocalSessionHead,
 }
 
-const LOCAL_SESSION_STORE_VERSION: u32 = 1;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalSessionTurnBinding {
+    pub invocation: RuntimeInvocationContext,
+    pub session_id: Uuid,
+    pub branch_id: Uuid,
+    pub generation: u64,
+    pub run_id: Uuid,
+    pub input: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalSessionTurnPreparation {
+    Execute(LocalSessionHead),
+    Existing(LocalSessionHead),
+}
+
+/// The read-only half of accepting a Turn.
+///
+/// Separated from the write so a retry can be answered before any quota is
+/// taken, and so ownership and admission are settled before anything durable
+/// records that a Turn is in flight. Deciding and writing in one step is what
+/// left a refused Turn holding a branch open against a Run that was never
+/// created.
+#[derive(Clone, Debug)]
+pub(crate) enum LocalSessionTurnDecision {
+    /// Already accepted, active or completed. The caller answers from the
+    /// current receipt rather than from anything carried here, and takes no run
+    /// capacity to do it.
+    Existing,
+    /// Not seen before, and admissible as far as the Session store is
+    /// concerned. The caller must take ownership and admission before writing.
+    New,
+}
+
+const LOCAL_SESSION_STORE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LocalSessionActiveTurn {
@@ -1831,13 +1865,17 @@ impl LocalSessionBranchRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LocalSessionRecord {
     store_version: u32,
+    #[serde(default = "crate::local_invocation_context")]
+    invocation: RuntimeInvocationContext,
     session_id: Uuid,
     branches: BTreeMap<Uuid, LocalSessionBranchRecord>,
 }
 
 impl LocalSessionRecord {
     fn is_well_formed(&self) -> bool {
-        self.store_version == LOCAL_SESSION_STORE_VERSION
+        (self.store_version == LOCAL_SESSION_STORE_VERSION
+            || (self.store_version == 1 && self.invocation == crate::local_invocation_context()))
+            && self.invocation.validate().is_ok()
             && !self.session_id.is_nil()
             && !self.branches.is_empty()
             && self.branches.iter().all(|(branch_id, branch)| {
@@ -4368,8 +4406,15 @@ impl LocalRuntimeHost {
         session_id: Uuid,
     ) -> Result<LocalSessionRecord, LocalRuntimeError> {
         let path = Self::session_record_path(state_root, session_id);
-        let body = std::fs::read(&path)
-            .map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+        // "There is no such Session" and "the state root is not readable" are
+        // different answers and only one of them is worth retrying. Folding the
+        // first into `StateRoot` told every caller its storage was down.
+        let body = std::fs::read(&path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                LocalRuntimeError::Execution("no such root Session".into())
+            }
+            _ => LocalRuntimeError::StateRoot(error.to_string()),
+        })?;
         let record: LocalSessionRecord = serde_json::from_slice(&body)
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
         if record.session_id != session_id || !record.is_well_formed() {
@@ -4390,9 +4435,25 @@ impl LocalRuntimeHost {
             ));
         }
         let path = Self::session_record_path(state_root, record.session_id);
-        let body = serde_json::to_vec_pretty(record)
+        let mut record = record.clone();
+        record.store_version = LOCAL_SESSION_STORE_VERSION;
+        let body = serde_json::to_vec_pretty(&record)
             .map_err(|error| LocalRuntimeError::Checkpoint(error.to_string()))?;
         durable_file::replace(&path, &body)
+    }
+
+    fn read_owned_session_record(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+    ) -> Result<LocalSessionRecord, LocalRuntimeError> {
+        let record = Self::read_session_record(state_root, session_id)?;
+        if record.invocation != invocation {
+            return Err(LocalRuntimeError::Execution(
+                "root Session is owned by another invocation".into(),
+            ));
+        }
+        Ok(record)
     }
 
     fn history_prefix(
@@ -4413,8 +4474,9 @@ impl LocalRuntimeHost {
         Ok(history[..=index].to_vec())
     }
 
-    fn find_active_session_turn(
+    pub(crate) fn find_active_session_turn(
         state_root: &Path,
+        invocation: RuntimeInvocationContext,
         run_id: Uuid,
     ) -> Result<Option<(Uuid, Uuid, u64, String)>, LocalRuntimeError> {
         let entries = match std::fs::read_dir(state_root.join("sessions")) {
@@ -4433,6 +4495,9 @@ impl LocalRuntimeHost {
                 continue;
             };
             let record = Self::read_session_record(state_root, session_id)?;
+            if record.invocation != invocation {
+                continue;
+            }
             for branch in record.branches.values() {
                 let Some(active) = branch
                     .active_turn
@@ -4455,6 +4520,76 @@ impl LocalRuntimeHost {
             }
         }
         Ok(found)
+    }
+
+    pub(crate) fn list_active_session_turns(
+        state_root: &Path,
+    ) -> Result<Vec<LocalSessionTurnBinding>, LocalRuntimeError> {
+        let entries = match std::fs::read_dir(state_root.join("sessions")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        };
+        let mut bindings = Vec::new();
+        let mut run_ids = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            let Some(session_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let record = Self::read_session_record(state_root, session_id)?;
+            for branch in record.branches.values() {
+                let Some(active) = &branch.active_turn else {
+                    continue;
+                };
+                if !run_ids.insert(active.run_id) {
+                    return Err(LocalRuntimeError::Checkpoint(
+                        "one root Run is active in multiple Session branches".into(),
+                    ));
+                }
+                bindings.push(LocalSessionTurnBinding {
+                    invocation: record.invocation,
+                    session_id,
+                    branch_id: branch.branch_id,
+                    generation: active.generation,
+                    run_id: active.run_id,
+                    input: active.input.clone(),
+                });
+            }
+        }
+        bindings.sort_by_key(|binding| (binding.session_id, binding.branch_id, binding.run_id));
+        Ok(bindings)
+    }
+
+    pub(crate) fn clear_active_session_turn(
+        state_root: &Path,
+        binding: &LocalSessionTurnBinding,
+    ) -> Result<LocalSessionHead, LocalRuntimeError> {
+        let mut record =
+            Self::read_owned_session_record(state_root, binding.invocation, binding.session_id)?;
+        let branch = record.branches.get_mut(&binding.branch_id).ok_or_else(|| {
+            LocalRuntimeError::Checkpoint("active root Session branch disappeared".into())
+        })?;
+        let active = branch.active_turn.as_ref().ok_or_else(|| {
+            LocalRuntimeError::Checkpoint("active root Session Turn disappeared".into())
+        })?;
+        if branch.generation != binding.generation
+            || active.run_id != binding.run_id
+            || active.generation != binding.generation
+            || active.input != binding.input
+        {
+            return Err(LocalRuntimeError::Checkpoint(
+                "active root Session Turn changed during recovery".into(),
+            ));
+        }
+        branch.active_turn = None;
+        let head = branch.head(binding.session_id);
+        Self::persist_session_record(state_root, &record)?;
+        Ok(head)
     }
 
     /// Returns the Run ids whose hot artifacts are still required to resume a
@@ -5373,14 +5508,284 @@ impl LocalRuntimeHost {
         &mut self,
         input: &str,
     ) -> Result<LocalSessionRunOutcome, LocalRuntimeError> {
-        if input.trim().is_empty() || input.len() > 32_000 {
-            return Err(LocalRuntimeError::Execution(
-                "root Session input must be nonblank and bounded".into(),
-            ));
-        }
         let session_id = Uuid::now_v7();
         let branch_id = Uuid::now_v7();
         let run_id = Uuid::now_v7();
+        match Self::prepare_session_start(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            branch_id,
+            run_id,
+            input,
+        )? {
+            LocalSessionTurnPreparation::Execute(_) => {
+                self.drive_prepared_session_turn(session_id, branch_id, 1, run_id, input, 1)
+                    .await
+            }
+            LocalSessionTurnPreparation::Existing(_) => Err(LocalRuntimeError::Checkpoint(
+                "new root Session unexpectedly resolved to an existing Turn".into(),
+            )),
+        }
+    }
+
+    fn session_turn_matches_input(turn: &SessionConversationTurn, input: &str) -> bool {
+        turn.transcript.first().is_some_and(|message| {
+            message.role == ProtocolRole::User
+                && message.content
+                    == vec![ProtocolContentPart::Text {
+                        text: input.to_owned(),
+                    }]
+        })
+    }
+
+    pub(crate) fn session_turn_binding_matches(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<bool, LocalRuntimeError> {
+        if !Self::session_record_path(state_root, session_id).is_file() {
+            return Ok(false);
+        }
+        let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
+        let Some(branch) = record.branches.get(&branch_id) else {
+            return Ok(false);
+        };
+        Ok(branch
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.run_id == run_id && active.input == input)
+            || branch
+                .history
+                .iter()
+                .chain(
+                    branch
+                        .archived_generations
+                        .values()
+                        .flat_map(|history| history.iter()),
+                )
+                .any(|turn| turn.run_id == run_id && Self::session_turn_matches_input(turn, input)))
+    }
+
+    /// Decides, without writing anything, whether a start is a retry.
+    ///
+    /// Mirrors `prepare_session_start`'s checks exactly and stops where that
+    /// one would begin to persist. Both run under the same Session lock, so the
+    /// answer cannot change between deciding here and committing there.
+    pub(crate) fn decide_session_start(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<LocalSessionTurnDecision, LocalRuntimeError> {
+        if session_id.is_nil()
+            || branch_id.is_nil()
+            || run_id.is_nil()
+            || input.trim().is_empty()
+            || input.len() > 32_000
+        {
+            return Err(LocalRuntimeError::Execution(
+                "root Session start identity and input must be nonblank and bounded".into(),
+            ));
+        }
+        if !Self::session_record_path(state_root, session_id).is_file() {
+            return Ok(LocalSessionTurnDecision::New);
+        }
+        let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
+        let branch = record.branches.get(&branch_id).ok_or_else(|| {
+            LocalRuntimeError::Execution(
+                "root Session id is already bound to another branch".into(),
+            )
+        })?;
+        let exact_active = branch.active_turn.as_ref().is_some_and(|active| {
+            active.run_id == run_id && active.generation == 1 && active.input == input
+        });
+        let exact_completed = branch
+            .history
+            .iter()
+            .any(|turn| turn.run_id == run_id && Self::session_turn_matches_input(turn, input));
+        if branch.generation == 1 && (exact_active || exact_completed) {
+            return Ok(LocalSessionTurnDecision::Existing);
+        }
+        Err(LocalRuntimeError::Execution(
+            "root Session start identity is already bound to another mutation".into(),
+        ))
+    }
+
+    /// The same decision for a continuation.
+    pub(crate) fn decide_session_continue(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<LocalSessionTurnDecision, LocalRuntimeError> {
+        if session_id.is_nil()
+            || branch_id.is_nil()
+            || run_id.is_nil()
+            || generation == 0
+            || input.trim().is_empty()
+            || input.len() > 32_000
+        {
+            return Err(LocalRuntimeError::Execution(
+                "root Session continuation identity and input must be nonblank and bounded".into(),
+            ));
+        }
+        let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
+        let branch = record.branches.get(&branch_id).ok_or_else(|| {
+            LocalRuntimeError::Execution("root Session branch does not exist".into())
+        })?;
+        let exact_active = branch
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.run_id == run_id && active.input == input);
+        let exact_completed = branch
+            .history
+            .iter()
+            .chain(
+                branch
+                    .archived_generations
+                    .values()
+                    .flat_map(|history| history.iter()),
+            )
+            .any(|turn| turn.run_id == run_id && Self::session_turn_matches_input(turn, input));
+        if exact_active || exact_completed {
+            return Ok(LocalSessionTurnDecision::Existing);
+        }
+        if branch.generation != generation {
+            return Err(LocalRuntimeError::Execution(format!(
+                "stale root Session generation {generation}; current generation is {}",
+                branch.generation
+            )));
+        }
+        if branch.active_turn.is_some() {
+            return Err(LocalRuntimeError::Execution(
+                "root Session branch already has an active Turn".into(),
+            ));
+        }
+        Ok(LocalSessionTurnDecision::New)
+    }
+
+    /// Undoes a `prepare_session_start` whose Run never came into existence.
+    ///
+    /// Deletes the Session this call created, and only that: every field is
+    /// checked against what the failed attempt wrote, so a record that has
+    /// since gained history, another branch or a different Turn is left alone.
+    /// Removing a Session that someone else's work is in would be a worse
+    /// outcome than the leak this exists to prevent.
+    pub(crate) fn rollback_prepared_session_start(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<(), LocalRuntimeError> {
+        let Ok(record) = Self::read_owned_session_record(state_root, invocation, session_id) else {
+            return Ok(());
+        };
+        if record.branches.len() != 1 {
+            return Ok(());
+        }
+        let Some(branch) = record.branches.get(&branch_id) else {
+            return Ok(());
+        };
+        let untouched = branch.generation == 1
+            && branch.history.is_empty()
+            && branch.archived_generations.is_empty()
+            && branch
+                .active_turn
+                .as_ref()
+                .is_some_and(|active| active.run_id == run_id);
+        if !untouched {
+            return Ok(());
+        }
+        let path = Self::session_record_path(state_root, session_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(LocalRuntimeError::StateRoot(error.to_string())),
+        }
+    }
+
+    /// Undoes a `prepare_session_continue` whose Run never came into existence.
+    ///
+    /// Clears only the active Turn this call wrote. History is never touched:
+    /// the branch existed before and must be left exactly as continuable as it
+    /// was.
+    pub(crate) fn rollback_prepared_session_continue(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<(), LocalRuntimeError> {
+        let Ok(mut record) = Self::read_owned_session_record(state_root, invocation, session_id)
+        else {
+            return Ok(());
+        };
+        let Some(branch) = record.branches.get_mut(&branch_id) else {
+            return Ok(());
+        };
+        if !branch
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.run_id == run_id)
+        {
+            return Ok(());
+        }
+        branch.active_turn = None;
+        Self::persist_session_record(state_root, &record)
+    }
+
+    pub(crate) fn prepare_session_start(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<LocalSessionTurnPreparation, LocalRuntimeError> {
+        if session_id.is_nil()
+            || branch_id.is_nil()
+            || run_id.is_nil()
+            || input.trim().is_empty()
+            || input.len() > 32_000
+        {
+            return Err(LocalRuntimeError::Execution(
+                "root Session start identity and input must be nonblank and bounded".into(),
+            ));
+        }
+        let path = Self::session_record_path(state_root, session_id);
+        if path.is_file() {
+            let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
+            let branch = record.branches.get(&branch_id).ok_or_else(|| {
+                LocalRuntimeError::Execution(
+                    "root Session id is already bound to another branch".into(),
+                )
+            })?;
+            let exact_active = branch.active_turn.as_ref().is_some_and(|active| {
+                active.run_id == run_id && active.generation == 1 && active.input == input
+            });
+            let exact_completed = branch
+                .history
+                .iter()
+                .any(|turn| turn.run_id == run_id && Self::session_turn_matches_input(turn, input));
+            if branch.generation == 1 && (exact_active || exact_completed) {
+                return Ok(LocalSessionTurnPreparation::Existing(
+                    branch.head(session_id),
+                ));
+            }
+            return Err(LocalRuntimeError::Execution(
+                "root Session start identity is already bound to another mutation".into(),
+            ));
+        }
         let branch = LocalSessionBranchRecord {
             branch_id,
             generation: 1,
@@ -5393,14 +5798,17 @@ impl LocalRuntimeHost {
                 input: input.to_owned(),
             }),
         };
-        let record = LocalSessionRecord {
-            store_version: LOCAL_SESSION_STORE_VERSION,
-            session_id,
-            branches: BTreeMap::from([(branch_id, branch)]),
-        };
-        Self::persist_session_record(&self.config.state_root, &record)?;
-        self.drive_session_turn(session_id, branch_id, 1, run_id, input, 1, None, None)
-            .await
+        let head = branch.head(session_id);
+        Self::persist_session_record(
+            state_root,
+            &LocalSessionRecord {
+                store_version: LOCAL_SESSION_STORE_VERSION,
+                invocation,
+                session_id,
+                branches: BTreeMap::from([(branch_id, branch)]),
+            },
+        )?;
+        Ok(LocalSessionTurnPreparation::Execute(head))
     }
 
     pub async fn continue_session(
@@ -5410,15 +5818,71 @@ impl LocalRuntimeHost {
         generation: u64,
         input: &str,
     ) -> Result<LocalSessionRunOutcome, LocalRuntimeError> {
-        if input.trim().is_empty() || input.len() > 32_000 {
+        let run_id = Uuid::now_v7();
+        match Self::prepare_session_continue(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            branch_id,
+            generation,
+            run_id,
+            input,
+        )? {
+            LocalSessionTurnPreparation::Execute(_) => {
+                self.drive_prepared_session_turn(
+                    session_id, branch_id, generation, run_id, input, 1,
+                )
+                .await
+            }
+            LocalSessionTurnPreparation::Existing(_) => Err(LocalRuntimeError::Checkpoint(
+                "new root Session continuation unexpectedly resolved to an existing Turn".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_session_continue(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: &str,
+    ) -> Result<LocalSessionTurnPreparation, LocalRuntimeError> {
+        if session_id.is_nil()
+            || branch_id.is_nil()
+            || run_id.is_nil()
+            || generation == 0
+            || input.trim().is_empty()
+            || input.len() > 32_000
+        {
             return Err(LocalRuntimeError::Execution(
-                "root Session input must be nonblank and bounded".into(),
+                "root Session continuation identity and input must be nonblank and bounded".into(),
             ));
         }
-        let mut record = Self::read_session_record(&self.config.state_root, session_id)?;
+        let mut record = Self::read_owned_session_record(state_root, invocation, session_id)?;
         let branch = record.branches.get_mut(&branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session branch does not exist".into())
         })?;
+        let exact_active = branch
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.run_id == run_id && active.input == input);
+        let exact_completed = branch
+            .history
+            .iter()
+            .chain(
+                branch
+                    .archived_generations
+                    .values()
+                    .flat_map(|history| history.iter()),
+            )
+            .any(|turn| turn.run_id == run_id && Self::session_turn_matches_input(turn, input));
+        if exact_active || exact_completed {
+            return Ok(LocalSessionTurnPreparation::Existing(
+                branch.head(session_id),
+            ));
+        }
         if branch.generation != generation {
             return Err(LocalRuntimeError::Execution(format!(
                 "stale root Session generation {generation}; current generation is {}",
@@ -5430,7 +5894,6 @@ impl LocalRuntimeHost {
                 "root Session branch already has an active Turn".into(),
             ));
         }
-        let run_id = Uuid::now_v7();
         let snapshot = branch.snapshot();
         branch.active_turn = Some(LocalSessionActiveTurn {
             run_id,
@@ -5438,9 +5901,29 @@ impl LocalRuntimeHost {
             history_digest: snapshot.history_digest,
             input: input.to_owned(),
         });
-        Self::persist_session_record(&self.config.state_root, &record)?;
+        let head = branch.head(session_id);
+        Self::persist_session_record(state_root, &record)?;
+        Ok(LocalSessionTurnPreparation::Execute(head))
+    }
+
+    pub(crate) async fn drive_prepared_session_turn(
+        &mut self,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: &str,
+        owner_epoch: u64,
+    ) -> Result<LocalSessionRunOutcome, LocalRuntimeError> {
         self.drive_session_turn(
-            session_id, branch_id, generation, run_id, input, 1, None, None,
+            session_id,
+            branch_id,
+            generation,
+            run_id,
+            input,
+            owner_epoch,
+            None,
+            None,
         )
         .await
     }
@@ -5452,7 +5935,37 @@ impl LocalRuntimeHost {
         source_generation: u64,
         through_turn_ordinal: u64,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
-        let mut record = Self::read_session_record(&self.config.state_root, session_id)?;
+        Self::fork_session_as(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            source_branch_id,
+            source_generation,
+            through_turn_ordinal,
+            Uuid::now_v7(),
+        )
+    }
+
+    pub(crate) fn fork_session_as(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        source_branch_id: Uuid,
+        source_generation: u64,
+        through_turn_ordinal: u64,
+        target_branch_id: Uuid,
+    ) -> Result<LocalSessionHead, LocalRuntimeError> {
+        if session_id.is_nil()
+            || source_branch_id.is_nil()
+            || target_branch_id.is_nil()
+            || source_generation == 0
+            || source_branch_id == target_branch_id
+        {
+            return Err(LocalRuntimeError::Execution(
+                "root Session Fork identity is invalid".into(),
+            ));
+        }
+        let mut record = Self::read_owned_session_record(state_root, invocation, session_id)?;
         let source = record.branches.get(&source_branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session source branch does not exist".into())
         })?;
@@ -5468,17 +5981,27 @@ impl LocalRuntimeHost {
             ));
         }
         let history = Self::history_prefix(&source.history, through_turn_ordinal)?;
-        let branch_id = Uuid::now_v7();
+        if let Some(existing) = record.branches.get(&target_branch_id) {
+            if existing.generation == 1
+                && existing.history == history
+                && existing.active_turn.is_none()
+            {
+                return Ok(existing.head(session_id));
+            }
+            return Err(LocalRuntimeError::Execution(
+                "root Session Fork target is already bound to another mutation".into(),
+            ));
+        }
         let branch = LocalSessionBranchRecord {
-            branch_id,
+            branch_id: target_branch_id,
             generation: 1,
             history,
             archived_generations: BTreeMap::new(),
             active_turn: None,
         };
         let head = branch.head(session_id);
-        record.branches.insert(branch_id, branch);
-        Self::persist_session_record(&self.config.state_root, &record)?;
+        record.branches.insert(target_branch_id, branch);
+        Self::persist_session_record(state_root, &record)?;
         Ok(head)
     }
 
@@ -5489,10 +6012,44 @@ impl LocalRuntimeHost {
         generation: u64,
         through_turn_ordinal: u64,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
-        let mut record = Self::read_session_record(&self.config.state_root, session_id)?;
+        Self::rollback_session_at(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            branch_id,
+            generation,
+            through_turn_ordinal,
+        )
+    }
+
+    pub(crate) fn rollback_session_at(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        through_turn_ordinal: u64,
+    ) -> Result<LocalSessionHead, LocalRuntimeError> {
+        if session_id.is_nil() || branch_id.is_nil() || generation == 0 {
+            return Err(LocalRuntimeError::Execution(
+                "root Session Rollback identity is invalid".into(),
+            ));
+        }
+        let mut record = Self::read_owned_session_record(state_root, invocation, session_id)?;
         let branch = record.branches.get_mut(&branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session branch does not exist".into())
         })?;
+        if branch.generation == generation.saturating_add(1)
+            && branch
+                .archived_generations
+                .get(&generation)
+                .is_some_and(|archived| {
+                    Self::history_prefix(archived, through_turn_ordinal)
+                        .is_ok_and(|prefix| branch.history.starts_with(&prefix))
+                })
+        {
+            return Ok(branch.head(session_id));
+        }
         if branch.generation != generation {
             return Err(LocalRuntimeError::Execution(format!(
                 "stale root Session generation {generation}; current generation is {}",
@@ -5525,7 +6082,7 @@ impl LocalRuntimeHost {
         branch.generation = next_generation;
         branch.history = history;
         let head = branch.head(session_id);
-        Self::persist_session_record(&self.config.state_root, &record)?;
+        Self::persist_session_record(state_root, &record)?;
         Ok(head)
     }
 
@@ -5535,7 +6092,23 @@ impl LocalRuntimeHost {
         branch_id: Uuid,
         generation: u64,
     ) -> Result<Vec<SessionConversationTurn>, LocalRuntimeError> {
-        let record = Self::read_session_record(&self.config.state_root, session_id)?;
+        Self::session_history_at(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            branch_id,
+            generation,
+        )
+    }
+
+    pub(crate) fn session_history_at(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+    ) -> Result<Vec<SessionConversationTurn>, LocalRuntimeError> {
+        let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
         let branch = record.branches.get(&branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session branch does not exist".into())
         })?;
@@ -5558,7 +6131,106 @@ impl LocalRuntimeHost {
         session_id: Uuid,
         branch_id: Uuid,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
-        let record = Self::read_session_record(&self.config.state_root, session_id)?;
+        Self::session_head_at(
+            &self.config.state_root,
+            self.invocation,
+            session_id,
+            branch_id,
+        )
+    }
+
+    /// Completes a Session head that its own terminal Run has already outrun.
+    ///
+    /// A Turn's terminal Kernel event is published before the Turn is committed
+    /// onto the branch head, so in between, a caller watching events sees a
+    /// finished Run on a branch that still holds an active Turn -- and a
+    /// `continue` issued on that observation is refused for a conflict the
+    /// caller did nothing to cause. Restart recovery already closes exactly
+    /// this window after a crash, using the Checkpoint as the authority. This
+    /// closes it while the process is still alive, the same way and from the
+    /// same authority: no model request, no Tool replay, no second terminal
+    /// event.
+    ///
+    /// Idempotent, and deliberately quiet. Every reason a Turn cannot be
+    /// projected yet -- no Checkpoint, an unverifiable one, a branch that moved
+    /// underneath -- returns without touching anything, because this runs on
+    /// the read path and a read must not start failing over work that recovery
+    /// will finish. The caller then reports whatever the head actually says.
+    ///
+    /// Callers MUST serialise on the Session: this is a read-modify-write and
+    /// two unsynchronised projections would each pass the fence and each append
+    /// the same Turn.
+    pub(crate) fn project_terminal_session_turn(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<(), LocalRuntimeError> {
+        // A Session that does not exist yet, or that this invocation may not
+        // read, has nothing to project. Both are ordinary on the accept path --
+        // `start` runs this before the Session is created -- so neither may
+        // become a failure to start.
+        let Ok(record) = Self::read_owned_session_record(state_root, invocation, session_id) else {
+            return Ok(());
+        };
+        let Some(branch) = record.branches.get(&branch_id) else {
+            return Ok(());
+        };
+        let Some(active) = branch.active_turn.as_ref() else {
+            return Ok(());
+        };
+        // The Checkpoint is the authority, not the Run record. A terminal Turn
+        // lands in three stages -- Kernel event, Run record projection, Session
+        // head commit -- and a caller can read between any two of them. Keying
+        // off the Run record would make this projection wait for a projection,
+        // which is how the window stayed open in the first place; recovery
+        // already keys off the Checkpoint and this must agree with it.
+        let checkpoint_path = Self::checkpoint_path(state_root, active.run_id);
+        if !checkpoint_path.is_file() {
+            return Ok(());
+        }
+        let Ok(checkpoint) = Self::load_checkpoint(&checkpoint_path) else {
+            return Ok(());
+        };
+        if !checkpoint.verify_digest() || !checkpoint.status.is_terminal() {
+            return Ok(());
+        }
+        let status = checkpoint.status;
+        let transcript = if status == RunStatus::Succeeded {
+            match WorkerProcessor::conversation_transcript_from_checkpoint(&checkpoint) {
+                Ok(transcript) => Some(transcript),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            None
+        };
+        // Fenced on the active Turn's own generation and input, so a branch
+        // that moved between the read above and the write below is refused
+        // inside the commit rather than overwritten here.
+        let generation = active.generation;
+        let run_id = active.run_id;
+        let input = active.input.clone();
+        drop(record);
+        let _ = Self::commit_session_turn(
+            state_root,
+            session_id,
+            branch_id,
+            generation,
+            run_id,
+            &input,
+            status,
+            transcript.as_deref(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn session_head_at(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+        session_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<LocalSessionHead, LocalRuntimeError> {
+        let record = Self::read_owned_session_record(state_root, invocation, session_id)?;
         record
             .branches
             .get(&branch_id)
@@ -5566,6 +6238,40 @@ impl LocalRuntimeHost {
             .ok_or_else(|| {
                 LocalRuntimeError::Execution("root Session branch does not exist".into())
             })
+    }
+
+    pub(crate) fn list_session_heads_at(
+        state_root: &Path,
+        invocation: RuntimeInvocationContext,
+    ) -> Result<Vec<LocalSessionHead>, LocalRuntimeError> {
+        let entries = match std::fs::read_dir(state_root.join("sessions")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(LocalRuntimeError::StateRoot(error.to_string())),
+        };
+        let mut heads = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| LocalRuntimeError::StateRoot(error.to_string()))?;
+            let Some(session_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let record = Self::read_session_record(state_root, session_id)?;
+            if record.invocation != invocation {
+                continue;
+            }
+            heads.extend(
+                record
+                    .branches
+                    .values()
+                    .map(|branch| branch.head(session_id)),
+            );
+        }
+        heads.sort_by_key(|head| (head.session_id, head.branch_id));
+        Ok(heads)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5825,7 +6531,38 @@ impl LocalRuntimeHost {
         outcome: &LocalRunOutcome,
         transcript: Option<&[agent_protocol::Message]>,
     ) -> Result<LocalSessionHead, LocalRuntimeError> {
-        let mut record = Self::read_session_record(&self.config.state_root, session_id)?;
+        Self::commit_session_turn(
+            &self.config.state_root,
+            session_id,
+            branch_id,
+            generation,
+            run_id,
+            input,
+            outcome.status,
+            transcript,
+        )
+    }
+
+    /// Commits one finished Turn onto its branch head, under the fence the
+    /// active Turn was accepted with.
+    ///
+    /// Static and taking only a status rather than a whole outcome, because the
+    /// projection path reconstructs a terminal Turn from its Checkpoint and has
+    /// no `LocalRunOutcome` to hand. Callers must serialise: this is a
+    /// read-modify-write of the Session record, and two callers that both pass
+    /// the fence would both append the same Turn.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_session_turn(
+        state_root: &Path,
+        session_id: Uuid,
+        branch_id: Uuid,
+        generation: u64,
+        run_id: Uuid,
+        input: &str,
+        status: RunStatus,
+        transcript: Option<&[agent_protocol::Message]>,
+    ) -> Result<LocalSessionHead, LocalRuntimeError> {
+        let mut record = Self::read_session_record(state_root, session_id)?;
         let branch = record.branches.get_mut(&branch_id).ok_or_else(|| {
             LocalRuntimeError::Checkpoint("terminal root Session branch disappeared".into())
         })?;
@@ -5846,7 +6583,7 @@ impl LocalRuntimeHost {
                 "late root Session result was fenced by a newer branch head".into(),
             ));
         }
-        if outcome.status == RunStatus::Succeeded {
+        if status == RunStatus::Succeeded {
             let transcript = transcript.ok_or_else(|| {
                 LocalRuntimeError::Checkpoint(
                     "succeeded root Session Turn has no terminal transcript".into(),
@@ -5882,7 +6619,7 @@ impl LocalRuntimeHost {
         }
         branch.active_turn = None;
         let head = branch.head(session_id);
-        Self::persist_session_record(&self.config.state_root, &record)?;
+        Self::persist_session_record(state_root, &record)?;
         Ok(head)
     }
 
@@ -6412,7 +7149,7 @@ impl LocalRuntimeHost {
         owner_epoch: u64,
     ) -> Result<LocalRunOutcome, LocalRuntimeError> {
         if let Some((session_id, branch_id, generation, bound_input)) =
-            Self::find_active_session_turn(&self.config.state_root, run_id)?
+            Self::find_active_session_turn(&self.config.state_root, self.invocation, run_id)?
         {
             if input != bound_input {
                 return Err(LocalRuntimeError::Execution(
@@ -6526,7 +7263,7 @@ impl LocalRuntimeHost {
         resolution: LocalApprovalResolution,
     ) -> Result<LocalRunOutcome, LocalRuntimeError> {
         if let Some((session_id, branch_id, generation, bound_input)) =
-            Self::find_active_session_turn(&self.config.state_root, run_id)?
+            Self::find_active_session_turn(&self.config.state_root, self.invocation, run_id)?
         {
             if input != bound_input {
                 return Err(LocalRuntimeError::Execution(
@@ -6571,7 +7308,7 @@ impl LocalRuntimeHost {
         resolution: LocalMcpInputResolution,
     ) -> Result<LocalRunOutcome, LocalRuntimeError> {
         if let Some((session_id, branch_id, generation, bound_input)) =
-            Self::find_active_session_turn(&self.config.state_root, run_id)?
+            Self::find_active_session_turn(&self.config.state_root, self.invocation, run_id)?
         {
             if input != bound_input {
                 return Err(LocalRuntimeError::Execution(

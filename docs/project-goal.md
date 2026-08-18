@@ -66,9 +66,10 @@ GUI、控制面、节点协议和部署编排可以驱动必要的稳定公共�
 ## 当前里程碑
 
 ADR-0142 已完成 Desktop-Ready 的第一道门禁：未来 Tauri 命令层、Electron sidecar、CLI 和 Java
-adapter 均使用同一 `RuntimeClient v1`，并在执行前完成版本/能力协商。该里程不代表已有
-桌面客户端：Session/Thread 公共契约、Profile 动态生命周期、应用关闭/恢复语义、本地凭证解析
-与可分发 artifact 仍是内核准备条件，不进入 GUI 开发。
+adapter 均使用同一 `RuntimeClient v1`，并在执行前完成版本/能力协商。ADR-0143 接着收口了 Session
+契约的语义：创建、继续、分支、回滚、查询与恢复在进程内与 gRPC 上语义一致，被拒绝的 Turn 不留下
+不可继续的分支，终态 head 投影以 Checkpoint 为权威。该里程不代表已有桌面客户端：Profile 动态
+生命周期、应用关闭/恢复语义、本地凭证解析与可分发 artifact 仍是内核准备条件，不进入 GUI 开发。
 
 独立 Rust Host 已完成角色子代理串行与最多 8 路有界并发闭环、嵌套审批、父子取消、Checkpoint 恢复、
 权限与预算子集约束，以及可恢复的父子树执行时限。持久异步生命周期的**第一阶段**也已落地：显式

@@ -24,6 +24,19 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-18 Session 契约语义收口（ADR-0143）：`RuntimeClient v1` 的七个 Session capability 从"形状可用"
+推进到"语义可依赖"。三处缺陷以确定性 RED 先复现再修改，不是从代码阅读推断的：接受顺序把 active Turn 写在
+admission 之前，被拒绝的 Turn 会留下指向不存在 Run 的分支，永久不可继续；终态落地分三级（Kernel 事件 →
+Run record → Session head），调用方观察到终态后立刻 `continue` 会被一个事实上已结束的 Turn 拒绝；
+`read_session_record` 把文件不存在归为 `StateRoot`，使"Session 不存在"被报成"存储暂时不可用"，调用方会
+无止境重试一个永远不会成功的调用。现已改为只读判定→重试免配额→所有权与准入→持久化→失败补偿，投影以
+Checkpoint 为权威并与重启恢复同源，错误码保持 `ResourceExhausted`/`NotFound`/`Unavailable` 分离。
+新增 `grpc_session_contract` 门禁：一个只持有 TCP 地址与 bearer token 的调用方完成
+Initialize→Start→Watch→Continue→Fork→Read/List/History 全链 **1/1**；全工作区 **854/854**、
+clippy `-D warnings` 与 fmt 均为 0。Desktop-Ready 仍未完成：应用关闭生命周期、Profile/credential
+resolver 和可分发 artifact 仍缺；本轮收口的是既有接口的语义而非新增能力，**总体仍为 70–75%**。证据见
+`docs/evidence/2026-08-18-session-acceptance-atomicity.md`。
+
 2026-08-18 无 UI Runtime Client 第一阶段完成（ADR-0142）：新增稳定的 `RuntimeClient v1`，只有协商成功
 返回的 `InitializedRuntimeClient` 才暴露执行方法；进程内
 嵌入与 gRPC 共用 initialize/submit/control/read/watch/recovery 语义；initialize 在开 Run 前检查

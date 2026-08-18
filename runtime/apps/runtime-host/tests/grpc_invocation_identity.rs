@@ -257,6 +257,9 @@ async fn initialization_negotiates_before_any_tenant_request() {
         .expect("compatible initialize")
         .into_inner();
     assert_eq!(compatible.contract_version, 1);
+    // The published network surface, written out rather than derived. This is
+    // what every remote caller negotiates against, so growing it is a
+    // deliberate act and a rename is a break even where the constant compiles.
     assert_eq!(
         compatible.capabilities,
         vec![
@@ -265,6 +268,13 @@ async fn initialization_negotiates_before_any_tenant_request() {
             "recovery.startup.v1",
             "run.control.v1",
             "run.submit.v1",
+            "session.continue.v1",
+            "session.fork.v1",
+            "session.history.v1",
+            "session.list.v1",
+            "session.read.v1",
+            "session.rollback.v1",
+            "session.start.v1",
         ]
     );
 
