@@ -193,7 +193,48 @@ const EVENT_WORDS: Record<string, string> = {
 /// to prevent. A refusal is one string and becomes a list of one; the caller
 /// draws each part on its own line, because two summary parts are two things
 /// the model said and joining them would report one.
+/// Which of `run.failed`'s several endings this one was.
+///
+/// One event type covers a budget, a required MCP server, a provider that
+/// would not answer and whatever the runtime adds next. Drawing only the name
+/// left a Run that reached the cap in its own status line saying nothing about
+/// which cap -- which reads as an agent that broke rather than a limit that was
+/// reached. Each sentence is built from the payload's own fields; a kind this
+/// build has never seen is printed as it arrived, because "stopped for a reason
+/// this client cannot name" is true and silence is not.
+function failureReason(payload: Record<string, unknown>): string | null {
+  const kind = typeof payload.kind === "string" ? payload.kind : null;
+  if (!kind) return null;
+  switch (kind) {
+    case "budget_exhausted": {
+      const dimension = String(payload.dimension ?? "");
+      const named: Record<string, string> = {
+        tokens: "token 预算用完了",
+        cost: "花费预算用完了",
+        duration: "时长预算用完了",
+      };
+      return named[dimension] ?? `预算用完了（${dimension || "没说是哪一项"}）`;
+    }
+    case "required_mcp_unavailable": {
+      const servers = Array.isArray(payload.servers)
+        ? payload.servers.map(String).join("、")
+        : "";
+      return servers
+        ? `必需的 MCP 服务起不来：${servers}`
+        : "必需的 MCP 服务起不来";
+    }
+    case "duration_budget":
+      return "时长预算用完了";
+    default:
+      return `这个版本不认识的失败原因：${kind}`;
+  }
+}
+
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
+  if (type === "run.failed") {
+    const reason = failureReason(payload);
+    return reason ? [reason] : null;
+  }
   const field = EVENT_WORDS[type];
   if (!field) return null;
   const words = payload[field];

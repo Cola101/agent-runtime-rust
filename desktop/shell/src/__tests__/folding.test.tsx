@@ -178,6 +178,43 @@ describe("what the runtime said in words", () => {
     await waitFor(() => expect(document.querySelectorAll("mark").length).toBeGreaterThan(0));
   });
 
+  /// `run.failed` is one event type covering several endings, and the client
+  /// drew only its name. A Run that stopped because it reached the cap shown in
+  /// its own status line said nothing about which cap, and read as an agent
+  /// that broke.
+  it("says which limit a Run ran into, not only that it failed", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "run.failed", {
+      status: "failed", kind: "budget_exhausted", dimension: "tokens", retryable: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/token 预算用完了/)).toBeTruthy());
+  });
+
+  it("names the servers when a required MCP server is what stopped it", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "run.failed", {
+      status: "failed", kind: "required_mcp_unavailable", servers: ["docs"], retryable: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/docs/)).toBeTruthy());
+  });
+
+  /// A kind this build has never heard of is printed rather than swallowed.
+  /// The runtime may add one, and "failed for a reason this client cannot name"
+  /// is a true sentence where silence is not.
+  it("prints a failure kind it does not recognise", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "run.failed", {
+      status: "failed", kind: "something_new", retryable: false,
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/something_new/)).toBeTruthy());
+  });
+
   it("still draws a refusal, which arrives as a plain string", async () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);

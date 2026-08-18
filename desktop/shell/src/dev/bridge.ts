@@ -19,6 +19,7 @@ const RUN_PROCESS = "01a01519-9102-72e2-b80e-f0990dcbd799";
 const SESSION = "01a01228-3d51-7f83-9c2b-8e4a1d5f6c70";
 const BRANCH = "01a01228-3d51-7f83-9c2b-8e4a1d5f6c71";
 const PROCESS_SESSION = "01a0151c-914a-7c31-8f0d-1b7c1a4e5d20";
+const RUN_BROKE = "01a01240-1c3a-7b90-9f01-5d5f1c0b7e22";
 
 let sequence = 0;
 function ev(type: string, payload: Record<string, unknown>, runId = RUN_WAITING, minute = 0) {
@@ -178,6 +179,21 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
       ev("run.succeeded", { status: "succeeded" }, RUN_PROCESS, 20),
     ],
   },
+  /// A Run that hit its own cap. Here so the failure reason can be looked at:
+  /// `run.failed` covers several endings and the client used to draw only its
+  /// name, so a Run that reached the limit shown in its own status line said
+  /// nothing about which limit.
+  [RUN_BROKE]: {
+    state: { state: "terminal", status: "failed" },
+    events: [
+      ev("run.started", { status: "running" }, RUN_BROKE, 25),
+      ev("model.output.delta", { text: "先把这个目录整个读一遍……" }, RUN_BROKE, 25),
+      ev("model.usage", { input_tokens: 399_000, output_tokens: 1_400, cost_micros: 8_200 }, RUN_BROKE, 25),
+      ev("run.failed", {
+        status: "failed", kind: "budget_exhausted", dimension: "tokens", retryable: false,
+      }, RUN_BROKE, 25),
+    ],
+  },
   [RUN_DONE]: {
     state: { state: "terminal", status: "succeeded" },
     events: [
@@ -245,6 +261,10 @@ export function installDevBridge() {
         {
           run_id: RUN_PROCESS, input: "开一个 shell 会话",
           state: { state: "finished", status: "succeeded" },
+        },
+        {
+          run_id: RUN_BROKE, input: "把整个目录读一遍",
+          state: { state: "finished", status: "failed" },
         },
         {
           run_id: RUN_DONE, input: "把结论写进 notes.txt",
