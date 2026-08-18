@@ -728,3 +728,207 @@ async fn a_refused_admission_leaves_no_active_turn_and_no_orphan_run() {
 
     queueing.abort();
 }
+
+/// A Run id names one Turn, not a slot to reuse.
+///
+/// Retry safety is what makes a caller-generated id worth having: a lost
+/// response can be asked again. That guarantee only holds if the id is bound to
+/// what it was accepted with. An id reused with different input is a different
+/// Turn wearing an accepted Turn's name, and answering it from the old result
+/// would silently drop the new input on the floor.
+#[tokio::test]
+async fn a_run_id_reused_with_different_input_is_refused() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let provider_endpoint = spawn_provider(Duration::from_millis(50)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    let runtime = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let start = RuntimeSessionTurnRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation: 1,
+        run_id,
+        input: "the input this Run id was accepted with".into(),
+    };
+    client.start_session(start.clone()).await.expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, run_id).await,
+        RunStatus::Succeeded
+    );
+
+    // Byte-identical: answered from what exists.
+    let replayed = client
+        .start_session(start.clone())
+        .await
+        .expect("an identical retry is the same Turn");
+    assert_eq!(replayed.run_id, run_id);
+
+    // Same id, different input: refused rather than answered from the old
+    // result, and refused on both entry points.
+    let mutated = RuntimeSessionTurnRequest {
+        input: "a different input under the same Run id".into(),
+        ..start.clone()
+    };
+    assert_eq!(
+        client
+            .start_session(mutated.clone())
+            .await
+            .expect_err("a reused Run id with different input must be refused")
+            .code,
+        RuntimeClientErrorCode::Conflict
+    );
+    assert_eq!(
+        client
+            .continue_session(RuntimeSessionTurnRequest {
+                generation: 1,
+                ..mutated
+            })
+            .await
+            .expect_err("continue must refuse it for the same reason")
+            .code,
+        RuntimeClientErrorCode::Conflict
+    );
+
+    // And the refusal changed nothing: the Turn that was accepted is still the
+    // one on the branch.
+    let head = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("head");
+    assert_eq!(head.turn_count, 1);
+    assert_eq!(head.active_run_id, None);
+}
+
+/// Rollback is retry-safe exactly once, and stops being so the moment the
+/// branch moves on.
+///
+/// A caller that loses the response to a rollback must be able to ask again.
+/// But "ask again" and "roll back a second time" look identical on the wire,
+/// so the retry is only honoured while the branch still looks the way the
+/// first rollback left it: one generation later, history exactly the prefix,
+/// nothing active. Once a Turn has been appended past it, replaying the old
+/// request must conflict rather than quietly discard that Turn.
+#[tokio::test]
+async fn a_rollback_is_replayable_until_the_branch_moves_past_it() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let invocation = invocation();
+    let provider_endpoint = spawn_provider(Duration::from_millis(50)).await;
+    let capabilities = [
+        RUNTIME_CAPABILITY_EVENTS_WATCH,
+        RUNTIME_CAPABILITY_SESSION_START,
+        RUNTIME_CAPABILITY_SESSION_CONTINUE,
+        RUNTIME_CAPABILITY_SESSION_ROLLBACK,
+        RUNTIME_CAPABILITY_SESSION_READ,
+    ];
+    let runtime = Arc::new(runtime(
+        state.path(),
+        workspace.path(),
+        &[invocation],
+        &provider_endpoint,
+    ));
+    let client = initialized_client(Arc::clone(&runtime), &capabilities);
+
+    let session_id = Uuid::now_v7();
+    let branch_id = Uuid::now_v7();
+    let turn = |generation: u64, text: &str| RuntimeSessionTurnRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation,
+        run_id: Uuid::now_v7(),
+        input: text.to_owned(),
+    };
+
+    let first = turn(1, "first turn");
+    let first_run_id = first.run_id;
+    client.start_session(first).await.expect("start");
+    assert_eq!(
+        wait_terminal(&client, invocation, first_run_id).await,
+        RunStatus::Succeeded
+    );
+    let second = turn(1, "second turn");
+    let second_run_id = second.run_id;
+    client.continue_session(second).await.expect("continue");
+    assert_eq!(
+        wait_terminal(&client, invocation, second_run_id).await,
+        RunStatus::Succeeded
+    );
+
+    let rollback = RuntimeSessionRollbackRequest {
+        schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+        invocation,
+        session_id,
+        branch_id,
+        generation: 1,
+        through_turn_ordinal: 1,
+    };
+    let rolled = client
+        .rollback_session(rollback.clone())
+        .await
+        .expect("rollback");
+    assert_eq!(rolled.turn_count, 1);
+    assert_eq!(rolled.generation, 2, "a rollback advances the generation");
+
+    // The lost-response case: the same request again is the same rollback.
+    let replayed = client
+        .rollback_session(rollback.clone())
+        .await
+        .expect("an identical rollback retry is the same rollback");
+    assert_eq!(replayed, rolled);
+
+    // Now the branch moves past it.
+    let third = turn(2, "a turn after the rollback");
+    let third_run_id = third.run_id;
+    client
+        .continue_session(third)
+        .await
+        .expect("continue after rollback");
+    assert_eq!(
+        wait_terminal(&client, invocation, third_run_id).await,
+        RunStatus::Succeeded
+    );
+
+    // Replaying the old rollback now would discard that Turn. It must not be
+    // mistaken for a retry.
+    assert_eq!(
+        client
+            .rollback_session(rollback)
+            .await
+            .expect_err("a rollback replayed past its own generation must conflict")
+            .code,
+        RuntimeClientErrorCode::Conflict
+    );
+    let head = client
+        .read_session(RuntimeSessionReadRequest {
+            schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+            invocation,
+            session_id,
+            branch_id,
+        })
+        .expect("head");
+    assert_eq!(head.turn_count, 2, "the refused replay kept the later Turn");
+}

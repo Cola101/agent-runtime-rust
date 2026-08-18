@@ -6039,13 +6039,22 @@ impl LocalRuntimeHost {
         let branch = record.branches.get_mut(&branch_id).ok_or_else(|| {
             LocalRuntimeError::Execution("root Session branch does not exist".into())
         })?;
-        if branch.generation == generation.saturating_add(1)
+        // The lost-response case, and only that. `starts_with` was too weak:
+        // after this rollback a Turn may have been appended, and a history of
+        // [prefix, later] still begins with [prefix] -- so replaying the old
+        // request would be answered as a retry while quietly discarding the
+        // later Turn. The branch has to look exactly as this rollback left it:
+        // one generation on, history equal to the prefix, nothing active.
+        // Overflow is refused rather than saturated, or a branch at u64::MAX
+        // would compare equal to its own successor and match falsely.
+        if generation.checked_add(1) == Some(branch.generation)
+            && branch.active_turn.is_none()
             && branch
                 .archived_generations
                 .get(&generation)
                 .is_some_and(|archived| {
                     Self::history_prefix(archived, through_turn_ordinal)
-                        .is_ok_and(|prefix| branch.history.starts_with(&prefix))
+                        .is_ok_and(|prefix| branch.history == prefix)
                 })
         {
             return Ok(branch.head(session_id));

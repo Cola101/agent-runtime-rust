@@ -513,6 +513,14 @@ pub enum EmbeddedRuntimeError {
     /// it reused an idempotency key. An adapter needs to be able to say so.
     #[error("control command id was already used for another command")]
     ControlCommandRebound,
+    /// A Session Turn's Run id is already bound to a different Turn.
+    ///
+    /// The same reasoning as `ControlCommandRebound`, for the same reason: the
+    /// caller reused an idempotency key with different content. Reported as a
+    /// configuration string it reached adapters as `Internal`, which tells a
+    /// caller the Runtime broke when in fact its own request was refused.
+    #[error("Session Turn Run id was already used for another Turn")]
+    SessionTurnRebound,
     #[error(transparent)]
     Admission(#[from] RuntimeAdmissionError),
     #[error(transparent)]
@@ -1941,9 +1949,7 @@ impl EmbeddedRuntime {
                     &input,
                 )?
             {
-                return Err(EmbeddedRuntimeError::Configuration(
-                    "Session Turn Run id is bound to another mutation".into(),
-                ));
+                return Err(EmbeddedRuntimeError::SessionTurnRebound);
             }
             return self.session_turn_receipt(invocation, session_id, branch_id, run_id);
         }

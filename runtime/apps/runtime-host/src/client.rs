@@ -356,6 +356,10 @@ impl RuntimeClientError {
                 RuntimeClientErrorCode::Conflict,
                 "this command id is already bound to a different command",
             ),
+            EmbeddedRuntimeError::SessionTurnRebound => Self::new(
+                RuntimeClientErrorCode::Conflict,
+                "this Run id is already bound to a different Session Turn",
+            ),
             EmbeddedRuntimeError::InvalidControlCommand(_) => Self::new(
                 RuntimeClientErrorCode::InvalidRequest,
                 "invalid Runtime control command",
