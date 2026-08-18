@@ -73,6 +73,9 @@ describe("what it says the Run is doing", () => {
     expect(doing("model.output.delta")).toBe("在回答");
     expect(doing("model.tool_call")).toBe("在用工具");
     expect(doing("approval.required")).toBe("等你决定");
+    // Not the same phrase: an MCP server asking for content is a different
+    // question from a decision about a tool call, and the gate says so too.
+    expect(doing("mcp.input.required")).toBe("等你回答");
     expect(doing("run.steer.applied")).toBe("刚改了向");
     expect(doing("subagent.spawned")).toBe("在派子代理");
   });

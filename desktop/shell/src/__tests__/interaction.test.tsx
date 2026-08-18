@@ -147,10 +147,10 @@ describe("the run list is operable from the keyboard", () => {
     const { user } = await open("Run");
     const rows = await waitFor(() => {
       const found = document.querySelectorAll("tbody tr");
-      expect(found.length).toBe(3);
+      expect(found.length).toBe(4);
       return found;
     });
-    expect(rows.length).toBe(3);
+    expect(rows.length).toBe(4);
     await user.keyboard("j");
     await waitFor(() =>
       expect(document.querySelector('tr[aria-selected="true"]')).toBeTruthy());
@@ -282,8 +282,10 @@ describe("the shell reports what it drew", () => {
     await waitFor(() => expect(bridge.desk.drew).toHaveBeenCalled());
     const summary = bridge.desk.drew.mock.calls[0][0];
     // These numbers are how a headless check tells a client from a shell. An
-    // App rewrite dropped this once already.
-    expect(summary).toMatchObject({ link: "live", runs: 3, waiting: 1 });
+    // App rewrite dropped this once already. `waiting` and `input` are counted
+    // apart because they are different questions: one is a decision about a
+    // tool call, the other is an MCP server asking a person for content.
+    expect(summary).toMatchObject({ link: "live", runs: 4, waiting: 1, input: 1 });
     expect(summary.events).toBeGreaterThan(0);
   });
 });

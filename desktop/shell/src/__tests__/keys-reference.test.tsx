@@ -253,8 +253,12 @@ describe("the key that opens it", () => {
     await waitFor(() => expect(document.querySelector(".keyref")).toBeTruthy());
     await user.keyboard("{Meta>}/{/Meta}");
     await waitFor(() => expect(document.querySelector(".keyref")).toBeNull());
-    // The run list, not the surface the window opened on.
-    await waitFor(() => expect(document.querySelectorAll("tbody tr").length).toBe(3));
+    // The run list, not the surface the window opened on. Asserted by the
+    // column only that surface draws: counting rows made this a test about how
+    // many Runs the fixture happens to hold, and it broke the moment another
+    // branch added one.
+    await waitFor(() =>
+      expect(screen.getByRole("columnheader", { name: "问的是" })).toBeTruthy());
   });
 
   it("is reachable from the palette as well", async () => {

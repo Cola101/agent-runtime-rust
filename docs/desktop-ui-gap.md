@@ -67,6 +67,7 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 28 | 每工具审批策略 | 待接入 | 设置里的 Tools & access |
 | 29 | 预算与配额 | 待接入 | 状态行 + 抽屉 |
 | 30 | 容器边界能力可视（ADR-0122） | 待接入 | 哪些保证这台机器给不了 |
+| 31 | MCP 输入请求（elicitation）应答 | **已接入** | `mcp.input.required` 原来只能看不能答；表单按 `requested_schema` 渲染，URL 模式给真实地址，回复经 `resolve_mcp_input` 原样回传 input id / 版本 / 绑定摘要 |
 
 ## 四、Runtime 侧阻塞与接入边界
 

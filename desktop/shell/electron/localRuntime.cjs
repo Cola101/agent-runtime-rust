@@ -491,6 +491,27 @@ class LocalRuntime {
     const reply = await this.#request({ type: action, run_id: runId });
     return reply;
   }
+
+  /// Answers the MCP input request a suspended Run is parked on.
+  ///
+  /// Not folded into `control`: that call is a verb and a run id, and this one
+  /// carries the identity of a specific question — the input id, the response
+  /// binding version, the binding digest, and one response per pending request
+  /// key. Every one of those is echoed from `mcp.input.required`, because the
+  /// daemon checks all of them against the exact pending request and refuses
+  /// anything else. Like the decisions above, the owner epoch and the full
+  /// `RuntimeControlCommand` stay the daemon's to construct.
+  async resolveMcpInput({ runId, inputId, inputVersion, bindingDigest, responses }) {
+    const reply = await this.#request({
+      type: "resolve_mcp_input",
+      run_id: runId,
+      input_id: inputId,
+      input_version: inputVersion,
+      binding_digest: bindingDigest,
+      responses,
+    });
+    return reply;
+  }
 }
 
 module.exports = { LocalRuntime, socketPathFor, EVENT_CURSOR_MAX_EVENTS, SESSION_HISTORY_MAX_TURNS };

@@ -144,6 +144,10 @@ export function App() {
       link: store.link.state,
       runs: store.runs.length,
       waiting: store.runs.filter((run) => run.approval).length,
+      // Counted apart from `waiting`: both park a run on a person, but one is
+      // a decision about a tool call and the other is an MCP server asking for
+      // content. Collapsing them would make the number mean neither.
+      input: store.runs.filter((run) => run.mcpInput).length,
       events: store.runs.reduce((total, run) => total + run.events.length, 0),
       policies: store.policies.length,
       // Reported because the launcher's line is how this client is checked

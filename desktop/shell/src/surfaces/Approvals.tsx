@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { register } from "./registry";
 import { effectLabel, sandboxLabel, shortId, since } from "./model";
 import { LinkBanner } from "./Link";
+import { McpInputForm } from "./McpInput";
 import { blocked, moveCursor, useDesk } from "../desk";
 import type { RunView } from "../store";
 
@@ -84,17 +85,25 @@ function ApprovalsView() {
 
       {queue.map((run) => {
         const approval = run.approval;
+        const input = run.mcpInput;
         const on = run.id === desk.selected;
+        // Only the third kind is coloured as unknown. An approval and an MCP
+        // input request are both questions a person can answer here;
+        // `indeterminate` is the one the log cannot settle either way.
+        const unsettled = !approval && !input;
         return (
           <div
             key={run.id}
             data-on={on}
-            className={`gate${approval ? "" : " unknown"}${on ? " sel" : ""}`}
+            className={`gate${unsettled ? " unknown" : ""}${on ? " sel" : ""}`}
             onClick={() => desk.select(run.id)}
           >
             <div className="h">
-              {approval ? "等你决定" : "结果无法判定"}
-              <span className="of"> ・ Run {shortId(run.id)} ・ {since(run.updatedAt)}</span>
+              {approval ? "等你决定" : input ? "等你回答" : "结果无法判定"}
+              <span className="of">
+                {input ? ` ・ MCP ${input.serverName}` : ""}
+                {" ・ "}Run {shortId(run.id)} ・ {since(run.updatedAt)}
+              </span>
             </div>
             {run.asked && <p className="q">{run.asked}</p>}
             {approval ? (
@@ -117,6 +126,8 @@ function ApprovalsView() {
                   绑定 {approval.bindingDigest.slice(0, 16)}…・只对这一次调用有效
                 </div>
               </>
+            ) : input ? (
+              <McpInputForm run={run} />
             ) : (
               <>
                 <p className="q">

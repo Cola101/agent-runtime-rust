@@ -211,6 +211,7 @@ ipcMain.handle("runtime:events", guarded((request) => local.eventCursor(request)
 ipcMain.handle("runtime:submit", guarded((input) => local.submit(input)));
 ipcMain.handle("runtime:control", guarded((request) => local.control(request)));
 ipcMain.handle("runtime:steer", guarded((request) => local.steer(request)));
+ipcMain.handle("runtime:resolveMcpInput", guarded((request) => local.resolveMcpInput(request)));
 // Session operations. Every one of them is an owner request, so none carries an
 // invocation and none of it is the renderer's to choose.
 ipcMain.handle("session:start", guarded((request) => local.sessionStart(request)));

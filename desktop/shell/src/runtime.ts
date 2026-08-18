@@ -158,6 +158,17 @@ type Bridge = {
   steer(request: {
     runId: string; steeringId: string; input: string;
   }): Promise<Reply<unknown>>;
+  /// Answers `mcp.input.required`. Separate from `control` because it carries
+  /// more than a verb and a run: the input id, the response-binding version and
+  /// the binding digest are all echoed from the event, and one response per
+  /// pending request key goes with them.
+  resolveMcpInput(request: {
+    runId: string;
+    inputId: string;
+    inputVersion: number;
+    bindingDigest: string;
+    responses: Record<string, { action: string; content?: Record<string, unknown> }>;
+  }): Promise<Reply<unknown>>;
   sessionStart(request: {
     sessionId: string; branchId: string; runId: string; input: string;
   }): Promise<Reply<SessionTurnReceipt>>;

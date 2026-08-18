@@ -17,6 +17,47 @@ export const RUN_LIVE = "01a01231-9f40-7d31-8c22-6b1a0e55c704";
 /// Run id would be standing for a conversation the runtime would not store.
 export const RUN_NOTED = "01a01232-5b31-7a44-9c07-3f2e6b0d1a95";
 
+export const RUN_INPUT = "01a0122e-4c11-7b90-9d63-1f8ac4b57e20";
+
+/// One MCP input round, as `mcp.input.required` carries it.
+///
+/// The form request is the shape the runtime's own MCP round-trip test drives
+/// (`runtime/apps/runtime-host/tests/grpc_invocation_mcp_input.rs`), with one
+/// optional field added. The URL request is the protocol's other elicitation
+/// mode. Two of them in one round because that is the part of the contract a
+/// client gets wrong: a resolution must answer the exact pending key set, so
+/// answering one of these is not answering the request.
+const MCP_INPUT = {
+  schema_version: 1,
+  input_id: "01a0122e-4c11-7b90-9d63-1f8ac4b57e21",
+  server_id: "01a0122e-4c11-7b90-9d63-1f8ac4b57e22",
+  server_name: "docs",
+  tool_call_id: "stub-call-7",
+  binding_digest: "7c9f1f5b0f5d4a2e8b6c3d1a9e7f2b4c6d8e0a2c4e6f8a0b2d4f6a8c0e2f4b6d",
+  round: 1,
+  request_state: "network-state-byte-exact",
+  requests: {
+    confirmation: {
+      mode: "form",
+      message: "Confirm this search",
+      requested_schema: {
+        type: "object",
+        properties: {
+          confirmed: { type: "boolean" },
+          note: { type: "string", title: "Note", description: "Anything to pass along" },
+        },
+        required: ["confirmed"],
+      },
+    },
+    verification: {
+      mode: "url",
+      message: "Finish verification in your browser",
+      url: "https://docs.example.test/verify/9f2",
+      elicitation_id: "elicit-9f2",
+    },
+  },
+};
+
 const APPROVAL = {
   approval_id: "01a0122b-217e-7e72-bec8-ad3273f16cd2",
   execution: {
@@ -33,52 +74,75 @@ const APPROVAL = {
 };
 
 export function event(
-  sequence: number, type: string, payload: Record<string, unknown>, minute = 0,
+  sequence: number, type: string, payload: Record<string, unknown>,
+  minute = 0, runId = RUN_WAITING,
 ) {
   return {
     event_id: `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
-    sequence, run_id: RUN_WAITING,
+    sequence, run_id: runId,
     timestamp: `2026-08-18T00:${String(minute).padStart(2, "0")}:0${sequence}.000Z`,
     type, payload, digest: "d".repeat(64),
   };
 }
 
-const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<typeof event>[] }> = {
-  [RUN_WAITING]: {
-    state: { state: "waiting_approval" },
-    events: [
-      event(1, "run.started", { status: "running" }),
-      event(2, "model.output.delta", { text: "I need to run a command." }),
-      event(3, "model.usage", { input_tokens: 180, output_tokens: 24, cost_micros: 0 }),
-      // Flat, which is what the runtime actually writes -- copied from a real
-      // dev-runtime log. It nests the call inside `approval.required` and not
-      // here, and a fake that nested both would let this client pass against a
-      // shape the runtime does not emit.
-      event(4, "model.tool_call", { name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-1" }),
-      event(5, "approval.required", { approval: APPROVAL, status: "waiting_approval" }),
-    ],
-  },
-  [RUN_LIVE]: {
-    state: { state: "running" },
-    events: [
-      event(1, "run.started", { status: "running" }, 30),
-      event(2, "model.output.delta", { text: "still going" }, 30),
-    ],
-  },
-  [RUN_DONE]: {
-    state: { state: "terminal", status: "succeeded" },
-    events: [
-      event(1, "run.started", { status: "running" }),
-      event(2, "model.output.delta", { text: "done" }),
-      // A tool call that names a path, which is what the workspace surface
-      // reads to say what the agent was asked to touch.
-      event(3, "model.tool_call", {
-        name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
-      }),
-      event(4, "run.succeeded", { status: "succeeded" }),
-    ],
-  },
-};
+type Log = { state: Record<string, unknown>; events: ReturnType<typeof event>[] };
+
+/// The runs this host has started, built per install so a test can hand the
+/// MCP round a request set of its own.
+function logs(mcpRequests: Record<string, unknown>): Record<string, Log> {
+  return {
+    [RUN_WAITING]: {
+      state: { state: "waiting_approval" },
+      events: [
+        event(1, "run.started", { status: "running" }),
+        event(2, "model.output.delta", { text: "I need to run a command." }),
+        event(3, "model.usage", { input_tokens: 180, output_tokens: 24, cost_micros: 0 }),
+        // Flat, which is what the runtime actually writes -- copied from a real
+        // dev-runtime log. It nests the call inside `approval.required` and not
+        // here, and a fake that nested both would let this client pass against a
+        // shape the runtime does not emit.
+        event(4, "model.tool_call", { name: "shell.exec", arguments: { command: "ls -la" }, id: "stub-call-1" }),
+        event(5, "approval.required", { approval: APPROVAL, status: "waiting_approval" }),
+      ],
+    },
+    // Suspended on an MCP server's input request. `suspended` is the boundary
+    // the local adapter reports for exactly this, and `input_version` sits
+    // beside the request rather than inside it -- both are what the client has
+    // to read to answer.
+    [RUN_INPUT]: {
+      state: { state: "suspended" },
+      events: [
+        event(1, "run.started", { status: "running" }, 10, RUN_INPUT),
+        event(2, "model.tool_call", {
+          name: "mcp:docs/confirm_search", arguments: { query: "retention sweep" }, id: "stub-call-7",
+        }, 10, RUN_INPUT),
+        event(3, "mcp.input.required", {
+          input: { ...MCP_INPUT, requests: mcpRequests }, input_version: 1, status: "suspended",
+        }, 10, RUN_INPUT),
+      ],
+    },
+    [RUN_LIVE]: {
+      state: { state: "running" },
+      events: [
+        event(1, "run.started", { status: "running" }, 30),
+        event(2, "model.output.delta", { text: "still going" }, 30),
+      ],
+    },
+    [RUN_DONE]: {
+      state: { state: "terminal", status: "succeeded" },
+      events: [
+        event(1, "run.started", { status: "running" }),
+        event(2, "model.output.delta", { text: "done" }),
+        // A tool call that names a path, which is what the workspace surface
+        // reads to say what the agent was asked to touch.
+        event(3, "model.tool_call", {
+          name: "workspace.write", arguments: { path: "notes.txt", contents: "x" }, id: "stub-call-2",
+        }),
+        event(4, "run.succeeded", { status: "succeeded" }),
+      ],
+    },
+  };
+}
 
 /// A Session with two committed Turns and nothing in flight.
 ///
@@ -191,7 +255,7 @@ export function installFakeRuntime(
   /// it and watch a Fork be refused.
   {
     activeRunId = null, later = {}, gap = false, capped = false,
-    unreadable = null, maxBranches = 32,
+    unreadable = null, maxBranches = 32, mcpRequests = MCP_INPUT.requests,
   }: {
     activeRunId?: string | null;
     later?: Record<string, FakeEvent[]>;
@@ -199,10 +263,26 @@ export function installFakeRuntime(
     capped?: boolean;
     unreadable?: string | null;
     maxBranches?: number;
+    /// Replaces the pending MCP round. It exists so a test can render a request
+    /// this build does not understand: a newer runtime may add an elicitation
+    /// mode, and the client must say so rather than draw a form for it.
+    mcpRequests?: Record<string, unknown>;
   } = {},
 ) {
   const control = vi.fn(async () => ({ ok: true as const, value: {} }));
   const submit = vi.fn(async () => ({ ok: true as const, value: RUN_DONE }));
+  // Built per install, so a test can hand the MCP round a request set of its
+  // own -- including one this build does not understand.
+  const runLogs = logs(mcpRequests);
+  // Typed like the preload's own call, so a test can read back exactly what
+  // the client decided to send.
+  const resolveMcpInput = vi.fn(async (_request: {
+    runId: string;
+    inputId: string;
+    inputVersion: number;
+    bindingDigest: string;
+    responses: Record<string, { action: string; content?: Record<string, unknown> }>;
+  }) => ({ ok: true as const, value: {} }));
   /// Branches, the way the store root holds them: keyed by Session *and*
   /// branch, in the `(session_id, branch_id)` order `session_list` answers in.
   /// A Fork adds one here and a Rollback shortens one, so a test can read what
@@ -393,6 +473,7 @@ export function installFakeRuntime(
       value: {
         runs: [
           { run_id: RUN_WAITING, input: "run a shell command", state: { state: "waiting_approval" } },
+          { run_id: RUN_INPUT, input: "search the docs", state: { state: "suspended" } },
           { run_id: RUN_LIVE, input: "something still going", state: { state: "running" } },
           { run_id: RUN_DONE, input: "something finished", state: { state: "finished", status: "succeeded" } },
         ],
@@ -421,7 +502,7 @@ export function installFakeRuntime(
       if (limit > 256) {
         return { ok: true as const, value: { ok: false as const, error: { code: "invalid_request" } } };
       }
-      const log = runId === unreadable ? undefined : LOGS[runId];
+      const log = runId === unreadable ? undefined : runLogs[runId];
       if (!log) return { ok: true as const, value: { ok: false as const, error: { code: "not_found" } } };
       // The durable log as this Run actually stands: what the fixture declared,
       // plus anything a test said had been written since. Every branch below
@@ -482,6 +563,7 @@ export function installFakeRuntime(
     submit,
     control,
     steer,
+    resolveMcpInput,
     sessionStart,
     sessionContinue,
     sessionRead,
@@ -553,6 +635,7 @@ export function installFakeRuntime(
   };
   return {
     control, submit, sessionStart, sessionContinue, sessionRead, sessionFork, sessionRollback,
-    saveProvider, forgetProvider, watch, unwatch, emit, event, launch, steer, desk, elsewhere,
+    resolveMcpInput, saveProvider, forgetProvider, watch, unwatch, emit, event, launch, steer,
+    desk, elsewhere,
   };
 }

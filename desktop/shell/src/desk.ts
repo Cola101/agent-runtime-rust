@@ -42,12 +42,14 @@ export function byRecency(desk: Desk) {
   return [...desk.runs].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
 }
 
-/// The runs that are blocked on a person: parked on an approval, or finished
-/// in a state only a person can settle.
+/// The runs that are blocked on a person: parked on an approval, suspended on
+/// an MCP server's input request, or finished in a state only a person can
+/// settle.
 export function blocked(desk: Desk) {
   return byRecency(desk).filter(
     (run) =>
       run.approval !== null ||
+      run.mcpInput !== null ||
       ((run.lifecycle.kind === "terminal" || run.lifecycle.kind === "retired") &&
         run.lifecycle.status === "indeterminate"),
   );
