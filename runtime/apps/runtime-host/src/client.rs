@@ -353,6 +353,18 @@ pub struct RuntimeClientRecoveryReport {
     pub failures: Vec<RuntimeClientRecoveryFailure>,
 }
 
+/// Keeps the reason on this side of the boundary.
+///
+/// A `StateRoot` error is a filesystem failure on the host's own path, and the
+/// path must not cross the client contract -- which is why the reply says only
+/// that storage is unavailable. The cost of that has been paid once already: a
+/// Session test failed under load for weeks and the message could not say
+/// whether it was an exhausted descriptor table, a transient ENOENT, or
+/// something else. The reply stays sanitised and the host says what it saw.
+fn note_state_root(operation: &str, error: &LocalRuntimeError) {
+    tracing::warn!(%error, operation, "Session storage failed on the state root");
+}
+
 impl RuntimeClientError {
     fn new(code: RuntimeClientErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -445,10 +457,13 @@ impl RuntimeClientError {
                 RuntimeClientErrorCode::DataLoss,
                 "Session history is inconsistent",
             ),
-            EmbeddedRuntimeError::Runtime(LocalRuntimeError::StateRoot(_)) => Self::new(
-                RuntimeClientErrorCode::Unavailable,
-                "Session storage is unavailable",
-            ),
+            EmbeddedRuntimeError::Runtime(error @ LocalRuntimeError::StateRoot(_)) => {
+                note_state_root("session_mutation", &error);
+                Self::new(
+                    RuntimeClientErrorCode::Unavailable,
+                    "Session storage is unavailable",
+                )
+            }
             error => Self::from_embedded(error),
         }
     }
@@ -466,10 +481,13 @@ impl RuntimeClientError {
                 RuntimeClientErrorCode::DataLoss,
                 "Session history is inconsistent",
             ),
-            EmbeddedRuntimeError::Runtime(LocalRuntimeError::StateRoot(_)) => Self::new(
-                RuntimeClientErrorCode::Unavailable,
-                "Session storage is unavailable",
-            ),
+            EmbeddedRuntimeError::Runtime(error @ LocalRuntimeError::StateRoot(_)) => {
+                note_state_root("session_read", &error);
+                Self::new(
+                    RuntimeClientErrorCode::Unavailable,
+                    "Session storage is unavailable",
+                )
+            }
             error => Self::from_embedded(error),
         }
     }

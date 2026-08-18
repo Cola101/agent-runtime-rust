@@ -109,20 +109,26 @@ fn load_subagent_roles_from_path(
 /// Refused rather than clamped when it cannot be read: a budget silently
 /// replaced by a default is a Run that ends for a reason nobody chose, and the
 /// dimension it ends on is reported to the person as though it were intended.
-fn budget_dimension(name: &str, fallback: u64) -> Result<u64, Box<dyn std::error::Error>> {
-    match std::env::var(name) {
-        Err(_) => Ok(fallback),
-        Ok(raw) => {
-            let value: u64 = raw
-                .trim()
-                .parse()
-                .map_err(|_| format!("{name} must be a whole number, not {raw:?}"))?;
-            if value == 0 {
-                return Err(format!("{name} must be greater than zero").into());
-            }
-            Ok(value)
-        }
+fn parse_budget_dimension(
+    name: &str,
+    raw: Option<&str>,
+    fallback: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let Some(raw) = raw else { return Ok(fallback) };
+    let value: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{name} must be a whole number, not {raw:?}"))?;
+    if value == 0 {
+        return Err(format!("{name} must be greater than zero").into());
     }
+    Ok(value)
+}
+
+/// Split from the parsing above so the rule can be tested without setting a
+/// process-wide variable, which the tests around it run in parallel with.
+fn budget_dimension(name: &str, fallback: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    parse_budget_dimension(name, std::env::var(name).ok().as_deref(), fallback)
 }
 
 /// What one Run may spend.
@@ -526,6 +532,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use agent_runtime_host::LocalMcpTransportConfig;
+
+    /// A Run budget is what stops a runaway Run on someone's own machine, so
+    /// every way of getting it wrong has to be a refusal rather than a
+    /// substitution: a budget silently replaced by the default ends a Run on a
+    /// limit nobody set, and reports the dimension as though it were intended.
+    #[test]
+    fn a_budget_dimension_is_refused_rather_than_replaced_when_it_cannot_be_read() {
+        let name = "AGENT_RUNTIME_LOCAL_BUDGET_MAX_TOKENS";
+        assert_eq!(
+            parse_budget_dimension(name, None, 8_192).expect("absent means the default"),
+            8_192
+        );
+        assert_eq!(
+            parse_budget_dimension(name, Some(" 400000 "), 8_192).expect("whitespace is trimmed"),
+            400_000
+        );
+        // Zero is not a budget, it is a Run that cannot take one step, and a
+        // host that started with it would fail every Run on its first token.
+        assert!(parse_budget_dimension(name, Some("0"), 8_192).is_err());
+        assert!(parse_budget_dimension(name, Some("many"), 8_192).is_err());
+        assert!(parse_budget_dimension(name, Some("-1"), 8_192).is_err());
+        assert!(parse_budget_dimension(name, Some(""), 8_192).is_err());
+        // The message names the variable, because a host that refuses to start
+        // has to say which of the three it refused for.
+        let refusal = parse_budget_dimension(name, Some("many"), 8_192)
+            .expect_err("must refuse")
+            .to_string();
+        assert!(refusal.contains(name), "the refusal must name the variable: {refusal}");
+    }
 
     /// The production break this catches is exposing stdio only through the Rust
     /// library while the shipped binary silently constructs an empty MCP list.
