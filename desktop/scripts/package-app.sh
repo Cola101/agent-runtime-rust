@@ -107,6 +107,18 @@ done
 # The two exclusions are not omissions: `main.cjs` and `preload.cjs` require
 # `electron` itself, which only resolves inside the Electron process, so bare
 # node cannot load them and their absence here says nothing about the bundle.
+# The two that cannot be loaded are still parsed. Excluding them from the load
+# check is right -- `electron` resolves only inside the Electron process -- but
+# it left the app's entry point and its only bridge as the two files in the
+# bundle nothing looked at. A syntax error in either ships a bundle that opens
+# no window at all, and `node --check` finds that without running anything.
+for parse_only in "electron/main.cjs" "electron/preload.cjs"; do
+  if ! node --check "$app/Contents/Resources/app/$parse_only"; then
+    echo "the bundled $parse_only does not parse" >&2
+    exit 1
+  fi
+done
+
 if ! (cd "$app/Contents/Resources/app" && node -e "
   const fs = require('node:fs');
   const inside = fs.readdirSync('./electron')
