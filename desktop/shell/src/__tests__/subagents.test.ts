@@ -123,6 +123,38 @@ describe("what a Run delegated", () => {
     expect(view.queued).toBe(1);
   });
 
+  /// A number of tokens spent means nothing without the number it was allowed.
+  /// `RunBudget` rides on the spawn request the client already parses and on
+  /// the fork event beside it, so this is the runtime's own cap rather than a
+  /// figure worked out here.
+  it("carries the cap the child was given, not only what it spent", () => {
+    const [view] = subagentsOf([
+      event("subagent.spawn.requested", {
+        status: "running",
+        request: {
+          tool_call_id: "call-1", delegation_id: A, role: "reviewer",
+          input: "读一遍", mode: "async",
+          budget: { max_tokens: 20000, max_cost_cents: 50, max_duration_seconds: 600 },
+        },
+      }),
+      event("subagent.terminal.observed", {
+        agent_id: A, child_run_id: "child-1", terminal_status: "succeeded",
+        is_error: false, usage: { tokens: 1020, cost_micros: 4200 },
+      }),
+    ]);
+    expect(view.budget).toEqual({ maxTokens: 20000, maxCostCents: 50, maxDurationSeconds: 600 });
+  });
+
+  /// Null rather than zero. A budget of zero tokens is a real cap that permits
+  /// nothing, and a client that wrote one where the log said nothing would be
+  /// reporting a child as over its limit the moment it started.
+  it("says nothing about a budget the log does not carry", () => {
+    const [view] = subagentsOf([
+      event("subagent.spawned", { agent_id: A, role: "reviewer", status: "running" }),
+    ]);
+    expect(view.budget).toBeNull();
+  });
+
   it("carries the generation a rollback moved to", () => {
     const [view] = subagentsOf([
       requested(A, "reviewer", "读一遍"),

@@ -35,6 +35,10 @@ export type SubagentView = {
   childRunId: string | null;
   tokens: number;
   costMicros: number;
+  /// The cap this child was given, from `RunBudget` on the spawn request or the
+  /// fork. Null when the log does not carry one -- not zero, which is a real cap
+  /// that permits nothing and would report a child as over its limit at birth.
+  budget: { maxTokens: number; maxCostCents: number; maxDurationSeconds: number } | null;
   /// Set on a forked delegation: the delegation it was forked from, and the
   /// generation it was taken at.
   forkedFrom: { id: string; generation: number; throughOrdinal: number } | null;
@@ -57,6 +61,17 @@ function payloadOf(event: RunEvent): Record<string, unknown> {
 /// a subagent event, so every child on screen reported 0 tokens no matter what
 /// it spent, and the test that covered it asserted the sum of a fixture nobody
 /// had checked against the runtime.
+function budgetOf(source: Record<string, unknown>): SubagentView["budget"] {
+  const budget = source.budget;
+  if (!budget || typeof budget !== "object") return null;
+  const fields = budget as Record<string, unknown>;
+  return {
+    maxTokens: Number(fields.max_tokens ?? 0),
+    maxCostCents: Number(fields.max_cost_cents ?? 0),
+    maxDurationSeconds: Number(fields.max_duration_seconds ?? 0),
+  };
+}
+
 function usageOf(payload: Record<string, unknown>): { tokens: number; costMicros: number } {
   const usage = (payload.usage ?? {}) as Record<string, unknown>;
   return {
@@ -84,6 +99,7 @@ export function subagentsOf(events: RunEvent[]): SubagentView[] {
       childRunId: null,
       tokens: 0,
       costMicros: 0,
+      budget: null,
       forkedFrom: null,
       generation: 1,
       queued: 0,
@@ -103,6 +119,7 @@ export function subagentsOf(events: RunEvent[]): SubagentView[] {
         const view = at(id, event.timestamp);
         view.role = String(request.role ?? view.role);
         view.asked = typeof request.input === "string" ? request.input : view.asked;
+        view.budget = budgetOf(request) ?? view.budget;
         break;
       }
       case "subagent.spawned": {
@@ -119,6 +136,9 @@ export function subagentsOf(events: RunEvent[]): SubagentView[] {
         const view = at(id, event.timestamp);
         view.role = String(payload.role ?? view.role);
         view.generation = Number(payload.generation ?? view.generation);
+        // A fork carries its own budget, which is the fork's and not the
+        // source's: the two are separate children with separate caps.
+        view.budget = budgetOf(payload) ?? view.budget;
         view.forkedFrom = {
           id: String(payload.source_agent_id ?? ""),
           generation: Number(payload.source_generation ?? 0),

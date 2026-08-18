@@ -395,8 +395,18 @@ function Delegations({ run, query }: { run: RunView; query: string }) {
                 />
               </span>
             )}
+            {/* Against its cap when the log carries one. A number of tokens on
+                its own does not say whether a child was close to being cut
+                off, which is the only thing a person reads this figure for. */}
             {view.tokens > 0 && (
-              <span><Mark text={`${view.tokens.toLocaleString()} token`} query={query} /></span>
+              <span>
+                <Mark
+                  text={view.budget && view.budget.maxTokens > 0
+                    ? `${view.tokens.toLocaleString()} / ${view.budget.maxTokens.toLocaleString()} token`
+                    : `${view.tokens.toLocaleString()} token`}
+                  query={query}
+                />
+              </span>
             )}
             {view.costMicros > 0 && (
               <span><Mark text={costLabel(view.costMicros)} query={query} /></span>
