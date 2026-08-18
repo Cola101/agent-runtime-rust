@@ -1102,6 +1102,36 @@ impl LocalRuntimeDaemon {
         Uuid::from_bytes(bytes)
     }
 
+    /// A decision this Run already recorded, if it recorded one of this kind.
+    ///
+    /// Only reached when nothing is pending, so there is no ambiguity left to
+    /// resolve: a Run that is not asking cannot have this stand for the wrong
+    /// approval. Which of several is returned does not matter for the same
+    /// reason -- every one of them is already recorded, and dispatching it
+    /// reconciles against its own receipt rather than deciding anything. It is
+    /// dispatched rather than answered here so that the ownership and epoch
+    /// checks in `control_detached` still run for a stale client.
+    fn replay_decided_approval(
+        &self,
+        run_id: Uuid,
+        decision: LocalApprovalDecision,
+    ) -> Result<Option<RuntimeControlCommand>, EmbeddedRuntimeError> {
+        Ok(self
+            .runtime
+            .list_control_receipts(self.invocation, run_id)?
+            .into_iter()
+            .filter(|receipt| {
+                matches!(
+                    &receipt.action,
+                    RuntimeControlAction::DecideApproval {
+                        decision: recorded, ..
+                    } if *recorded == decision
+                )
+            })
+            .map(|receipt| receipt.command())
+            .next())
+    }
+
     fn existing_legacy_command(
         &self,
         command_id: Uuid,
@@ -1137,31 +1167,6 @@ impl LocalRuntimeDaemon {
             LocalApprovalDecision::AllowOnce => "approve",
             LocalApprovalDecision::Deny => "deny",
         };
-        let command_id = Self::legacy_command_id(run_id, kind, None);
-        match self.existing_legacy_command(command_id) {
-            Ok(Some(command))
-                if matches!(
-                    command.action,
-                    RuntimeControlAction::DecideApproval {
-                        decision: recorded,
-                        ..
-                    } if recorded == decision
-                ) =>
-            {
-                return self.dispatch_legacy_control(command).await;
-            }
-            Ok(Some(_)) => {
-                return LocalResponse::Error {
-                    message: "legacy approval command id is bound to another action".into(),
-                };
-            }
-            Err(error) => {
-                return LocalResponse::Error {
-                    message: error.to_string(),
-                };
-            }
-            Ok(None) => {}
-        }
         let record = match self.read_owned_record(run_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
@@ -1196,12 +1201,57 @@ impl LocalRuntimeDaemon {
                     message: "approval was already decided differently".into(),
                 };
             }
+            // Nothing is pending. Either this Run never asked, or a duplicate
+            // of a decision already delivered arrived late -- and a client
+            // resending one it did not see answered should not be told the Run
+            // is in the wrong state. The Run's own ledger settles which: if it
+            // holds a decision of this kind, replaying it is the reply.
             state => {
-                return LocalResponse::Error {
-                    message: format!("run is not awaiting approval: {state:?}"),
+                return match self.replay_decided_approval(run_id, decision) {
+                    Ok(Some(command)) => self.dispatch_legacy_control(command).await,
+                    Ok(None) => LocalResponse::Error {
+                        message: format!("run is not awaiting approval: {state:?}"),
+                    },
+                    Err(error) => LocalResponse::Error {
+                        message: error.to_string(),
+                    },
                 };
             }
         };
+        // Derived from the approval, not only from the Run. A Run asks more
+        // than once -- one process session asks five times -- and without the
+        // approval in the id the second Approve hashed to the first one's
+        // command, found its receipt, matched on the decision and replayed it:
+        // it answered a question already answered and left the pending one
+        // pending. `steer` and `resolve_mcp_input` both carry a discriminator
+        // for this reason. The id is still stable per approval, so retrying one
+        // decision is still one durable command.
+        let command_id = Self::legacy_command_id(run_id, kind, Some(approval_id));
+        match self.existing_legacy_command(command_id) {
+            Ok(Some(command))
+                if matches!(
+                    command.action,
+                    RuntimeControlAction::DecideApproval {
+                        approval_id: recorded_approval,
+                        decision: recorded,
+                        ..
+                    } if recorded == decision && recorded_approval == approval_id
+                ) =>
+            {
+                return self.dispatch_legacy_control(command).await;
+            }
+            Ok(Some(_)) => {
+                return LocalResponse::Error {
+                    message: "legacy approval command id is bound to another action".into(),
+                };
+            }
+            Err(error) => {
+                return LocalResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            Ok(None) => {}
+        }
         self.dispatch_legacy_control(RuntimeControlCommand {
             schema_version: RUNTIME_CONTROL_COMMAND_SCHEMA_VERSION,
             command_id,

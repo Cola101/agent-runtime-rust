@@ -79,7 +79,6 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
 | MCP 服务健康度 | `McpServerDiscoveryStatus` 只活在 Runtime 进程里：它进 `LocalRunOutcome`，而 owner socket 与 workload socket 都没有返回它的调用，事件日志里也没有它。要让界面说“这个服务起来了”，得先在 `OwnerRequest` 上开一个读它的调用 |
 | MCP 服务的密钥 | provider 的密钥能进钥匙串，是因为路由配置里写的是 `api_key_env` 这个变量名。stdio MCP 的 `env` 是字面值，只能写进配置文件，所以设置里不收密钥。要解除，得给 `LocalMcpTransportConfig::Stdio` 加一个同形状的间接层 —— 那会改动 stdio 的 authority digest，是一次单独的决定 |
-| 同一个 Run 的第二次审批 | `ipc.rs` 的 `decide` 仍用 `legacy_command_id(run_id, kind, None)`：`(run_id, "approve")` 摘要成固定的 control command id，第二次 Approve 命中同一张回执并重放它，而不是决定新的问题。`Steer` 已经按 `steering_id` 派生命令 id，`decide` 没跟上——同一处代码里两种做法。一次进程会话要审 5 次（8 个 `process.*` 工具里有 5 个是 Ask），所以从窗口里只批得动第一次。实测于 `dev-runtime.sh` |
 | 实时进程输出 | Runtime 侧没有面向客户端的 `process.*` 读取契约。字节只在 Agent 调用工具时进入事件日志，`LocalRequest` 里也没有对应的动作。不是 UI 问题 |
 
 ## 五、推进顺序

@@ -80,6 +80,39 @@ async fn spawn_provider() -> String {
 /// approval had not arrived -- naming the approval chain for a failure that was
 /// nowhere near it. A full `cargo clean` removes this binary, which makes that
 /// hour cost recur.
+/// Serves two tool-call turns before it answers, so one Run parks on two
+/// separate approvals. Every other test here parks once, and once is the only
+/// case a command id derived from `(run_id, "approve")` can tell apart.
+async fn spawn_provider_asking_twice() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let mut served = 0u32;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = vec![0u8; 64 * 1024];
+            let _ = socket.read(&mut buffer).await;
+            let body = if served < 2 {
+                TOOL_CALL_TURN.replace("call_local_1", &format!("call_local_{}", served + 1))
+            } else {
+                text_turn("answered after both approvals")
+            };
+            served += 1;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
 fn trusted_tool_binary() -> PathBuf {
     let mut current = std::env::current_exe().expect("test executable path");
     while current.pop() {
@@ -765,6 +798,112 @@ async fn legacy_approval_is_one_replayable_runtime_control_command() {
         .filter(|event| event.event_type == "tool.execution.started")
         .count();
     assert_eq!(tool_starts, 1, "approval retry executed the Tool twice");
+}
+
+/// The second approval of one Run is a different question from the first.
+///
+/// The legacy command id was derived from `(run_id, "approve")` alone, so both
+/// hashed to one id: the second Approve found the first one's receipt, matched
+/// on the decision, and replayed it -- answering an approval that had already
+/// been answered while the one actually pending stayed pending. `steer` and
+/// `resolve_mcp_input` both carry a discriminator for exactly this reason;
+/// `decide` did not. A Run that asks more than once is ordinary -- one process
+/// session asks five times -- so this was every parked Run after the first.
+#[tokio::test]
+async fn two_approvals_in_one_run_are_two_decisions_and_not_a_replay_of_the_first() {
+    let state = tempfile::tempdir().expect("state");
+    let workspace = fixture_workspace();
+    let state_root = state.path().to_path_buf();
+    let (socket, _serving) = start(config(
+        state_root.clone(),
+        workspace.path().canonicalize().expect("canonical"),
+        spawn_provider_asking_twice().await,
+    ))
+    .await;
+    let LocalResponse::Accepted { run_id } = request(
+        &socket,
+        &LocalRequest::Submit {
+            input: "Read README.txt twice.".into(),
+        },
+    )
+    .await
+    else {
+        panic!("expected acceptance");
+    };
+
+    let pending = |root: PathBuf| {
+        move || {
+            matches!(
+                LocalRuntimeHost::read_run_record(&root, run_id),
+                Ok(Some(record)) if matches!(record.state, LocalRunState::AwaitingApproval { .. })
+            )
+        }
+    };
+
+    wait_for("the first approval", pending(state_root.clone())).await;
+    let first = match LocalRuntimeHost::read_run_record(&state_root, run_id) {
+        Ok(Some(record)) => match record.state {
+            LocalRunState::AwaitingApproval { approval_id, .. } => approval_id,
+            other => panic!("expected an approval: {other:?}"),
+        },
+        other => panic!("unreadable: {other:?}"),
+    };
+    assert!(matches!(
+        request(&socket, &LocalRequest::Approve { run_id }).await,
+        LocalResponse::Accepted { .. }
+    ));
+
+    // The second one, which the kernel raises only after the first tool ran.
+    let probe = state_root.clone();
+    wait_for("a second, different approval", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(
+                record.state,
+                LocalRunState::AwaitingApproval { approval_id, .. } if approval_id != first
+            )
+        )
+    })
+    .await;
+    assert!(matches!(
+        request(&socket, &LocalRequest::Approve { run_id }).await,
+        LocalResponse::Accepted { .. }
+    ));
+
+    let probe = state_root.clone();
+    wait_for("the run to finish", move || {
+        matches!(
+            LocalRuntimeHost::read_run_record(&probe, run_id),
+            Ok(Some(record)) if matches!(record.state, LocalRunState::Finished { .. })
+        )
+    })
+    .await;
+
+    // Two decisions, two commands. One receipt would mean the second Approve
+    // replayed the first.
+    let receipts = control_receipts(&state_root);
+    assert_eq!(
+        receipts.len(),
+        2,
+        "the second approval did not become its own command: {receipts:?}"
+    );
+    let decided = receipts
+        .iter()
+        .filter_map(|receipt| match &receipt.action {
+            RuntimeControlAction::DecideApproval { approval_id, .. } => Some(*approval_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(decided.len(), 2, "both commands answered one approval");
+    assert!(decided.contains(&first), "the first approval was not decided");
+
+    // And the tool ran once per approval, which is the point of approving twice.
+    let starts = LocalRuntimeHost::replay_events(&state_root, run_id, 0)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "tool.execution.started")
+        .count();
+    assert_eq!(starts, 2, "the second approved tool never ran");
 }
 
 #[tokio::test]
