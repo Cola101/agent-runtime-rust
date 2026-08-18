@@ -70,6 +70,48 @@ const DELEGATED_SCOPES = [
   "tool:workspace.read",
   "tool:workspace.write",
   "tool:shell.exec",
+  // Delegation needs two things and the roles above are only one of them: the
+  // `agent.*` family is installed when the roles are non-empty *and* the parent
+  // holds this scope (`worker/src/lib.rs`, where the tool family is built).
+  // Configured roles alone offer the model no way to use them -- checked by
+  // running a turn and reading the tool list the provider was sent.
+  "agent:spawn",
+];
+
+/// Roles a Run may delegate to.
+///
+/// Without this the host loads an empty role list, and a Run that tries to
+/// delegate is refused because its role matches nothing. Every `agent.*` tool
+/// and every `subagent.*` event is then unreachable -- including the tree this
+/// client already renders, which could never have had anything in it.
+///
+/// Each role is narrower than the parent, not equal to it. A reviewer that can
+/// write the workspace is not a reviewer, and a scope granted here is one the
+/// parent cannot take back once it has delegated.
+const SUBAGENT_ROLES = [
+  {
+    name: "reader",
+    instructions:
+      "Read what you are pointed at and report what is there. Quote the file and line "
+      + "you are describing. If the answer is not in what you can read, say that rather "
+      + "than inferring it.",
+    delegated_scopes: ["tool:workspace.read"],
+  },
+  {
+    name: "editor",
+    instructions:
+      "Make the change you were asked for and nothing beside it. Read before you write, "
+      + "and report what you changed as a path and a description rather than as a claim "
+      + "that it is finished.",
+    delegated_scopes: ["tool:workspace.read", "tool:workspace.write"],
+  },
+  {
+    name: "runner",
+    instructions:
+      "Run the command you were asked to run and report exactly what it printed, "
+      + "including a failure. Do not interpret a non-zero exit as success.",
+    delegated_scopes: ["tool:workspace.read", "tool:shell.exec"],
+  },
 ];
 
 const workspaceRoot = process.env.RUNTIME_DESK_WORKSPACE
@@ -294,6 +336,13 @@ async function openRuntime() {
   // Read once, here, and handed to the child. The secret exists in this
   // process for the length of a spawn and never reaches the renderer, the
   // config file, or a log line.
+  // Written next to the routing file, for the same reason: it is derived state
+  // the host reads at startup, and deriving it every launch keeps it from
+  // disagreeing with the roles this app actually offers.
+  const rolesFile = path.join(app.getPath("userData"), "providers", "subagent-roles.json");
+  fs.mkdirSync(path.dirname(rolesFile), { recursive: true });
+  fs.writeFileSync(rolesFile, `${JSON.stringify(SUBAGENT_ROLES, null, 2)}\n`, { mode: 0o600 });
+
   const routing = await credentials.routing();
   if (!routing) {
     console.log("runtime-desk: no provider configured — set one in 设置 before starting a runtime");
@@ -326,6 +375,7 @@ async function openRuntime() {
         // boundary that holds because nobody set a variable is a boundary that
         // moves the first time someone does.
         AGENT_RUNTIME_LOCAL_TOOL_CONSENT: "ask",
+        AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG: rolesFile,
       },
     });
     console.log(`runtime-desk: started runtime-host (pid ${pid})`);

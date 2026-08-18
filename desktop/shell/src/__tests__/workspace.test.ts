@@ -159,6 +159,22 @@ describe("what the packaged app expects to find beside it", () => {
     expect(main).toMatch(/AGENT_RUNTIME_LOCAL_TOOL_CONSENT:\s*"ask"/);
   });
 
+  /// Delegation is gated on two things, not one. The `agent.*` tool family is
+  /// installed when the configured roles are non-empty *and* the parent holds
+  /// `agent:spawn`; with roles alone the model is offered no way to use them.
+  /// Checked by running a turn and reading the tool list the provider received:
+  /// roles-only produced `shell.exec, workspace.read_text, workspace.write_text`
+  /// and nothing else.
+  it("configures both halves of the delegation gate", () => {
+    const main = readFileSync(path.join(root, "electron", "main.cjs"), "utf8");
+    expect(main).toContain("AGENT_RUNTIME_LOCAL_SUBAGENT_CONFIG");
+    expect(main).toContain("agent:spawn");
+    // Roles narrower than the parent. A reviewer that can write the workspace
+    // is not a reviewer, and a scope delegated cannot be taken back.
+    expect(main).toMatch(/name:\s*"reader"/);
+    expect(main).toContain("subagent-roles.json");
+  });
+
   it("ships only what the host process needs, not the whole tree", () => {
     const script = readFileSync(
       path.join(root, "..", "scripts", "package-app.sh"), "utf8",
