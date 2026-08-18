@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { register } from "./registry";
-import { effectLabel, sandboxLabel, since } from "./model";
+import { effectLabel, sandboxLabel, shortId, since } from "./model";
 import { useDesk } from "../desk";
 
 /// Which of these actually reach the runtime, and which only configure this
@@ -188,11 +188,169 @@ function Models() {
   );
 }
 
+/// Where local MCP servers are configured.
+///
+/// What this page may claim is narrower than it looks. The list is this app's
+/// own configuration file, and the runtime reads that file once, at startup
+/// (`load_mcp_servers`). Whether a server then came up is
+/// `McpServerDiscoveryStatus`, which stays inside the runtime process — the
+/// local socket has no call that returns it. So a configured server is not a
+/// running server, and this page says which of the two it is showing.
+///
+/// The one exception is the whole reason 必需 is offered: a required server
+/// that fails discovery fails the Run, and names itself in the durable log.
+function Mcp() {
+  const desk = useDesk();
+  const [name, setName] = useState("");
+  const [command, setCommand] = useState("");
+  const [args, setArgs] = useState("");
+  const [cwd, setCwd] = useState("");
+  const [tools, setTools] = useState("");
+  const [required, setRequired] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const applied = desk.mcp.applied;
+  const live = applied === null ? null : new Set(applied.map((entry) => entry.digest));
+  // Servers the runtime was started with that are no longer configured. It is
+  // still running them, and a list that quietly dropped them would be saying
+  // the removal had taken effect.
+  const configured = new Set(desk.mcp.servers.map((server) => server.name));
+  const leftover = (applied ?? []).filter((entry) => !configured.has(entry.name));
+
+  const save = async () => {
+    setBusy(true);
+    const failure = await desk.saveMcpServer({
+      name: name.trim(),
+      command: command.trim(),
+      // One per line: an MCP server's arguments are usually paths, and a
+      // space-separated field cannot carry one with a space in it.
+      args: args.split("\n").map((arg) => arg.trim()).filter(Boolean),
+      cwd: cwd.trim() === "" ? null : cwd.trim(),
+      // Split on anything a tool name cannot contain, so nothing is lost.
+      toolNames: tools.split(/[\s,]+/).filter(Boolean),
+      required,
+    });
+    setError(failure);
+    setBusy(false);
+    if (!failure) {
+      setName(""); setCommand(""); setArgs(""); setCwd(""); setTools(""); setRequired(false);
+    }
+  };
+
+  return (
+    <>
+      {desk.mcp.servers.length > 0 && (
+        <table className="rows">
+          <thead>
+            <tr>
+              <th>名字</th><th>命令</th><th>工具</th><th>授权</th><th>必需</th>
+              <th>配置</th><th className="num" />
+            </tr>
+          </thead>
+          <tbody>
+            {desk.mcp.servers.map((server) => (
+              <tr key={server.name}>
+                <td className="p mono">{server.name}</td>
+                <td className="mono" title={[server.command, ...server.args].join(" ")}>
+                  {server.command.split("/").pop()}
+                </td>
+                <td className="mono">{server.toolNames.join("・")}</td>
+                <td className="mono">{server.scope}</td>
+                <td>{server.required ? "必需" : "可选"}</td>
+                <td className={live?.has(server.digest) ? "" : "warn"}>
+                  {live === null
+                    ? "不知道有没有生效"
+                    : live.has(server.digest) ? "Runtime 启动时拿到了" : "还没生效"}
+                </td>
+                <td className="num">
+                  <button type="button" className="flat"
+                    onClick={() => void desk.forgetMcpServer(server.name)}>
+                    删掉
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {applied === null && (
+        <p className="note">
+          这个 Runtime 不是这个应用启动的（或者还没启动），它读的是哪一份 MCP 配置，这个应用无从知道 ——
+          所以上面那一列只说「不知道」。
+        </p>
+      )}
+      {leftover.length > 0 && (
+        <p className="note">
+          Runtime 启动时还带着已经删掉的 {leftover.map((entry) => entry.name).join("、")}，
+          它现在仍在跑。退出应用再打开才会真的没有。
+        </p>
+      )}
+
+      {desk.mcpFailures.length > 0 && (
+        <>
+          <div className="note"><span>这些是 Run 日志里真的报过起不来的服务</span></div>
+          <table className="rows">
+            <thead>
+              <tr><th>服务</th><th>Run</th><th className="num">时间</th></tr>
+            </thead>
+            <tbody>
+              {desk.mcpFailures.map((failure) => (
+                <tr key={`${failure.runId}-${failure.server}`}>
+                  <td className="p mono warn">{failure.server}</td>
+                  <td className="mono">{shortId(failure.runId)}</td>
+                  <td className="num" title={failure.at}>{since(failure.at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <div className="form">
+        <label>名字<input value={name} onChange={(e) => setName(e.target.value)} placeholder="filesystem" /></label>
+        <label>命令<input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="/opt/homebrew/bin/npx" /></label>
+        <label>
+          参数
+          <textarea value={args} onChange={(e) => setArgs(e.target.value)}
+            placeholder={"一行一个\n-y\n@modelcontextprotocol/server-filesystem"} />
+        </label>
+        <label>工作目录<input value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="留空就不设" /></label>
+        <label>工具名<input value={tools} onChange={(e) => setTools(e.target.value)} placeholder="read_file write_file" /></label>
+        <label>
+          必需
+          <input type="checkbox" checked={required} onChange={(e) => setRequired(e.target.checked)} />
+        </label>
+        <button type="button"
+          disabled={busy || !name.trim() || !command.trim() || !tools.trim()}
+          onClick={() => void save()}>
+          {busy ? "保存中" : "保存"}
+        </button>
+      </div>
+      {error && <div className="err">{error}</div>}
+
+      <p className="note">
+        配置了不等于起来了。某个服务有没有起来，是 Runtime 进程里的 <code>McpServerDiscoveryStatus</code>，
+        本地 socket 没有任何调用能读到它 —— 所以这一页只说配了什么，不说它们活着没有。
+        标成「必需」是例外：它起不来时 Run 会直接失败，日志里是 <code>run.failed</code> ・
+        <code>required_mcp_unavailable</code> 并点名，那是这台机器上唯一看得见的地方。
+      </p>
+      <p className="note">
+        工具名要自己写：Runtime 拿它当白名单，发现阶段只会收窄，不会加上没写的工具。
+        环境变量这里不收 —— stdio 服务的环境只能写进配置文件，而密钥不写进配置文件是上面那条规矩。
+      </p>
+      <p className="note">
+        Runtime 只在启动时读这份配置。改完要退出应用再打开，新的服务才会真的在。
+      </p>
+    </>
+  );
+}
+
 /// Everything not yet reachable says exactly what is missing, and where the
 /// gap is tracked. An empty section that only says "coming soon" tells a
 /// person nothing they can act on.
 const PENDING: Record<string, { need: string }> = {
-  mcp: { need: "MCP 服务清单在 Runtime 侧已有读取契约（ADR-0116/0117），但本地适配器还没有暴露出来。" },
   appearance: { need: "只影响这个客户端。还没做。" },
   advanced: { need: "只影响这个客户端。还没做。" },
 };
@@ -219,6 +377,7 @@ function SettingsView() {
         {section === "connection" && <Connection />}
         {section === "tools" && <Tools />}
         {section === "models" && <Models />}
+        {section === "mcp" && <Mcp />}
         {PENDING[section] && (
           <div className="empty">
             {current?.title} —— 还没接。
@@ -241,5 +400,6 @@ register({
     { id: "settings:connection", title: "连接设置", hint: "连的是哪个 Runtime" },
     { id: "settings:tools", title: "工具与授权", hint: "实际生效过的策略快照" },
     { id: "settings:models", title: "模型与密钥", hint: "密钥进钥匙串，不进配置文件" },
+    { id: "settings:mcp", title: "MCP 服务", hint: "配了什么；起没起来读不到" },
   ],
 });

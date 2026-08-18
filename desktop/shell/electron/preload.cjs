@@ -65,6 +65,12 @@ contextBridge.exposeInMainWorld("desk", {
     providers: () => ipcRenderer.invoke("providers:list"),
     saveProvider: (request) => ipcRenderer.invoke("providers:save", request),
     forgetProvider: (id) => ipcRenderer.invoke("providers:forget", id),
+    // Configured MCP servers, plus what the runtime behind this window was
+    // started with. There is no call that asks the runtime whether a server
+    // came up, because the runtime's local socket has none.
+    mcpServers: () => ipcRenderer.invoke("mcp:list"),
+    saveMcpServer: (request) => ipcRenderer.invoke("mcp:save", request),
+    forgetMcpServer: (name) => ipcRenderer.invoke("mcp:forget", name),
   },
   remote: {
     status: () => ipcRenderer.invoke("remote:status"),

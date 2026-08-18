@@ -14,7 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   bridge, lifecycleFromCursor, probe,
   type CursorError, type CursorPage, type Link, type RunEvent,
-  type SessionHead, type SessionTurn, type ProviderView,
+  type SessionHead, type SessionTurn, type ProviderView, type McpServers,
 } from "./runtime";
 import { keyOf, newestFirst, viewOf, type SessionView } from "./session";
 import { uuidv7 } from "./ids";
@@ -117,6 +117,19 @@ export type ObservedPolicy = {
   requiredScopes: string[];
   policyDigest: string;
   seenAt: string;
+};
+
+/// A required MCP server that was not there when a Run started.
+///
+/// This is the only thing the runtime tells this client about whether a server
+/// came up, and it only exists for servers marked required: `run.failed` with
+/// `kind: "required_mcp_unavailable"` names them in the durable log. An optional
+/// server that failed leaves nothing behind but a line in the runtime process's
+/// own tracing output, which this client cannot read.
+export type McpUnavailable = {
+  server: string;
+  runId: string;
+  at: string;
 };
 
 export type RunView = {
@@ -491,6 +504,16 @@ export type Store = {
     id: string; protocol: string; endpoint: string; model: string; secret?: string | null;
   }): Promise<string | null>;
   forgetProvider(id: string): Promise<string | null>;
+  /// Configured MCP servers, and what the runtime was started with. Never a
+  /// claim that a server is running — nothing on the socket can say that.
+  mcp: McpServers;
+  /// Required MCP servers a Run was refused for, read from that Run's own log.
+  mcpFailures: McpUnavailable[];
+  saveMcpServer(request: {
+    name: string; command: string; args: string[]; cwd: string | null;
+    toolNames: string[]; required: boolean;
+  }): Promise<string | null>;
+  forgetMcpServer(name: string): Promise<string | null>;
   /// Say something in the current conversation, starting one if there is none.
   ///
   /// This is what `submit` should have been. `submit` starts a bare Run, which
@@ -557,6 +580,27 @@ function readPolicies(runs: RunView[]): ObservedPolicy[] {
   return [...seen.values()].sort((a, b) => a.toolName.localeCompare(b.toolName));
 }
 
+/// Pulls the named servers out of the terminal event that carries them.
+///
+/// Matched on `kind` rather than on the event type alone: `run.failed` is also
+/// how a budget or a provider failure ends, and a client that read the server
+/// list out of every failure would attribute unrelated ones to MCP.
+function readMcpFailures(runs: RunView[]): McpUnavailable[] {
+  const found: McpUnavailable[] = [];
+  for (const run of runs) {
+    for (const event of run.events) {
+      if (event.type !== "run.failed") continue;
+      if (event.payload.kind !== "required_mcp_unavailable") continue;
+      const servers = event.payload.servers;
+      if (!Array.isArray(servers)) continue;
+      for (const server of servers) {
+        found.push({ server: String(server), runId: run.id, at: event.timestamp });
+      }
+    }
+  }
+  return found.sort((a, b) => b.at.localeCompare(a.at));
+}
+
 export function useRuntime(): Store {
   const [link, setLink] = useState<Link>({ state: "no-bridge" });
   const [runs, setRuns] = useState<RunView[]>([]);
@@ -564,6 +608,10 @@ export function useRuntime(): Store {
   const [listedAt, setListedAt] = useState<number | null>(null);
   const [sessions, setSessions] = useState<SessionView[]>([]);
   const [providers, setProviders] = useState<ProviderView[]>([]);
+  /// `applied: null` until the host answers, which is also what it answers for
+  /// a runtime this app did not start. Both mean "this client cannot say", and
+  /// collapsing either into an empty list would be a claim.
+  const [mcp, setMcp] = useState<McpServers>({ servers: [], applied: null });
   /// Events that arrived on the stream ahead of the poll.
   ///
   /// Dropped per run once the poll's own read has reached them, so this stays a
@@ -712,6 +760,37 @@ export function useRuntime(): Store {
     await refreshProviders();
     return reply.ok ? null : reply.error;
   }, [refreshProviders]);
+
+  /// Read on mount and after a change, like the providers and for the same
+  /// reason: this is a file on disk plus what the host recorded at spawn, and
+  /// neither changes unless a person changes it.
+  const refreshMcp = useCallback(async () => {
+    const api = bridge();
+    if (!api?.mcpServers) return;
+    const reply = await api.mcpServers();
+    if (reply.ok) setMcp(reply.value);
+  }, []);
+
+  useEffect(() => { void refreshMcp(); }, [refreshMcp]);
+
+  const saveMcpServer = useCallback(async (request: {
+    name: string; command: string; args: string[]; cwd: string | null;
+    toolNames: string[]; required: boolean;
+  }) => {
+    const api = bridge();
+    if (!api?.saveMcpServer) return "not running in the desktop host";
+    const reply = await api.saveMcpServer(request);
+    await refreshMcp();
+    return reply.ok ? null : reply.error;
+  }, [refreshMcp]);
+
+  const forgetMcpServer = useCallback(async (name: string) => {
+    const api = bridge();
+    if (!api?.forgetMcpServer) return "not running in the desktop host";
+    const reply = await api.forgetMcpServer(name);
+    await refreshMcp();
+    return reply.ok ? null : reply.error;
+  }, [refreshMcp]);
 
   /// One subscription for the window, for the run on screen.
   ///
@@ -917,6 +996,7 @@ export function useRuntime(): Store {
     current: sessions.find((session) => session.key === current) ?? null,
     selectSession, newConversation, send, steer, fork, rollback,
     providers, saveProvider, forgetProvider,
+    mcp, mcpFailures: readMcpFailures(merged), saveMcpServer, forgetMcpServer,
     submit, decide, answerMcpInput, refresh: () => void load(),
   };
 }

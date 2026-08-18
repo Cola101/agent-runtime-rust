@@ -62,6 +62,8 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | 23.5 | 子代理树 | 已接入 | 角色、状态、排队输入、代数、用量、分叉血缘，各字段都来自事件；每行可跳到子 Run |
 | 24 | 持久进程会话 / PTY | 未做 | `process.*` 工具族，需要终端面 |
 | 25 | MCP resources / prompts 浏览 | 未做 | ADR-0116/0117 已实现读取契约 |
+| 25.1 | MCP 服务配置（stdio） | 已接入 | 设置里可增删；应用写 `AGENT_RUNTIME_LOCAL_MCP_CONFIG` 并补 `tool:mcp:<name>` 授权 |
+| 25.2 | MCP 服务是否起来了 | Runtime 侧阻塞 | `McpServerDiscoveryStatus` 只在 Runtime 进程内，socket 无调用；界面只说配了什么。必需服务起不来会写进 `run.failed`・`required_mcp_unavailable`，那一条已接入 |
 | 26 | `indeterminate` 人工裁决 | 待接入 | 已在 Approvals 队列里设计 |
 | 27 | 事件游标 / 原始事件检查器 | 待接入 | 抽屉里有位置 |
 | 28 | 每工具审批策略 | 待接入 | 设置里的 Tools & access |
@@ -75,6 +77,8 @@ renderer 不拥有凭证、owner token 或另一套 Agent 状态机。
 | --- | --- |
 | ~~中途改向（#8）~~ | ✅ 已解除。取消拓扑、`select!` 安全时机、重绑、控制面四步落地并实测；`docs/evidence/2026-08-18-local-steer-blocker.md` 记录了定位、设计与三条守卫 |
 | 中途改向以外的真实连接 | 已接通 Node gRPC 与 owner socket；剩余工作是把各界面从演示数据迁移到同一真实数据源 |
+| MCP 服务健康度 | `McpServerDiscoveryStatus` 只活在 Runtime 进程里：它进 `LocalRunOutcome`，而 owner socket 与 workload socket 都没有返回它的调用，事件日志里也没有它。要让界面说“这个服务起来了”，得先在 `OwnerRequest` 上开一个读它的调用 |
+| MCP 服务的密钥 | provider 的密钥能进钥匙串，是因为路由配置里写的是 `api_key_env` 这个变量名。stdio MCP 的 `env` 是字面值，只能写进配置文件，所以设置里不收密钥。要解除，得给 `LocalMcpTransportConfig::Stdio` 加一个同形状的间接层 —— 那会改动 stdio 的 authority digest，是一次单独的决定 |
 
 ## 五、推进顺序
 

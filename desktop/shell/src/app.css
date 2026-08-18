@@ -80,9 +80,15 @@ body {
 .act b { color: var(--ink); font-weight: 600; }
 .act .out { display: block; padding-left: 15px; color: var(--ink-3); }
 
-.note { display: flex; align-items: center; gap: 11px; color: var(--ink-3); font-size: 11.5px; }
-.note::before, .note::after { content: ""; flex: 1; height: 1px; background: var(--rule-2); }
-.note span { white-space: nowrap; }
+/* Two different things have been sharing this name: a rule across the column
+   with a label in the middle, drawn as `div.note`, and a paragraph of
+   explanation under a section, written as `p.note`. Only the first one wants to
+   be a flex row, and saying so is not tidying: the paragraphs were getting
+   `display: flex` too, which was invisible while each was a single run of text
+   and became one character per line the moment one contained a `<code>`. */
+div.note { display: flex; align-items: center; gap: 11px; color: var(--ink-3); font-size: 11.5px; }
+div.note::before, div.note::after { content: ""; flex: 1; height: 1px; background: var(--rule-2); }
+div.note span { white-space: nowrap; }
 
 .gate { border-left: 2px solid var(--accent); padding: 2px 0 2px 15px; }
 .gate .h {
@@ -124,6 +130,20 @@ body {
 .form input { font-family: var(--mono); }
 .form input:focus, .form select:focus { border-color: var(--accent); }
 .form input::placeholder { color: var(--ink-3); font-family: var(--ui); }
+/* One value per line, for the fields whose values are paths: a space-separated
+   field cannot carry an argument that has a space in it. */
+.form textarea {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 6px 9px; color: var(--ink); font: inherit; font-family: var(--mono);
+  font-size: 12.5px; line-height: 1.5; outline: none; min-width: 0;
+  resize: vertical; min-height: 5em;
+}
+.form textarea:focus { border-color: var(--accent); }
+.form textarea::placeholder { color: var(--ink-3); font-family: var(--ui); }
+.form input[type="checkbox"] {
+  justify-self: start; width: 15px; height: 15px; padding: 0;
+  accent-color: var(--accent);
+}
 .form > button {
   grid-column: 2; justify-self: start; margin-top: 4px;
   background: var(--accent-wash); border: 1px solid var(--accent);
@@ -531,8 +551,6 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
 .pane, .flow { padding: 20px 28px 14px; }
 .chrome-r { display: inline-flex; align-items: center; gap: 6px; }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 /* ---------- keyboard reference ---------- */
 
 /* Two columns, not a table: the chords align so the eye can run down them,
@@ -575,7 +593,6 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
   border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px;
 }
 .keyref .crow .d { color: var(--ink-3); font-size: 11.5px; }
-=======
 /* ---------- branching ---------- */
 
 /* Where a conversation can be cut, drawn on the Turn it would be cut at.
@@ -591,8 +608,7 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
    next click cannot be taken back. */
 .turn .branch .arm { color: var(--accent); font-weight: 600; }
 .flow > .err { color: var(--accent); font-size: 12px; }
->>>>>>> worktree-wf_ee7bf5f1-0a3-4
-=======
+
 /* ---------- answering an MCP input request ---------- */
 /* Inside the same gate as an approval, because it is the same situation: the
    Run is stopped and a person is the only way forward. What it adds is the
@@ -641,4 +657,3 @@ table.rows tbody tr:focus-visible { outline-offset: -2px; }
 .ask-input .answer:disabled { color: var(--ink-3); cursor: default; }
 .ask-input .err { margin-top: 5px; color: var(--accent); font-size: 11.5px; }
 .field .err { margin-top: 4px; color: var(--accent); font-size: 11.5px; }
->>>>>>> worktree-wf_f2c9b15e-0d0-1
