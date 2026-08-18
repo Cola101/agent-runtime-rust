@@ -199,6 +199,18 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
     state: { state: "terminal", status: "failed" },
     events: [
       ev("run.started", { status: "running" }, RUN_BROKE, 25),
+      // One server answered and one did not. The Run carries on without the
+      // second one's tools, which is the case that used to look like nothing.
+      ev("mcp.discovery.completed", {
+        servers: [
+          { server_name: "filesystem", required: false, health: "ready", attempts: 1, capabilities: ["tools"] },
+          {
+            server_name: "notes", required: false, health: "unavailable", attempts: 3,
+            capabilities: [], error: "server exited before initialize",
+          },
+        ],
+        status: "running",
+      }, RUN_BROKE, 25),
       ev("model.output.delta", { text: "先把这个目录整个读一遍……" }, RUN_BROKE, 25),
       ev("model.provider.failed", {
         provider_id: "local-stub", kind: "rate_limited", retryable: true, status: "running",
