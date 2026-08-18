@@ -31,7 +31,7 @@ use agent_protocol::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -645,17 +645,54 @@ pub struct TrustedNativeExecutor {
     /// nothing about what another may overwrite, and sharing the entry would
     /// refuse a write for a reason that has nothing to do with the Run being
     /// refused.
-    seen: Arc<Mutex<HashMap<(Uuid, String), String>>>,
+    seen: Arc<Mutex<SeenFiles>>,
 }
 
 /// How many (Run, path) pairs one executor remembers.
 ///
 /// A bound rather than a policy: this map lives for the life of the process and
 /// a long-running host would otherwise hold one entry per file per Run for
-/// ever. Reaching it means the oldest entries are dropped, and dropping one is
+/// ever. Reaching it means the oldest entry is dropped, and dropping one is
 /// safe in the direction that matters -- a write with no expectation behaves
 /// exactly as it did before any of this, which is to say it writes.
 const MAX_SEEN_FILES: usize = 4_096;
+
+/// The longest path this executor will remember.
+///
+/// The key is a string taken from the Tool's own stdout, so without a cap here
+/// the bound above is a count of entries and not a bound on memory: one entry
+/// could be as long as `max_stdout_bytes`. `PATH_MAX` on the platforms this
+/// runs on is 1024, so a longer one is not a path this Tool could have opened.
+const MAX_SEEN_PATH_BYTES: usize = 1024;
+
+/// What each Run has read, oldest first.
+///
+/// The order is kept explicitly rather than read off the map: `HashMap` has no
+/// order, so evicting `keys().next()` drops an arbitrary entry -- which at
+/// capacity can be the read whose write is the next thing to happen. That was
+/// what the first version of this did while its comment said "oldest".
+#[derive(Debug, Default)]
+struct SeenFiles {
+    digests: HashMap<(Uuid, String), String>,
+    order: VecDeque<(Uuid, String)>,
+}
+
+impl SeenFiles {
+    fn get(&self, key: &(Uuid, String)) -> Option<&String> {
+        self.digests.get(key)
+    }
+
+    fn insert(&mut self, key: (Uuid, String), digest: String) {
+        if self.digests.insert(key.clone(), digest).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_SEEN_FILES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.digests.remove(&oldest);
+            }
+        }
+    }
+}
 
 impl TrustedNativeExecutor {
     pub fn new(definition: TrustedNativeToolDefinition) -> Result<Self, ToolExecutionError> {
@@ -718,7 +755,7 @@ impl TrustedNativeExecutor {
             executable,
             executable_digest,
             implementation_digest,
-            seen: Arc::new(Mutex::new(HashMap::new())),
+            seen: Arc::new(Mutex::new(SeenFiles::default())),
         })
     }
 
@@ -737,19 +774,18 @@ impl TrustedNativeExecutor {
     /// carry what its own first write left, or the second would be refused for
     /// a change the Run made itself.
     fn remember(&self, run: Uuid, path: &str, text: &str) {
-        let mut seen = self
-            .seen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A path longer than any this Tool could have opened is not remembered
+        // at all, rather than remembered and counted against the bound.
+        if path.len() > MAX_SEEN_PATH_BYTES {
+            return;
+        }
         // Bounded by dropping rather than by refusing. An entry lost means a
         // later write carries no expectation, which is exactly how every write
         // behaved before this existed.
-        if seen.len() >= MAX_SEEN_FILES && !seen.contains_key(&(run, path.to_owned())) {
-            if let Some(oldest) = seen.keys().next().cloned() {
-                seen.remove(&oldest);
-            }
-        }
-        seen.insert((run, path.to_owned()), digest_bytes(text.as_bytes()));
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((run, path.to_owned()), digest_bytes(text.as_bytes()));
     }
 
     #[must_use]
@@ -862,22 +898,40 @@ impl TrustedNativeExecutor {
     /// Added here rather than by the caller because the caller does not know
     /// what this Run has read -- and must not, since the point of keeping it
     /// here is that the model cannot decline to send it.
+    ///
+    /// The field is this executor's alone in both directions: a value the model
+    /// put in the arguments is dropped whether or not one is added back. A
+    /// model that could set it could not widen anything -- the check only ever
+    /// refuses -- but it could make its own writes fail for a reason nobody
+    /// could see, and "the tool refused" is not a sentence worth sharing
+    /// between a guarantee and a model's mistake.
+    ///
+    /// One consequence to state plainly: the arguments the tool executes are no
+    /// longer byte-identical to the arguments the binding digest was computed
+    /// over, because that digest is fixed when the approval is issued and this
+    /// is added when the call is launched. Nothing recomputes the digest from
+    /// what the tool received, so nothing breaks today -- but the difference is
+    /// real, and it is only acceptable in this direction: the added field can
+    /// refuse the approved write and can never turn it into a different one.
     fn with_expectation(&self, call: &ToolCall, context: &ToolExecutionContext) -> Value {
         let mut wire = serde_json::to_value(call).expect("a tool call is serializable");
-        if call.name != "workspace.write_text" {
-            return wire;
-        }
-        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
-            return wire;
-        };
-        let Some(expected) = self.expectation(context.run_id, path) else {
-            // Never read by this Run: creating a file, or deliberately
-            // replacing one nobody looked at. An expectation invented here
-            // would refuse an act the person is entitled to.
-            return wire;
+        let expected = if call.name == "workspace.write_text" {
+            call.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                // No expectation means this Run never read the path: it is
+                // creating a file, or deliberately replacing one nobody looked
+                // at. An expectation invented here would refuse an act the
+                // person is entitled to.
+                .and_then(|path| self.expectation(context.run_id, path))
+        } else {
+            None
         };
         if let Some(arguments) = wire.get_mut("arguments").and_then(Value::as_object_mut) {
-            arguments.insert("expected_sha256".into(), Value::String(expected));
+            arguments.remove("expected_sha256");
+            if let Some(expected) = expected {
+                arguments.insert("expected_sha256".into(), Value::String(expected));
+            }
         }
         wire
     }
@@ -1163,4 +1217,51 @@ fn validate_definition(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seen_files_tests {
+    use super::{MAX_SEEN_FILES, SeenFiles};
+    use uuid::Uuid;
+
+    /// The bound must drop the oldest entry, not an arbitrary one.
+    ///
+    /// The first version read `keys().next()` off a `HashMap` and called it the
+    /// oldest. At capacity that can discard the read whose write is the next
+    /// thing to happen -- so the guard would go quiet on exactly the file being
+    /// worked on, and nothing would say it had.
+    #[test]
+    fn the_bound_drops_the_oldest_and_keeps_the_newest() {
+        let run = Uuid::now_v7();
+        let mut seen = SeenFiles::default();
+        for index in 0..MAX_SEEN_FILES + 8 {
+            seen.insert((run, format!("file-{index}")), format!("digest-{index}"));
+        }
+        assert_eq!(seen.digests.len(), MAX_SEEN_FILES);
+        for index in 0..8 {
+            assert!(
+                seen.get(&(run, format!("file-{index}"))).is_none(),
+                "file-{index} was inserted first and must be the first to go",
+            );
+        }
+        for index in 8..MAX_SEEN_FILES + 8 {
+            assert_eq!(
+                seen.get(&(run, format!("file-{index}"))),
+                Some(&format!("digest-{index}")),
+                "file-{index} is newer than what was dropped",
+            );
+        }
+    }
+
+    /// Writing the same path twice must not queue it twice, or the order would
+    /// hold stale keys and the map would be evicted below its own bound.
+    #[test]
+    fn rewriting_one_path_does_not_take_a_second_place_in_the_queue() {
+        let run = Uuid::now_v7();
+        let mut seen = SeenFiles::default();
+        seen.insert((run, "notes.txt".into()), "one".into());
+        seen.insert((run, "notes.txt".into()), "two".into());
+        assert_eq!(seen.order.len(), 1);
+        assert_eq!(seen.get(&(run, "notes.txt".into())), Some(&"two".to_string()));
+    }
 }

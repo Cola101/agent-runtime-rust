@@ -227,27 +227,7 @@ async fn a_write_is_refused_when_the_file_changed_while_the_approval_was_on_scre
     fs::write(workspace.path().join("notes.txt"), "one\n").expect("seed");
 
     // The real binary, found the way its own tests find it.
-    let mut current = std::env::current_exe().expect("test binary path");
-    let tool = loop {
-        if !current.pop() {
-            panic!("agent-trusted-workspace-tool must be built");
-        }
-        let candidate = current.join("agent-trusted-workspace-tool");
-        if candidate.is_file() {
-            break candidate;
-        }
-    };
-    let trusted_root = tool.parent().expect("the tool has a parent").to_path_buf();
-
-    let executor = TrustedNativeExecutor::new(TrustedNativeToolDefinition {
-        trusted_root,
-        executable: tool,
-        fixed_args: vec!["--stdio".into()],
-        workspace_access: WorkspaceAccess::ReadWrite,
-        max_stdout_bytes: 64 * 1024,
-        max_stderr_bytes: 8 * 1024,
-    })
-    .expect("executor");
+    let executor = real_executor();
     let run = Uuid::now_v7();
 
     let read = executor
@@ -285,27 +265,7 @@ async fn a_run_that_writes_twice_is_not_refused_for_its_own_first_write() {
     let workspace = temporary("twice");
     fs::write(workspace.path().join("notes.txt"), "one\n").expect("seed");
 
-    let mut current = std::env::current_exe().expect("test binary path");
-    let tool = loop {
-        if !current.pop() {
-            panic!("agent-trusted-workspace-tool must be built");
-        }
-        let candidate = current.join("agent-trusted-workspace-tool");
-        if candidate.is_file() {
-            break candidate;
-        }
-    };
-    let trusted_root = tool.parent().expect("the tool has a parent").to_path_buf();
-
-    let executor = TrustedNativeExecutor::new(TrustedNativeToolDefinition {
-        trusted_root,
-        executable: tool,
-        fixed_args: vec!["--stdio".into()],
-        workspace_access: WorkspaceAccess::ReadWrite,
-        max_stdout_bytes: 64 * 1024,
-        max_stderr_bytes: 8 * 1024,
-    })
-    .expect("executor");
+    let executor = real_executor();
     let run = Uuid::now_v7();
 
     executor
@@ -339,5 +299,69 @@ async fn a_run_that_writes_twice_is_not_refused_for_its_own_first_write() {
     assert_eq!(
         fs::read_to_string(workspace.path().join("notes.txt")).expect("read back"),
         "third\n",
+    );
+}
+
+/// The shipped tool binary, found the way its own tests find it.
+fn real_executor() -> TrustedNativeExecutor {
+    let mut current = std::env::current_exe().expect("test binary path");
+    let tool = loop {
+        if !current.pop() {
+            panic!("agent-trusted-workspace-tool must be built");
+        }
+        let candidate = current.join("agent-trusted-workspace-tool");
+        if candidate.is_file() {
+            break candidate;
+        }
+    };
+    let trusted_root = tool.parent().expect("the tool has a parent").to_path_buf();
+    TrustedNativeExecutor::new(TrustedNativeToolDefinition {
+        trusted_root,
+        executable: tool,
+        fixed_args: vec!["--stdio".into()],
+        workspace_access: WorkspaceAccess::ReadWrite,
+        max_stdout_bytes: 64 * 1024,
+        max_stderr_bytes: 8 * 1024,
+    })
+    .expect("executor")
+}
+
+/// A model that puts `expected_sha256` in its own arguments does not get to
+/// keep it.
+///
+/// It could not widen anything -- the check only refuses -- but it could make
+/// its own writes fail for a reason nobody on the outside could see. The field
+/// belongs to the executor in both directions: dropped when there is nothing to
+/// add, replaced when there is.
+#[tokio::test]
+async fn a_digest_the_model_supplied_is_not_the_one_that_is_checked() {
+    let workspace = temporary("model-supplied");
+    fs::write(workspace.path().join("notes.txt"), "one\n").expect("seed");
+    let executor = real_executor();
+    let run = Uuid::now_v7();
+
+    // Never read by this Run, and the model invents an expectation anyway.
+    let wrote = executor
+        .execute(
+            call(
+                "workspace.write_text",
+                json!({
+                    "path": "notes.txt",
+                    "text": "rewritten\n",
+                    "expected_sha256": "0".repeat(64),
+                }),
+            ),
+            context(run, workspace.path()),
+        )
+        .await
+        .expect("the call completes");
+    assert!(
+        !wrote.is_error,
+        "a digest the model made up must not decide anything: {:?}",
+        wrote.content,
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("notes.txt")).expect("read back"),
+        "rewritten\n",
     );
 }
