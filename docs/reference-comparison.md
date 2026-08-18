@@ -14,7 +14,30 @@
 4. 本阶段是否引入了与 `tenant_id`、Workspace 单写、fencing、副作用安全相冲突的捷径？
 5. 对标结论是否已经反映到 ADR、测试与“尚未实现”清单？
 
-## 当前阶段：可执行 Runtime 控制边界
+## 当前阶段：无 UI Runtime Client 契约
+
+| 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
+| --- | --- | --- | --- | --- |
+| 初始化 | `initialize` 声明 ClientInfo/capabilities | connect 声明 min/max protocol、client/caps | `RuntimeClientHello` 声明 min/max contract 和 required capabilities | 已追平执行前协商原则 |
+| 服务端描述 | 返回 user agent/platform/home，产品属性较强 | `hello-ok` 返回 protocol/methods/events/caps/snapshot | 返回 contract/runtime version、caps 与真实上限 | 更窄且协议中立；无 presence/snapshot |
+| 进程内/网络一致 | app-server 为统一产品协议 | Gateway 是主产品边界 | Tauri 可直接持有 client，gRPC 也调同一 client | 避免 Electron/Java 复制状态机 |
+| 会话广度 | Thread/Turn 完整 | Session/Gateway/channel 完整 | 当前只有 Run submit/control/events/recovery | 这是 Desktop-Ready 下一主缺口 |
+| 多租户 | 本地 Thread 为主 | Gateway account/session/device 成熟 | invocation + tenant/app/workload + owner epoch + receipt | 共享 Runtime 边界更显式 |
+
+### 本阶段结论
+
+- 已确认：进程内真实 Run 仅使用 `RuntimeClient`完成 initialize→submit→watch→terminal；gRPC
+  同时使用同一门面，版本不重叠或缺 capability 在 Run 之前拒绝。
+- 相比 Codex，当前只吸收 initialize/capabilities 原则，没有复制 Codex Home、账户或 Thread 产品类型；
+  Codex 的 Thread/Turn 客户端完整度仍明显领先。
+- 相比 OpenClaw，已吸收 min/max protocol 与服务端能力目录；OpenClaw 的 methods/events、snapshot、
+  presence、Gateway 重连和 channel 路由仍明显更完整。
+- 本项目仅在多租户 invocation、owner epoch、持久 receipt 和客户端错误去敏上更适合共享 Runtime；
+  不把这个窄面优势扩大为桌面产品领先。
+- **下一内核目标**：Session/Thread client contract→Profile/关闭生命周期→credential resolver→可分发
+  artifact；不进入 GUI。总体仍为 70–75%。
+
+## 上一阶段：可执行 Runtime 控制边界
 
 | 对标面 | Codex | OpenClaw | 本平台 Rust Runtime 当前实现 | 判断 |
 | --- | --- | --- | --- | --- |

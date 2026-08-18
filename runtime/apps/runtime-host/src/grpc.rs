@@ -11,25 +11,32 @@
 //! body.** `RuntimeControlCommand` carries its own invocation, and its doc
 //! comment says authentication belongs to the adapter -- this is that adapter.
 
-use crate::LocalRunState;
+use crate::client::{
+    InitializedRuntimeClient, RUNTIME_CAPABILITY_EVENTS_CURSOR, RUNTIME_CAPABILITY_EVENTS_WATCH,
+    RUNTIME_CAPABILITY_RECOVERY_STARTUP, RUNTIME_CAPABILITY_RUN_CONTROL,
+    RUNTIME_CAPABILITY_RUN_SUBMIT, RUNTIME_CLIENT_CONTRACT_VERSION,
+    RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES, RUNTIME_CLIENT_MAX_INPUT_BYTES,
+    RUNTIME_CLIENT_SCHEMA_VERSION, RuntimeClient, RuntimeClientError, RuntimeClientErrorCode,
+    RuntimeClientEventCursorRequest, RuntimeClientHello, RuntimeSubmitRequest,
+};
 use crate::embedded::RuntimeEventStreamItem;
 use crate::embedded::{
-    EmbeddedRuntime, EmbeddedRuntimeError, RuntimeControlAction, RuntimeControlCommand,
-    RuntimeControlReceiptState, RuntimeEventCursorErrorCode, RuntimeEventCursorRequest,
+    EmbeddedRuntime, RuntimeControlAction, RuntimeControlCommand, RuntimeControlReceiptState,
     RuntimeEventCursorState,
 };
 use agent_protocol::{RUNTIME_INVOCATION_SCHEMA_VERSION, RunStatus, RuntimeInvocationContext};
 use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocation;
 use agent_runtime_invocation_protocol::v1::{
-    ControlReceiptState, ControlRunRequest, ControlRunResponse, ReadRunEventsRequest,
-    ReadRunEventsResponse, RunEventBoundary, RunEventStreamItem, RunLifecycleBoundary,
-    RuntimeEvent, RuntimeInvocationRef, SubmitRunRequest, SubmitRunResponse, WatchRunEventsRequest,
-    run_event_stream_item, run_lifecycle_boundary,
+    ControlReceiptState, ControlRunRequest, ControlRunResponse, InitializeRuntimeRequest,
+    InitializeRuntimeResponse, ReadRunEventsRequest, ReadRunEventsResponse, RunEventBoundary,
+    RunEventStreamItem, RunLifecycleBoundary, RuntimeEvent, RuntimeInvocationRef, SubmitRunRequest,
+    SubmitRunResponse, WatchRunEventsRequest, run_event_stream_item, run_lifecycle_boundary,
 };
 use agent_workload_identity::{
     RequiredCapability, WorkloadIdentityBinding, WorkloadTokenError, WorkloadTokenVerifier,
 };
 use chrono::Utc;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
@@ -50,20 +57,35 @@ const RUNTIME_INVOKE_SCOPE: &str = "runtime.invoke";
 
 const RUNTIME_AUDIENCE: &str = "runtime-host";
 
-/// Fail-closed bounds. tonic's own message ceiling is a backstop, not a
-/// contract; a surface that accepts whatever arrives has no stated limit.
-const MAX_ACTION_JSON_BYTES: usize = 64 * 1024;
-const MAX_INPUT_BYTES: usize = 1024 * 1024;
-
 pub struct RuntimeInvocationGrpcService {
-    runtime: Arc<EmbeddedRuntime>,
+    client_port: RuntimeClient,
+    client: InitializedRuntimeClient,
     verifier: WorkloadTokenVerifier,
 }
 
 impl RuntimeInvocationGrpcService {
     #[must_use]
     pub fn new(runtime: Arc<EmbeddedRuntime>, verifier: WorkloadTokenVerifier) -> Self {
-        Self { runtime, verifier }
+        let client_port = RuntimeClient::new(runtime);
+        let client = client_port
+            .initialize(&RuntimeClientHello {
+                schema_version: RUNTIME_CLIENT_SCHEMA_VERSION,
+                min_contract_version: RUNTIME_CLIENT_CONTRACT_VERSION,
+                max_contract_version: RUNTIME_CLIENT_CONTRACT_VERSION,
+                required_capabilities: BTreeSet::from([
+                    RUNTIME_CAPABILITY_RUN_SUBMIT.into(),
+                    RUNTIME_CAPABILITY_RUN_CONTROL.into(),
+                    RUNTIME_CAPABILITY_EVENTS_CURSOR.into(),
+                    RUNTIME_CAPABILITY_EVENTS_WATCH.into(),
+                    RUNTIME_CAPABILITY_RECOVERY_STARTUP.into(),
+                ]),
+            })
+            .expect("the gRPC adapter and Runtime client contract are compiled together");
+        Self {
+            client_port,
+            client,
+            verifier,
+        }
     }
 
     /// Verifies the bearer token and resolves the invocation the caller may act
@@ -148,30 +170,64 @@ impl RuntimeInvocationGrpcService {
 
 #[tonic::async_trait]
 impl RuntimeInvocation for RuntimeInvocationGrpcService {
+    async fn initialize(
+        &self,
+        request: Request<InitializeRuntimeRequest>,
+    ) -> Result<Response<InitializeRuntimeResponse>, Status> {
+        let message = request.get_ref();
+        let client = self
+            .client_port
+            .initialize(&RuntimeClientHello {
+                schema_version: message.schema_version,
+                min_contract_version: message.min_contract_version,
+                max_contract_version: message.max_contract_version,
+                required_capabilities: message
+                    .required_capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+            })
+            .map_err(runtime_client_status)?;
+        let descriptor = client.descriptor();
+        Ok(Response::new(InitializeRuntimeResponse {
+            schema_version: descriptor.schema_version,
+            contract_version: descriptor.contract_version,
+            runtime_version: descriptor.runtime_version.clone(),
+            capabilities: descriptor.capabilities.iter().cloned().collect(),
+            max_input_bytes: descriptor.max_input_bytes,
+            max_action_json_bytes: descriptor.max_action_json_bytes,
+            max_event_page_size: descriptor.max_event_page_size,
+            max_event_stream_capacity: descriptor.max_event_stream_capacity,
+        }))
+    }
+
     async fn submit(
         &self,
         request: Request<SubmitRunRequest>,
     ) -> Result<Response<SubmitRunResponse>, Status> {
         let invocation = self.authenticate(&request, request.get_ref().invocation.as_ref())?;
         let message = request.get_ref();
-        if message.input.len() > MAX_INPUT_BYTES {
+        if message.input.len() > RUNTIME_CLIENT_MAX_INPUT_BYTES {
             return Err(Status::invalid_argument("run input exceeds its bound"));
         }
         // Caller-chosen so a retried Submit reaches the same Run instead of
         // starting a second one.
         let run_id = parse_uuid(&message.run_id, "run_id")?;
-        let input = message.input.clone();
-
-        let record = self
-            .runtime
-            .execute_detached(invocation, run_id, input)
+        let receipt = self
+            .client
+            .submit(RuntimeSubmitRequest {
+                schema_version: crate::client::RUNTIME_CLIENT_SCHEMA_VERSION,
+                invocation,
+                run_id,
+                input: message.input.clone(),
+            })
             .await
-            .map_err(runtime_status)?;
+            .map_err(runtime_client_status)?;
 
         Ok(Response::new(SubmitRunResponse {
-            run_id: record.run_id.to_string(),
-            owner_epoch: record.owner_epoch,
-            status: run_state_token(&record.state),
+            run_id: receipt.run_id.to_string(),
+            owner_epoch: receipt.owner_epoch,
+            status: boundary_status_token(&receipt.state),
         }))
     }
 
@@ -186,7 +242,7 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
                 "unsupported Runtime control schema version",
             ));
         }
-        if message.action_json.len() > MAX_ACTION_JSON_BYTES {
+        if message.action_json.len() > RUNTIME_CLIENT_MAX_ACTION_JSON_BYTES {
             return Err(Status::invalid_argument("control action exceeds its bound"));
         }
         let action: RuntimeControlAction = serde_json::from_slice(&message.action_json)
@@ -202,10 +258,10 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
         };
 
         let receipt = self
-            .runtime
-            .control_detached(command)
+            .client
+            .control(command)
             .await
-            .map_err(runtime_status)?;
+            .map_err(runtime_client_status)?;
 
         Ok(Response::new(ControlRunResponse {
             command_id: receipt.command_id.to_string(),
@@ -249,16 +305,16 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
         // Rejected, not clamped: a caller that asked for a buffer it will not
         // get should learn that rather than silently receive another one.
         let mut subscription = self
-            .runtime
-            .subscribe_events(invocation, run_id, message.after_sequence, capacity)
-            .map_err(runtime_status)?;
+            .client
+            .watch_events(invocation, run_id, message.after_sequence, message.capacity)
+            .map_err(runtime_client_status)?;
 
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
         tokio::spawn(async move {
             while let Some(item) = subscription.recv().await {
                 let message = match item {
                     Ok(item) => Ok(wire_stream_item(item)),
-                    Err(error) => Err(runtime_status(error)),
+                    Err(error) => Err(runtime_client_status(error)),
                 };
                 let failed = message.is_err();
                 if sender.send(message).await.is_err() || failed {
@@ -282,15 +338,15 @@ impl RuntimeInvocation for RuntimeInvocationGrpcService {
         }
 
         let page = self
-            .runtime
-            .event_cursor(RuntimeEventCursorRequest {
+            .client
+            .read_events(RuntimeClientEventCursorRequest {
                 schema_version: crate::embedded::RUNTIME_EVENT_CURSOR_SCHEMA_VERSION,
                 invocation,
                 run_id: parse_uuid(&message.run_id, "run_id")?,
                 after_sequence: message.after_sequence,
-                limit: message.limit as usize,
+                limit: message.limit,
             })
-            .map_err(runtime_status)?;
+            .map_err(runtime_client_status)?;
 
         Ok(Response::new(ReadRunEventsResponse {
             schema_version: EVENT_PAGE_SCHEMA_VERSION,
@@ -356,56 +412,19 @@ fn wire_boundary(state: &RuntimeEventCursorState) -> RunLifecycleBoundary {
     }
 }
 
-/// Maps a Runtime failure to a status **without** passing the internal message
-/// through.
-///
-/// `LocalRuntimeError` and `Configuration` carry state-root paths and other
-/// host-local detail. A network caller gets the typed outcome and nothing that
-/// describes this machine.
-fn runtime_status(error: EmbeddedRuntimeError) -> Status {
-    match error {
-        // Deliberately not `not_found`: whether a Profile exists is not
-        // something an unauthorized caller should be able to probe, and to an
-        // authorized one the answer is the same either way -- it may not
-        // invoke this.
-        EmbeddedRuntimeError::UnregisteredInvocation => {
-            Status::permission_denied("this invocation is not registered")
-        }
-        // The caller reused an idempotency key for a different action. It is
-        // actionable and it is theirs, so it must not arrive as `internal`.
-        EmbeddedRuntimeError::ControlCommandRebound => {
-            Status::failed_precondition("this command id is already bound to a different command")
-        }
-        EmbeddedRuntimeError::InvalidControlCommand(_) => {
-            Status::invalid_argument("invalid Runtime control command")
-        }
-        EmbeddedRuntimeError::Admission(_) => {
-            Status::resource_exhausted("the Runtime is at its admission ceiling")
-        }
-        EmbeddedRuntimeError::EventCursor(cursor) => match cursor.code {
-            RuntimeEventCursorErrorCode::UnsupportedSchema => {
-                Status::failed_precondition("unsupported event cursor schema")
-            }
-            RuntimeEventCursorErrorCode::InvalidRequest => {
-                Status::invalid_argument("invalid event cursor request")
-            }
-            RuntimeEventCursorErrorCode::NotFound => Status::not_found("no such Run"),
-            RuntimeEventCursorErrorCode::CursorAhead => {
-                Status::out_of_range("cursor is ahead of the committed log")
-            }
-            RuntimeEventCursorErrorCode::IdentityMismatch => {
-                Status::permission_denied("this Run belongs to another invocation")
-            }
-            RuntimeEventCursorErrorCode::CorruptLog => {
-                Status::data_loss("the event log is corrupt")
-            }
-            RuntimeEventCursorErrorCode::StorageUnavailable => {
-                Status::unavailable("the event log is unavailable")
-            }
-        },
-        EmbeddedRuntimeError::Configuration(_) | EmbeddedRuntimeError::Runtime(_) => {
-            Status::internal("the Runtime could not complete this request")
-        }
+/// Maps the already-sanitized stable client error into its wire status.
+fn runtime_client_status(error: RuntimeClientError) -> Status {
+    match error.code {
+        RuntimeClientErrorCode::InvalidRequest => Status::invalid_argument(error.message),
+        RuntimeClientErrorCode::UnsupportedContract => Status::failed_precondition(error.message),
+        RuntimeClientErrorCode::Forbidden => Status::permission_denied(error.message),
+        RuntimeClientErrorCode::Conflict => Status::failed_precondition(error.message),
+        RuntimeClientErrorCode::ResourceExhausted => Status::resource_exhausted(error.message),
+        RuntimeClientErrorCode::NotFound => Status::not_found(error.message),
+        RuntimeClientErrorCode::CursorAhead => Status::out_of_range(error.message),
+        RuntimeClientErrorCode::DataLoss => Status::data_loss(error.message),
+        RuntimeClientErrorCode::Unavailable => Status::unavailable(error.message),
+        RuntimeClientErrorCode::Internal => Status::internal(error.message),
     }
 }
 
@@ -449,19 +468,17 @@ fn status_token(status: RunStatus) -> String {
         .unwrap_or_default()
 }
 
-/// The state tag only, never the data a variant carries.
-///
-/// `LocalRunState` is `#[serde(tag = "state")]`, so `Cancelling { reason }`
-/// debug-formats the operator's reason text straight into what this field
-/// documents as a status token. Reading the tag drops it.
-fn run_state_token(state: &LocalRunState) -> String {
-    serde_json::to_value(state)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("state")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
+/// Submit returns the same actionable lifecycle projection as the event
+/// cursor, never an internal Run-record tag that can become visible before its
+/// control owner is released.
+fn boundary_status_token(state: &RuntimeEventCursorState) -> String {
+    match state {
+        RuntimeEventCursorState::Running => "running".into(),
+        RuntimeEventCursorState::Cancelling => "cancelling".into(),
+        RuntimeEventCursorState::WaitingApproval => "waiting_approval".into(),
+        RuntimeEventCursorState::Suspended => "suspended".into(),
+        RuntimeEventCursorState::Interrupted => "interrupted".into(),
+        RuntimeEventCursorState::Terminal { status }
+        | RuntimeEventCursorState::Retired { status, .. } => status_token(*status),
+    }
 }

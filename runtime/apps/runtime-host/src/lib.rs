@@ -6,6 +6,7 @@
 //! the provider adapters in-process because there is no boundary to cross.
 
 pub mod admission;
+pub mod client;
 mod durable_file;
 pub mod embedded;
 mod event_archive;

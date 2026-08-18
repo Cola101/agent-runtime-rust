@@ -22,7 +22,7 @@ use agent_runtime_invocation_protocol::v1::run_lifecycle_boundary::Boundary;
 use agent_runtime_invocation_protocol::v1::runtime_invocation_client::RuntimeInvocationClient;
 use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocationServer;
 use agent_runtime_invocation_protocol::v1::{
-    ReadRunEventsRequest, RuntimeInvocationRef, SubmitRunRequest,
+    InitializeRuntimeRequest, ReadRunEventsRequest, RuntimeInvocationRef, SubmitRunRequest,
 };
 use agent_workload_identity::{WorkloadIdentityClaims, WorkloadTokenVerifier};
 use base64::Engine;
@@ -193,6 +193,25 @@ async fn a_network_caller_submits_observes_and_completes_a_real_run() {
     let mut client = RuntimeInvocationClient::connect(format!("http://{address}"))
         .await
         .expect("connect");
+    let initialized = client
+        .initialize(InitializeRuntimeRequest {
+            schema_version: 1,
+            min_contract_version: 1,
+            max_contract_version: 1,
+            required_capabilities: vec!["events.cursor.v1".into(), "run.submit.v1".into()],
+        })
+        .await
+        .expect("initialize")
+        .into_inner();
+    assert_eq!(initialized.contract_version, 1);
+    assert_eq!(initialized.runtime_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(initialized.max_input_bytes, 32_000);
+    assert!(
+        initialized
+            .capabilities
+            .iter()
+            .any(|capability| capability == "events.watch.v1")
+    );
     let invocation = RuntimeInvocationRef {
         schema_version: 1,
         tenant_id: claims.tenant_id.to_string(),

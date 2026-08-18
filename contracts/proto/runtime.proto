@@ -14,15 +14,20 @@ option java_package = "com.agentplatform.contract.runtime.v1";
 // direction it described belongs to `edge_node.proto`, which does have an
 // implementation; git retains the removed messages.
 //
-// Three operations, matching the three things an external caller needs and
-// nothing more: start a Run, act on one, observe one. Everything else the
-// Runtime can do is reached through these.
+// One initialization handshake plus four operations, matching the things an
+// external caller needs and nothing more: negotiate, start a Run, act on one,
+// observe one. Everything else the Runtime can do is reached through these.
 //
 // The caller authenticates with an OPERATOR workload token (claims schema 5,
 // ADR-0121): an identity that is not bound to any Run. tenant, application and
 // workload identity are taken from the verified claims -- the fields below may
 // only agree with them, never widen them.
 service RuntimeInvocation {
+  // Fail closed before work starts when client and Runtime versions or
+  // required capabilities do not overlap. The transport already requires
+  // mTLS; this method intentionally needs no tenant bearer token and reveals
+  // no tenant/profile state.
+  rpc Initialize(InitializeRuntimeRequest) returns (InitializeRuntimeResponse);
   // Start a Run under a pre-registered invocation Profile.
   rpc Submit(SubmitRunRequest) returns (SubmitRunResponse);
   // Resume, approve, deny, cancel or answer MCP input on an existing Run.
@@ -34,6 +39,24 @@ service RuntimeInvocation {
   // sequence seen -- there is no in-memory broadcaster to fall out of sync
   // with, and no best-effort queue that can silently lose a gap.
   rpc WatchEvents(WatchRunEventsRequest) returns (stream RunEventStreamItem);
+}
+
+message InitializeRuntimeRequest {
+  uint32 schema_version = 1;
+  uint32 min_contract_version = 2;
+  uint32 max_contract_version = 3;
+  repeated string required_capabilities = 4;
+}
+
+message InitializeRuntimeResponse {
+  uint32 schema_version = 1;
+  uint32 contract_version = 2;
+  string runtime_version = 3;
+  repeated string capabilities = 4;
+  uint64 max_input_bytes = 5;
+  uint64 max_action_json_bytes = 6;
+  uint32 max_event_page_size = 7;
+  uint32 max_event_stream_capacity = 8;
 }
 
 // Selects a pre-registered invocation Profile.

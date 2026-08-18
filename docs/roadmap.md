@@ -108,6 +108,28 @@ variant 的理由正是「那些名字指的是本平台施加的容器边界，
 
 ---
 
+### 阶段 1.5 — Desktop-Ready Runtime（**进行中**）
+
+**目标。** 不开发 UI，把 Rust Runtime 收口为随时可装入 Tauri、Electron sidecar、CLI 或 Java
+adapter 的稳定无 UI 内核。
+
+**已完成（2026-08-18，ADR-0142）。** `RuntimeClient v1` 及 initialize/version/capability negotiation；
+执行方法只由初始化成功后的 client 暴露；
+gRPC 与进程内嵌入调用同一门面；无 UI 真实 Run 1/1、受影响 gRPC 26/26。同时修正
+对外 1 MiB/内核 32,000-byte 的 input 上限冲突，拒绝请求不留 durable Run。
+
+**剩余出口标准。**
+
+1. Session/Thread 契约：创建、继续、分支/回滚、列表/恢复不泄漏 Local Host 内部类型。
+2. 应用生命周期：停止接纳、有界 drain、安全关闭/下次启动恢复，不把“退出应用”伪造成“用户取消 Run”。
+3. Profile 与 credential：受控添加/替换 Profile，Provider credential 通过 resolver handle 获取，不进入 UI 命令或持久配置。
+4. 可分发验收：一个无 UI artifact 在干净目录完成 initialize、真实 Provider、Tool 审批、中断恢复、
+   升级迁移和优雅退出，无 Java/云服务/GUI 依赖。
+
+**未完成前的表述边界。** 可以说“Run-level client port 已可嵌入”，不得说“Desktop-Ready 已完成”。
+
+---
+
 ### 阶段 2 — 平台隔离兑现（**需要一台 Linux 机器**）
 
 **门槛。** 一台可用的 Linux 主机（内核 ≥ 5.13 以启用 landlock，cgroup v2 已挂载并可 delegate）。

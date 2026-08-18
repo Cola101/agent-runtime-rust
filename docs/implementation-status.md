@@ -24,6 +24,16 @@
 该百分比是技术 Alpha 后期的主观范围，不是 Beta SLA、代码行覆盖率或功能清单勾选率。新的并发、真实厂商、
 跨平台或生产持久层证据会改变它；单个新增测试不会自动提高百分比。
 
+2026-08-18 无 UI Runtime Client 第一阶段完成（ADR-0142）：新增稳定的 `RuntimeClient v1`，只有协商成功
+返回的 `InitializedRuntimeClient` 才暴露执行方法；进程内
+嵌入与 gRPC 共用 initialize/submit/control/read/watch/recovery 语义；initialize 在开 Run 前检查
+min/max contract version 与 required capabilities。审计发现 gRPC 对外宣称 input 上限 1 MiB，但
+Kernel 真实上限为 32,000 bytes；现已统一且在持久 Run 创建前拒绝，32,001-byte 门禁确认
+没有留下任何 Run 状态。无 UI 真实模型闭环 **1/1**、client 单测 **3/3**、受影响 gRPC
+门禁 **26/26** 通过。Desktop-Ready 仍未完成：Session/Thread client contract、Profile/关闭生命周期、
+本地 credential resolver 和可分发 artifact 仍缺；总体仍为 70–75%。证据见
+`docs/evidence/2026-08-18-headless-runtime-client-contract.md`。
+
 2026-08-18 Runtime 控制边界竞态闭合（ADR-0141）：全工作区负载下曾出现事件页已公开
 `WaitingApproval`，网络决定却因旧 execution owner 尚未释放而返回 Internal。确定性 RED 直接建立
 `AwaitingApproval + active owner`，证明持久投影可见性早于控制可执行性。修复后分页与流式订阅在 owner

@@ -21,7 +21,8 @@ use agent_runtime_host::{
 use agent_runtime_invocation_protocol::v1::runtime_invocation_client::RuntimeInvocationClient;
 use agent_runtime_invocation_protocol::v1::runtime_invocation_server::RuntimeInvocationServer;
 use agent_runtime_invocation_protocol::v1::{
-    ControlRunRequest, ReadRunEventsRequest, RuntimeInvocationRef, SubmitRunRequest,
+    ControlRunRequest, InitializeRuntimeRequest, ReadRunEventsRequest, RuntimeInvocationRef,
+    SubmitRunRequest,
 };
 use agent_workload_identity::{WorkloadIdentityClaims, WorkloadTokenVerifier};
 use base64::Engine;
@@ -234,6 +235,60 @@ fn submit(invocation: RuntimeInvocationRef) -> SubmitRunRequest {
         run_id: Uuid::now_v7().to_string(),
         input: "hello".into(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initialization_negotiates_before_any_tenant_request() {
+    let signing_key = SigningKey::from_bytes(&[70; 32]);
+    let root = TestRoot::new();
+    let claims = operator_claims(Uuid::now_v7(), &[INVOKE_SCOPE]);
+    let profile = profile_for(&claims);
+    let endpoint = spawn_surface(&signing_key, &root, profile).await;
+    let mut client = RuntimeInvocationClient::connect(endpoint).await.unwrap();
+
+    let compatible = client
+        .initialize(InitializeRuntimeRequest {
+            schema_version: 1,
+            min_contract_version: 1,
+            max_contract_version: 1,
+            required_capabilities: vec!["run.submit.v1".into()],
+        })
+        .await
+        .expect("compatible initialize")
+        .into_inner();
+    assert_eq!(compatible.contract_version, 1);
+    assert_eq!(
+        compatible.capabilities,
+        vec![
+            "events.cursor.v1",
+            "events.watch.v1",
+            "recovery.startup.v1",
+            "run.control.v1",
+            "run.submit.v1",
+        ]
+    );
+
+    let incompatible = client
+        .initialize(InitializeRuntimeRequest {
+            schema_version: 1,
+            min_contract_version: 2,
+            max_contract_version: 2,
+            required_capabilities: Vec::new(),
+        })
+        .await
+        .expect_err("version mismatch must fail before a Run starts");
+    assert_eq!(incompatible.code(), Code::FailedPrecondition);
+
+    let missing = client
+        .initialize(InitializeRuntimeRequest {
+            schema_version: 1,
+            min_contract_version: 1,
+            max_contract_version: 1,
+            required_capabilities: vec!["desktop.magic.v1".into()],
+        })
+        .await
+        .expect_err("a required capability cannot be guessed");
+    assert_eq!(missing.code(), Code::FailedPrecondition);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -75,7 +75,7 @@ flowchart LR
 | 身份 | 运维形状（schema 5）+ `runtime.invoke`；Run 形状即使带该 scope 也 `permission_denied` |
 | 越权断言 | 请求体命名他租户 → `permission_denied`，非 `unauthenticated` |
 | Profile | 完整六元组精确匹配；未注册 → `permission_denied`，不确认其是否存在 |
-| 有界性 | `action_json` ≤64 KiB、`input` ≤1 MiB；tonic 自身上限只是兜底，不是契约 |
+| 有界性 | `action_json` ≤64 KiB、`input` ≤32,000 bytes（ADR-0142 按 Kernel 真实上限修正）；tonic 自身上限只是兜底，不是契约 |
 | 幂等 | `run_id` 与 `command_id` 由调用方提供；重试不会开出第二个 Run，改用途会被 receipt 的 command digest 拒绝 |
 | 信息泄漏 | 状态消息不含 state root、路径或内部错误文本 |
 | 分层 | 本层只认证与翻译；准入、owner epoch、持久收据、retention、游标全部仍在 `embedded` |
