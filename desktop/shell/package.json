@@ -6,24 +6,30 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vitest run && vite build",
     "typecheck": "tsc --noEmit",
     "start": "electron .",
-    "app": "pnpm build && electron ."
+    "app": "pnpm build && electron .",
+    "test": "vitest run"
   },
   "dependencies": {
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
     "@grpc/grpc-js": "^1.14.0",
-    "@grpc/proto-loader": "^0.8.0"
+    "@grpc/proto-loader": "^0.8.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.4",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",
+    "@vitest/browser": "^4.1.10",
+    "electron": "^38.4.0",
+    "jsdom": "25.0.1",
     "typescript": "^5.9.0",
     "vite": "^7.2.0",
-    "electron": "^38.4.0"
+    "vitest": "2.1.8"
   },
   "main": "electron/main.cjs"
 }

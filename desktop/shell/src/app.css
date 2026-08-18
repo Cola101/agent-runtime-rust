@@ -89,12 +89,6 @@ body {
   display: block; background: var(--accent-wash); border-radius: 4px;
   padding: 8px 11px; margin-bottom: 10px; color: var(--ink); overflow-x: auto;
 }
-.gate ol { list-style: none; margin: 0 0 9px; padding: 0; }
-.gate li { color: var(--ink-2); }
-.gate li.pick { color: var(--ink); }
-.gate li.pick::before { content: "\276F  "; color: var(--accent); }
-.gate li:not(.pick) { padding-left: 16px; }
-.gate li .k { color: var(--accent); }
 .gate .bind { color: var(--ink-3); font-size: 11.5px; }
 
 .write { border-top: 1px solid var(--rule); padding: 13px 28px 9px; flex: none; }
@@ -216,15 +210,6 @@ table.rows td.warn { color: var(--accent); }
   background: var(--panel); border: 1px solid var(--rule); border-radius: 7px;
   box-shadow: 0 16px 40px rgba(0,0,0,.34);
 }
-.pal .in { padding: 9px 13px; border-bottom: 1px solid var(--rule); color: var(--ink-3); }
-.pal .in::before { content: "\276F "; color: var(--accent); }
-.pal .it {
-  display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left;
-  padding: 6px 13px; background: none; border: 0; font-family: inherit; font-size: 12.5px;
-  color: var(--ink); cursor: pointer;
-}
-.pal .it:hover, .pal .it:focus-visible { background: var(--accent-wash); outline: none; }
-.pal .it .d { margin-left: auto; color: var(--ink-3); font-size: 11.5px; }
 
 /* Stated, not implied: placeholder data must never read as real. */
 .offline {
@@ -278,3 +263,114 @@ table.rows td.ask {
 .empty .sub { display: block; margin-top: 6px; color: var(--ink-3); font-size: 11.5px; max-width: 70ch; }
 
 code { font-family: var(--mono); font-size: .93em; color: var(--ink); }
+
+
+/* ---------- keys ---------- */
+
+/* Every key hint on this screen is rendered from the binding that dispatches
+   it. A hint that is only a styled character is how a screen ends up
+   promising keys that do nothing. */
+kbd {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.6;
+  padding: 0 4px; border: 1px solid var(--rule); border-radius: 3px;
+  color: var(--ink-2); background: var(--paper); white-space: nowrap;
+}
+.keys { display: inline-flex; gap: 14px; margin-right: 16px; }
+.keys > span { display: inline-flex; align-items: center; gap: 5px; }
+
+/* One focus treatment for the whole app. Anything reachable shows it. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+button.flat {
+  background: none; border: 0; font: inherit; color: var(--ink-2);
+  cursor: pointer; padding: 0; display: inline-flex; align-items: center; gap: 5px;
+}
+button.flat:hover { color: var(--ink); }
+button.flat.stop { margin-left: 14px; color: var(--accent); }
+
+/* ---------- decisions ---------- */
+.picks { list-style: none; margin: 0 0 9px; padding: 0; }
+.picks button.pick {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: none; border: 0; font: inherit; color: var(--ink-2);
+  padding: 3px 0; cursor: pointer;
+}
+.picks button.pick.on { color: var(--ink); }
+.picks button.pick:hover { color: var(--ink); }
+.picks button.pick:hover kbd { border-color: var(--accent); color: var(--accent); }
+.gate.sel { background: var(--rule-2); border-radius: 0 4px 4px 0; }
+.gate { cursor: default; }
+
+/* ---------- composer ---------- */
+.write-row { display: flex; align-items: flex-end; gap: 12px; max-width: 82ch; }
+.write-row .in { flex: 1; }
+.write .send {
+  flex: none; font: inherit; font-size: 12px; padding: 2px 12px;
+  border: 1px solid var(--rule); border-radius: 4px; background: none;
+  color: var(--ink-2); cursor: pointer;
+}
+.write .send:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+.write .send:disabled { color: var(--ink-3); cursor: default; }
+.write-hint { margin-top: 6px; color: var(--ink-3); font-size: 10.5px; }
+
+/* ---------- command palette ---------- */
+.pal input.in {
+  display: block; width: 100%; padding: 10px 13px; background: none;
+  border: 0; border-bottom: 1px solid var(--rule); outline: none;
+  font: inherit; color: var(--ink);
+}
+.pal input.in::placeholder { color: var(--ink-3); }
+.pal-list { max-height: 46vh; overflow-y: auto; padding: 4px 0; }
+.pal .it {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left;
+  padding: 6px 13px; background: none; border: 0; font: inherit; font-size: 12.5px;
+  color: var(--ink); cursor: pointer;
+}
+.pal .it.on { background: var(--accent-wash); }
+.pal .it:focus-visible { outline-offset: -2px; }
+.pal .it .s {
+  font-size: 10px; letter-spacing: .06em; color: var(--ink-3);
+  border: 1px solid var(--rule); border-radius: 3px; padding: 0 4px;
+}
+.pal .it .d { margin-left: auto; color: var(--ink-3); font-size: 11.5px; }
+.pal-none { padding: 10px 13px; color: var(--ink-3); font-size: 12px; }
+
+/* ---------- drawer ---------- */
+.dhd {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; letter-spacing: .13em; text-transform: uppercase;
+  color: var(--ink-3); margin-bottom: 10px;
+}
+.raw-hd { font-size: 10.5px; color: var(--ink-3); margin-bottom: 8px; }
+.raw-row { border-bottom: 1px solid var(--rule-2); }
+.raw-row > button {
+  display: flex; gap: 9px; width: 100%; text-align: left; padding: 3px 0;
+  background: none; border: 0; font: inherit; font-size: 11px; color: var(--ink-2);
+  cursor: pointer;
+}
+.raw-row > button:hover { color: var(--ink); }
+.raw-row .seq { color: var(--ink-3); min-width: 2.4em; text-align: right; }
+.raw-row .ty { overflow: hidden; text-overflow: ellipsis; }
+.raw-row pre {
+  margin: 2px 0 7px; padding: 7px 9px; background: var(--paper);
+  border-radius: 4px; font-size: 10.5px; color: var(--ink-2);
+  overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+}
+
+/* ---------- identity popover ---------- */
+.pop .mi.act {
+  display: block; width: 100%; text-align: left; background: none; border: 0;
+  border-top: 1px solid var(--rule-2); font: inherit; font-size: 11.5px;
+  color: var(--ink-2); cursor: pointer; padding: 5px 11px;
+}
+.pop .mi.act:hover { color: var(--accent); }
+
+/* ---------- rows, reachable from the keyboard ---------- */
+table.rows tbody tr:focus-visible { outline-offset: -2px; }
+
+/* ---------- consistent gutters ---------- */
+/* One horizontal gutter for every row in the main column: toolbar, content,
+   composer and status line. They were 28 / 28 / 28 / 28 with three different
+   vertical paddings, which reads as four slightly misaligned panels. */
+.pane, .flow { padding: 20px 28px 14px; }
+.chrome-r { display: inline-flex; align-items: center; gap: 6px; }

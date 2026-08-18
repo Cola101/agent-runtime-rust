@@ -1,11 +1,12 @@
+import { useEffect, useRef } from "react";
 import { register } from "./registry";
 import { costLabel, lifecycleLabel, lifecycleTone, since, shortId } from "./model";
 import { LinkBanner } from "./Link";
-import { useDesk } from "../desk";
+import { byRecency, moveCursor, useDesk } from "../desk";
 
 function RunsToolbar() {
   const desk = useDesk();
-  const waiting = desk.runs.filter((run) => run.lifecycle.kind === "waiting_approval").length;
+  const waiting = desk.runs.filter((run) => run.approval).length;
   return (
     <>
       <b>Run</b>
@@ -25,8 +26,14 @@ function RunsToolbar() {
 /// a directory full of runs has been told something false.
 function RunsView() {
   const desk = useDesk();
-  const rows = [...desk.runs].sort((a, b) =>
-    (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  const rows = byRecency(desk);
+  const body = useRef<HTMLTableSectionElement>(null);
+
+  // The keyboard cursor has to stay on screen or it is not a cursor.
+  useEffect(() => {
+    body.current?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [desk.selected]);
 
   return (
     <div className="pane">
@@ -49,18 +56,30 @@ function RunsView() {
               <th className="num">token</th><th className="num">花费</th><th className="num">最后更新</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody ref={body}>
             {rows.map((run) => (
               <tr
                 key={run.id}
+                // Rows are reachable and operable from the keyboard. A clickable
+                // <tr> with no tabindex and no key handler is a control that
+                // only exists for a mouse.
+                tabIndex={0}
+                role="button"
+                aria-selected={run.id === desk.selected}
                 className={run.id === desk.selected ? "on" : ""}
-                onClick={() => { desk.select(run.id); desk.go("chat"); }}
+                onClick={() => desk.select(run.id)}
+                onDoubleClick={() => { desk.select(run.id); desk.go("chat"); }}
+                onFocus={() => desk.select(run.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") { desk.select(run.id); desk.go("chat"); }
+                }}
               >
                 <td className="p mono">{shortId(run.id)}</td>
                 <td>
                   <span className={`dot t-${lifecycleTone(run.lifecycle)}`} />
                   {lifecycleLabel(run.lifecycle)}
                   {run.historyGap && <span className="flag">日志有缺口</span>}
+                  {run.truncated && <span className="flag">只读到前一段</span>}
                   {run.error && <span className="flag">读不出来・{run.error.code}</span>}
                 </td>
                 {/* The runtime does not store the prompt, so this column is
@@ -89,5 +108,15 @@ register({
   },
   view: RunsView,
   toolbar: RunsToolbar,
-  commands: [{ id: "runs:open", title: "查看所有 Run", hint: "这个 Runtime 跑过什么" }],
+  keys: [
+    { key: "j", hint: "下一个", when: (d) => d.runs.length > 0,
+      run: (d) => moveCursor(d, byRecency(d).map((r) => r.id), 1) },
+    { key: "k", hint: "上一个", when: (d) => d.runs.length > 0,
+      run: (d) => moveCursor(d, byRecency(d).map((r) => r.id), -1) },
+    { key: "Enter", hint: "看转录", when: (d) => d.selected !== null, run: (d) => d.go("chat") },
+  ],
+  commands: [
+    { id: "runs:open", title: "查看所有 Run", hint: "这个 Runtime 跑过什么" },
+    { id: "runs:refresh", title: "重新读取 Run 列表", run: (d) => d.refresh() },
+  ],
 });
