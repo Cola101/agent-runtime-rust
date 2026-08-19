@@ -3076,3 +3076,68 @@ lex 的开销**，不算已完成。
 ### 因此关闭
 
 - 扫描表 blocking：`usage.prompt_tokens_details.cached_tokens`、`reasoning_effort`。
+
+## 2026-08-19（十）：额度用尽该不该换 Provider，以及排队输入归谁管
+
+本轮三条线并行（runtime 扫描表 / desktop 排队输入 / 读源码），外加一轮对抗复核。
+对抗复核推翻了两条已经写好的东西，都在提交前修掉了——这一节的价值主要在那两条。
+
+### 一、`retryable` 一个标志位管了两个问题
+
+- **缺口**：429 分不出「太快了」和「额度用尽」，一律当可重试限流。
+- **参考**：opencode / codex 都读 body 分流，额度类不可重试。**不同意 openclaw**：
+  它也解析 429 body，但只用来拼一句更友好的话（`openai-chatgpt-responses.ts:1598-1634`），
+  `isRetryableError`（同文件 :141-148）仍然只看状态码，所有 429 一律重试。那等于修了
+  措辞、没修白等的那几分钟——而缺口抱怨的正是那几分钟。
+- **对抗复核推翻的地方**：把 quota 429 改成 `Billing / retryable:false` 之后，
+  `is_policy_fallback`（`failover.rs:156-167`）和 `can_fallback`
+  （`runtime-host/src/lib.rs:4041`）都要求 `retryable: true`，而 `Billing` 连
+  `fallback_on` 的**校验白名单**都进不去（`failover.rs:76-82`、`protocol/src/lib.rs:344`）。
+  于是**额度用尽既不重试也不换 Provider**——而这恰恰是配第二个 Provider 唯一的理由。
+  改之前它能转，是因为被**错分**成了 `RateLimited`，而 `RateLimited` 在默认集合里。
+  **更诚实的分类不该让行为倒退。**
+- **结论**：`retryable` 问的是「同一个 Provider 待会儿会好吗」，故障转移问的是
+  「换一个现在能行吗」。所有瞬时故障两个答案一致，所以一个标志位混用了很久；额度用尽
+  是第一个答案分叉的故障。两边各自问各自的问题，`Billing` 进入可转移集合与出厂默认。
+
+### 二、`response.incomplete` 一律报 Length（比缺口描述的更糟）
+
+`openai_responses.rs:277-302` 从不读 `incomplete_details.reason`，而 OpenAI 在这个字段
+上放两种结局。因为 `Length` 在内核里是**成功**，被安全策略挡下的人看到的是
+「这段回答没说完 —— 模型到了单轮长度上限」，而且是 `run.succeeded`——被支去缩短一个
+根本不长的 prompt，连失败都不算。
+
+**明确拒绝了三家都在做的一件事**：把适配器的 `Completed{ContentFilter}` 改成
+`Failed{...}`。在本仓库这么改是净倒退——内核的 `Failed` 分支不写 `reason` 键，桌面的
+`cutShort` 就够不着，标题句会从已经正确的「这段回答被内容过滤挡下了」掉回
+「回复的格式不对」。它们能这么做是因为它们的 error 类型自带 message 字段，我们的
+`ModelStreamEvent::Completed` 没有。**这是协议形状差异，不是可以照抄的经验。**
+
+### 三、排队输入：客户端排还是内核排
+
+四家的分歧（本轮之前已读，此处只记结论与出处）：codex 默认走内核 steer、客户端队列
+兜底，打断时**内核丢弃、TUI 把话合并回输入框**（`input_restore.rs:119-163`，分工写在
+:138-141）；opencode 内核排队并落 SQLite，且**桌面端的客户端队列正在被废弃**；
+openclaw gateway 拥有策略，队列 cap 20、溢出 summarize；openhands 前端完全不排。
+
+**我们选客户端队列**，理由不是省事：排队的输入**从来没有发给模型**，所以它不是内核
+状态、不构成冻结转录的契约问题，性质上就是「还没发出去的草稿」——codex 也正是这么
+定位它的。代价明说：**不跨窗口，关窗即失**。内核的 `SteeringMailbox` 没有被建在上面，
+因为它的注释写明「是槽不是队列，这是语义」（`runtime-host/src/lib.rs:626-630`）。
+
+### 四、对抗复核找到的两个洞（本节最该记的部分）
+
+1. **抽干判据读的是同一次 poll 里更旧的快照。** `load()` 先读 run list、后读 session
+   heads，所以 head 的 `active_run_id` 永远比 Run 自己的 lifecycle **新**。判据在下降沿
+   去问更旧的那一份「它是怎么结束的」，而**每一次正常成功都要穿过这个窗口**——于是
+   队列在幸福路径上把话退了回去，还说「这轮没有正常结束」。9 条守卫都没抓到，因为 fake 的
+   `ends()` 把清 head 和置终局做在同一拍里，**根本表达不出真实的交错**。
+2. **「改向」按钮零行为守卫。** 把 `onClick={() => void send(true)}` 改成 `send()`
+   ——语义完全反转——362 条测试全绿。唯一碰它的断言只证明「屏幕上有个叫改向的按钮」。
+
+两条都补了守卫，并且都验证过守卫能抓住那个具体的破坏。
+
+### 因此关闭
+
+- 扫描表 blocking：`HTTP 429 限流 vs 额度用尽`、`response.incomplete 的 content_filter`。
+- `docs/desktop-ui-gap.md` 第 7 行（运行中排队输入）、第 8 行（中途改向）。
