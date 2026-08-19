@@ -3141,3 +3141,93 @@ openclaw gateway 拥有策略，队列 cap 20、溢出 summarize；openhands 前
 
 - 扫描表 blocking：`HTTP 429 限流 vs 额度用尽`、`response.incomplete 的 content_filter`。
 - `docs/desktop-ui-gap.md` 第 7 行（运行中排队输入）、第 8 行（中途改向）。
+
+## 2026-08-19（十一）：Codex 怎么用一个 Rust 核心撑起一个 TS GUI 的扩展生态
+
+这一节回答的是一个战略问题：如果插件要能进侧边栏、要用 TS 写，Rust 内核是不是就边缘化了。
+Codex 是严格同构的案例——Rust 核心 + Electron GUI——所以读它。
+
+### 一、它划的不是「Rust 后端 / TS 前端」
+
+边界宣言在 `codex-rs/docs/protocol_v1.md:43`：
+
+> The UI is external to Codex, as Codex is intended to be operated by arbitrary
+> UI implementations.
+
+硬到什么程度：
+
+- **它自己的 TUI 已经不依赖 `codex-core`**（`codex-rs/tui/Cargo.toml:30-51` 只剩
+  `codex-app-server-client`）。
+- **进程内嵌也不许抄近路**：`codex-rs/app-server/src/in_process.rs:18-24` 仍走 JSON-RPC
+  信封，注释写明是为了「避免制造第二套执行契约」。
+- **连读一个文件都不许 GUI 自己干**：有 `fs/readFile` / `fs/writeFile`（base64），
+  根因写在 `codex/AGENTS.md:321-322`——app-server 和 exec-server 可能在不同操作系统上。
+- **完全没有动态插件 ABI**：`codex-rs/ext/` 下 12 个 crate 全部静态链接进 app-server
+  （`app-server/src/extensions.rs:51-57`），整个 workspace 搜不到 libloading/dlopen/dylib。
+  `codex-extension-api` 是编译期 trait 注册表，不是给第三方的。
+- GUI 被允许自主做的事是一份**封闭短名单**：6 类 server→client 反向请求
+  （`app-server-protocol/src/protocol/common.rs:1489-1543`）。
+
+**同意，并且认为这条比我们现在做得更彻底。** 我们的桌面端目前仍有若干只在客户端存在的
+判断（组合框状态、队列），虽然都不是内核状态机的副本，但「唯一入口」这条纪律值得更硬。
+
+### 二、插件能贡献什么：包格式不能带 UI，MCP tool 能
+
+这里必须分两层说，我上一轮只说了一半，**在此更正**。
+
+**包格式层：确定不能。** `codex-rs/plugin/src/manifest.rs:19-24`——插件只有四类贡献：
+skills / mcpServers / apps / hooks。`:42-58` 的 `interface` 块全是描述符：
+displayName / category / capabilities / brandColor / defaultPrompt / composerIcon /
+logo / screenshots。送到宿主的是**路径或 URL**，宿主自己画
+（`app-server-protocol/src/protocol/v2/plugin.rs:803-833`）。
+`interface.capabilities` 是自由字符串，唯一用途是判断 interface 块非空
+（`core-plugins/src/manifest.rs:79,350`）——**不是权限声明**。
+
+**MCP tool 层：确定能，而且直达侧边栏。**
+入口声明在 tool 的 `_meta["openai/ui"].entrypoints`，类型只有四种
+`global | settings | thread | file`。`global` 被直接拼进侧边栏目的地数组，
+id 形如 `mcp:["mcp-global",connectorId,toolName,"global"]`，`visibleByDefault:false`。
+**内置项和 MCP 项共用同一个描述符形状** `{id,label,icon,visibleByDefault,onSelect,…}`。
+门槛是两条同时满足：指针以 `ui://` 开头，且 `_meta.ui.visibility` 含 `"app"`。
+
+### 三、UI 怎么送到屏幕（这段可以逐条抄成验收标准）
+
+1. `mcpServer/resource/read` 取 `ui://…`，MIME 必须是 `text/html;profile=mcp-app`
+   或 `text/html+skybridge`。
+2. 塞进 Electron `<webview>`，主进程在 `will-attach-webview` **强制覆写**：
+   `sandbox:true, contextIsolation:true, nodeIntegration:false,
+   nodeIntegrationInSubFrames:false, webviewTag:false, disableDialogs:true, plugins:false`。
+3. 该 session 一律拒权限、拦下载、`setWindowOpenHandler` 全 deny、导航协议白名单。
+4. 宿主 API 只经 MessageChannel 暴露 **15 个方法**。
+5. renderer 自身 CSP 限死 `frame-src`，`script-src` 无 `unsafe-eval`；
+   bundle 里 `new Function` / `eval` / `importScripts` 命中数 **0**。
+
+**第三方 JS 从不在 renderer 或 main 中执行；Rust 侧完全不渲染，只把 resourceUri 透传。**
+
+### 四、协议断在哪里（我们要自己发明的部分）
+
+- **display mode 枚举里没有侧边栏**，只有 `inline | fullscreen | pip`。三处独立实现交叉印证
+  （`assistant-ui/packages/react/src/mcp-apps/types.ts:34` 等）。
+- **UI 必须锚定一次 tool call**，不存在「server 主动请求开面板」的方法。
+- **没有生命周期、没有持久授权**。openclaw 不得不自己发明 view lease
+  （`openclaw/src/agents/mcp-ui-resource.ts:12-17`：TTL 10 分钟、6MB/view、64MB/store、32 views），
+  并在 `openclaw/docs/web/dashboard-architecture.md:114-127` 写下关键判断：
+  **MCP apps 不定义 widget 模型，是宿主的 widget 原语获得了承载它们的能力。**
+- ChatGPT 自己怎么绕过第二条：点侧边栏项时开一条专用线程
+  `thread/start {ephemeral:true, permissions:':read-only', threadSource:'system'}`。
+  **侧边栏项是宿主侧的描述符，点击时 mint 一次只读的一次性调用。**
+
+### 五、因此推翻的两条自己的结论
+
+1. **推翻「插件不能带 UI」**（我上一轮的说法）。准确说法是：包格式不能带可执行 UI，
+   MCP tool 能带 sandboxed HTML，且能到侧边栏。
+2. **推翻「Electron 已经装了 Node，所以逻辑可以挪过去」这条推理。** Codex 的演进方向
+   正好相反：它在持续把东西**从 GUI 收回 Rust**，连自家 TUI 都被剥夺了直连内核的权利。
+
+### 六、我们比它强的一处
+
+**Codex 的插件安装没有任何签名或摘要校验**——只有 tar 解包安全（路径穿越拒绝、
+symlink/hardlink 拒绝、大小上限）加下载 URL scheme 白名单。而我们已经有把策略摘要
+冻进 checkpoint 的机制，插件摘要进冻结快照是现成的。这是可以做得比它好、且成本很低的一点。
+
+结论已写进 ADR-0146（提案）。
