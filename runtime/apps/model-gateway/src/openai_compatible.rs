@@ -209,6 +209,18 @@ impl OpenAiCompatibleAdapter {
                     format!("provider SSE data is not valid JSON: {error}"),
                 )
             })?;
+            // A fault reported after the 200. This is the primary error
+            // channel for the servers this adapter talks to -- vLLM, SGLang
+            // and the proxies in front of them accept the request, open the
+            // stream, and report a rate limit or an overrun as a data frame.
+            // Unread, the frame was discarded and the Run failed with
+            // "provider stream ended without [DONE]": a sentence about our own
+            // framing, marked non-retryable, with the provider's own words
+            // thrown away. The same shape is already handled one file over
+            // (`anthropic_messages.rs`).
+            if let Some(reported) = in_band_error(&chunk, credential) {
+                return Err(reported);
+            }
             consume_chunk(
                 &events,
                 &mut tool_calls,
@@ -572,6 +584,63 @@ pub(crate) fn calculate_cost(
         + u128::from(output_tokens) * u128::from(pricing.output_million_tokens_micros);
     let rounded_up = total.saturating_add(999_999) / 1_000_000;
     u64::try_from(rounded_up).unwrap_or(u64::MAX)
+}
+
+/// A provider fault carried inside the stream rather than by the status line.
+///
+/// `None` when the chunk is an ordinary one, including a chunk that carries an
+/// explicit `"error": null` -- several servers send that on every frame, and
+/// treating it as a fault would fail every stream they produce.
+///
+/// The kind comes from the message where the message says so, because these
+/// servers are not consistent about `type`: a context overrun arrives as
+/// `invalid_request_error`, as `BadRequestError`, or with no type at all, and
+/// the sentence is the one part that reliably names it.
+fn in_band_error(chunk: &Value, credential: &ProviderCredential) -> Option<ProviderExecutionError> {
+    let error = chunk.get("error").filter(|value| !value.is_null())?;
+    let kind_hint = error
+        .get("type")
+        .or_else(|| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let said = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("provider reported a fault with no message");
+    let message = credential.redact(said.chars().take(2048).collect::<String>());
+    let (kind, retryable) = if looks_like_context_overflow(&message) {
+        (ModelErrorKind::ContextOverflow, false)
+    } else if kind_hint.contains("rate_limit") || kind_hint.contains("overloaded") {
+        (ModelErrorKind::RateLimited, true)
+    } else if kind_hint.contains("quota") || kind_hint.contains("billing") {
+        (ModelErrorKind::Billing, false)
+    } else if kind_hint.contains("authentication") || kind_hint.contains("permission") {
+        (ModelErrorKind::Authentication, false)
+    } else if kind_hint.contains("timeout") {
+        (ModelErrorKind::Timeout, true)
+    } else if kind_hint.contains("server") || kind_hint.contains("unavailable") {
+        (ModelErrorKind::Unavailable, true)
+    } else {
+        // Unrecognised, and deliberately not retried: a fault this build
+        // cannot name is one it cannot say is safe to repeat.
+        (ModelErrorKind::Protocol, false)
+    };
+    Some(ProviderExecutionError::Provider {
+        kind,
+        retryable,
+        status: None,
+        retry_after_ms: error
+            .get("retry_after_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                error
+                    .get("retry_after")
+                    .and_then(Value::as_str)
+                    .and_then(parse_retry_after_ms)
+            }),
+        message,
+    })
 }
 
 pub(crate) async fn classify_http_error(

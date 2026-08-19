@@ -450,6 +450,145 @@ async fn an_unknown_finish_reason_does_not_throw_away_the_answer() {
     );
 }
 
+/// A provider that reports a fault after it has already answered 200.
+///
+/// This is the primary error channel for the provider family this adapter
+/// targets: vLLM, SGLang and the proxies in front of them accept the request,
+/// start the stream, and report a rate limit or an overrun as a data frame.
+/// Nothing here read `chunk["error"]`, so the frame was discarded and the Run
+/// failed with "provider stream ended without [DONE]" -- a sentence about our
+/// own framing, non-retryable, with the provider's actual words thrown away.
+///
+/// The pattern already exists one file over: `anthropic_messages.rs:244-263`
+/// maps the in-band error type to a kind and redacts the message through the
+/// credential. Codex does the same for its own envelope
+/// (`codex-rs/codex-api/src/sse/responses.rs:387-421`).
+#[tokio::test]
+async fn a_mid_stream_error_frame_is_reported_as_what_it_says() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\":{\"type\":\"rate_limit_exceeded\",\"message\":\"rate limit reached, try again in 11s\"}}\n\n",
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let error = outcome.expect_err("a reported fault is a failure");
+    let ProviderExecutionError::Provider {
+        kind,
+        retryable,
+        message,
+        ..
+    } = &error
+    else {
+        panic!("expected a provider failure, got {error:?}");
+    };
+    assert_eq!(*kind, ModelErrorKind::RateLimited, "{error:?}");
+    assert!(
+        *retryable,
+        "a rate limit is the textbook retryable failure: {error:?}"
+    );
+    assert!(
+        message.contains("rate limit reached"),
+        "the provider's own sentence is the only lead there is: {message}",
+    );
+    // And never the credential, whatever the provider echoed back.
+    assert!(!format!("{error:?}").contains("tenant-secret-token"));
+}
+
+/// An explicit `"error": null` is not a fault.
+///
+/// Several servers put the key on every chunk. Treating its presence as the
+/// signal would fail every stream they produce -- which is a worse failure
+/// than the one being fixed, because it is total.
+#[tokio::test]
+async fn an_explicit_null_error_key_is_an_ordinary_chunk() {
+    let sse = concat!(
+        "data: {\"error\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fine\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "a null error key must not fail the stream: {outcome:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::TextDelta { text, .. } if text == "fine")),
+        "the answer must still arrive: {events:?}",
+    );
+}
+
+/// A fault frame whose message is about the context window is not a rate
+/// limit, and retrying it forever would be the wrong answer.
+#[tokio::test]
+async fn a_mid_stream_context_overrun_is_not_reported_as_retryable() {
+    let sse = concat!(
+        "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"This model's maximum context length is 8192 tokens\"}}\n\n",
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    while events_rx.recv().await.is_some() {}
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let error = outcome.expect_err("a reported fault is a failure");
+    let ProviderExecutionError::Provider {
+        kind, retryable, ..
+    } = &error
+    else {
+        panic!("expected a provider failure, got {error:?}");
+    };
+    assert_eq!(*kind, ModelErrorKind::ContextOverflow, "{error:?}");
+    assert!(
+        !*retryable,
+        "a prompt that does not fit will not fit next time: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn cancellation_stops_a_live_provider_http_stream_without_waiting_for_timeout() {
     let first_delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"started\"},\"finish_reason\":null}]}\n\n";

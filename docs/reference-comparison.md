@@ -2642,6 +2642,68 @@ protocol → kernel（`model.reasoning.delta`）→ worker → proto → gRPC �
 工具调用组装边界），结论回来之后单独成节。
 
 
+
+## 2026-08-19（四）：流中报错、以及「跑着的时候打字」到底归谁管
+
+### 一、HTTP 200 之后在流里报的错，我们整帧丢掉
+
+这是这一族服务端（vLLM / SGLang / 前面的代理）**主要的**报错通道：请求收下了、
+200 也发了、流也开了，然后把限流或超长作为一个 data 帧发出来。
+
+`openai_compatible.rs` 只读 `chunk["choices"]` 和 `chunk["usage"]`，
+从来没读过 `chunk["error"]`。于是那一帧被丢掉，Run 最后失败在
+
+```
+provider stream ended without [DONE]
+```
+
+——一句关于**我们自己帧格式**的话，标成不可重试，而 Provider 自己那句
+「rate limit reached, try again in 11s」被扔了。
+
+| 谁 | 怎么做 |
+| --- | --- |
+| Codex | `codex-rs/codex-api/src/sse/responses.rs:387-421` 拆开带内错误并按 code 分类，`try_parse_retry_after`（`:599-623`）取重试间隔 |
+| OpenClaw | 靠 openai-node SDK：`streaming.js` 见到 `data.error` 直接 throw APIError，transport 侧 `failTransportStream` 接住 |
+| opencode | schema 里没有 `error` 成员且 `choices` 必填，于是解码失败、报 `eventError` 并带上原始帧文本——不分类，但至少响 |
+
+**三家都会响，只有我们吞掉。** 而同一个目录下的 `anthropic_messages.rs:244-263`
+早就有这套处理（含 `credential.redact`）。已补，两条守卫，各自破坏一次确认独立。
+
+### 二、跑着的时候打字：我先前的判断是错的，这里推翻
+
+我本来打算写的结论是：「Codex 把 steer-vs-send 的判断压进内核，而我们在 GUI 里做，
+所以我们违反了『GUI 不复制内核状态机』」。**这个结论不成立。**
+
+对抗复核逐行读出来的是：Codex 有**两个**入口。
+
+| 入口 | 行为 | 谁决定 |
+| --- | --- | --- |
+| 不加围栏的 `Op::UserInput`（`core/src/session/handlers.rs:177-268`，`:219` 传 `expected_turn_id = None`） | 先 `steer_input`，返回 `NoActiveTurn` 再 `spawn_task`（`:228`→`:253`） | 内核 |
+| **加围栏的 `turn/steer`**（要求非空 `expectedTurnId`） | 没有活跃轮次就**拒绝** | **调用方**：`tui/src/app/thread_routing.rs:663-724` —— 有缓存的活跃 turn id 就带围栏 steer，没有或服务端说 Missing 就 `turn_start` |
+
+**我们的客户端对应的是第二条**：`store.ts` 的 `steer` 带 `runId` + `steeringId`，
+宿主把它绑到 `expected_owner_epoch`。也就是说 Codex 自己的 TUI 在围栏路径上
+做的正是我们在做的事。**没有违反那条原则。**
+
+### 三、那么第 7 行（运行中排队输入）该怎么做，还没定
+
+已经量清楚的事实：
+
+- 我们的 steering 是**一个槽不是队列**（`runtime-host/src/lib.rs:625-635` 的注释就是这么写的：
+  两次 steer 在任一被应用前到达，意味着人改了两次主意，第二次才是他要的）。
+  所以**不能**把排队输入建在 `desk.steer` 上。
+- Codex 的 `pending_input` 是**内核里真的队列**，在每轮循环顶部被抽干进模型请求；
+  任务结束时还没被消费的，内核会记进对话历史，**打的字不会静默消失**。
+- 我们的内核里唯一真的输入队列是**子代理消息**（FIFO），不是根分支的。
+
+**这一轮没有做**，理由是：要么在内核加一个根分支的 `pending_input`（契约决定），
+要么在客户端排队（那就要回答「Run 失败了这条消息去哪」）。
+按错误的模型抢先实现，比晚一轮更贵。
+
+值得**现在就抄**的只有一条客户端做法：Codex 的 TUI 在轮次被打断时，
+把三份客户端列表**都还回输入框**。我们已经做了其中一半（被拒的发送把句子放回框里）。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`
