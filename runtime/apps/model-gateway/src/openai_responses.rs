@@ -227,14 +227,27 @@ impl OpenAiResponsesAdapter {
                             "function call is missing arguments",
                         )
                     })?;
-                    let arguments = serde_json::from_str(arguments).map_err(|error| {
-                        provider_error(
-                            ModelErrorKind::Protocol,
-                            false,
-                            None,
-                            format!("function call arguments are invalid JSON: {error}"),
-                        )
-                    })?;
+                    // A call with no arguments is a call with no arguments,
+                    // the same as in the chat-completions adapter. This one
+                    // was the second instance of that defect and had no test
+                    // at all; the name goes into the failure for the same
+                    // reason it does there -- "invalid JSON" alone does not say
+                    // which call broke.
+                    let trimmed = arguments.trim();
+                    let arguments = if trimmed.is_empty() {
+                        Value::Object(serde_json::Map::new())
+                    } else {
+                        serde_json::from_str(trimmed).map_err(|error| {
+                            provider_error(
+                                ModelErrorKind::Protocol,
+                                false,
+                                None,
+                                format!(
+                                    "function call arguments for {name} are invalid JSON: {error}"
+                                ),
+                            )
+                        })?
+                    };
                     emit(
                         &events,
                         ModelStreamEvent::ToolCall {

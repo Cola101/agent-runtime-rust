@@ -444,6 +444,7 @@ fn candidate(
         cost_per_million_tokens_micros: 0,
         response_timeout_ms: 1_000,
         stream_idle_timeout_ms: 100,
+        max_output_tokens: None,
     }
 }
 
@@ -1576,4 +1577,71 @@ async fn route_freeze_filters_health_region_capability_and_cost_before_network_e
         .cloned()
         .expect("current route journal");
     assert_eq!(journal["candidate_ids"], serde_json::json!(["eligible"]));
+}
+
+/// What the Provider said, said back.
+///
+/// A failed Run used to reach the operator as "Provider qwen-local failed;
+/// diagnostic digest 848e98e3...". The digest is a fixed-width identity for
+/// comparing one failure to another and it is genuinely useful for that. It is
+/// also the only thing that survived, and it is a one-way hash: nobody -- not
+/// the operator, not the person who wrote the Provider, not this process
+/// later -- can get from it back to what went wrong.
+///
+/// The real case that produced this guard: a local vLLM box answered 400 with
+/// "max_tokens=400000 cannot be greater than max_model_len=204800. Please
+/// request fewer output tokens." That sentence names the parameter, the two
+/// numbers and the fix. The desktop client showed a hex string instead, and
+/// the conversation simply failed with nothing to act on.
+///
+/// The Provider's message is already redacted of credentials by the adapter
+/// that built it, which is what makes it safe to carry here.
+#[tokio::test]
+async fn a_failed_run_repeats_what_the_provider_said_not_only_its_digest() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let (endpoint, _captured, server) = spawn_response(
+        400,
+        r#"{"error":{"message":"max_tokens=400000 cannot be greater than max_model_len=204800. Please request fewer output tokens.","type":"BadRequestError","param":"max_tokens","code":400}}"#,
+    )
+    .await;
+    let cfg = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        vec![candidate(
+            "says-why",
+            ProviderProtocol::OpenAiCompatible,
+            format!("{endpoint}/v1/chat/completions"),
+            1,
+        )],
+    );
+
+    let mut host = LocalRuntimeHost::start(cfg).expect("Host");
+    let outcome = host.execute("ask for too many tokens").await.expect("Run");
+    assert_eq!(outcome.status, RunStatus::Failed);
+
+    let events = std::fs::read_to_string(
+        state
+            .path()
+            .join("runs")
+            .join(outcome.run_id.to_string())
+            .join("events.jsonl"),
+    )
+    .expect("events journal");
+    let failed = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .find(|event| event["type"] == "run.failed")
+        .expect("a run.failed event");
+    let message = failed["payload"]["message"].as_str().expect("a message");
+
+    assert!(
+        message.contains("max_tokens=400000 cannot be greater than max_model_len=204800"),
+        "the operator was not told what the Provider said: {message}"
+    );
+    assert!(
+        message.contains("says-why"),
+        "the message does not say which Provider it came from: {message}"
+    );
+    server.await.unwrap();
 }

@@ -25,6 +25,14 @@ pub struct OpenAiCompatibleConfig {
     pub pricing: ProviderPricing,
     pub response_timeout: Duration,
     pub stream_idle_timeout: Duration,
+    /// The longest single reply this model will accept being asked for, when
+    /// the operator knows it.
+    ///
+    /// Beside `model` and `endpoint` because that is what it is a property of.
+    /// `None` means the field is not sent at all and the provider applies its
+    /// own default, which is always valid -- unlike a number we would have had
+    /// to guess.
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -85,6 +93,7 @@ pub struct OpenAiCompatibleAdapter {
     pricing: ProviderPricing,
     response_timeout: Duration,
     stream_idle_timeout: Duration,
+    max_output_tokens: Option<u64>,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -125,6 +134,7 @@ impl OpenAiCompatibleAdapter {
             pricing: config.pricing,
             response_timeout: config.response_timeout,
             stream_idle_timeout: config.stream_idle_timeout,
+            max_output_tokens: config.max_output_tokens,
         })
     }
 
@@ -284,7 +294,34 @@ impl OpenAiCompatibleAdapter {
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
-            "max_tokens": request.max_output_tokens
+        });
+        // What the caller asked for, capped by what the operator said this model
+        // will accept.
+        //
+        // `request.max_output_tokens` carries two different intents through one
+        // non-optional `u64`, and telling them apart here is not possible. Some
+        // callers mean it: transcript compaction sets it to `max_summary_tokens`
+        // (`worker/src/lib.rs:6940-6943`) because a summary really must be
+        // short. The ordinary turn does not: `worker/src/lib.rs:6784` fills it
+        // with the Run's *remaining budget*, and a desktop Run carries 400,000 --
+        // which a real server rejects outright with "max_tokens=400000 cannot be
+        // greater than max_model_len=204800", so no conversation could start.
+        //
+        // An earlier attempt at this dropped `max_tokens` unless a ceiling was
+        // configured. That fixed the desktop and silently broke compaction,
+        // which had a genuine reason for its 256 and stopped being able to say
+        // so. The adapter now sends faithfully and the ceiling does the capping,
+        // which is the only one of the two jobs the adapter has the standing to
+        // do: it knows what the operator declared about this model, and it does
+        // not know what the caller meant.
+        //
+        // Consequence worth stating plainly: with no ceiling configured, the Run
+        // budget still goes out as `max_tokens` and a real server will still
+        // reject it. The ceiling is what makes an OpenAI-compatible provider
+        // usable, which is why the desktop now always writes one.
+        payload["max_tokens"] = json!(match self.max_output_tokens {
+            Some(ceiling) => ceiling.min(request.max_output_tokens),
+            None => request.max_output_tokens,
         });
         if !tools.is_empty() {
             payload["tools"] = Value::Array(tools);
@@ -567,14 +604,36 @@ async fn flush_tool_calls(
                 "streamed tool call is missing id or function name",
             ));
         }
-        let arguments = serde_json::from_str(&tool_call.arguments).map_err(|error| {
-            provider_error(
-                ModelErrorKind::Protocol,
-                false,
-                None,
-                format!("streamed tool arguments are invalid JSON: {error}"),
-            )
-        })?;
+        // A call with no arguments is a call with no arguments. Models emit
+        // these with `arguments` as `""` or omit the field, and parsing that
+        // as JSON failed and took the whole turn down over a perfectly well
+        // formed call. Both references treat empty as `{}`: opencode writes
+        // `raw || "{}"` (`packages/llm/src/protocols/shared.ts:155-156`) and
+        // openclaw returns `{}` for empty or whitespace
+        // (`packages/ai/src/utils/json-parse.ts:130-132`).
+        //
+        // Arguments that were cut off mid-object stay a failure. openclaw
+        // repairs and, failing that, silently substitutes `{}`; we do not
+        // agree -- turning `{"path": "/etc/pas` into `{}` runs a call the
+        // model never asked for, and for a write or an exec that is not the
+        // smaller mistake. What we were missing is which call broke: "invalid
+        // JSON" alone does not say which of eleven it was.
+        let raw = tool_call.arguments.trim();
+        let arguments = if raw.is_empty() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(raw).map_err(|error| {
+                provider_error(
+                    ModelErrorKind::Protocol,
+                    false,
+                    None,
+                    format!(
+                        "streamed tool arguments for {} are invalid JSON: {error}",
+                        tool_call.name,
+                    ),
+                )
+            })?
+        };
         emit(
             events,
             ModelStreamEvent::ToolCall {

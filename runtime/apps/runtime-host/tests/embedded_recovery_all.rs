@@ -70,6 +70,7 @@ fn config(state_root: PathBuf, workspace_root: PathBuf, endpoint: String) -> Loc
             cost_per_million_tokens_micros: 1,
             response_timeout_ms: 10_000,
             stream_idle_timeout_ms: 10_000,
+            max_output_tokens: None,
         }],
     };
     model_routing.health_policy.max_same_provider_attempts = 2;

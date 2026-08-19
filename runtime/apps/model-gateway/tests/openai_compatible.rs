@@ -48,6 +48,7 @@ fn config(endpoint: String) -> OpenAiCompatibleConfig {
         },
         response_timeout: Duration::from_secs(5),
         stream_idle_timeout: Duration::from_secs(5),
+        max_output_tokens: None,
     }
 }
 
@@ -93,7 +94,10 @@ async fn real_http_sse_maps_request_and_emits_text_usage_then_completion() {
     assert_eq!(request.body["model"], "local-agent-model");
     assert_eq!(request.body["stream"], true);
     assert_eq!(request.body["stream_options"]["include_usage"], true);
-    assert_eq!(request.body["max_tokens"], 64);
+    // Forwarded unchanged, because this fixture configures no ceiling. What
+    // bounds a reply is the operator's ceiling, not the adapter -- see
+    // `without_a_ceiling_...` and `a_configured_ceiling_...` below.
+    assert_eq!(request.body["max_tokens"], 64, "{}", request.body);
     assert_eq!(request.body["messages"][0]["role"], "user");
     assert_eq!(request.body["messages"][0]["content"], "say hello");
     assert_eq!(request.body["tools"][0]["function"]["name"], "read_file");
@@ -779,6 +783,183 @@ async fn an_ordinary_answer_still_ends_as_a_stop() {
         )),
         "promotion must need a tool call, not merely a stop: {events:?}",
     );
+}
+
+/// A tool that takes no arguments.
+///
+/// Models emit these with `arguments` as `""`, or omit the field entirely.
+/// We parsed the accumulated string as JSON with no special case, so an empty
+/// one failed to parse and took the whole turn down with a non-retryable
+/// protocol error -- for a call that was perfectly well formed.
+///
+/// Both references treat empty as `{}`: opencode literally writes
+/// `raw || "{}"` (`packages/llm/src/protocols/shared.ts:155-156`), and
+/// openclaw returns `{}` for an empty or whitespace string
+/// (`packages/ai/src/utils/json-parse.ts:130-132`).
+#[tokio::test]
+async fn a_tool_call_with_no_arguments_is_a_call_with_no_arguments() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_3\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "an argument-free call is not a malformed one: {outcome:?}"
+    );
+    let call = events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCall {
+                name, arguments, ..
+            } => Some((name, arguments)),
+            _ => None,
+        })
+        .expect("the call must be delivered");
+    assert_eq!(call.0, "read_file");
+    assert_eq!(
+        *call.1,
+        json!({}),
+        "no arguments is an empty object, not a failure"
+    );
+}
+
+/// Arguments that were cut off mid-object are still a failure, and the failure
+/// says which call broke.
+///
+/// openclaw repairs and, failing that, silently substitutes `{}`
+/// (`packages/ai/src/utils/json-parse.ts:134-145`). We do not agree: turning
+/// `{"path": "/etc/pas` into `{}` runs a call the model never asked for, and
+/// for a write or an exec that is not a smaller mistake than failing. opencode
+/// errors too, and names the tool in the message
+/// (`packages/llm/src/protocols/shared.ts:156`) -- which is the part we were
+/// missing, because "invalid JSON" alone does not say which of eleven calls it
+/// was.
+#[tokio::test]
+async fn truncated_tool_arguments_fail_and_name_the_call() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_4\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\": \\\"a\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    while events_rx.recv().await.is_some() {}
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let error = outcome.expect_err("half an argument object is not a call we can make");
+    let said = format!("{error:?}");
+    assert!(
+        said.contains("write_file"),
+        "the failure must name the call that broke: {said}",
+    );
+}
+
+/// No reference does it: openclaw clamps a caller-supplied cap to the model's
+/// own ceiling (`openai-completions-transport.ts:1834-1851`), opencode sends a
+/// A configured ceiling is what makes a Run budget safe to send.
+///
+/// `request.max_output_tokens` carries the Run's remaining budget on an
+/// ordinary turn -- 400,000 on the desktop -- and a real server rejects that
+/// outright. The adapter cannot tell that intent apart from transcript
+/// compaction's deliberate 256, so it does not try: it sends what it is given
+/// and the operator's ceiling caps it.
+///
+/// This guard is the second half of `a_configured_ceiling_...` below: together
+/// they pin that the ceiling, not the adapter's judgement, is what bounds a
+/// reply.
+#[tokio::test]
+async fn without_a_ceiling_the_caller_s_number_goes_out_unchanged() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let mut request = model_request();
+    // What a desktop Run actually carries.
+    request.max_output_tokens = 400_000;
+    adapter
+        .execute(&request, &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap();
+    while events_rx.recv().await.is_some() {}
+    let sent = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        sent.body["max_tokens"], 400_000,
+        "with no ceiling the adapter must not invent one: {}",
+        sent.body,
+    );
+}
+
+/// When an operator does know their model's ceiling, it is sent -- and it is
+/// the smaller of the two.
+///
+/// Asking for more than the Run can afford is paying for tokens the Run will
+/// discard; asking for more than the model can produce is the failure this
+/// whole change is about.
+#[tokio::test]
+async fn a_configured_ceiling_is_sent_and_never_exceeds_what_the_run_can_afford() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    for (ceiling, remaining, expected) in [(4_096_u64, 400_000_u64, 4_096_u64), (4_096, 100, 100)] {
+        let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+        let mut settings = config(endpoint);
+        settings.max_output_tokens = Some(ceiling);
+        let adapter = OpenAiCompatibleAdapter::new(settings).unwrap();
+        let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let mut request = model_request();
+        request.max_output_tokens = remaining;
+        adapter
+            .execute(&request, &credential, CancellationToken::new(), events_tx)
+            .await
+            .unwrap();
+        while events_rx.recv().await.is_some() {}
+        let sent = captured.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            sent.body["max_tokens"], expected,
+            "ceiling {ceiling} against {remaining} remaining: {}",
+            sent.body,
+        );
+    }
 }
 
 #[tokio::test]

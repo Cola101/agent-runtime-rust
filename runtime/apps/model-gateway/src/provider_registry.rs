@@ -137,6 +137,14 @@ impl ModelPolicyRouteResolver {
                         pricing,
                         response_timeout: self.response_timeout,
                         stream_idle_timeout: self.stream_idle_timeout,
+                        // Not carried by the routing config yet, so the field
+                        // is not sent and the provider applies its own default.
+                        // That is the whole fix for the blocker: what was being
+                        // sent was the Run's budget, which no real model
+                        // accepts. Letting an operator set a real per-reply
+                        // ceiling for their model is the follow-up, and it
+                        // belongs on the routing candidate beside the model.
+                        max_output_tokens: None,
                     })?)
                 }
                 ProviderProtocol::OpenAiResponses => {

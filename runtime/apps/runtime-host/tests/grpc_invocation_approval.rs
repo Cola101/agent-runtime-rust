@@ -226,6 +226,7 @@ async fn an_operator_approves_a_parked_run_over_the_network_and_it_finishes() {
                         cost_per_million_tokens_micros: 1,
                         response_timeout_ms: 10_000,
                         stream_idle_timeout_ms: 10_000,
+                        max_output_tokens: None,
                     }],
                 },
                 mcp_servers: Vec::new(),

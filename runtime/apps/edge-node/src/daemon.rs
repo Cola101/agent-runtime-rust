@@ -266,6 +266,7 @@ fn build_runtime_profile(
                     cost_per_million_tokens_micros: max_cost,
                     response_timeout_ms: profile.provider.response_timeout_ms,
                     stream_idle_timeout_ms: profile.provider.stream_idle_timeout_ms,
+                    max_output_tokens: None,
                 }],
                 allowed_regions: BTreeSet::from([provider_region]),
                 data_class,

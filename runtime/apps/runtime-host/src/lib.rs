@@ -785,6 +785,15 @@ pub struct LocalProviderConfig {
     pub cost_per_million_tokens_micros: u64,
     pub response_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
+    /// The longest single reply this model will accept being asked for, when
+    /// the operator knows it.
+    ///
+    /// Unset is the honest default: a per-reply ceiling is a property of the
+    /// model, and a number guessed here would be wrong for the next one. What
+    /// must NOT go here is a Run budget -- doing that asked a real server for a
+    /// 400,000-token reply and made every conversation on the desktop fail
+    /// before it started.
+    pub max_output_tokens: Option<u64>,
 }
 
 impl std::fmt::Debug for LocalProviderConfig {
@@ -896,6 +905,7 @@ impl LocalModelRoutingConfig {
                 cost_per_million_tokens_micros: 0,
                 response_timeout_ms: 120_000,
                 stream_idle_timeout_ms: 60_000,
+                max_output_tokens: None,
             }],
             allowed_regions: BTreeSet::from(["local".into()]),
             data_class: DataClass::Internal,
@@ -2403,6 +2413,56 @@ struct LocalModelRouteFailure {
     #[serde(default)]
     retry_after_ms: Option<u64>,
     message_digest: String,
+    /// What the Provider actually said, bounded and already redacted of
+    /// credentials by the adapter that built it.
+    ///
+    /// The digest above is a fixed-width identity for comparing one failure to
+    /// another, and it stays for that. It cannot do this job as well: it is a
+    /// one-way hash, so an operator holding it has no route back to the cause.
+    /// A local vLLM box answering "max_tokens=400000 cannot be greater than
+    /// max_model_len=204800" names the parameter, both numbers and the fix,
+    /// and every word of that used to be discarded here.
+    ///
+    /// `serde(default)` because route journals written before this field
+    /// existed are still replayed after an upgrade; they report the empty
+    /// string, and the caller falls back to the digest alone.
+    #[serde(default)]
+    message: String,
+}
+
+/// The Provider's own words, cut to a length a journal line and a person can
+/// both hold. Providers answer failures with anything from one clause to an
+/// entire HTML error page.
+/// How a Provider failure reads to whoever has to act on it.
+///
+/// The Provider's own sentence first, because it is the only part that can
+/// name a cause; the digest last, because it is what correlates this failure
+/// with another one in a journal. A record written before the message was
+/// carried has nothing to lead with and reports the digest alone.
+fn provider_failure_sentence(failure: &LocalModelRouteFailure, situation: &str) -> String {
+    if failure.message.is_empty() {
+        return format!(
+            "Provider {} {}; diagnostic digest {}",
+            failure.provider_id, situation, failure.message_digest
+        );
+    }
+    format!(
+        "Provider {} {}: {} (diagnostic digest {})",
+        failure.provider_id, situation, failure.message, failure.message_digest
+    )
+}
+
+fn bounded_provider_message(message: &str) -> String {
+    const MAX: usize = 2048;
+    let trimmed = message.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_owned();
+    }
+    let mut cut = MAX;
+    while cut > 0 && !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &trimmed[..cut])
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2880,6 +2940,7 @@ impl LocalRuntimeHost {
                         stream_idle_timeout: Duration::from_millis(
                             candidate.stream_idle_timeout_ms,
                         ),
+                        max_output_tokens: candidate.max_output_tokens,
                     })
                     .map_err(|error| LocalRuntimeError::Configuration(error.to_string()))?,
                 ),
@@ -3959,6 +4020,7 @@ impl LocalRuntimeHost {
             status,
             retry_after_ms,
             message_digest: hex::encode(Sha256::digest(message.as_bytes())),
+            message: bounded_provider_message(message),
         }
     }
 
@@ -4194,6 +4256,8 @@ impl LocalRuntimeHost {
                 message_digest: hex::encode(Sha256::digest(
                     b"Provider invocation was interrupted before a durable response",
                 )),
+                message: "Provider invocation was interrupted before a durable response"
+                    .to_owned(),
             };
             if journal.same_provider_attempts
                 < self
@@ -4256,9 +4320,9 @@ impl LocalRuntimeHost {
                 journal.staged_events = vec![ModelStreamEvent::Failed {
                     kind: failure.kind,
                     retryable: false,
-                    message: format!(
-                        "Provider {} exhausted the frozen same-provider attempt budget; diagnostic digest {}",
-                        failure.provider_id, failure.message_digest
+                    message: provider_failure_sentence(
+                        &failure,
+                        "exhausted the frozen same-provider attempt budget",
                     ),
                 }];
                 Self::persist_model_route_journal(&path, &journal)?;
@@ -4481,26 +4545,23 @@ impl LocalRuntimeHost {
                             journal.staged_events = vec![ModelStreamEvent::Failed {
                                 kind: failure.kind,
                                 retryable: false,
-                                message: format!(
-                                    "Provider {} exhausted the frozen same-provider attempt budget; diagnostic digest {}",
-                                    failure.provider_id, failure.message_digest
+                                message: provider_failure_sentence(
+                                    &failure,
+                                    "exhausted the frozen same-provider attempt budget",
                                 ),
                             }];
                             Self::persist_model_route_journal(&path, &journal)?;
                             return Ok((path, journal.staged_events.clone()));
                         }
-                        return Err(LocalRuntimeError::Provider(format!(
-                            "retryable Provider {} failure before output; diagnostic digest {}",
-                            failure.provider_id, failure.message_digest
+                        return Err(LocalRuntimeError::Provider(provider_failure_sentence(
+                            &failure,
+                            "failed retryably before any output",
                         )));
                     }
                     events.push(ModelStreamEvent::Failed {
                         kind: failure.kind,
                         retryable: failure.retryable,
-                        message: format!(
-                            "Provider {} failed; diagnostic digest {}",
-                            failure.provider_id, failure.message_digest
-                        ),
+                        message: provider_failure_sentence(&failure, "failed"),
                     });
                     journal.terminal_failure = Some(failure);
                     journal.staged_events = events;

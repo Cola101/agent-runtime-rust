@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pricing,
                 response_timeout,
                 stream_idle_timeout,
+                max_output_tokens: None,
             })?)
         }
         ProviderProtocol::OpenAiResponses => {

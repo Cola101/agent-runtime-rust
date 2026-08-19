@@ -165,6 +165,7 @@ async fn spawn_surface(seed: u8) -> Surface {
                         // under test rather than by its own timeout.
                         response_timeout_ms: 120_000,
                         stream_idle_timeout_ms: 120_000,
+                        max_output_tokens: None,
                     }],
                 },
                 mcp_servers: Vec::new(),

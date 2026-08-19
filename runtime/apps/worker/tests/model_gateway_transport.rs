@@ -985,6 +985,7 @@ async fn spawn_gateway(
         },
         response_timeout: Duration::from_secs(2),
         stream_idle_timeout: Duration::from_secs(2),
+        max_output_tokens: None,
     })
     .unwrap();
     let credential = ProviderCredential::bearer("provider-only-secret").unwrap();

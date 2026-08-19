@@ -187,7 +187,8 @@ describe("the routing file handed to the runtime", () => {
     expect(Object.keys(candidate).sort()).toEqual([
       "accepted_data_classes", "api_key_env", "capabilities",
       "cost_per_million_tokens_micros", "endpoint", "healthy", "id", "latency_ms",
-      "model", "protocol", "region", "response_timeout_ms", "stream_idle_timeout_ms",
+      "max_output_tokens", "model", "protocol", "region", "response_timeout_ms",
+      "stream_idle_timeout_ms",
     ]);
     // The region a candidate declares has to be one the routing allows, or
     // ranking drops it and the runtime starts with nothing to call.
@@ -205,5 +206,35 @@ describe("the routing file handed to the runtime", () => {
     expect(routing!.file && existsSync(routing!.file)).toBe(true);
     const parsed = JSON.parse(readFileSync(routing!.file, "utf8"));
     expect(parsed.candidates.map((c: { id: string }) => c.id)).toEqual([provider.id]);
+  });
+});
+
+/// Why the derived routing file has to carry a reply ceiling.
+///
+/// `max_tokens` is not optional in practice for an OpenAI-compatible provider.
+/// The worker fills a turn's `max_output_tokens` with the Run's *remaining
+/// budget* and the adapter forwards what it is given, so with no ceiling a
+/// desktop Run asks a real server for a 400,000-token reply and is refused:
+///
+///   max_tokens=400000 cannot be greater than max_model_len=204800.
+///
+/// Measured against a self-hosted vLLM. No conversation could be started at
+/// all. The ceiling is what makes such a provider usable, so the file the app
+/// derives always states one.
+describe("派生出来的模型路由文件", () => {
+  it("给每个 provider 写上单条回复的上限", async () => {
+    const credentials = store();
+    await credentials.save({ ...provider, secret: NOT_A_SECRET });
+    const routing = await credentials.routing();
+    const written = JSON.parse(readFileSync(routing!.file, "utf8"));
+    expect(written.candidates[0].max_output_tokens).toBeGreaterThan(0);
+  });
+
+  it("上限是操作者说了算的，写死的默认值不覆盖它", async () => {
+    const credentials = store();
+    await credentials.save({ ...provider, secret: NOT_A_SECRET, maxOutputTokens: 1234 });
+    const routing = await credentials.routing();
+    const written = JSON.parse(readFileSync(routing!.file, "utf8"));
+    expect(written.candidates[0].max_output_tokens).toBe(1234);
   });
 });

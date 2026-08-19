@@ -184,6 +184,15 @@ struct LocalProviderFile {
     cost_per_million_tokens_micros: u64,
     response_timeout_ms: u64,
     stream_idle_timeout_ms: u64,
+    /// The longest single reply this model will accept being asked for.
+    ///
+    /// Optional, and absent means absent: the adapter then forwards whatever
+    /// the caller asked for. On an OpenAI-compatible provider that is the Run's
+    /// remaining budget, which a real server rejects -- so anyone writing this
+    /// file for such a provider wants to set it. `serde(default)` because
+    /// routing files written before this field existed must still load.
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 fn load_model_routing_from_path(
@@ -234,6 +243,7 @@ fn load_model_routing_from_path(
                 cost_per_million_tokens_micros: candidate.cost_per_million_tokens_micros,
                 response_timeout_ms: candidate.response_timeout_ms,
                 stream_idle_timeout_ms: candidate.stream_idle_timeout_ms,
+                max_output_tokens: candidate.max_output_tokens,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

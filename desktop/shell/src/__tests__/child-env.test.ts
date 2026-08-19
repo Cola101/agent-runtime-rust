@@ -195,3 +195,26 @@ describe("what the app hands the runtime", () => {
     }
   });
 });
+
+/// The trusted workspace tool is its own program.
+///
+/// This pointed `AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN` at the runtime binary,
+/// with a comment saying the host re-execs itself for that role. It does not:
+/// `agent-runtime-host --stdio` answers "unsupported command --stdio". So every
+/// `workspace.read_text` and `workspace.write_text` in the desktop app failed
+/// with "tool execution failed inside its assigned sandbox" -- measured in the
+/// app against a real provider, which is the only place it shows. Every CLI
+/// test passes the separate binary, which is why nothing caught it.
+describe("the trusted workspace tool", () => {
+  it("is not the runtime binary", () => {
+    const env = childEnv.runtimeEnv({ ...base, workspace: "/w" });
+    expect(env.AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN).not.toBe("/opt/rt");
+  });
+
+  /// Beside the runtime binary: that is where the packaged bundle puts it and
+  /// where a checkout builds it.
+  it("sits beside the runtime binary", () => {
+    const env = childEnv.runtimeEnv({ ...base, workspace: "/w" });
+    expect(env.AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN).toBe("/opt/agent-trusted-workspace-tool");
+  });
+});

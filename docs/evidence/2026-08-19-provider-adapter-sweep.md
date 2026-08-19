@@ -244,6 +244,16 @@
 
 1. Line numbers have drifted about 24 lines; the quoted code is verbatim correct but sits lower in the file. The `serde_json::from_str` call is at `openai_compatible.rs:505-512`, not 481-488. `PartialToolCall` is at 485-490, not 461-466. The `[DONE]` branch calling `flush_tool_calls` is at line 200 as stated. The Anthropic comparison at `anthropi
 
+- **已关闭（2026-08-19）**：空或全空白的参数当成 `{}`。两家都这么做
+  （opencode `protocols/shared.ts:155-156` 的 `raw || "{}"`；openclaw
+  `utils/json-parse.ts:130-132`），而我们此前对一个完全合法的零参数调用**整轮报错**。
+  失败信息现在点名是哪个调用——「invalid JSON」一句话不说明十一次调用里是哪一次。
+  **同一处缺陷在 `openai_responses.rs:230` 还有第二份**，那边连测试都没有，一并关掉。
+  三处行为各有守卫，逐条破坏确认独立。
+  **仍然不同意 openclaw 的另一半**：它对截断的 JSON 一路修复、最后兜底返回 `{}`，
+  从不失败。把 `{"path": "/etc/pas` 变成 `{}` 是去跑一次模型没要过的调用，
+  对写文件或 exec 来说这不是更小的错误。
+
 ### assembled function.arguments is not valid JSON (truncated or malformed)
 
 - **面**：工具调用组装边界
@@ -1047,3 +1057,37 @@
 - **后果**：`arguments: "\"hello\""` or `"[1,2]"` passes our flush intact and reaches the worker as a non-object `Value`. It then fails at each tool's own deserialization — e.g. runtime/apps/worker/src/lib.rs:7067-7069 `serde_json::from_value::<SubagentHistoryArguments>(...).map_err(|_| WorkerAssignmentError::InvalidToolCall)` — so it is caught, but as an opaque `InvalidToolCall` at dispatch rather than as a shape error at the boundary that could name what arrived.
 - **同不同意**：**不同意** —— Caught either way, and codex's message ("arguments must be an object") is only better because codex can hand it back to the model — a channel we do not currently have. Not worth a change on its own; worth folding in if the invalid-JSON entry above is reworked to a respond-to-model shape.
 
+
+---
+
+## 追加（2026-08-19，真机撞出来的，不在原 111 条里）— **已关闭（2026-08-19）**
+
+### Provider 的原话被换成一个哈希，操作者拿不回任何线索
+
+- **怎么撞上的**：桌面 App 接真机 Qwen（vLLM），发一句话，Run 直接 `失败`。
+  转录里什么都没有；`events.jsonl` 里是：
+  `run.failed {"kind":"protocol","message":"Provider qwen-local failed; diagnostic digest 848e98e3…","retryable":false,"status":"failed"}`
+- **服务器实际说的是**（同一 endpoint 同一参数 curl 复现，HTTP 400）：
+  `max_tokens=400000 cannot be greater than max_model_len=max_total_tokens=204800. Please request fewer output tokens. (parameter=max_tokens, value=400000)`
+  这一句点名了参数、两个数字和改法。
+- **我们**：`runtime-host/src/lib.rs` 里 `LocalModelRouteFailure` 只存
+  `message_digest: hex::encode(Sha256::digest(message))`，原文在构造那一行就被丢掉；
+  四处 `format!` 把摘要拼进人看的 `Failed.message`。**摘要是单向的**——我按几种可能的
+  包装重算 SHA-256 都对不上 `848e98e3…`，也就是说连我自己也没法从这条记录反推原因。
+  这正是它的问题，不是它的缺陷证明。
+- **他们**：opencode `openai-chat.ts` 与 openclaw `openai-stop-reason.ts:36-39` 都把
+  provider 的原始 message 带进 stopReason；codex `codex-api/src/sse/responses.rs:387-421`
+  分类之后仍保留 `Retryable{message, delay}` 里的 message。三家都没有只留哈希的做法。
+- **同不同意**：同意他们。摘要有真实用途（定宽、可比、进 WAL 不涨行），但它不能是**唯一**
+  留下来的东西。
+- **改了哪里**：`LocalModelRouteFailure` 增 `message: String`（`#[serde(default)]`，
+  升级后旧路由日志仍可回放，回放时退回只报摘要）；`bounded_provider_message()` 截到
+  2 KiB 且按 char boundary 切；四处 `format!` 收敛成一个 `provider_failure_sentence()`，
+  格式为 `Provider {id} {situation}: {原话} (diagnostic digest {hex})`。
+  原话在 adapter 里已经过 `credential.redact`，所以带出来是安全的。
+- **守卫**：`multi_provider.rs::a_failed_run_repeats_what_the_provider_said_not_only_its_digest`
+  ——先红（`Provider says-why failed; diagnostic digest 88ce493e…`）后绿。
+- **配套**：`max_tokens` 送的是 Run 预算而不是单条回复上限，这条本轮同时修掉
+  （`OpenAiCompatibleConfig.max_output_tokens`，未配置就不发 `max_tokens`）。
+  两件事叠在一起才是「桌面上一句话都发不出去」的完整成因：一个让请求必然 400，
+  另一个让 400 的原因永远看不见。

@@ -13,6 +13,7 @@
 "use strict";
 
 const fs = require("node:fs");
+const path = require("node:path");
 
 /// Every scope the agent may be *asked* to use.
 ///
@@ -142,10 +143,24 @@ function runtimeEnv({
     AGENT_RUNTIME_LOCAL_MODEL_ROUTING_CONFIG: routing.file,
     ...(mcp ? { AGENT_RUNTIME_LOCAL_MCP_CONFIG: mcp.file } : {}),
     ...(workspace ? { AGENT_RUNTIME_LOCAL_WORKSPACE_ROOT: workspace } : {}),
-    // The runtime binary is also the trusted workspace tool -- it re-execs
-    // itself for that role. Pointing at the binary this app just spawned means
-    // the two can never be different builds.
-    AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN: runtimeBinary,
+    // Its own program, beside the runtime binary.
+    //
+    // This used to point at the runtime binary, with a comment claiming the
+    // host re-execs itself for that role. It does not -- `agent-runtime-host
+    // --stdio` answers "unsupported command --stdio" -- so every
+    // `workspace.read_text` and `workspace.write_text` in this app failed with
+    // "tool execution failed inside its assigned sandbox". It showed only when
+    // the app was driven end to end against a real provider: every test below
+    // this layer passes the separate binary, so nothing else could see it.
+    //
+    // Beside the runtime binary rather than looked up on PATH: a checkout
+    // builds both into one target directory and the bundle copies both into
+    // Resources, so "next to the host we were told to spawn" is the one place
+    // that is right in both, and the two can never be different builds.
+    AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN: path.join(
+      path.dirname(runtimeBinary),
+      "agent-trusted-workspace-tool",
+    ),
     // The same binary again, and again for a role it plays itself: the PTY
     // supervisor is `runtime-host __pty-session-supervisor`, wired by the host
     // rather than by this app. Setting the executable is the whole of what

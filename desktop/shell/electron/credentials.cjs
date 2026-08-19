@@ -95,10 +95,17 @@ class Credentials {
 
   /// Adds or replaces a provider. The secret is optional: changing an endpoint
   /// should not require retyping a key that is already on file.
-  async save({ id, protocol, endpoint, model, secret = null }, now = new Date()) {
+  async save({ id, protocol, endpoint, model, secret = null, maxOutputTokens = null }, now = new Date()) {
     if (!id || !/^[a-zA-Z0-9._-]{1,64}$/.test(id)) throw new Error("provider id is not usable");
     if (!endpoint || !/^https?:\/\//.test(endpoint)) throw new Error("endpoint must be http or https");
     if (!model) throw new Error("a model is required");
+    // A ceiling that is not a positive whole number is not a ceiling. Refused
+    // here rather than written out and rejected later by a provider, where the
+    // complaint arrives as a failed conversation instead of a failed save.
+    if (maxOutputTokens !== null
+      && (!Number.isInteger(maxOutputTokens) || maxOutputTokens <= 0)) {
+      throw new Error("the per-reply ceiling must be a positive whole number of tokens");
+    }
     // The spellings `ProviderProtocol::from_str` takes, which are also what
     // `provider_registry`, `edge-node` and the gateway CLI take. They reach the
     // routing file's serde path through the aliases added for exactly this --
@@ -122,6 +129,10 @@ class Credentials {
     const previous = this.#read().find((provider) => provider.id === id);
     providers.push({
       id, protocol, endpoint, model,
+      // Kept across a save that does not mention it, the same way the secret's
+      // timestamp is: editing an endpoint should not silently reset a ceiling
+      // the operator set on purpose.
+      maxOutputTokens: maxOutputTokens ?? previous?.maxOutputTokens ?? null,
       secretSetAt: secret !== null ? now.toISOString() : previous?.secretSetAt ?? null,
     });
     this.#write(providers);
@@ -167,6 +178,21 @@ class Credentials {
         cost_per_million_tokens_micros: 0,
         response_timeout_ms: 120_000,
         stream_idle_timeout_ms: 30_000,
+        // The longest single reply this model will be asked for.
+        //
+        // Not optional in practice. The worker fills a turn's
+        // `max_output_tokens` with the Run's *remaining budget* and the adapter
+        // forwards what it is given, so with nothing here a Run asks a real
+        // server for a 400,000-token reply and is refused outright:
+        //
+        //   max_tokens=400000 cannot be greater than max_model_len=204800.
+        //
+        // Measured against a self-hosted vLLM; no conversation could be started
+        // at all. The default below is a floor low enough that every model in
+        // current use accepts it and high enough for a long answer -- it is a
+        // number that keeps the app working, not a claim about this model, so
+        // an operator who knows the real ceiling overrides it.
+        max_output_tokens: provider.maxOutputTokens ?? 8192,
       });
     }
     if (candidates.length === 0) return null;

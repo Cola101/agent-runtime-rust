@@ -40,6 +40,7 @@ fn route(id: &str, endpoint: String) -> ProviderRoute {
         },
         response_timeout: Duration::from_secs(1),
         stream_idle_timeout: Duration::from_millis(75),
+        max_output_tokens: None,
     })
     .unwrap();
     ProviderRoute::new(

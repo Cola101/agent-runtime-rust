@@ -28,6 +28,7 @@ shell="$repo/desktop/shell"
 out="$repo/desktop/dist-app"
 app="$out/Runtime Desk.app"
 runtime="$repo/runtime/target/release/agent-runtime-host"
+trusted_tool="$repo/runtime/target/release/agent-trusted-workspace-tool"
 proto="$repo/contracts/proto/runtime.proto"
 
 if [[ "$(uname -sm)" != "Darwin arm64" ]]; then
@@ -37,6 +38,7 @@ fi
 
 echo "==> runtime (release)"
 cargo build --manifest-path "$repo/runtime/Cargo.toml" --release -p agent-runtime-host --bin agent-runtime-host
+cargo build --manifest-path "$repo/runtime/Cargo.toml" --release -p agent-trusted-workspace-tool
 [[ -x "$runtime" ]] || { echo "the release runtime is missing at $runtime" >&2; exit 1; }
 
 echo "==> renderer"
@@ -83,6 +85,13 @@ node "$here/bundle-deps.mjs" "$shell" "$target/node_modules"
 echo "==> resources"
 cp "$runtime" "$app/Contents/Resources/agent-runtime-host"
 chmod +x "$app/Contents/Resources/agent-runtime-host"
+# The trusted workspace tool is its own program, and the bundle shipped without
+# it: the app pointed AGENT_RUNTIME_LOCAL_TRUSTED_TOOL_BIN at the host, which
+# answers "unsupported command --stdio", so every workspace read and write in
+# an installed build failed. It goes beside the host because that is where the
+# app looks for it.
+cp "$trusted_tool" "$app/Contents/Resources/agent-trusted-workspace-tool"
+chmod +x "$app/Contents/Resources/agent-trusted-workspace-tool"
 cp "$proto" "$app/Contents/Resources/runtime.proto"
 
 # The three things the app cannot start without. Checked here rather than
@@ -94,6 +103,8 @@ for required in \
   "Contents/Resources/app/dist/index.html"; do
   [[ -e "$app/$required" ]] || { echo "the bundle is missing $required" >&2; exit 1; }
 done
+[[ -x "$app/Contents/Resources/agent-trusted-workspace-tool" ]] \
+  || { echo "the trusted workspace tool is missing from the bundle" >&2; exit 1; }
 [[ -x "$app/Contents/Resources/agent-runtime-host" ]] \
   || { echo "the bundled runtime is not executable" >&2; exit 1; }
 

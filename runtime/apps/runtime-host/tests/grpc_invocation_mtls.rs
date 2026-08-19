@@ -209,6 +209,7 @@ fn config(
                 cost_per_million_tokens_micros: 1,
                 response_timeout_ms: 5_000,
                 stream_idle_timeout_ms: 5_000,
+                max_output_tokens: None,
             }],
         },
         mcp_servers: Vec::new(),

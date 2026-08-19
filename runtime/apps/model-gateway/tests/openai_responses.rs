@@ -139,6 +139,46 @@ async fn maps_typed_items_and_requires_response_completed() {
     );
 }
 
+/// The same defect as the chat-completions adapter had, in this one.
+///
+/// A zero-argument function call arrives with `arguments` as `""`, and parsing
+/// that as JSON took the whole turn down over a perfectly well formed call.
+/// Fixed there this round; the sibling was found by the same sweep and had no
+/// test at all.
+#[tokio::test]
+async fn a_function_call_with_no_arguments_is_a_call_with_no_arguments() {
+    let sse = concat!(
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_7\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n"
+    );
+    let (endpoint, captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    let outcome = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await;
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "an argument-free call is not a malformed one: {outcome:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCall { name, arguments, .. }
+                if name == "read_file" && *arguments == json!({}))),
+        "no arguments is an empty object, not a failure: {events:?}",
+    );
+}
+
 #[tokio::test]
 async fn eof_without_terminal_event_is_a_protocol_failure() {
     let sse = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
