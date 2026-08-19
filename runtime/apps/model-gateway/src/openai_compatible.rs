@@ -1,5 +1,6 @@
 use agent_protocol::{
-    ContentPart, Message, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent, Role,
+    ContentPart, Message, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
+    ReasoningPolicy, Role,
 };
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -16,6 +17,18 @@ use zeroize::Zeroizing;
 pub struct ProviderPricing {
     pub input_million_tokens_micros: u64,
     pub output_million_tokens_micros: u64,
+    /// What a prompt token served from the provider's cache costs, when the
+    /// operator knows it.
+    ///
+    /// Separate from `input_million_tokens_micros` because it is a different
+    /// price for the same token: OpenAI bills a cache hit at a tenth of a fresh
+    /// prompt token, DeepSeek at roughly a tenth to a quarter. `None` is the
+    /// honest unset -- a discount this adapter invented would be wrong for the
+    /// next endpoint, and the safe direction for a number that ends Runs is the
+    /// one we already charge. Unset means a cache hit is billed at the full
+    /// input rate, which is what this adapter did before it read the field at
+    /// all.
+    pub cached_input_million_tokens_micros: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +46,25 @@ pub struct OpenAiCompatibleConfig {
     /// own default, which is always valid -- unlike a number we would have had
     /// to guess.
     pub max_output_tokens: Option<u64>,
+    /// Whether this endpoint accepts `reasoning_effort`, as the operator
+    /// declared it.
+    ///
+    /// Off by default, and that default is the evidence-backed one for the
+    /// servers this adapter talks to. `reasoning_effort` is an OpenAI spelling:
+    /// DeepSeek reads `thinking: {type}`, Qwen reads `enable_thinking`, Z.ai
+    /// reads its own object, and OpenRouter takes the nested `reasoning:
+    /// {effort}` shape on this very endpoint (openclaw
+    /// `providers/openai-completions.ts:826-861` branches five ways on exactly
+    /// this). openclaw's own auto-detection turns the flat field *off* for
+    /// proxy-like endpoints (`openai-completions-compat.ts:130-135`), which is
+    /// the population this adapter exists to serve.
+    ///
+    /// So sending it unasked would put an unrecognised argument in front of
+    /// every vLLM, SGLang and proxy we already talk to, to carry a policy that
+    /// no caller can currently vary -- the sole producer hardcodes
+    /// `Balanced` (`worker/src/lib.rs:6783`). Declared, it is sent and means
+    /// what it says; undeclared, the request is byte-for-byte what it was.
+    pub supports_reasoning_effort: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +126,7 @@ pub struct OpenAiCompatibleAdapter {
     response_timeout: Duration,
     stream_idle_timeout: Duration,
     max_output_tokens: Option<u64>,
+    supports_reasoning_effort: bool,
 }
 
 impl OpenAiCompatibleAdapter {
@@ -135,6 +168,7 @@ impl OpenAiCompatibleAdapter {
             response_timeout: config.response_timeout,
             stream_idle_timeout: config.stream_idle_timeout,
             max_output_tokens: config.max_output_tokens,
+            supports_reasoning_effort: config.supports_reasoning_effort,
         })
     }
 
@@ -323,6 +357,28 @@ impl OpenAiCompatibleAdapter {
             Some(ceiling) => ceiling.min(request.max_output_tokens),
             None => request.max_output_tokens,
         });
+        // How hard to think, in the spelling this endpoint uses -- but only
+        // where the operator said it has one.
+        //
+        // The same three values already go out as `reasoning: {effort}` on the
+        // Responses adapter (`openai_responses.rs:330-334`). Unsent here, one
+        // `ModelRequest` meant two different things depending on which adapter
+        // failover picked, and `Thorough` bought nothing on this path.
+        //
+        // Flat rather than nested is what chat-completions takes (openclaw
+        // `openai-completions-transport.ts:1927`, opencode
+        // `protocols/openai-chat.ts:340`); the nested object is the Responses
+        // shape, which OpenRouter confusingly also wants on this endpoint. That
+        // is one of several reasons the field is gated rather than assumed:
+        // this adapter has no model catalogue to tell OpenRouter from vLLM, so
+        // the operator is the one who knows.
+        if self.supports_reasoning_effort {
+            payload["reasoning_effort"] = json!(match request.reasoning {
+                ReasoningPolicy::Minimal => "low",
+                ReasoningPolicy::Balanced => "medium",
+                ReasoningPolicy::Thorough => "high",
+            });
+        }
         if !tools.is_empty() {
             payload["tools"] = Value::Array(tools);
             payload["tool_choice"] = Value::String("auto".into());
@@ -585,12 +641,38 @@ async fn consume_chunk(
             .get("completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // The part of the prompt the provider served from its own cache, and
+        // charged a fraction of the fresh rate for. It is a *subset* of
+        // `prompt_tokens`, not a number beside it -- opencode states that
+        // invariant outright (`packages/llm/src/schema/events.ts:7-60`) and
+        // openclaw's arithmetic proves it by subtracting
+        // (`providers/openai-completions.ts:1091`).
+        //
+        // Unread, the whole prompt was billed fresh. On an agent loop whose
+        // prompt is mostly a cache hit every turn that is several times the real
+        // charge, and `cost_micros` is not merely displayed: the worker spends
+        // it against the Run's budget (`worker/src/lib.rs:6236-6246`), so Runs
+        // died for money nobody was charged.
+        //
+        // The counts reported upward stay inclusive. A cache hit sits in the
+        // context window exactly like a fresh token; only its price differs.
+        let cached_input_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(Value::as_object)
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         emit(
             events,
             ModelStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
-                cost_micros: calculate_cost(input_tokens, output_tokens, pricing),
+                cost_micros: calculate_cost(
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    pricing,
+                ),
             },
         )
         .await?;
@@ -671,12 +753,38 @@ pub(crate) async fn emit(
         .map_err(|_| ProviderExecutionError::ConsumerClosed)
 }
 
+/// What this turn cost, in micros.
+///
+/// `input_tokens` is the provider's inclusive prompt total and
+/// `cached_input_tokens` is the subset of it served from cache. The two are made
+/// disjoint before either is priced: charging the inclusive total at the fresh
+/// rate *and* the cached subset at the cached rate would bill a cache hit twice,
+/// which is the trap openclaw's `calculateCost` (`model-utils.ts:12-18`) avoids
+/// by normalising to disjoint buckets at ingest.
+///
+/// A provider reporting more cache hits than prompt tokens is nonsense, and both
+/// TypeScript references clamp it rather than trusting it (opencode's
+/// `subtractTokens`, `protocols/shared.ts:61-76`). Here the clamp is not
+/// cosmetic: unsigned subtraction would panic in a debug build and wrap to
+/// something budget-ending in a release one. The reported cache hits are still
+/// priced in full -- we clamp our own arithmetic, we do not silently rewrite
+/// what the provider said.
 pub(crate) fn calculate_cost(
     input_tokens: u64,
     output_tokens: u64,
+    cached_input_tokens: u64,
     pricing: ProviderPricing,
 ) -> u64 {
-    let total = u128::from(input_tokens) * u128::from(pricing.input_million_tokens_micros)
+    // Unset is not a discount. Without a declared rate a cache hit costs what a
+    // fresh prompt token costs, which is what this adapter charged before it
+    // read the field -- and of the two ways to be wrong, over-charging ends a
+    // Run early while under-charging quietly overspends a budget.
+    let cached_rate = pricing
+        .cached_input_million_tokens_micros
+        .unwrap_or(pricing.input_million_tokens_micros);
+    let fresh_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let total = u128::from(fresh_input_tokens) * u128::from(pricing.input_million_tokens_micros)
+        + u128::from(cached_input_tokens) * u128::from(cached_rate)
         + u128::from(output_tokens) * u128::from(pricing.output_million_tokens_micros);
     let rounded_up = total.saturating_add(999_999) / 1_000_000;
     u64::try_from(rounded_up).unwrap_or(u64::MAX)

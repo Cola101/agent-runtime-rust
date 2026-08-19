@@ -521,7 +521,11 @@ async fn emit_usage(
         ModelStreamEvent::Usage {
             input_tokens,
             output_tokens,
-            cost_micros: calculate_cost(input_tokens, output_tokens, pricing),
+            // Zero because this adapter does not read its own cache field yet,
+            // not because a Responses turn never hits cache -- it reports
+            // `input_tokens_details.cached_tokens`, and reading it here is its
+            // own entry in the sweep.
+            cost_micros: calculate_cost(input_tokens, output_tokens, 0, pricing),
         },
     )
     .await

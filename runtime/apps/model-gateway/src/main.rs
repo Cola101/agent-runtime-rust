@@ -46,6 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "AGENT_RUNTIME_PROVIDER_OUTPUT_MILLION_TOKENS_MICROS",
             0,
         )?,
+        // Unset means unset, not zero: an absent rate bills a cache hit at the
+        // full input rate above, and a zero declared here means the operator is
+        // saying cache hits are free -- which is true of a self-hosted server
+        // and false of every paid API.
+        cached_input_million_tokens_micros: optional_parse_environment(
+            "AGENT_RUNTIME_PROVIDER_CACHED_INPUT_MILLION_TOKENS_MICROS",
+        )?,
     };
     let response_timeout = Duration::from_secs(parse_environment(
         "AGENT_RUNTIME_PROVIDER_RESPONSE_TIMEOUT_SECONDS",
@@ -64,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 response_timeout,
                 stream_idle_timeout,
                 max_output_tokens: None,
+                supports_reasoning_effort: parse_environment(
+                    "AGENT_RUNTIME_PROVIDER_SUPPORTS_REASONING_EFFORT",
+                    false,
+                )?,
             })?)
         }
         ProviderProtocol::OpenAiResponses => {
@@ -260,4 +271,18 @@ where
     T::Err: std::error::Error + 'static,
 {
     Ok(environment(name, &default.to_string()).parse::<T>()?)
+}
+
+/// Like `parse_environment`, for a setting whose absence is a fact rather than
+/// a number: unset stays `None` instead of collapsing onto a default that would
+/// claim something the operator never said.
+fn optional_parse_environment<T>(name: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + 'static,
+{
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value.parse::<T>()?)),
+        Err(_) => Ok(None),
+    }
 }

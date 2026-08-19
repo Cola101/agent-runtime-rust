@@ -37,10 +37,12 @@ fn route(id: &str, endpoint: String) -> ProviderRoute {
         pricing: ProviderPricing {
             input_million_tokens_micros: 0,
             output_million_tokens_micros: 0,
+            cached_input_million_tokens_micros: None,
         },
         response_timeout: Duration::from_secs(1),
         stream_idle_timeout: Duration::from_millis(75),
         max_output_tokens: None,
+        supports_reasoning_effort: false,
     })
     .unwrap();
     ProviderRoute::new(

@@ -21,6 +21,7 @@ fn config(endpoint: String) -> AnthropicMessagesConfig {
         pricing: ProviderPricing {
             input_million_tokens_micros: 1_000_000,
             output_million_tokens_micros: 2_000_000,
+            cached_input_million_tokens_micros: None,
         },
         response_timeout: Duration::from_secs(5),
         stream_idle_timeout: Duration::from_secs(5),

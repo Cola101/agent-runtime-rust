@@ -982,10 +982,12 @@ async fn spawn_gateway(
         pricing: ProviderPricing {
             input_million_tokens_micros: 1_000_000,
             output_million_tokens_micros: 2_000_000,
+            cached_input_million_tokens_micros: None,
         },
         response_timeout: Duration::from_secs(2),
         stream_idle_timeout: Duration::from_secs(2),
         max_output_tokens: None,
+        supports_reasoning_effort: false,
     })
     .unwrap();
     let credential = ProviderCredential::bearer("provider-only-secret").unwrap();

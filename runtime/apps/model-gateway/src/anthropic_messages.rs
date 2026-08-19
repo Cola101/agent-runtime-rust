@@ -233,6 +233,12 @@ impl AnthropicMessagesAdapter {
                             cost_micros: calculate_cost(
                                 state.input_tokens,
                                 state.output_tokens,
+                                // Zero because this adapter does not read
+                                // `cache_read_input_tokens` yet, not because an
+                                // Anthropic turn never hits cache. Its own entry
+                                // in the sweep, and its own shape: Anthropic
+                                // reports the buckets disjoint already.
+                                0,
                                 self.pricing,
                             ),
                         },

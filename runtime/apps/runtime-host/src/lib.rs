@@ -2929,6 +2929,14 @@ impl LocalRuntimeHost {
             let pricing = ProviderPricing {
                 input_million_tokens_micros: candidate.cost_per_million_tokens_micros,
                 output_million_tokens_micros: candidate.cost_per_million_tokens_micros,
+                // This config carries one rate and spends it on both buckets
+                // above, so it has nothing truthful to say about a third. Unset
+                // bills a cache hit at that same rate -- what this adapter
+                // charged before it read the field, and the direction that ends
+                // a Run early rather than overspending it. Letting an operator
+                // state a real cached rate is the follow-up, and it belongs on
+                // `LocalProviderConfig` beside `cost_per_million_tokens_micros`.
+                cached_input_million_tokens_micros: None,
             };
             let adapter = match candidate.protocol {
                 ProviderProtocol::OpenAiCompatible => ProviderAdapter::from(
@@ -2941,6 +2949,11 @@ impl LocalRuntimeHost {
                             candidate.stream_idle_timeout_ms,
                         ),
                         max_output_tokens: candidate.max_output_tokens,
+                        // Undeclared until this config can carry the operator's
+                        // answer. A desktop provider here is most often a local
+                        // vLLM or an OpenAI-compatible proxy, neither of which
+                        // reliably knows the field.
+                        supports_reasoning_effort: false,
                     })
                     .map_err(|error| LocalRuntimeError::Configuration(error.to_string()))?,
                 ),

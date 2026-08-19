@@ -45,10 +45,12 @@ fn config(endpoint: String) -> OpenAiCompatibleConfig {
         pricing: ProviderPricing {
             input_million_tokens_micros: 1_000_000,
             output_million_tokens_micros: 2_000_000,
+            cached_input_million_tokens_micros: None,
         },
         response_timeout: Duration::from_secs(5),
         stream_idle_timeout: Duration::from_secs(5),
         max_output_tokens: None,
+        supports_reasoning_effort: false,
     }
 }
 
@@ -1357,6 +1359,187 @@ async fn private_object_storage_image_is_rejected_before_provider_egress() {
                     .into(),
         }
     );
+}
+
+/// A prompt token served from the provider's cache is not a prompt token at the
+/// full price, and this adapter charged for it as if it were.
+///
+/// `prompt_tokens` is an inclusive total with `prompt_tokens_details.cached_tokens`
+/// as a subset of it -- all three references agree on that shape and two of them
+/// restructured their usage model around it (opencode
+/// `packages/llm/src/schema/events.ts:7-60` states the invariant outright;
+/// openclaw `providers/openai-completions.ts:1091` subtracts so the priced
+/// buckets stay disjoint). Multiplying the whole inclusive total by the fresh
+/// input rate bills the cache hit at ten times what OpenAI charges for it.
+///
+/// This is not only a wrong number on a screen. `cost_micros` is what the worker
+/// adds to `budget_usage.cost_micros` (`worker/src/lib.rs:6236-6246`), and that
+/// is what ends a Run for budget exhaustion -- so an agent loop whose prompt is
+/// mostly a cache hit every turn gets killed for money it never spent.
+///
+/// The token counts stay inclusive on the way out. `input_tokens` is what the
+/// context window holds, and a cache hit occupies the context exactly like a
+/// fresh token does; only the price differs.
+#[tokio::test]
+async fn a_cached_prompt_token_is_billed_at_the_cached_rate_rather_than_the_full_one() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let mut settings = config(endpoint);
+    // A tenth of the fresh input rate, which is what OpenAI actually charges
+    // for a cache hit.
+    settings.pricing.cached_input_million_tokens_micros = Some(100_000);
+    let adapter = OpenAiCompatibleAdapter::new(settings).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    captured.await.unwrap();
+    server.await.unwrap();
+
+    let usage = events
+        .iter()
+        .find(|event| matches!(event, ModelStreamEvent::Usage { .. }))
+        .expect("the turn must report what it used");
+    assert_eq!(
+        usage,
+        // 200 fresh at 1 micro + 800 cached at 0.1 micro + 10 output at 2
+        // micros. Billing all 1000 as fresh would be 1020.
+        &ModelStreamEvent::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cost_micros: 300,
+        },
+    );
+}
+
+/// A provider that reports more cache hits than prompt tokens must not take the
+/// billed input below zero.
+///
+/// Both TypeScript references clamp this explicitly and one of them says why:
+/// opencode's `subtractTokens` (`packages/llm/src/protocols/shared.ts:61-76`)
+/// documents "clamping to zero if the provider reports a non-sensical breakdown
+/// (e.g. `cached_tokens > prompt_tokens`)", and openclaw's Responses sibling
+/// carries the same note. In their languages an underflow is a negative number;
+/// in ours `u64` subtraction panics in a debug build and wraps to 18 quintillion
+/// in a release one, which as a cost would exhaust any budget instantly.
+///
+/// The reported `input_tokens` stays what the provider said the prompt was. We
+/// do not get to correct its arithmetic, only to refuse to crash on it.
+#[tokio::test]
+async fn a_cache_hit_larger_than_the_prompt_does_not_underflow_the_billed_input() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":1200}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let mut settings = config(endpoint);
+    settings.pricing.cached_input_million_tokens_micros = Some(100_000);
+    let adapter = OpenAiCompatibleAdapter::new(settings).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    captured.await.unwrap();
+    server.await.unwrap();
+
+    let usage = events
+        .iter()
+        .find(|event| matches!(event, ModelStreamEvent::Usage { .. }))
+        .expect("the turn must report what it used");
+    assert_eq!(
+        usage,
+        // No fresh input left to bill, 1200 cached at 0.1 micro, 10 output at 2.
+        &ModelStreamEvent::Usage {
+            input_tokens: 1000,
+            output_tokens: 10,
+            cost_micros: 140,
+        },
+    );
+}
+
+/// `ReasoningPolicy` said how hard to think and this adapter never told the
+/// provider, so on the chat-completions path the policy meant nothing.
+///
+/// The sibling adapter one file over already maps the same three values
+/// (`openai_responses.rs:330-334` -> `reasoning: {effort}`), so the same
+/// `ModelRequest` meant two different things depending on which adapter failover
+/// picked. The flat `reasoning_effort` spelling is the chat-completions one:
+/// openclaw sets it at `openai-completions-transport.ts:1927` and opencode at
+/// `packages/llm/src/protocols/openai-chat.ts:340`, while the nested object
+/// belongs to Responses (and, awkwardly, to OpenRouter on this same endpoint).
+///
+/// It is sent only where the operator declared the endpoint takes it. That gate
+/// is openclaw's posture too -- its `supportsReasoningEffort`
+/// (`openai-completions-compat.ts:130-135`) turns the field off for Mistral,
+/// Z.ai, Together, xAI and proxy-like endpoints, which is the population this
+/// adapter serves. DeepSeek reads `thinking: {type}` instead and Qwen reads
+/// `enable_thinking`, so an unasked `reasoning_effort` is at best ignored and at
+/// worst an unrecognised argument on every request we already make.
+#[tokio::test]
+async fn the_reasoning_policy_is_sent_only_to_an_endpoint_that_declared_it() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    for (declared, policy, expected) in [
+        (true, ReasoningPolicy::Minimal, json!("low")),
+        (true, ReasoningPolicy::Balanced, json!("medium")),
+        (true, ReasoningPolicy::Thorough, json!("high")),
+        // Undeclared: the request must be exactly what it was before this
+        // adapter knew the field existed.
+        (false, ReasoningPolicy::Thorough, Value::Null),
+    ] {
+        let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+        let mut settings = config(endpoint);
+        settings.supports_reasoning_effort = declared;
+        let adapter = OpenAiCompatibleAdapter::new(settings).unwrap();
+        let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let mut request = model_request();
+        request.reasoning = policy;
+        adapter
+            .execute(&request, &credential, CancellationToken::new(), events_tx)
+            .await
+            .unwrap();
+        while events_rx.recv().await.is_some() {}
+        let sent = captured.await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            sent.body["reasoning_effort"], expected,
+            "{policy:?} against an endpoint that declared {declared}: {}",
+            sent.body,
+        );
+    }
 }
 
 async fn spawn_complete_server(

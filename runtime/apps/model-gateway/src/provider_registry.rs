@@ -128,6 +128,9 @@ impl ModelPolicyRouteResolver {
             let pricing = ProviderPricing {
                 input_million_tokens_micros: 0,
                 output_million_tokens_micros: 0,
+                // Not carried by the routing config yet, alongside the two
+                // rates above it that are also still zero here.
+                cached_input_million_tokens_micros: None,
             };
             let adapter = match protocol {
                 ProviderProtocol::OpenAiCompatible => {
@@ -145,6 +148,11 @@ impl ModelPolicyRouteResolver {
                         // ceiling for their model is the follow-up, and it
                         // belongs on the routing candidate beside the model.
                         max_output_tokens: None,
+                        // Likewise not carried by the routing config, and the
+                        // routed population is the proxy-like one that is least
+                        // likely to accept the field. Undeclared until an
+                        // operator can say otherwise.
+                        supports_reasoning_effort: false,
                     })?)
                 }
                 ProviderProtocol::OpenAiResponses => {
