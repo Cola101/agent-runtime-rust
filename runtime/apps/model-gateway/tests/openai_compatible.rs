@@ -221,6 +221,235 @@ async fn reasoning_content_is_read_under_its_other_name() {
     );
 }
 
+/// A provider that streams content as parts, not as a bare string.
+///
+/// `delta.content` is typed `string | null` by OpenAI, and several providers
+/// send an array of parts instead (openclaw handles it and names Mistral's
+/// thinking models: `openclaw/packages/ai/src/transports/openai-completions-transport.ts:1061-1101`).
+/// `as_str()` returns None for an array, so the whole answer was skipped and
+/// the Run finished `succeeded` with nothing in it -- the worst shape a
+/// failure can take, because nothing anywhere says it happened.
+#[tokio::test]
+async fn content_streamed_as_parts_is_not_silently_dropped() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"Hel\"}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"lo\"}]},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let answer = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        answer, "Hello",
+        "a part-shaped answer must still be the answer: {events:?}"
+    );
+}
+
+/// A thinking part inside `delta.content` is thinking, not answer.
+#[tokio::test]
+async fn a_thinking_part_inside_content_is_reported_as_thinking() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"weighing it\"},{\"type\":\"text\",\"text\":\"done\"}]},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::ReasoningDelta { text, .. } if text == "weighing it")),
+        "a thinking part must not be read as the answer: {events:?}",
+    );
+    let answer = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(answer, "done");
+}
+
+/// A provider that repeats the tool call id and name on every fragment.
+///
+/// Both references replace these; we appended. Azure and some vLLM builds
+/// resend the full id and name with each argument fragment, which turned one
+/// call into `call_1call_1call_1` naming `read_fileread_file` -- a Tool that
+/// does not exist, refused by the runtime, with the model told nothing useful.
+#[tokio::test]
+async fn a_repeated_tool_call_id_and_name_are_not_concatenated() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"th\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let call = events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id, name, arguments)),
+            _ => None,
+        })
+        .expect("a tool call must be assembled");
+    assert_eq!(call.0, "call_1", "an id resent is the same id: {events:?}");
+    assert_eq!(
+        call.1, "read_file",
+        "a name resent is the same name: {events:?}"
+    );
+    assert_eq!(call.2["path"], "a.txt");
+}
+
+/// A refusal is words the model produced, and it arrives on its own field.
+///
+/// `content` is null when a model refuses; the text is in `refusal`. Reading
+/// only content meant a refusal was reported as a successful, empty answer.
+#[tokio::test]
+async fn a_streamed_refusal_is_not_reported_as_an_empty_success() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"refusal\":\"I cannot help with that.\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::Refusal { text } if text == "I cannot help with that.")),
+        "a refusal must reach the client rather than becoming an empty answer: {events:?}",
+    );
+}
+
+/// A terminal word this build has never seen must not destroy a finished
+/// answer.
+///
+/// We were the only one of the three that turned an unrecognised
+/// `finish_reason` into a hard, non-retryable protocol error -- after the text
+/// had already streamed to the person, and after the tokens had been paid for.
+#[tokio::test]
+async fn an_unknown_finish_reason_does_not_throw_away_the_answer() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answered\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"eos_token\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "an unrecognised terminal word must not fail a finished answer: {outcome:?}",
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::TextDelta { text, .. } if text == "answered")),
+        "the answer that already streamed must survive: {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Completed { .. })),
+        "the turn must still end: {events:?}",
+    );
+}
+
 #[tokio::test]
 async fn cancellation_stops_a_live_provider_http_stream_without_waiting_for_timeout() {
     let first_delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"started\"},\"finish_reason\":null}]}\n\n";
@@ -379,11 +608,25 @@ async fn http_429_is_classified_without_leaking_the_bearer_token() {
     assert!(!format!("{error:?}").contains("do-not-log-this-token"));
 }
 
+/// Only the arguments are streamed in fragments.
+///
+/// This test used to send the *name* in two pieces (`read_` then `file`) and
+/// assert they were concatenated. No reference implementation does that, and
+/// nothing on the wire produces it: both read the identity fields as
+/// last-value-wins and append only the arguments --
+/// `opencode/packages/llm/src/protocols/utils/tool-stream.ts:125-132`
+/// (`delta.id ?? current?.id`, `input: current.input + delta.text`) and
+/// `openclaw/packages/ai/src/transports/openai-completions-transport.ts:771-778`
+/// (`block.id = toolCall.id`, `block.name = ...`, `block.partialArgs += ...`).
+///
+/// The old premise was not merely unused: it forced the concatenating
+/// assembly that turns a provider resending its id and name on every fragment
+/// into a call named `read_fileread_file`.
 #[tokio::test]
 async fn fragmented_streamed_tool_call_is_assembled_before_completion() {
     let sse = concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_42\",\"function\":{\"name\":\"read_\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_42\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
     let (endpoint, _captured, server) = spawn_complete_server(200, sse).await;

@@ -204,6 +204,11 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
     state: { state: "terminal", status: "failed" },
     events: [
       ev("run.started", { status: "running" }, RUN_BROKE, 25),
+      // What a reasoning model actually sends: many fragments of thinking for
+      // every fragment of answer. Copied from a real self-hosted vLLM serving
+      // Qwen3, which sent 34 of these for a two-character reply.
+      ev("model.reasoning.delta", { text: "用户要我读整个目录。" }, RUN_BROKE, 25),
+      ev("model.reasoning.delta", { text: "先看看有哪些子目录，再决定读哪几个文件。" }, RUN_BROKE, 25),
       // One server answered and one did not. The Run carries on without the
       // second one's tools, which is the case that used to look like nothing.
       ev("mcp.discovery.completed", {

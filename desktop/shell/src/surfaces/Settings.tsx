@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { register } from "./registry";
 import { effectLabel, sandboxLabel, shortId, since } from "./model";
+import { linkSummary } from "./Link";
 import { useDesk } from "../desk";
 
 /// Which of these actually reach the runtime, and which only configure this
@@ -24,12 +25,7 @@ function Connection() {
       <dt>传输</dt>
       <dd>本机 Unix socket（runtime-host 的本地适配器）</dd>
       <dt>状态</dt>
-      <dd>
-        {link.state === "live" && "已连上"}
-        {link.state === "unreachable" && `连不上 —— ${link.reason}`}
-        {link.state === "unconfigured" && "没有配置 —— 客户端不会去猜路径"}
-        {link.state === "no-bridge" && "不在桌面宿主里运行"}
-      </dd>
+      <dd>{linkSummary(link).row}</dd>
       <dt>socket</dt>
       <dd className="mono">
         {link.state === "live" || link.state === "unreachable" ? link.socketPath : "—"}

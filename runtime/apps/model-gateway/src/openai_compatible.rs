@@ -407,18 +407,32 @@ async fn consume_chunk(
             )
             .await?;
         }
-        if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
-            // The choice's own index. This protocol has one content stream per
-            // choice, so the choice *is* the block, and a provider asked for
-            // more than one completion produces more than one.
-            let block = choice["index"]
-                .as_u64()
-                .map(|index| u32::try_from(index).unwrap_or(u32::MAX));
+        // The choice's own index. This protocol has one content stream per
+        // choice, so the choice *is* the block, and a provider asked for more
+        // than one completion produces more than one.
+        let block = choice["index"]
+            .as_u64()
+            .map(|index| u32::try_from(index).unwrap_or(u32::MAX));
+        // `content` is typed `string | null` by OpenAI and sent as an array of
+        // parts by several providers. Reading only the string meant an entire
+        // answer could be skipped in silence: the Run reached `[DONE]` with a
+        // finish_reason and reported success having emitted nothing, which is
+        // the worst shape a failure can take because nothing says it happened.
+        for said in content_parts(&delta["content"]) {
+            let event = match said {
+                Said::Text(text) => ModelStreamEvent::TextDelta { text, block },
+                Said::Thinking(text) => ModelStreamEvent::ReasoningDelta { text, block },
+            };
+            emit(events, event).await?;
+        }
+        // A refusal is words the model produced, on its own field, with
+        // `content` null beside it. Unread, a refusal was a successful empty
+        // answer -- and the Run's own record said the model had said nothing.
+        if let Some(text) = delta["refusal"].as_str().filter(|text| !text.is_empty()) {
             emit(
                 events,
-                ModelStreamEvent::TextDelta {
-                    text: text.into(),
-                    block,
+                ModelStreamEvent::Refusal {
+                    text: text.to_owned(),
                 },
             )
             .await?;
@@ -433,10 +447,21 @@ async fn consume_chunk(
                 )
             })?;
             let partial = tool_calls.entry(index).or_default();
-            if let Some(id) = fragment["id"].as_str() {
+            // Replaced, not appended. Only `arguments` is streamed in
+            // fragments; the id and the name are identity, and several
+            // providers resend them whole with every fragment. Appending
+            // turned one call into `call_1call_1call_1` naming
+            // `read_fileread_file` -- a Tool that does not exist, refused by
+            // the runtime, with the model told nothing it could act on.
+            if let Some(id) = fragment["id"].as_str().filter(|id| !id.is_empty()) {
+                partial.id.clear();
                 partial.id.push_str(id);
             }
-            if let Some(name) = fragment["function"]["name"].as_str() {
+            if let Some(name) = fragment["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+            {
+                partial.name.clear();
                 partial.name.push_str(name);
             }
             if let Some(arguments) = fragment["function"]["arguments"].as_str() {
@@ -449,13 +474,18 @@ async fn consume_chunk(
                 "tool_calls" | "function_call" => ModelFinishReason::ToolCalls,
                 "length" => ModelFinishReason::Length,
                 "content_filter" => ModelFinishReason::ContentFilter,
+                // A terminal word this build has never seen still means the
+                // turn ended. `eos_token`, `end_turn` and `COMPLETE` are all
+                // in the wild, and refusing them destroyed a finished answer:
+                // the text had already streamed to the person and the tokens
+                // had already been paid for, and the Run failed anyway. None
+                // of the three reference implementations does that.
                 value => {
-                    return Err(provider_error(
-                        ModelErrorKind::Protocol,
-                        false,
-                        None,
-                        format!("unsupported provider finish_reason {value}"),
-                    ));
+                    tracing::debug!(
+                        finish_reason = value,
+                        "provider ended the turn with a word this build does not know",
+                    );
+                    ModelFinishReason::Stop
                 }
             });
         }
@@ -598,6 +628,54 @@ pub(crate) fn classify_transport_error(error: reqwest::Error) -> ProviderExecuti
 
 pub(crate) fn capability_error(message: impl Into<String>) -> ProviderExecutionError {
     provider_error(ModelErrorKind::CapabilityMismatch, false, None, message)
+}
+
+/// One thing the model said in a content part.
+enum Said {
+    Text(String),
+    Thinking(String),
+}
+
+/// Everything a `delta.content` carries, whichever shape it came in.
+///
+/// OpenAI types this `string | null`; providers send an array of typed parts
+/// as well. openclaw handles all three and names Mistral's thinking models
+/// (`openclaw/packages/ai/src/transports/openai-completions-transport.ts:1061-1101`),
+/// with a note that coercing the objects had produced literal "[object Object]"
+/// in stored transcripts. Reading only the string is quieter and worse: the
+/// answer simply is not there, and nothing says so.
+fn content_parts(content: &Value) -> Vec<Said> {
+    match content {
+        Value::String(text) if !text.is_empty() => vec![Said::Text(text.clone())],
+        Value::Array(parts) => parts.iter().flat_map(content_parts).collect(),
+        Value::Object(part) => {
+            let kind = part
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let text = part
+                .get("text")
+                .or_else(|| part.get("content"))
+                .or_else(|| part.get("thinking"))
+                .map(content_parts)
+                .unwrap_or_default();
+            // A thinking part is thinking wherever it appears. Routed to the
+            // reasoning stream rather than the answer, because the two are
+            // read by a person for different purposes and mixing them buries
+            // the reply.
+            if kind.contains("thinking") || kind.contains("reasoning") {
+                text.into_iter()
+                    .map(|said| match said {
+                        Said::Text(text) | Said::Thinking(text) => Said::Thinking(text),
+                    })
+                    .collect()
+            } else {
+                text
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 pub(crate) fn provider_error(

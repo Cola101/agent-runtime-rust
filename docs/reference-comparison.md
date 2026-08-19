@@ -2583,6 +2583,65 @@ Codex 那句警告正是为这种情况写的，而**我们这边它更要紧**�
 详见 `docs/evidence/2026-08-19-restart-during-a-turn.md`。
 
 
+
+## 2026-08-19（三）：流式思考——第一次接真机就撞出来的洞
+
+### 事实
+
+拿到一台自建 vLLM（Qwen3-27B）之后的第一次真实请求，抓下来的分片是这样：
+
+```
+delta keys seen: {'role': 1, 'content': 2, 'reasoning': 34}
+finish_reason: stop
+```
+
+**34 条 `reasoning`，2 条 `content`。** 而
+`runtime/apps/model-gateway/src/openai_compatible.rs` 只读 `delta["content"]`——
+思考的全过程被整段丢掉，人在屏幕前看到的是一片空白，最后蹦出四个字。
+
+一句话的问题尚且 6:1，编码任务只会更悬殊。
+
+### Codex 怎么做的
+
+| 位置 | 内容 |
+| --- | --- |
+| `codex-rs/protocol/src/protocol.rs:1462` | `ReasoningContentDelta(ReasoningContentDeltaEvent)`，和 `AgentMessageContentDelta` 并列 |
+| 同上 `:1875-1883` | `{ thread_id, turn_id, item_id, delta: String, summary_index: i64 }` |
+
+**理由**：思考是流式的，和答案的流式分片是同一类东西——增量，带一个块序号让客户端知道该往哪一段里追加。
+不是等它结束再给一份摘要。
+
+**我们同意**，而且我们本来就有对称的形状：`TextDelta { text, block }`。
+所以补的是 `ReasoningDelta { text, block }`，一路打通
+protocol → kernel（`model.reasoning.delta`）→ worker → proto → gRPC → 适配器 → 客户端。
+
+两个拼写都读：`reasoning`（vLLM 服务 Qwen3 发的）和 `reasoning_content`
+（DeepSeek 的 API、以及 vLLM / SGLang 的 reasoning parser 发的）。
+
+### 有意没做的一件事
+
+**不写进冻结转录。** 流式思考要不要在下一轮回传给模型，每家答案都不一样，
+那是一个耐久格式决定。今天「会流式思考的 Provider 对转录一个字都不贡献」，
+这次改动保持这一点不变，只把它显示出来。
+
+### 真机验收
+
+| 场景 | 结果 |
+| --- | --- |
+| 普通问答 | `succeeded`；**116 条** `model.reasoning.delta`（401 字）+ 19 条 `model.output.delta` |
+| 工具调用 | 调用 → 审批 → 执行 → 读回真实文件内容 → 作答 |
+
+修之前这 116 条**一条都不存在**。
+
+### 这件事本身的教训
+
+这个洞是**靠真机偶然撞上**的，不是扫出来的。协议适配是最底层的一层，
+而 Codex / OpenClaw / opencode 的源码就在本地——正确做法是拿它们把适配器
+**逐字段**扫一遍，而不是等真机把洞一个一个撞出来。
+四条并行扫描线已经派出去（流式分片全字段 / 错误与重试分类 / 请求体全字段 /
+工具调用组装边界），结论回来之后单独成节。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`

@@ -11,6 +11,7 @@
 /// new person is guaranteed to see.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { App } from "../App";
 import { installFakeRuntime } from "./fake-runtime";
 
@@ -45,6 +46,33 @@ describe("the first launch", () => {
     // The socket path is not the person's problem and naming it reads as a
     // fault in the app rather than a step they have not taken.
     expect(screen.queryByText(/runtime-host\.sock/)).toBeNull();
+  });
+
+  /// The identity in the corner is the first thing a person reads about the
+  /// state of the app, and on a fresh install it said 无宿主 -- the host is
+  /// there, it just has no Provider yet. Three of the seven link states fell
+  /// through to that word, including the one every fresh install starts in.
+  it("does not call a host that is present and unconfigured 无宿主", async () => {
+    withoutAProvider();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/还没配 Provider/)).toBeTruthy());
+    expect(screen.queryByText("无宿主")).toBeNull();
+  });
+
+  /// The connection row on the settings page said nothing at all for the same
+  /// three states -- a blank where the one fact the row exists for belongs.
+  it("says what the connection is, on the page about the connection", async () => {
+    const user = userEvent.setup();
+    withoutAProvider();
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /设置/ })).toBeTruthy());
+    await user.click(
+      screen.getAllByRole("button", { name: /^设置/ }).find((node) => node.classList.contains("r"))!,
+    );
+    // The 状态 row itself. It named four of the seven states and drew a blank
+    // for this one -- on the page whose whole subject is the connection.
+    await waitFor(() =>
+      expect(screen.getByText(/没有 Provider，所以没启动 Runtime/)).toBeTruthy());
   });
 
   it("says where to go, in the words the rail uses for that surface", async () => {

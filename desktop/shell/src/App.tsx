@@ -4,6 +4,7 @@ import { DeskContext, useDesk, waiting, type Desk } from "./desk";
 import { DRAWER_KEY, PALETTE_KEY, SHELL_KEYS, keyLabel, type Shell } from "./shell-keys";
 import { useRuntime } from "./store";
 import { Palette } from "./Palette";
+import { linkSummary } from "./surfaces/Link";
 import "./surfaces/Chat";
 import "./surfaces/Conversations";
 import "./surfaces/Workspace";
@@ -52,11 +53,7 @@ function Identity() {
     return () => document.removeEventListener("mousedown", away);
   }, [open]);
 
-  const state =
-    link.state === "live" ? "已连上"
-    : link.state === "unreachable" ? "连不上"
-    : link.state === "unconfigured" ? "未配置"
-    : "无宿主";
+  const state = linkSummary(link).short;
 
   return (
     <div className="who" ref={box}>

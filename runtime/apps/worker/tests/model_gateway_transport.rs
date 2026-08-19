@@ -412,11 +412,21 @@ async fn worker_cancellation_crosses_grpc_and_closes_the_provider_http_stream() 
     provider_server.await.unwrap();
 }
 
+/// Only the arguments are streamed in fragments.
+///
+/// This used to send the *name* in two pieces and assert they were joined. No
+/// reference implementation does that: both read the identity fields as
+/// last-value-wins and append only the arguments --
+/// `opencode/packages/llm/src/protocols/utils/tool-stream.ts:125-132` and
+/// `openclaw/packages/ai/src/transports/openai-completions-transport.ts:771-778`.
+/// The premise was not idle: it forced a concatenating assembly, which turns a
+/// provider that resends its id and name on every fragment into a call named
+/// `read_fileread_file`.
 #[tokio::test]
 async fn tool_call_survives_the_provider_and_grpc_stream_boundaries() {
     let sse = concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"function\":{\"name\":\"read_\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\",\"arguments\":\"notes.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"notes.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
     let (provider_endpoint, _provider_request, provider_server) = spawn_provider(sse).await;
