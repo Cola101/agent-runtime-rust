@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { asMarkdown } from "../export";
 import { register } from "./registry";
 import {
   belongsInConversation, callLine, costCapLabel, costLabel, doing, durationCapLabel,
@@ -18,6 +19,7 @@ import type { RunView } from "../store";
 import { textOf, type SessionView } from "../session";
 import { lineage, subagentsOf, type SubagentState } from "../subagents";
 import { Mark } from "./Mark";
+import { Markdown } from "./markdown";
 import { WriteReview } from "./WriteReview";
 
 /// What one tool call draws: the tool's name, and its arguments as the line
@@ -339,15 +341,21 @@ function Transcript({ run, writing, query }: { run: RunView; writing: boolean; q
   const flushText = (key: string, last = false) => {
     if (!text) return;
     blocks.push(
-      <div className="rep" key={`t-${key}`}>
-        <p>
-          <Mark text={text} query={query} />
-          {/* Only on the block still being written, and only while the Run is
-              producing text. A sentence that stops mid-clause reads the same
-              whether more is coming or the model finished there, and the
-              status line is too far from the words to answer it. */}
-          {last && writing && <span className="writing" aria-label="还在写" />}
-        </p>
+      // The caret is an attribute rather than an element because it belongs at
+      // the end of the last *rendered* line, and after markdown that line may
+      // be a list item or a line of code rather than a paragraph. CSS can put
+      // it there; a sibling element cannot without guessing.
+      //
+      // Only while the Run is producing text: a sentence that stops mid-clause
+      // reads the same whether more is coming or the model finished there, and
+      // the status line is too far from the words to answer it.
+      <div
+        className="rep"
+        key={`t-${key}`}
+        data-writing={last && writing ? "" : undefined}
+        aria-busy={last && writing ? true : undefined}
+      >
+        <Markdown text={text} query={query} />
       </div>,
     );
     text = "";
@@ -630,7 +638,7 @@ function Turns({ session, query }: { session: SessionView; query: string }) {
         return (
           <div className="turn" key={turn.digest || turn.turn_ordinal}>
             {said && <div className="ask"><Mark text={said} query={query} /></div>}
-            {back && <div className="rep"><p><Mark text={back} query={query} /></p></div>}
+            {back && <div className="rep"><Markdown text={back} query={query} /></div>}
             {/* Both are refused while a Turn is in flight, so neither is
                 offered then. A control that is certain to be refused is the
                 same mistake as a key hint for a key that does nothing. */}
@@ -1306,6 +1314,20 @@ register({
       hint: "下一句话会开一段新的",
       when: (desk) => desk.current !== null,
       run: (desk) => desk.newConversation(),
+    },
+    {
+      id: "chat:copy",
+      title: "复制这段对话",
+      hint: "Markdown，放进剪贴板",
+      // Only the conversation on screen. "Whatever is current" would put a
+      // different conversation on the clipboard than the one being read, and a
+      // clipboard gives no clue where its contents came from.
+      when: (desk) => desk.current !== null,
+      run: (desk) => {
+        const session = desk.current;
+        if (!session) return;
+        void navigator.clipboard?.writeText(asMarkdown(session));
+      },
     },
     {
       id: "chat:cancel",

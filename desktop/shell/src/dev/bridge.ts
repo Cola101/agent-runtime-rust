@@ -272,6 +272,34 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
   },
 };
 
+/// A reply with the shapes a real one has.
+///
+/// The fixture used to be one short sentence, which meant the column could be
+/// looked at and still say nothing about how a reply reads -- a renderer that
+/// drew markdown as flat prose looked identical to one that drew it properly.
+/// Every block this client knows how to draw appears here once.
+const REPLY = `改好了。下面是这次动过的地方。
+
+## 改了什么
+
+写入 \`notes.txt\` 用的是 **工作区工具**，不是 shell，所以这一步走的是受信任根目录里的路径检查：
+
+\`\`\`rust
+let path = trusted.resolve(request.path)?;
+fs::write(&path, request.text)?;
+Ok(WriteResult { bytes: request.text.len() })
+\`\`\`
+
+有三点要注意：
+
+1. 原来的文件是空的，现在有一行；
+2. 路径在受信任根之外会被拒绝，*不会*落盘；
+3. 写入不是原子的，中途失败会留下半个文件。
+
+> 如果要原子写，得先写临时文件再 rename。
+
+细节见 [工作区工具说明](https://example.com/workspace)。`;
+
 const TURNS: SessionTurn[] = [
   {
     turn_ordinal: 1, run_id: RUN_WAITING, digest: "a1b2".repeat(16),
@@ -284,10 +312,11 @@ const TURNS: SessionTurn[] = [
     turn_ordinal: 2, run_id: RUN_DONE, digest: "c3d4".repeat(16),
     transcript: [
       { role: "user", content: [{ type: "text", text: "把结论写进 notes.txt" }] },
-      { role: "assistant", content: [{ type: "text", text: "改好了。" }] },
+      { role: "assistant", content: [{ type: "text", text: REPLY }] },
     ],
   },
 ];
+
 
 import type { Bridge, SessionTurn } from "../runtime";
 

@@ -349,6 +349,31 @@ describe("the command palette", () => {
     expect(screen.queryByText("停止当前 Run")).toBeNull();
   });
 
+  /// The conversation on screen, on the clipboard — gap-list row 16.
+  ///
+  /// Driven through the palette rather than by calling the command's `run`,
+  /// because the thing worth guarding is that a person can reach it and that
+  /// what lands is the conversation they were reading.
+  it("copies the conversation being read, not whatever is newest", async () => {
+    const { user } = await open("对话");
+    // After `open`, not before: `userEvent.setup()` installs a clipboard stub
+    // of its own, so a mock defined earlier is replaced before the command
+    // ever runs.
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: async (text: string) => { written.push(text); } },
+    });
+    await user.keyboard("{Meta>}k{/Meta}");
+    const input = await screen.findByPlaceholderText("输入命令");
+    await user.type(input, "复制");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(written.length).toBe(1));
+    // The fixture's conversation, from the same `textOf` the transcript uses.
+    expect(written[0]).toContain("记住了。");
+    expect(written[0]).toContain("小林。");
+  });
+
   it("hides a command that cannot run right now", async () => {
     const { user } = await open("待决定");
     // The cursor is on a parked run, so "stop the current run" is not offered.

@@ -2752,6 +2752,35 @@ provider stream ended without [DONE]
 在一个破折号旁边挂上限等于声称有个度量在进行。所以**只在真有花费时才画上限**。
 
 
+
+## 2026-08-19（六）：工具参数解析不出来的时候
+
+### 三家的立场，逐行读出来的
+
+| 谁 | 空参数 | 坏 JSON |
+| --- | --- | --- |
+| opencode | `shared.ts:155-156` 的 `raw \|\| "{}"` → `{}`。注释里写明理由（`:150-153`）：**「provider 偶尔会在没有发过任何 input delta 的情况下结束一次工具调用，比如零参数工具」** | 报错，并且**点名是哪个工具** |
+| openclaw | `utils/json-parse.ts:130-132` → `{}` | `:134-145` 一路修复 → 局部解析 → 修复后再局部解析 → **兜底还是 `{}`，从不失败** |
+| 我们（改前） | **整轮报错，不可重试** | 整轮报错，且不说是哪个调用 |
+
+### 我们同意一半，不同意另一半
+
+**空参数当 `{}`：同意，两家都这么做，而且它就是对的。** 零参数工具是完全正常的东西，
+为它把整个 Run 打掉是把一个合法调用当成了协议错误。我们的实现比 opencode 还宽一点点：
+先 `trim()`，所以全空白也算空——opencode 的 `raw || "{}"` 对 `"  "` 是 truthy，会抛。
+
+**坏 JSON 兜底成 `{}`：不同意 openclaw。** 把 `{"path": "/etc/pas` 变成 `{}`
+是去执行一次**模型从来没有要过**的调用；对 `workspace.write_text` 或一次 exec 来说，
+这不是比失败更小的错误，是更大的。我们和 opencode 一样报错，
+并且抄了它**在错误里点名工具**这一点——「invalid JSON」一句话，
+在一轮十一次调用里等于什么都没说。
+
+### 顺带查到的第二处
+
+同一个缺陷在 `openai_responses.rs:230` 还有一份，**而且那边一条测试都没有**
+（`tests/openai_responses.rs` 里每一次工具调用的参数都是非空的）。一并关掉了。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`
@@ -2799,3 +2828,79 @@ provider stream ended without [DONE]
 - OpenClaw：`agent-source-research/openclaw/src/infra/device-auth-store.ts`
 - OpenClaw：`agent-source-research/openclaw/src/infra/node-pairing.ts`
 - OpenClaw：`agent-source-research/openclaw/src/infra/node-pairing-authz.ts`
+
+## 2026-08-19（七）：读 ChatGPT 桌面版自己的样式表，把「工程化的日志」改回一段对话
+
+前六节读的都是开源仓库。这一节读的是**装在这台机器上、正在卖的产品**：
+`/Applications/ChatGPT.app`。它是 Electron，`Contents/Resources/app.asar`
+里有 280 MB 的 Vite 产物，`webview/assets/*.css` 是可读的真样式表——
+不是别人写的文章，是他们线上跑的那份。
+
+### 读到的数字（全部来自 `app-initial-JeCCd060.css` / `app-HA18C9Gp.css`）
+
+| 他们怎么定的 | 值 | 我们原来 |
+|---|---|---|
+| `--thread-content-max-width` | `40rem`（640px） | `82ch`，且贴左边 |
+| `--markdown-line-height` | `calc(var(--markdown-font-size) + 8px)` | `line-height: 1.75` |
+| `--spacing` | `.25rem` | 无标度，全是散落的像素 |
+| `--color-border` | `color-mix(in oklab, var(--color-text-foreground) 8%, transparent)` | 深浅两套各写一个十六进制 |
+| `--transition-duration-basic` | `.15s` | 无 |
+| 流式进场 `_fade-in_1ns57_1` | `opacity:0` → `1`，`cubic-bezier(.37,.55,.86,.88)` `forwards` | 无 |
+| 逐字进场 `_fade-in-marker_1ns57_1` | `0%{color:#0000}`——动的是**颜色**不是透明度 | 无 |
+| 等待微光 `_shimmer_yklzu_1` | `background-size:220% 100%`，位置 `140%`→`-105%`，`2.2s cubic-bezier(.4,0,.2,1) infinite` | 无 |
+
+### 他们为什么这么做，我们同不同意
+
+**列宽 40rem——同意，并且推翻我们自己的旧做法。**
+`.flow > * { max-width: 82ch }` 贴着左边，是把转录当**日志**排的：日志要的是
+一行塞得下、扫得快。对话要的是读得下去。82ch 在中文正文里接近 80 个汉字一行，
+回行时眼睛找不回下一行的起点；而且窗口一宽，文字就成了贴着左边的一条带子，右边
+半屏空着。**被推翻的旧结论：转录列按可扫的日志宽度排、靠左对齐。**现在是 40rem
+居中，输入框用同一列宽同样居中——原来输入框是 82ch 靠左，人打字的框和他上面正在
+回答的那段话根本不对齐。
+
+**行高用绝对步长而不是比例——同意。**`font-size + 8px` 让一行代码和一行正文落在
+同一条节奏上。比例行高在混排（14.5px 正文 + 12px 等宽）时两种块的行距会岔开，
+围栏一多，整段看起来就是碎的。
+
+**边框颜色从文字色 `color-mix` 出来——同意，而且这条最省事。**我们深浅两套各自
+声明六个灰阶，加一个面就要改两处，早晚会岔。改成 `color-mix(in oklab, var(--ink)
+N%, transparent)` 之后，「一层薄面 = 文字色的 6%」在两套主题里都成立，一条规则
+写一次。本轮 `--wash / --wash-2 / --hair` 就是这么定的。
+
+**用户消息进气泡、模型回复不进——同意，但这是我们从他们的布局里读出来的，不是
+他们写在变量里的。**他们的气泡是 Tailwind 行内类（`type === "user" && "bg-tertiary
+self-end px-4 py-2.5"`，openhands 的 `chat-message.tsx:148` 是同一套写法）。
+不对称才是重点：两边都套灰盒子，眼睛就找不到回答从哪儿开始。短、可引用的一边要
+盒子；长、带代码的一边不要。
+
+**逐字进场动 `color` 不动 `opacity`——同意，理由值得记。**`opacity` 会让整个行盒
+参与合成，长文本里每来一个 token 就重绘一大片；`color: transparent → currentColor`
+只影响字形着色，不动布局也不新建合成层。我们这轮先只做了**块级** fade-in
+（`.rep > *`，`.15s` 同一条 easing），逐字那层没做——我们的 delta 落在同一个
+`<p>` 里，要做逐字就得把每个 token 包成 span，那是拿真实开销换一个我们还没量过
+的效果。**这条明确记为「读了、同意、但本轮没做」，不是「做了」。**
+
+### 不同意的一条
+
+他们的 composer 是浮起来的圆角面板，`backdrop-filter: blur(var(--blur-lg))`，
+`--composer-border-radius` 在单行时是胶囊、多行时 `--radius-3xl`。我们**不跟**。
+这个 App 的输入框上面永远压着一条键位提示行和一条状态行，浮起来的面板会和它们抢
+层次；而且 `backdrop-filter` 在 Electron 里是实打实的合成开销，为了一个模糊背景
+让每帧多一次离屏合成，在一个要长时间挂着跑的桌面客户端上不划算。我们保持贴底、
+一条 1px 分隔线，只把**列宽对齐**这一条抄过来。
+
+### 因此在差距清单上新增两行，并当轮关闭
+
+先说错的：写这段时我以为清单上已经有「对话渲染」和「会话列表」两行，报的是
+第 12、27 行。查了，没有——**这两件事从来没上过差距清单**。清单三十一行盯的全是
+*功能*（面板、审批、PTY、MCP、导出……），没有一行问过「这些功能画出来像不像一个
+能用的东西」。功能齐了、每一行都写着已接入，而整个界面读起来仍然是一份工程日志，
+盲区就在这里。所以补的是第 32、33 行，而不是改两行旧的。
+
+- 第 32 行 · 对话渲染（Markdown）——模型的回答一直按纯文本画，围栏代码块出来是
+  带三个反引号的正文，五步列表出来是一长行。本轮补上渲染器（标题/围栏/行内代码/
+  列表/引用/链接/强调），并按 ChatGPT 桌面版的 `_fade-in` 给块级进场。
+- 第 33 行 · 会话列表——原来是 `说的是 / 状态 / 轮次 / 最后更新` 四列表格。表格适合
+  Run 列表（列与列之间真的要比），不适合这里：没人按轮次排序找对话，人找的是**认得出
+  的那句话**。改成标题 + 末次回复摘要（经 `plain()` 去掉 markdown 标记）+ 元信息。

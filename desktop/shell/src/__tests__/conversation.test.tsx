@@ -180,6 +180,29 @@ describe("the conversation list", () => {
     expect(screen.queryByText("小林。")).toBeNull();
   });
 
+  /// What a row has to say beyond its title.
+  ///
+  /// A list of first sentences answers "which one was this" and nothing else.
+  /// The rows a person actually scans for are the ones where they remember the
+  /// answer and not the question, so the row carries the last thing the model
+  /// said as well.
+  it("shows the last reply under the first sentence", async () => {
+    const { user } = await openChat();
+    await waitFor(() => expect(screen.getByText("小林。")).toBeTruthy());
+    await openList(user);
+    const row = await screen.findByRole("option", { name: /上礼拜那段对话/ });
+    expect(row.textContent).toContain("还在这儿。");
+  });
+
+  it("invents no reply for a conversation that has had none", async () => {
+    const { user } = await openChat();
+    await openList(user);
+    for (const row of screen.getAllByRole("option")) {
+      const preview = row.querySelector(".last");
+      if (preview) expect(preview.textContent!.trim()).not.toBe("");
+    }
+  });
+
   it("puts nothing irreversible on a bare key", () => {
     const surface = all().find((candidate) => candidate.id === "conversations");
     expect(surface).toBeTruthy();

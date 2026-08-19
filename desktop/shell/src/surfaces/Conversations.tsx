@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { register } from "./registry";
 import { shortId, since } from "./model";
+import { textOf } from "../session";
+import { plain } from "./markdown";
 import { LinkBanner } from "./Link";
 import { useDesk, type Desk } from "../desk";
 import type { SessionView } from "../session";
@@ -24,6 +26,29 @@ function touchedAt(desk: Desk, session: SessionView): string | null {
 
 function name(session: SessionView): string {
   return session.title || "（还没说出第一句）";
+}
+
+/// The last thing the model said in a conversation, as one line.
+///
+/// The second line of a row. A list of nothing but first sentences answers
+/// "which one was this" and no more, and the conversation a person is looking
+/// for is often the one where they remember the answer rather than the
+/// question.
+///
+/// Empty when the branch holds no reply -- a conversation whose Turns have not
+/// been read yet, or one that has only ever been asked. The row then draws no
+/// second line at all rather than a blank one, because an empty line under
+/// every title is a list that has grown a gutter for nothing.
+function lastReply(session: SessionView): string {
+  for (let at = session.turns.length - 1; at >= 0; at -= 1) {
+    const said = textOf(session.turns[at], "assistant").trim();
+    // Through the markdown summariser, not a raw slice: the raw text opens
+    // with whatever markup the model used, and a row would spend its one line
+    // on "## 改了什么" and three backticks.
+    const line = plain(said);
+    if (line) return line;
+  }
+  return "";
 }
 
 function move(desk: Desk, delta: number): void {
@@ -59,7 +84,7 @@ function ConversationsToolbar() {
 /// another is two answers to one question.
 function ConversationsView() {
   const desk = useDesk();
-  const body = useRef<HTMLTableSectionElement>(null);
+  const body = useRef<HTMLUListElement>(null);
 
   useEffect(() => {
     body.current?.querySelector<HTMLElement>('[aria-selected="true"]')
@@ -87,23 +112,18 @@ function ConversationsView() {
       )}
 
       {desk.sessions.length > 0 && (
-        <table className="rows">
-          <thead>
-            <tr>
-              <th>说的是</th><th>状态</th>
-              <th className="num">轮次</th><th className="num">最后更新</th>
-            </tr>
-          </thead>
-          <tbody ref={body}>
-            {desk.sessions.map((session) => {
-              const open = desk.current?.key === session.key;
-              return (
-                <tr
-                  key={session.key}
+        <ul className="convos" role="listbox" aria-label="会话" ref={body}>
+          {desk.sessions.map((session) => {
+            const open = desk.current?.key === session.key;
+            const reply = lastReply(session);
+            const when = since(touchedAt(desk, session));
+            return (
+              <li key={session.key}>
+                <div
                   tabIndex={0}
-                  role="button"
+                  role="option"
                   aria-selected={open}
-                  className={open ? "on" : ""}
+                  className={open ? "convo on" : "convo"}
                   onClick={() => desk.selectSession(session)}
                   onDoubleClick={() => { desk.selectSession(session); desk.go("chat"); }}
                   onFocus={() => desk.selectSession(session)}
@@ -114,11 +134,15 @@ function ConversationsView() {
                     }
                   }}
                 >
-                  <td className="ask" title={name(session)}>{name(session)}</td>
-                  <td>
+                  <div className="hd">
+                    <span className="ask" title={name(session)}>{name(session)}</span>
+                    {when && <span className="when">{when}</span>}
+                  </div>
+                  {reply && <div className="last">{reply}</div>}
+                  <div className="meta">
                     {session.activeRunId
-                      ? <><span className="dot t-live" />这轮还在跑</>
-                      : <><span className="dot t-done" />停着</>}
+                      ? <span className="live"><span className="dot t-live" />这轮还在跑</span>
+                      : <span>{session.turnCount} 轮</span>}
                     {/* A branch past generation 1 has been rolled back. Worth
                         saying: it is why an earlier Turn is no longer here. */}
                     {session.generation > 1 && (
@@ -130,14 +154,12 @@ function ConversationsView() {
                     {(strands.get(session.sessionId) ?? 0) > 1 && (
                       <span className="flag mono">分支 {shortId(session.branchId)}</span>
                     )}
-                  </td>
-                  <td className="num">{session.turnCount}</td>
-                  <td className="num">{since(touchedAt(desk, session))}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
     </div>
   );
