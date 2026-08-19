@@ -2997,3 +2997,82 @@ shadcn + `@/` 别名，而这个 shell 是裸 React 19 + Vite，没有 Tailwind�
 
 - `docs/desktop-ui-gap.md` 第 32 行从「已接入」改写为覆盖真实形状：表格、嵌套
   列表、任务清单、删除线、裸链接、转义、硬换行，以及流式残缺块。
+
+## 2026-08-19（九）：缓存命中的钱、思考深度的拼写、以及「跟着流走」的判据
+
+本轮三条线并行：一条内核（扫描表两条 blocking）、一条 desktop（跟随滚动）、
+一条读源码。中途机器崩过一次，未提交的工作全部完好，全量门禁 935 passed / 0 failed。
+
+### 一、缓存命中的 token 是子集，不是并列项
+
+- **opencode** `packages/llm/src/schema/events.ts:7-60` 直接把这条写成不变量；
+  **openclaw** `providers/openai-completions.ts:1091` 用减法证明了同一件事。
+- **我们**：`usage.prompt_tokens_details.cached_tokens` 从来没读过（`grep -c` = 0），
+  整个 prompt 按全价计费。
+- **后果不止是数字难看**：`cost_micros` 会被 worker 拿去扣 Run 预算
+  （`worker/src/lib.rs:6236-6246`），所以在一个「每轮 prompt 大部分命中缓存」的
+  agent 循环上，**Run 会为没人收的钱而死**。
+- **同意他们**，并且照抄了两处防御：计价前先把两个桶做成不相交的
+  （openclaw `model-utils.ts:12-18` 在入口归一化就是为了躲开「总数按全价 + 缓存
+  子集再算一次」这个双重计费陷阱）；provider 报的缓存数大于 prompt 总数时钳制而
+  不是信任（opencode `protocols/shared.ts:61-76` 的 `subtractTokens`）——这条在
+  Rust 里不是装饰：无符号减法在 debug 会 panic，在 release 会绕回一个能把预算打死
+  的数。
+- **一处不同意**：上报给上层的 token 数我们保持**含缓存的总数**。缓存命中在上下文
+  窗口里占的位置和新 token 一模一样，只有价格不同，把它从计数里扣掉会让「还剩多少
+  上下文」变成错的。
+
+### 二、`reasoning_effort` 是 OpenAI 的拼写，不是通用字段
+
+- **openclaw** `providers/openai-completions.ts:826-861` 在同一个 chat-completions
+  端点上**分五路**：DeepSeek 用 `thinking: {type}`、Qwen 用 `enable_thinking`、
+  Z.ai 自己一套、OpenRouter 要嵌套的 `reasoning: {effort}`、其余才是扁平的
+  `reasoning_effort`。更关键的是它的自动探测对**代理型端点默认关掉**这个扁平字段
+  （`openai-completions-compat.ts:130-135`）。
+- **同意，因此做成了「操作者声明才发」而不是「默认发」**。理由是我们服务的正是
+  openclaw 关掉它的那一类：本机 vLLM、SGLang、各种 OpenAI 兼容代理。默认发出去等于
+  在每个请求前面加一个它们不认识的参数，而承载的策略目前没有任何调用方能改——
+  唯一的生产者硬编码 `Balanced`（`worker/src/lib.rs:6783`）。
+- 扁平而非嵌套，依据是 openclaw `openai-completions-transport.ts:1927` 与 opencode
+  `protocols/openai-chat.ts:340`。
+- 顺带修掉一个一致性洞：同样三个值在 Responses 适配器上一直是发的
+  （`openai_responses.rs:330-334`），所以在此之前**同一个 `ModelRequest` 会因为
+  failover 挑中哪个适配器而含义不同**。
+
+### 三、截断的回复要留下来（推翻我们自己的一条）
+
+- **openclaw** `packages/agent-core/src/agent-loop.test.ts:507-536` 断言
+  `stopReason: "length"` 时那条被截断的 assistant 消息**被发出并被回放进下一个
+  context**，工具调用被剥掉（半截参数的调用不是调用），`execute` 不被调用。
+- **我们原来**：`crates/kernel/src/lib.rs` 把 `Length` 变成
+  `run.failed { kind: context_overflow }`。**推翻这一条。** 真机上它扔掉了 1,300 条
+  已经画在屏幕上的 delta，并且把「单条回复上限用完」说成「上下文超长」——输入
+  4,945 token，窗口 204,800，两者的修法正好相反。
+- **同意留下文字，不同意继续跑**。openclaw 接着自动进下一轮；继续要花没人同意花的
+  钱，所以我们停下并说明这段话没说完。
+
+### 四、跟着流走的判据（desktop）
+
+三家阈值：opencode 10px（`create-auto-scroll.tsx:19`）、openhands 20px
+（`use-scroll-to-bottom.ts:17-21`）、assistant-ui 1px
+（`useThreadViewportAutoScroll.ts:118`）。我们原来 40px——**比这个转录的一行还宽**，
+所以「往上翻一行重读」会被下一个 delta 拽回去。改成 10px，并加了两条：选区非空即
+交给人（opencode `:148-154`；否则流式回复里的字根本选不中），以及跟随时把
+`overflow-anchor` 关掉（opencode `:156-170`；浏览器的滚动锚定和我们的锁底是两套
+机制，打架时的抖动谁单独都不会产生）。
+
+**测了之后决定不做的：逐字平滑输出。** assistant-ui 的 `useSmooth` 存在是因为它的
+chunk 成串到达；我们不是。四个真机 run 实测 delta **中位数 2 字符、p95 6、最大 12**
+——加一层平滑反而会让每步比 provider 自己给的更大。opencode 和 openhands 也都不做
+文字平滑，而且 opencode 明确拒绝平滑滚动，理由写在注释里：跟随时的追赶动画本身就是
+视觉噪声（`:75, :95-96`）。
+
+**记录但未做**：markdown 现在每个 delta 全量重新 lex。opencode 与 codex 各自独立
+收敛到「稳定前缀 + 可变尾部」（`markdown-stream.ts:52-85`、`streaming/render.rs:17-31`），
+codex 还额外把 pipe table 从表头起整体扣留到 finalize，因为每多一行都会重排所有列宽
+（`streaming/controller.rs:13-25`）。两条都值得做；**本轮都没做，也没测过我们重新
+lex 的开销**，不算已完成。
+
+### 因此关闭
+
+- 扫描表 blocking：`usage.prompt_tokens_details.cached_tokens`、`reasoning_effort`。
