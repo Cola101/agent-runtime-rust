@@ -58,6 +58,29 @@ describe("events the runtime reports about the exchange", () => {
     expect(screen.queryByText(/这个版本不认识/)).toBeNull();
   });
 
+  /// A reply that ran out of room says so, and keeps what it wrote.
+  ///
+  /// `cutShort()` in `surfaces/model.ts` has had these words since it was
+  /// written and could never fire: the kernel turned a `length` finish into
+  /// `run.failed { kind: "context_overflow" }`, so the note keyed to
+  /// `model.turn.completed` never had an event to attach to. Measured against
+  /// a real vLLM, that path discarded 1,300 deltas of answer that were already
+  /// on screen, and blamed a context window that was 4,945 tokens into 204,800.
+  ///
+  /// Guarded here rather than against the provider because reaching the cap
+  /// needs the model to decide to think for 6,877 reasoning deltas, which is
+  /// not something a prompt can ask for on demand.
+  it("says a reply hit its length cap instead of losing it", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "model.output.delta", { text: "答案的前半段" }, 30));
+    bridge.emit(RUN_LIVE, bridge.event(41, "model.turn.completed", {
+      status: "succeeded", reason: "length",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/没说完/)).toBeTruthy());
+    // The point of keeping it: the words are still there.
+    expect(screen.getByText(/答案的前半段/)).toBeTruthy();
+  });
+
   /// A kind this build *does* know still has to say what the provider said.
   ///
   /// The real case, measured against a self-hosted vLLM: the Run ended

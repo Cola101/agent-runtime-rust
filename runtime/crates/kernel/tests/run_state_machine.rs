@@ -278,3 +278,66 @@ fn a_text_delta_carries_the_block_it_came_from() {
     // client that read a default here would group unrelated text together.
     assert!(unblocked.payload.get("block").is_none());
 }
+
+/// A reply that ran into its own length cap is a short answer, not a lost one.
+///
+/// Measured against a real self-hosted vLLM: a turn produced 6,877 reasoning
+/// deltas and 1,300 output deltas, hit `max_tokens`, and the Run ended
+/// `run.failed { kind: "context_overflow", reason: "length" }`. Two things
+/// were wrong with that.
+///
+/// It was not a context overflow. The input was 4,945 tokens against a 204,800
+/// window; what ran out was the *per-reply* ceiling. The two have opposite
+/// fixes -- one means the conversation must be shortened, the other means the
+/// ceiling must be raised or less must be asked for -- and reporting the first
+/// when the second happened sends a person to shorten a conversation that is
+/// nowhere near the limit.
+///
+/// And 1,300 deltas of real answer were on screen when the Run declared
+/// itself failed. openclaw keeps that text: its
+/// `packages/agent-core/src/agent-loop.test.ts:507-536` asserts the truncated
+/// assistant message is emitted *and replayed into the next context*, with
+/// tool calls stripped (a call cut off mid-arguments is not a call anybody
+/// should run) and `execute` never invoked. We agree about keeping the text.
+/// We do not follow it all the way: openclaw's loop then continues on its own,
+/// and continuing costs money the person did not agree to spend, so this stops
+/// and says the answer is short.
+///
+/// `model.turn.completed { reason: "length" }` is the shape the client is
+/// already built for -- `cutShort()` in `desktop/shell/src/surfaces/model.ts`
+/// has said "这段回答没说完 —— 模型到了单轮长度上限" since it was written, and
+/// could never fire because the Run failed instead.
+#[test]
+fn a_reply_that_hit_its_length_cap_is_kept_and_called_short() {
+    let mut run = machine();
+    run.apply(RunCommand::Start).unwrap();
+
+    let turn = run
+        .apply_model_event(ModelStreamEvent::Completed {
+            reason: ModelFinishReason::Length,
+        })
+        .expect("a truncated reply still completes its turn");
+
+    assert_eq!(
+        turn.event_type, "model.turn.completed",
+        "a length-capped reply is a completed turn, not a failed Run: {:?}",
+        turn.payload,
+    );
+    assert_eq!(turn.payload["reason"], "length");
+    assert_ne!(
+        turn.payload["kind"], "context_overflow",
+        "the input fit; it was the reply that ran out of room",
+    );
+
+    // And it has to *end*. Only `ToolCalls` plans another turn
+    // (`worker/src/lib.rs:10089-10116`); every other completion that leaves
+    // the Run running leaves it running forever, with the composer disabled
+    // and nothing on its way. Keeping the text is worth nothing if the
+    // conversation can never be continued afterwards.
+    assert!(
+        run.status().is_terminal(),
+        "a truncated reply must still end the Run, or nothing will: {:?}",
+        run.status(),
+    );
+    assert_eq!(run.status(), RunStatus::Succeeded);
+}

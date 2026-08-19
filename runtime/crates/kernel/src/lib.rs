@@ -547,16 +547,36 @@ impl RunMachine {
                 "model.turn.completed",
                 json!({ "reason": ModelFinishReason::ToolCalls }),
             ),
+            // A reply that ran into its own length cap is a short answer, not
+            // a lost one.
+            //
+            // This used to be `run.failed { kind: context_overflow }`, which
+            // was wrong twice. It is not a context overflow: measured against
+            // a real vLLM, the input was 4,945 tokens against a 204,800 window
+            // and what ran out was the *per-reply* ceiling. The two have
+            // opposite fixes, so naming the wrong one sends a person to
+            // shorten a conversation that is nowhere near any limit. And it
+            // threw the answer away -- 1,300 deltas of it were already on
+            // screen when the Run declared itself failed.
+            //
+            // openclaw keeps the text (`agent-loop.test.ts:507-536` asserts
+            // the truncated message is emitted and replayed, with tool calls
+            // stripped) and then continues its loop. We keep the text and stop:
+            // continuing spends money nobody agreed to spend, and a turn that
+            // says it is short lets the person decide.
+            // Terminal, and terminal as a success. Only `ToolCalls` plans
+            // another turn (`worker/src/lib.rs:10089-10116`), so leaving this
+            // one Running would leave it running forever -- the composer
+            // disabled and nothing on its way. The event is still
+            // `model.turn.completed { reason: "length" }` because that is what
+            // happened and because the client already has words for it; the
+            // status is what ends the Run.
             ModelStreamEvent::Completed {
                 reason: ModelFinishReason::Length,
             } => self.emit(
-                RunStatus::Failed,
-                "run.failed",
-                json!({
-                    "status": RunStatus::Failed,
-                    "kind": ModelErrorKind::ContextOverflow,
-                    "reason": ModelFinishReason::Length
-                }),
+                RunStatus::Succeeded,
+                "model.turn.completed",
+                json!({ "status": RunStatus::Succeeded, "reason": ModelFinishReason::Length }),
             ),
             ModelStreamEvent::Completed {
                 reason: ModelFinishReason::ContentFilter,
