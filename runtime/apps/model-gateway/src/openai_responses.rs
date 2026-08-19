@@ -1,7 +1,7 @@
 use crate::openai_compatible::{
     ProviderCredential, ProviderExecutionError, ProviderPricing, calculate_cost, capability_error,
     classify_http_error, classify_transport_error, emit, is_provider_safe_image_source,
-    provider_error,
+    looks_like_exhausted_quota, provider_error,
 };
 use agent_protocol::{
     ContentPart, ModelErrorKind, ModelFinishReason, ModelRequest, ModelStreamEvent,
@@ -302,13 +302,80 @@ impl OpenAiResponsesAdapter {
                     emit(&events, ModelStreamEvent::Completed { reason }).await?;
                     return Ok(());
                 }
+                // Several different endings arrive on this one event, and the
+                // `error` object says which. Reporting `Protocol` for all of
+                // them was not a naming quibble: `Protocol` is neither
+                // retryable nor in any `fallback_on` set, so an exhausted
+                // account ended the Run on the spot, was told "回复的格式不对"
+                // when nothing was malformed, and never reached the second
+                // candidate that exists for exactly that case.
+                //
+                // codex splits the same event on the same field --
+                // `response.failed` reads `error.code` and answers
+                // `insufficient_quota` with `QuotaExceeded` rather than the
+                // generic stream error
+                // (`codex-rs/codex-api/src/sse/responses.rs:387-400`, with
+                // `is_quota_exceeded_error` at `:629-631`), covered end to end
+                // by `codex-rs/core/tests/suite/quota_exceeded.rs`. We agree
+                // and take the same split, with one difference: codex matches
+                // `error.code` exactly, while this reads the code *and* the
+                // sentence through `looks_like_exhausted_quota`, because the
+                // 429 path in this gateway already had to -- OpenAI-compatible
+                // servers in this family are not consistent about which field
+                // carries the name.
                 "response.failed" => {
                     let message = value["response"]["error"]["message"]
                         .as_str()
                         .unwrap_or("OpenAI Responses request failed");
+                    let code = value["response"]["error"]["code"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let (kind, retryable) = if looks_like_refused_content(code) {
+                        // Never retried and never carried elsewhere: the
+                        // content is what was refused, so a second attempt and
+                        // a second vendor both fail the same way -- and the
+                        // second vendor would have been shown content the
+                        // first one declined. `ContentFilter` is deliberately
+                        // outside the `fallback_on` whitelist
+                        // (`RuntimeExecutionPolicySnapshot::is_bounded_and_safe`).
+                        (ModelErrorKind::ContentFilter, false)
+                    } else if looks_like_exhausted_quota(code)
+                        || looks_like_exhausted_quota(message)
+                    {
+                        // Not retryable on the account that reported it, and
+                        // that is the point: `Billing` crosses to another
+                        // provider anyway (`failover.rs`,
+                        // `crosses_to_another_provider`), because a different
+                        // provider is a different account.
+                        (ModelErrorKind::Billing, false)
+                    } else if looks_like_transient_response_failure(code) {
+                        // The same fault must not end differently for arriving
+                        // a moment later. Reaching us before the stream opens,
+                        // a server fault is `HTTP 500` -> `(Unavailable, true)`
+                        // and is both retried and carried to the next
+                        // candidate. Arriving after the 200 as
+                        // `response.failed { code: "server_error" }` it used to
+                        // fall in the unnamed arm below and become fatal -- no
+                        // retry, second candidate never called. Arrival timing
+                        // is not a property of the failure.
+                        (ModelErrorKind::Unavailable, true)
+                    } else if code.eq_ignore_ascii_case("rate_limit_exceeded") {
+                        (ModelErrorKind::RateLimited, true)
+                    } else if code.eq_ignore_ascii_case("context_length_exceeded") {
+                        (ModelErrorKind::ContextOverflow, false)
+                    } else {
+                        // Unnamed, and deliberately still fatal. codex defaults
+                        // this position to `Retryable`
+                        // (`codex-rs/codex-api/src/sse/responses.rs:387-410`)
+                        // and we do not follow it that far: retrying a fault
+                        // this build cannot describe spends someone's money on
+                        // a guess. What changed is that the transient codes
+                        // above are no longer unnamed.
+                        (ModelErrorKind::Protocol, false)
+                    };
                     return Err(provider_error(
-                        ModelErrorKind::Protocol,
-                        false,
+                        kind,
+                        retryable,
                         None,
                         credential.redact(message.to_owned()),
                     ));
@@ -546,4 +613,38 @@ async fn emit_usage(
         },
     )
     .await
+}
+
+/// Whether a `response.failed` names a policy refusal rather than a fault.
+///
+/// The provider's own codes, matched exactly, and nothing looser. A substring
+/// search would be actively harmful here: the destination is the one kind that
+/// must never be handed to a second provider, so a false positive silently
+/// ends a Run that a fallback would have answered. `invalid_prompt` is what
+/// OpenAI returns for a prompt its usage policy declined; `bio_policy` and
+/// `cyber_policy` are the two topic-specific refusals codex parses out of this
+/// same event (`codex-rs/codex-api/src/sse/responses.rs:398-405`);
+/// `content_filter` and `content_policy_violation` are what other servers in
+/// this family spell it.
+/// Codes that name a fault the provider expects to pass.
+///
+/// Kept narrow and exact. The point of this list is that these are the codes
+/// whose out-of-band twin is an HTTP 5xx, which this gateway already treats as
+/// `Unavailable` and retries; anything not on it stays fatal.
+fn looks_like_transient_response_failure(code: &str) -> bool {
+    matches!(
+        code.to_ascii_lowercase().as_str(),
+        "server_error" | "server_overloaded" | "slow_down" | "internal_error"
+    )
+}
+
+fn looks_like_refused_content(code: &str) -> bool {
+    matches!(
+        code.to_ascii_lowercase().as_str(),
+        "invalid_prompt"
+            | "bio_policy"
+            | "cyber_policy"
+            | "content_filter"
+            | "content_policy_violation"
+    )
 }

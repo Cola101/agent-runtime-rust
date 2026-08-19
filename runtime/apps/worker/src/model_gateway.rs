@@ -125,8 +125,21 @@ fn decode_event(event: ModelEvent) -> Result<ModelStreamEvent, ModelGatewayClien
         Some(Body::Completed(completed)) => Ok(ModelStreamEvent::Completed {
             reason: decode_finish_reason(completed.reason)?,
         }),
+        // An unknown kind degrades; it does not void the event.
+        //
+        // The ordinary rolling upgrade is server-first, so a newer gateway
+        // emitting a kind this binary predates is expected, not exceptional.
+        // This used to be `decode_error_kind(failed.kind)?`, and the `?`
+        // discarded the whole failure -- including `message` on the next line,
+        // which had already been carried from the Provider into this process.
+        // The person was shown "model gateway returned an invalid event",
+        // a sentence about transport, for a Run that failed for a reason the
+        // Provider had explained in words.
+        //
+        // Losing the classification is honest: this build really does not have
+        // a name for it. Losing the message is not.
         Some(Body::Failed(failed)) => Ok(ModelStreamEvent::Failed {
-            kind: decode_error_kind(failed.kind)?,
+            kind: decode_error_kind(failed.kind).unwrap_or(ModelErrorKind::Protocol),
             retryable: failed.retryable,
             message: failed.message,
         }),
@@ -194,6 +207,7 @@ fn decode_error_kind(value: i32) -> Result<ModelErrorKind, ModelGatewayClientErr
         Ok(WireErrorKind::ContextOverflow) => Ok(ModelErrorKind::ContextOverflow),
         Ok(WireErrorKind::CapabilityMismatch) => Ok(ModelErrorKind::CapabilityMismatch),
         Ok(WireErrorKind::Unavailable) => Ok(ModelErrorKind::Unavailable),
+        Ok(WireErrorKind::ContentFilter) => Ok(ModelErrorKind::ContentFilter),
         _ => Err(ModelGatewayClientError::InvalidEvent(
             "model error kind is unspecified".into(),
         )),

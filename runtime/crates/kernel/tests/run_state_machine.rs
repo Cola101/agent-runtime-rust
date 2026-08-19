@@ -427,3 +427,85 @@ fn every_terminal_ending_uses_an_event_type_the_log_readers_recognise() {
         );
     }
 }
+
+/// A refused turn is filed as a refusal, not as a broken exchange.
+///
+/// `run.failed` carries both a `kind` and, on this branch, a `reason`. Every
+/// consumer reads the kind -- it is the field the whole failure vocabulary is
+/// built on -- and only the desktop transcript happens to also read the
+/// reason. So filing a content-filtered turn under `Protocol` told the rest of
+/// the system, truthfully as far as it could tell, that the provider had sent
+/// something malformed: an exchange to retry, or to send to a second provider.
+/// Neither is what happened, and neither helps. The content was declined, and
+/// the only person who can act on that is the one who wrote it.
+///
+/// The `reason` stays alongside the kind. It is the narrower fact and it is
+/// already load-bearing (`desktop/shell/src/surfaces/model.ts`, `cutShort`);
+/// the kind is what makes the same fact legible to a consumer that never
+/// learned this branch exists.
+#[test]
+fn a_content_filtered_turn_fails_as_a_content_filter_rather_than_a_protocol_fault() {
+    let mut run = machine();
+    run.apply(RunCommand::Start).unwrap();
+    let ending = run
+        .apply_model_event(ModelStreamEvent::Completed {
+            reason: ModelFinishReason::ContentFilter,
+        })
+        .expect("a completion is applicable to a running Run");
+
+    assert_eq!(run.status(), RunStatus::Failed);
+    assert_eq!(ending.event_type, "run.failed");
+    assert_eq!(
+        ending.payload["kind"],
+        serde_json::json!("content_filter"),
+        "a refused turn must not be filed as a protocol fault: {:?}",
+        ending.payload,
+    );
+    assert_eq!(
+        ending.payload["reason"],
+        serde_json::json!("content_filter"),
+        "the narrower reason must survive the kind gaining its own name: {:?}",
+        ending.payload,
+    );
+}
+
+/// Every `run.failed` says whether it is worth trying again.
+///
+/// A guard on the shape rather than on one incident. `retryable` is on every
+/// other `run.failed` this machine writes -- the provider-failure branch, the
+/// budget branch, the required-MCP branch, the duration branch -- and a
+/// consumer reading it cannot tell "this ending said false" from "this ending
+/// forgot to say". The content-filter branch was written without it, and
+/// nothing noticed because no consumer reads it *yet*; the day one does, the
+/// omission is a silent wrong answer rather than a missing field.
+#[test]
+fn every_failed_ending_says_whether_it_is_worth_repeating() {
+    let mut refused = machine();
+    refused.apply(RunCommand::Start).unwrap();
+    let refusal = refused
+        .apply_model_event(ModelStreamEvent::Completed {
+            reason: ModelFinishReason::ContentFilter,
+        })
+        .expect("a refused turn ends the Run");
+    assert_eq!(refusal.event_type, "run.failed");
+    assert!(
+        refusal.payload.get("retryable").is_some(),
+        "a `run.failed` that does not say whether to retry is one a consumer \
+         cannot tell apart from `retryable: false`: {:?}",
+        refusal.payload,
+    );
+
+    // The branch that has always carried it, so the assertion above is about
+    // the shape rather than about this one ending.
+    let mut broke = machine();
+    broke.apply(RunCommand::Start).unwrap();
+    let failure = broke
+        .apply_model_event(ModelStreamEvent::Failed {
+            kind: ModelErrorKind::Protocol,
+            retryable: false,
+            message: "ended".into(),
+        })
+        .expect("a provider failure ends the Run");
+    assert_eq!(failure.event_type, "run.failed");
+    assert!(failure.payload.get("retryable").is_some());
+}

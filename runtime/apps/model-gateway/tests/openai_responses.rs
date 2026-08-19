@@ -474,3 +474,178 @@ async fn an_incomplete_response_that_hit_its_output_ceiling_is_still_a_length_ca
         "a turn that hit its output ceiling must still end as length: {events:?}"
     );
 }
+
+/// An account with nothing left is a billing ending, even when the provider
+/// says so after it has already answered 200.
+///
+/// `response.failed` reported `Protocol` for everything it carried, and
+/// `Protocol` is neither retryable nor in any `fallback_on` set -- so an
+/// exhausted key ended the Run then and there, told the person "回复的格式不对"
+/// (nothing was malformed), and skipped the second candidate that exists for
+/// exactly this case. `Billing` crosses to another provider even though it is
+/// not retryable on the account that reported it (`failover.rs`,
+/// `crosses_to_another_provider`).
+///
+/// codex splits this same event on the same field: `response.failed` reads
+/// `error.code` and answers `insufficient_quota` with its own `QuotaExceeded`
+/// rather than the generic stream error
+/// (`codex-rs/codex-api/src/sse/responses.rs:387-400`, with
+/// `is_quota_exceeded_error` at `:629-631`), and covers it end to end in
+/// `codex-rs/core/tests/suite/quota_exceeded.rs`.
+#[tokio::test]
+async fn a_response_failed_carrying_an_exhausted_quota_is_a_billing_ending() {
+    let sse = concat!(
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",",
+        "\"error\":{\"code\":\"insufficient_quota\",\"message\":\"You exceeded your current quota, please check your plan and billing details.\"}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, _events_rx) = mpsc::channel(8);
+
+    let error = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let ProviderExecutionError::Provider {
+        kind, retryable, ..
+    } = &error
+    else {
+        panic!("an in-band response.failed must be a provider error: {error:?}");
+    };
+    assert_eq!(
+        (*kind, *retryable),
+        (ModelErrorKind::Billing, false),
+        "an exhausted quota reported on response.failed must be Billing, not Protocol: {error:?}",
+    );
+}
+
+/// And the endings that are not about billing keep the one they had.
+///
+/// The split above reads the provider's own sentence, so it has to be the
+/// provider's sentence and not the word "quota": a `response.failed` that says
+/// nothing about an allowance is still an unnamed fault, and calling it
+/// `Billing` would send a Run down the fallback chain on a guess.
+#[tokio::test]
+async fn a_response_failed_that_says_nothing_about_billing_is_still_a_protocol_ending() {
+    let sse = concat!(
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",",
+        // Not `server_error`: that one is a transient fault and has its own
+        // guard below. This sample is a code no build here has ever seen,
+        // which is the case this arm is actually for.
+        "\"error\":{\"code\":\"something_this_build_has_never_seen\",\"message\":\"the model produced an invalid response\"}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, _events_rx) = mpsc::channel(8);
+
+    let error = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let ProviderExecutionError::Provider {
+        kind, retryable, ..
+    } = &error
+    else {
+        panic!("an in-band response.failed must be a provider error: {error:?}");
+    };
+    assert_eq!(
+        (*kind, *retryable),
+        (ModelErrorKind::Protocol, false),
+        "an unnamed response.failed must keep the ending it had: {error:?}",
+    );
+}
+
+/// A prompt the provider's policy refused is a refusal, not a broken exchange.
+///
+/// The same event, the same field, a different answer. `Protocol` here said
+/// "the provider sent something malformed", which points at the runtime and
+/// invites a retry; what happened is that the *content* was declined, which
+/// only the person who wrote it can do anything about. It is also the one kind
+/// that must never be handed to a second provider: the request would be
+/// re-sent, near-certainly refused again, and a vendor that had not seen the
+/// content would now have it.
+///
+/// codex splits the same codes off the same event -- `invalid_prompt` and
+/// `bio_policy` become `InvalidRequest`, `cyber_policy` gets its own error
+/// (`codex-rs/codex-api/src/sse/responses.rs:387-410`). We agree that these
+/// are not stream faults and disagree only about the destination: codex has no
+/// content-filter category at this layer, so it files them as invalid
+/// requests, while this runtime already ends a filtered *turn* as
+/// `ContentFilter` (`ModelFinishReason`). Sending the error form of the same
+/// refusal to the same word is what lets one sentence cover both.
+#[tokio::test]
+async fn a_response_failed_the_policy_refused_is_a_content_filter_ending() {
+    let sse = concat!(
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",",
+        "\"error\":{\"code\":\"invalid_prompt\",\"message\":\"Your prompt was flagged as potentially violating our usage policy.\"}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, _events_rx) = mpsc::channel(8);
+
+    let error = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let ProviderExecutionError::Provider {
+        kind, retryable, ..
+    } = &error
+    else {
+        panic!("an in-band response.failed must be a provider error: {error:?}");
+    };
+    assert_eq!(
+        (*kind, *retryable),
+        (ModelErrorKind::ContentFilter, false),
+        "a policy refusal must be a content filter, and must not be retried: {error:?}",
+    );
+}
+
+/// The same fault must not end differently for arriving a moment later.
+///
+/// A transient server fault reaching us *before* the stream opens is
+/// `HTTP 500` -> `(Unavailable, true)`: retried on this Provider and carried
+/// to the next, because `Unavailable` is in the shipped `fallback_on`. The
+/// identical fault arriving *after* the 200, as `response.failed` with
+/// `code: "server_error"`, fell into the unnamed arm and became
+/// `(Protocol, false)` -- no retry at all, and the second candidate never
+/// called. Arrival timing is not a property of the failure.
+///
+/// codex splits this position five ways and defaults everything it cannot name
+/// to `Retryable` (`codex-rs/codex-api/src/sse/responses.rs:387-410`). We do
+/// not follow it that far: an unnamed code stays fatal here, because retrying a
+/// fault this build cannot describe spends someone's money on a guess. What
+/// changes is that the transient codes stop being unnamed.
+#[tokio::test]
+async fn a_response_failed_carrying_a_server_fault_is_retried_like_one() {
+    let sse = concat!(
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",",
+        "\"error\":{\"code\":\"server_error\",\"message\":\"The server had an error while processing your request.\"}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let failure = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .expect_err("a failed response is a failure");
+    while events_rx.recv().await.is_some() {}
+    server.await.unwrap();
+
+    match failure {
+        ProviderExecutionError::Provider { kind, retryable, .. } => {
+            assert_eq!(kind, ModelErrorKind::Unavailable, "{failure:?}");
+            assert!(retryable, "a server fault is the definition of worth retrying");
+        }
+        other => panic!("expected a Provider failure, got {other:?}"),
+    }
+}

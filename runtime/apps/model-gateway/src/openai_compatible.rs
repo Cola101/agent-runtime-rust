@@ -842,7 +842,25 @@ fn in_band_error(chunk: &Value, credential: &ProviderCredential) -> Option<Provi
         .and_then(Value::as_str)
         .unwrap_or("provider reported a fault with no message");
     let message = credential.redact(said.chars().take(2048).collect::<String>());
-    let (kind, retryable) = if looks_like_context_overflow(&message) {
+    // Both fields, not the type-or-code hint the arms below read: the
+    // commonest refusal body in this family types itself
+    // `invalid_request_error` and names the refusal in `code`, so a hint that
+    // stops at the first of the two would miss exactly the case that matters.
+    let refused = [error.get("code"), error.get("type")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(is_refusal_code);
+    // Before the context-overflow guess, for the reason `classify_http_error`
+    // gives at the same seam: a refusal is stated in a field the provider
+    // filled in deliberately, an overflow is only inferred from prose.
+    //
+    // And before everything else because the header path already ends here --
+    // the same body arriving as a 400 is a `ContentFilter` there, and where a
+    // provider chose to put its refusal is not a fact about what it refused.
+    let (kind, retryable) = if refused {
+        (ModelErrorKind::ContentFilter, false)
+    } else if looks_like_context_overflow(&message) {
         (ModelErrorKind::ContextOverflow, false)
     } else if kind_hint.contains("rate_limit") || kind_hint.contains("overloaded") {
         (ModelErrorKind::RateLimited, true)
@@ -874,6 +892,49 @@ fn in_band_error(chunk: &Value, credential: &ProviderCredential) -> Option<Provi
             }),
         message,
     })
+}
+
+/// The error codes a provider uses to say it refused the content.
+///
+/// One list, two readers: this classifier and the Responses adapter's
+/// `response.failed` branch. They matched different things once and the result
+/// was that a refusal arriving one way was named and arriving the other way
+/// was not.
+///
+/// Exact codes, never a substring search of the message. `ContentFilter` is the
+/// one kind that must never be handed to a second Provider -- doing so would be
+/// the runtime disclosing, on its own initiative, content one vendor already
+/// refused to a vendor that has never seen it. A false positive there is a
+/// Run silently ended that a fallback could have answered, so the match has to
+/// be on a field the provider filled in deliberately.
+pub(crate) fn is_refusal_code(code: &str) -> bool {
+    matches!(
+        code.to_ascii_lowercase().as_str(),
+        "invalid_prompt"
+            | "bio_policy"
+            | "cyber_policy"
+            | "content_filter"
+            | "content_policy_violation"
+    )
+}
+
+/// Whether an error body names a refusal, read from the field rather than the
+/// prose.
+///
+/// Azure OpenAI -- the commonest enterprise deployment in this family --
+/// refuses a *prompt* with `HTTP 400 {"error":{"code":"content_filter"}}`,
+/// before any stream opens, so this is the path most real refusals take. It
+/// used to fall through to `Protocol` and tell the person their reply was
+/// malformed when nothing was malformed and no reply existed.
+pub(crate) fn body_names_a_refusal(body: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = &parsed["error"];
+    [&error["code"], &error["type"], &parsed["code"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .any(is_refusal_code)
 }
 
 pub(crate) async fn classify_http_error(
@@ -909,6 +970,9 @@ pub(crate) async fn classify_http_error(
             (ModelErrorKind::Timeout, true)
         }
         status if status.is_server_error() => (ModelErrorKind::Unavailable, true),
+        // Before the context-overflow guess, because a refusal is stated in a
+        // field and an overflow is only inferred from prose.
+        _ if body_names_a_refusal(&message) => (ModelErrorKind::ContentFilter, false),
         _ if looks_like_context_overflow(&message) => (ModelErrorKind::ContextOverflow, false),
         _ => (ModelErrorKind::Protocol, false),
     };
@@ -1036,9 +1100,12 @@ fn looks_like_context_overflow(message: &str) -> bool {
 /// and Anthropic's balance sentence.
 ///
 /// The in-band streaming path already made this split on the error's `type`
-/// field (`in_band_error`, `kind_hint.contains("quota")`); here there is only
-/// the body, because a provider that answers 429 answers with no stream at all.
-fn looks_like_exhausted_quota(message: &str) -> bool {
+/// field (`in_band_error`, `kind_hint.contains("quota")`); on the 429 path
+/// there is only the body, because a provider that answers 429 answers with no
+/// stream at all. The Responses adapter reads both -- a `response.failed`
+/// carries `error.code` *and* `error.message`, and servers in this family are
+/// not consistent about which one names the allowance.
+pub(crate) fn looks_like_exhausted_quota(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("insufficient_quota")
         || message.contains("usage_limit_reached")

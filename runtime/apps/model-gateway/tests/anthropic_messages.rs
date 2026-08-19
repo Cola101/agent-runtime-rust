@@ -303,3 +303,96 @@ async fn thinking_is_private_continuation_state_and_never_visible_text() {
         "sig-opaque"
     );
 }
+
+/// A thinking block that ends without a signature is unreplayable, not broken.
+///
+/// The signature is what makes thinking *replayable*: Anthropic rejects a
+/// `thinking` block handed back without it, which is why `anthropic_content`
+/// refuses to send one. Ending the turn over it is a different claim
+/// altogether -- that the stream was malformed -- and it costs everything the
+/// model already said. The failure lands at `content_block_stop`, after the
+/// visible answer has been emitted, as `Protocol, false`: not retryable, and
+/// (`runtime-host` `can_fallback`) not eligible for another Provider either,
+/// because deltas were already committed.
+///
+/// Neither reference fails here. openclaw carries the block with
+/// `thinkingSignature: ""` (`packages/ai/src/providers/anthropic.ts:574,660`)
+/// and only decides what to do with it at replay time, downgrading an unsigned
+/// block to plain text so the next request is still valid
+/// (`anthropic.ts:1406-1412`, comment: missing/empty signature "e.g., from
+/// aborted stream"). opencode types the field
+/// `signature: Schema.optional(Schema.String)`
+/// (`packages/llm/src/protocols/anthropic-messages.ts:60`) and has no path
+/// that errors when it never arrives. Both have met streams like this --
+/// openclaw carries a whole `allowEmptySignature` switch and a
+/// `"reasoning_content"` sentinel for proxies that translate some other
+/// model's reasoning into Anthropic-shaped thinking blocks
+/// (`anthropic.ts:1399-1418`). This adapter is pointed at whatever endpoint an
+/// operator configures, so those are exactly the streams it will meet.
+///
+/// Agreeing with them, with our own reason: an unsigned thinking block means
+/// the reasoning cannot be carried into the next turn. It does not mean the
+/// answer beside it is worthless.
+#[tokio::test]
+async fn thinking_that_never_gets_signed_costs_the_replay_not_the_turn() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private thought\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Visible answer\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/messages", sse).await;
+    let adapter = AnthropicMessagesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    let outcome = adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "an unsigned thinking block must not end the turn: {outcome:?}",
+    );
+    // Said out loud, because a dropped reasoning block that nobody records is
+    // the same loss with nothing left to read.
+    assert_eq!(
+        events[0],
+        ModelStreamEvent::Reasoning {
+            summary: Vec::new(),
+            private_state: None,
+        },
+        "the reasoning happened and cannot be replayed; both halves are facts: {events:?}",
+    );
+    assert!(
+        events.contains(&ModelStreamEvent::TextDelta {
+            text: "Visible answer".into(),
+            block: Some(1),
+        }),
+        "the answer the model already finished must survive: {events:?}",
+    );
+    assert!(
+        events.contains(&ModelStreamEvent::Completed {
+            reason: ModelFinishReason::Stop,
+        }),
+        "the turn ended the way the model ended it: {events:?}",
+    );
+    // Unsigned or not, thinking is still not the answer.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::TextDelta { text, .. } if text.contains("private thought")
+        )),
+        "thinking must never arrive as visible text: {events:?}",
+    );
+}

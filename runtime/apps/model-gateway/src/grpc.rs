@@ -406,6 +406,7 @@ const fn encode_error_kind(kind: ModelErrorKind) -> WireErrorKind {
         ModelErrorKind::ContextOverflow => WireErrorKind::ContextOverflow,
         ModelErrorKind::CapabilityMismatch => WireErrorKind::CapabilityMismatch,
         ModelErrorKind::Unavailable => WireErrorKind::Unavailable,
+        ModelErrorKind::ContentFilter => WireErrorKind::ContentFilter,
     }
 }
 

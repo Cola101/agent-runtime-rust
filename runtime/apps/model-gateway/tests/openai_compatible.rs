@@ -1697,3 +1697,110 @@ async fn a_429_that_names_an_exhausted_quota_is_billing_rather_than_a_rate_limit
         "a 429 whose body names an exhausted quota must not be retried as a rate limit: {error:?}"
     );
 }
+
+/// The commonest way a content filter actually arrives.
+///
+/// Azure OpenAI -- the largest enterprise deployment in the
+/// openai-compatible family -- refuses a *prompt* with
+/// `HTTP 400 {"error":{"code":"content_filter", ...}}`, before any stream
+/// opens. That lands in `classify_http_error`, which had no content-filter
+/// branch at all: 400 matches none of the status arms, the body is not a
+/// context overflow, so it fell to `(Protocol, false)` and the person was told
+/// "回复的格式不对" about a reply that was never malformed.
+///
+/// The round that introduced `ModelErrorKind::ContentFilter` reached only the
+/// Responses adapter's `response.failed`, and every guard it wrote tested that
+/// one path -- so the whole set stayed green while the sentence it set out to
+/// kill survived in the commonest case. This is that case.
+#[tokio::test]
+async fn a_four_hundred_naming_a_content_filter_is_a_refusal_not_a_malformed_reply() {
+    let (endpoint, _captured, server) = spawn_complete_server(
+        400,
+        r#"{"error":{"message":"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.","type":"invalid_request_error","code":"content_filter"}}"#,
+    )
+    .await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let failure = adapter
+        .execute(&model_request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .expect_err("a refused prompt is a failure");
+    while events_rx.recv().await.is_some() {}
+    server.await.unwrap();
+
+    match failure {
+        ProviderExecutionError::Provider { kind, retryable, .. } => {
+            assert_eq!(
+                kind,
+                ModelErrorKind::ContentFilter,
+                "a refused prompt is not a protocol fault: {failure:?}",
+            );
+            // A decision, not a blip. Sending the same words again gets the
+            // same answer, and the words must not be handed to a second
+            // Provider that has never seen them.
+            assert!(!retryable, "a content filter is a decision, not a blip");
+        }
+        other => panic!("expected a Provider failure, got {other:?}"),
+    }
+}
+
+/// The same refusal, arriving one frame later.
+///
+/// A server that has already answered 200 reports a refusal the only way it
+/// still can: a `data:` frame carrying the same `{"error":{"code":
+/// "content_filter"}}` body it would have put in a 400. `classify_http_error`
+/// names that a `ContentFilter`; `in_band_error` split five ways -- rate
+/// limit, quota, authentication, timeout, server -- and had no refusal arm, so
+/// the identical body became `Protocol, false` and the person was told the
+/// reply's format was wrong about a reply the provider refused to write.
+///
+/// Where a refusal is decided is not something the wire tells us, so the two
+/// arrival paths must not end differently. Note the `type` here is
+/// `invalid_request_error`: the refusal is named in `code`, which is why
+/// reading only the type-or-code hint the kind arms use is not enough.
+#[tokio::test]
+async fn a_mid_stream_error_frame_naming_a_content_filter_is_a_refusal_too() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\":{\"message\":\"The response was filtered due to the prompt triggering Azure OpenAI's content management policy.\",\"type\":\"invalid_request_error\",\"code\":\"content_filter\"}}\n\n",
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    while events_rx.recv().await.is_some() {}
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let failure = outcome.expect_err("a refused turn is a failure");
+    let ProviderExecutionError::Provider {
+        kind,
+        retryable,
+        message,
+        ..
+    } = &failure
+    else {
+        panic!("expected a provider failure, got {failure:?}");
+    };
+    assert_eq!(
+        *kind,
+        ModelErrorKind::ContentFilter,
+        "a refusal is a refusal whichever frame carries it: {failure:?}",
+    );
+    // A decision, not a blip -- and never handed to a second Provider that has
+    // never seen the words this one refused.
+    assert!(!retryable, "a content filter is a decision: {failure:?}");
+    assert!(
+        message.contains("content management policy"),
+        "the provider's own sentence is the only lead there is: {message}",
+    );
+}

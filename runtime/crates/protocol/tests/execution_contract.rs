@@ -1,8 +1,9 @@
 use agent_protocol::{
-    ContentPart, HistoryImportSource, Message, Placement, Role, RunExecutionAccepted,
-    RunExecutionCommand, RunStatus, RuntimeExecutionPolicySnapshot, RuntimeInvocationContext,
-    SubagentBudgetUsage, SubagentConversationTurn, SubagentResultDelivery, SubagentResultOutcome,
-    SubagentResultSource, WorkerHeartbeat, WorkloadIdentityRenewalCommand,
+    ContentPart, HistoryImportSource, Message, ModelErrorKind, Placement, Role,
+    RunExecutionAccepted, RunExecutionCommand, RunStatus, RuntimeExecutionPolicySnapshot,
+    RuntimeInvocationContext, SubagentBudgetUsage, SubagentConversationTurn,
+    SubagentResultDelivery, SubagentResultOutcome, SubagentResultSource, WorkerHeartbeat,
+    WorkloadIdentityRenewalCommand,
 };
 use chrono::{Duration, Utc};
 use std::collections::BTreeSet;
@@ -1249,4 +1250,41 @@ fn a_skill_may_declare_a_qualified_federated_tool_name() {
             command.validate()
         );
     }
+}
+
+/// A refused prompt is not a failure a second Provider can absorb.
+///
+/// `fallback_on` is the set of endings worth carrying to another candidate,
+/// and every member of it is a fact about the *Provider*: it is busy, it is
+/// slow, it is down, the account behind it is empty. Another vendor is another
+/// vendor, so trying again there is reasonable. `ContentFilter` is a fact
+/// about the *request content*, which travels with the Run -- the second
+/// Provider is shown the same words and near-certainly refuses them too.
+///
+/// So the cost of allowing it is not a wasted call. It is that content one
+/// vendor declined gets disclosed to a vendor that had never seen it, on the
+/// runtime's initiative, to buy a retry that was never going to work. The
+/// whitelist is the place that decision is made once, for every operator, so
+/// this asserts an operator cannot configure their way past it.
+#[test]
+fn a_content_filter_is_never_a_failure_worth_carrying_to_another_provider() {
+    let policy = RuntimeExecutionPolicySnapshot::default();
+    assert!(policy.is_bounded_and_safe());
+    assert!(
+        !policy
+            .model_failover
+            .fallback_on
+            .contains(&ModelErrorKind::ContentFilter),
+        "the shipped default must not re-send refused content to a second vendor",
+    );
+
+    let mut configured = policy;
+    configured
+        .model_failover
+        .fallback_on
+        .insert(ModelErrorKind::ContentFilter);
+    assert!(
+        !configured.is_bounded_and_safe(),
+        "a policy that fails over on a content filter must be refused, not honoured",
+    );
 }

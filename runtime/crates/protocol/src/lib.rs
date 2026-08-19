@@ -2994,6 +2994,21 @@ pub enum ModelErrorKind {
     ContextOverflow,
     CapabilityMismatch,
     Unavailable,
+    /// The provider refused the content rather than failing to serve it.
+    ///
+    /// Apart from `Protocol` because they are not the same fact and do not
+    /// have the same remedy. `Protocol` says the exchange broke -- retry it,
+    /// or send it somewhere else. This says the *request content* was
+    /// declined, which no amount of retrying and no other vendor changes; the
+    /// only party who can act is the person who wrote it.
+    ///
+    /// It was `Protocol` until now, which meant a content-filtered Run reached
+    /// every consumer that reads `kind` without also reading the finish reason
+    /// as "the provider sent something malformed" -- a sentence that is not
+    /// true and that points at the wrong person. Deliberately *not* in the
+    /// `fallback_on` whitelist above: see `RuntimeExecutionPolicySnapshot::
+    /// is_bounded_and_safe`.
+    ContentFilter,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

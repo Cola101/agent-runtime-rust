@@ -592,6 +592,25 @@ impl RunMachine {
                 "run.succeeded",
                 json!({ "status": RunStatus::Succeeded, "reason": ModelFinishReason::Length }),
             ),
+            // Filed under its own kind rather than `Protocol`. Both fields
+            // are on the event and only one of them is read widely: `kind` is
+            // the field the whole failure vocabulary is built on, `reason`
+            // happens to be read by the desktop transcript. Under `Protocol`
+            // this ending told every other consumer that the provider had sent
+            // something malformed -- an exchange to retry, or to hand to a
+            // second provider. The content was declined instead, which no
+            // retry and no second vendor changes.
+            //
+            // `reason` stays: it is the narrower fact, it is already
+            // load-bearing (`desktop/shell/src/surfaces/model.ts`,
+            // `cutShort`), and dropping it to avoid saying the same thing
+            // twice would break a sentence a person reads for the sake of a
+            // tidiness nobody benefits from.
+            //
+            // No `message`, on purpose. A `Completed` event carries a reason
+            // and nothing else -- there is no provider sentence here to pass
+            // on, and writing one from the kernel would be inventing the one
+            // part of a failure a person is entitled to trust.
             ModelStreamEvent::Completed {
                 reason: ModelFinishReason::ContentFilter,
             } => self.emit(
@@ -599,7 +618,13 @@ impl RunMachine {
                 "run.failed",
                 json!({
                     "status": RunStatus::Failed,
-                    "kind": ModelErrorKind::Protocol,
+                    "kind": ModelErrorKind::ContentFilter,
+                    // Stated, not omitted. Every other `run.failed` this
+                    // machine writes carries it, and a consumer reading the
+                    // field cannot tell an ending that said `false` from one
+                    // that forgot to speak. A refusal is a decision: the same
+                    // words get the same answer.
+                    "retryable": false,
                     "reason": ModelFinishReason::ContentFilter
                 }),
             ),

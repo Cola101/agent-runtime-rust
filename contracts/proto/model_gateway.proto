@@ -199,6 +199,13 @@ enum ModelErrorKind {
   MODEL_ERROR_KIND_CONTEXT_OVERFLOW = 6;
   MODEL_ERROR_KIND_CAPABILITY_MISMATCH = 7;
   MODEL_ERROR_KIND_UNAVAILABLE = 8;
+  // A refusal by the provider's safety filter, kept apart from PROTOCOL.
+  // Filed under PROTOCOL, it was indistinguishable from a malformed response
+  // to every consumer that reads `kind` without also reading the finish
+  // reason -- and the two call for opposite handling: a malformed response is
+  // the caller's to retry or report, a refused one is the *content's* and no
+  // second provider will accept it either.
+  MODEL_ERROR_KIND_CONTENT_FILTER = 9;
 }
 
 // Federated MCP tool calls (ADR-0040).

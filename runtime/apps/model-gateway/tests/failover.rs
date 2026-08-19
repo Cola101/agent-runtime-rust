@@ -338,3 +338,48 @@ fn provider_route_debug_never_exposes_the_credential() {
         ProviderRoute::safe_fallback_kinds()
     );
 }
+
+/// The gateway refuses to fail over on a content filter, whatever the policy
+/// snapshot says.
+///
+/// The whitelist is stated twice on purpose -- here and in
+/// `RuntimeExecutionPolicySnapshot::is_bounded_and_safe` -- because these are
+/// two different doors into the same behaviour and a Run that arrives through
+/// one must not get semantics the other would have refused. What is being kept
+/// out is not a wasted call: a refused prompt handed to a second vendor is
+/// content the first vendor declined being disclosed to a vendor that had
+/// never seen it, on the runtime's own initiative, to buy a retry that cannot
+/// work. So a snapshot naming it is rejected outright rather than quietly
+/// ignored: silently dropping a member would leave an operator believing they
+/// had configured something.
+#[tokio::test]
+async fn a_policy_that_fails_over_on_a_content_filter_is_refused_outright() {
+    let routes = vec![
+        route("primary", "http://127.0.0.1:9/v1/chat/completions".into()),
+        route("fallback", "http://127.0.0.1:9/v1/chat/completions".into()),
+    ];
+    let policy = ModelFailoverPolicySnapshot {
+        max_provider_attempts: 2,
+        fallback_on: BTreeSet::from([ModelErrorKind::RateLimited, ModelErrorKind::ContentFilter]),
+    };
+    let (events_tx, _events_rx) = mpsc::channel(16);
+
+    let error = execute_with_frozen_failover(
+        &routes,
+        &request(),
+        &policy,
+        CancellationToken::new(),
+        events_tx,
+    )
+    .await
+    .expect_err("a content-filter fallback must not be honoured");
+
+    assert!(
+        matches!(
+            &error,
+            ProviderExecutionError::InvalidConfiguration(message)
+                if message == "runtime model failover policy is invalid"
+        ),
+        "the policy must be rejected before any provider is called: {error:?}",
+    );
+}

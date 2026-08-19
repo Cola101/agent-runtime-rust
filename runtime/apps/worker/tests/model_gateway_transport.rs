@@ -5,9 +5,10 @@ use agent_model_gateway::{
 };
 use agent_model_gateway_protocol::v1::model_execution_server::ModelExecutionServer;
 use agent_model_gateway_protocol::v1::{
-    Completed, ContentPart, FinishReason, ModelEvent, ModelInvocation, ModelMessage, ModelRole,
-    ModelTool, PrivateStateOmitted, ProviderPrivateState as WireProviderPrivateState, Reasoning,
-    ReasoningPolicy, Refusal, TextDelta, TextPart, content_part, model_event,
+    Completed, ContentPart, Failed as WireFailed, FinishReason, ModelErrorKind as WireErrorKind,
+    ModelEvent, ModelInvocation, ModelMessage, ModelRole, ModelTool, PrivateStateOmitted,
+    ProviderPrivateState as WireProviderPrivateState, Reasoning, ReasoningPolicy, Refusal,
+    TextDelta, TextPart, content_part, model_event,
 };
 use agent_protocol::{
     ModelErrorKind, ModelFinishReason, ModelStreamEvent, Placement, ProviderPrivateState,
@@ -1081,4 +1082,197 @@ async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
         }
     }
     String::from_utf8(buffer).unwrap()
+}
+
+/// One `Failed`, with whatever error kind the test hands it.
+///
+/// One connection per kind because the client returns as soon as it forwards a
+/// terminal event, which a `Failed` is.
+#[derive(Clone, Copy)]
+struct SingleFailureService(i32);
+
+#[tonic::async_trait]
+impl agent_model_gateway_protocol::v1::model_execution_server::ModelExecution
+    for SingleFailureService
+{
+    type ExecuteStream =
+        Pin<Box<dyn Stream<Item = Result<ModelEvent, Status>> + Send + Sync + 'static>>;
+
+    async fn execute(
+        &self,
+        _request: Request<ModelInvocation>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        let stream = tokio_stream::iter(vec![Ok(ModelEvent {
+            schema_version: 1,
+            sequence: 1,
+            body: Some(model_event::Body::Failed(WireFailed {
+                kind: self.0,
+                retryable: false,
+                message: "provider said no".into(),
+            })),
+        })]);
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// What each wire error kind means to the runtime.
+///
+/// Written out here rather than reused from the gateway's encoder on purpose:
+/// this match is exhaustive over the *proto* enum, so a value added to
+/// `ModelErrorKind` in `contracts/proto/model_gateway.proto` does not compile
+/// until someone says what the runtime should make of it -- which is the
+/// question that was skipped the last time the vocabulary grew.
+fn runtime_kind(wire: WireErrorKind) -> Option<ModelErrorKind> {
+    match wire {
+        WireErrorKind::Unspecified => None,
+        WireErrorKind::Authentication => Some(ModelErrorKind::Authentication),
+        WireErrorKind::Billing => Some(ModelErrorKind::Billing),
+        WireErrorKind::RateLimited => Some(ModelErrorKind::RateLimited),
+        WireErrorKind::Timeout => Some(ModelErrorKind::Timeout),
+        WireErrorKind::Protocol => Some(ModelErrorKind::Protocol),
+        WireErrorKind::ContextOverflow => Some(ModelErrorKind::ContextOverflow),
+        WireErrorKind::CapabilityMismatch => Some(ModelErrorKind::CapabilityMismatch),
+        WireErrorKind::Unavailable => Some(ModelErrorKind::Unavailable),
+        WireErrorKind::ContentFilter => Some(ModelErrorKind::ContentFilter),
+    }
+}
+
+/// Every error kind the contract defines has to survive the wire.
+///
+/// The two halves of this hop are not symmetric. The gateway's encoder is an
+/// exhaustive `match` on the runtime enum, so a new kind cannot be forgotten
+/// there -- it will not compile. The worker's decoder is a `match` with a
+/// catch-all `Err("model error kind is unspecified")`, so a kind it has not
+/// learned is not a compile error: it is a Run that dies at the transport with
+/// a sentence about an unspecified enum, having thrown away the real failure
+/// the provider reported. That is the shape of loss this walks the whole
+/// vocabulary to prevent, rather than checking only the kind added today.
+#[tokio::test]
+async fn every_error_kind_the_contract_defines_survives_the_gateway_hop() {
+    let mut checked = Vec::new();
+    for value in 1..i32::MAX {
+        let Ok(wire) = WireErrorKind::try_from(value) else {
+            break;
+        };
+        let Some(expected) = runtime_kind(wire) else {
+            continue;
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ModelExecutionServer::new(SingleFailureService(value)))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    shutdown_rx.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+        let claims = claims();
+        let mut client = GrpcModelGatewayClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+
+        let outcome = client
+            .execute(
+                invocation(&claims),
+                &sign_token(&claims),
+                CancellationToken::new(),
+                events_tx,
+            )
+            .await;
+
+        assert!(
+            outcome.is_ok(),
+            "{wire:?} is in the contract but the worker refuses it: {outcome:?}",
+        );
+        assert_eq!(
+            events_rx.recv().await,
+            Some(ModelStreamEvent::Failed {
+                kind: expected,
+                retryable: false,
+                message: "provider said no".into(),
+            }),
+            "{wire:?} did not arrive as {expected:?}",
+        );
+        checked.push(expected);
+
+        shutdown_tx.send(()).ok();
+        server.await.unwrap();
+    }
+
+    assert!(
+        checked.contains(&ModelErrorKind::ContentFilter),
+        "the loop must have reached the kind this vocabulary was just widened for: {checked:?}",
+    );
+}
+
+/// A kind this build has never heard of must not cost the sentence that came
+/// with it.
+///
+/// The ordinary rolling upgrade is server-first: a newer gateway starts
+/// emitting an error kind an older worker has no name for. `decode_error_kind`
+/// answered that with `Err`, and the `?` on it discarded the whole `Failed`
+/// event -- including `message`, one line below, which had already been carried
+/// all the way from the Provider into this process. What the person then read
+/// was "model gateway returned an invalid event: model error kind is
+/// unspecified": a transport sentence, about a Run that failed for a perfectly
+/// nameable reason the Provider had explained.
+///
+/// Degrading an unknown kind to `Protocol` loses the classification, which is
+/// the part this build genuinely does not have. Keeping the message loses
+/// nothing, and it is the only part of a failure worth trusting.
+#[tokio::test]
+async fn an_error_kind_from_a_newer_gateway_still_carries_what_the_provider_said() {
+    // Beyond every variant this build knows: what a gateway sending a kind
+    // added after this binary was compiled looks like on the wire.
+    let from_the_future = 9_999;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ModelExecutionServer::new(SingleFailureService(from_the_future)))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+    let claims = claims();
+    let mut client = GrpcModelGatewayClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    let outcome = client
+        .execute(
+            invocation(&claims),
+            &sign_token(&claims),
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+
+    assert!(
+        outcome.is_ok(),
+        "an unnameable kind must not void the whole event: {outcome:?}",
+    );
+    assert_eq!(
+        events_rx.recv().await,
+        Some(ModelStreamEvent::Failed {
+            // The classification is the part this build really does not have.
+            kind: ModelErrorKind::Protocol,
+            retryable: false,
+            // The part it does have, and the only part worth trusting.
+            message: "provider said no".into(),
+        }),
+    );
+
+    shutdown_tx.send(()).ok();
+    server.await.unwrap();
 }

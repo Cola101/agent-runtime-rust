@@ -638,13 +638,43 @@ async fn emit_reasoning(
             thinking,
             signature,
         } => {
+            // An unsigned thinking block costs the replay, not the turn.
+            //
+            // The signature is what makes thinking replayable -- Anthropic
+            // rejects a `thinking` block handed back without one, which is why
+            // `anthropic_content` refuses to send one. Ending the Run over it
+            // said something else entirely, that the stream was malformed, and
+            // charged the whole answer for it: the failure lands at
+            // `content_block_stop`, after the visible text has already been
+            // emitted, as `Protocol, false` -- not retried, and not eligible
+            // for another Provider either, because deltas are already
+            // committed.
+            //
+            // Neither reference fails here. openclaw carries the block with an
+            // empty signature (`packages/ai/src/providers/anthropic.ts:574`,
+            // `:660`) and decides only at replay time, downgrading an unsigned
+            // block to plain text so the next request stays valid (`:1406-1412`,
+            // its comment naming an aborted stream as the cause); opencode
+            // types the field optional
+            // (`packages/llm/src/protocols/anthropic-messages.ts:60`) and has
+            // no path that errors when it never arrives. openclaw carries a
+            // whole `allowEmptySignature` switch and a `"reasoning_content"`
+            // sentinel (`:1399-1418`) for proxies that translate some other
+            // model's reasoning into Anthropic-shaped blocks -- and this
+            // adapter is pointed at whatever endpoint an operator configures.
+            //
+            // Still emitted rather than dropped: that the model reasoned and
+            // that none of it can be carried forward are both facts, and a
+            // silent drop leaves nothing to read for either.
             if signature.is_empty() {
-                return Err(provider_error(
-                    ModelErrorKind::Protocol,
-                    false,
-                    None,
-                    "thinking block ended without signature",
-                ));
+                return emit(
+                    events,
+                    ModelStreamEvent::Reasoning {
+                        summary: Vec::new(),
+                        private_state: None,
+                    },
+                )
+                .await;
             }
             json!({
                 "type": "thinking",
