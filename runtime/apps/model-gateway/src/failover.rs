@@ -76,7 +76,10 @@ pub async fn execute_with_frozen_failover(
         || policy.fallback_on.iter().any(|kind| {
             !matches!(
                 kind,
-                ModelErrorKind::RateLimited | ModelErrorKind::Timeout | ModelErrorKind::Unavailable
+                ModelErrorKind::RateLimited
+                    | ModelErrorKind::Timeout
+                    | ModelErrorKind::Unavailable
+                    | ModelErrorKind::Billing
             )
         })
     {
@@ -153,16 +156,31 @@ pub async fn execute_with_frozen_failover(
     ))
 }
 
+/// Whether this failure says anything about a *different* provider.
+///
+/// Two questions were being answered by one flag. `retryable` asks whether the
+/// same call will work later; failover asks whether a different provider will
+/// work now. For every transient kind the answers coincide, which is why one
+/// flag served for both until a failure appeared where they diverge.
+///
+/// An exhausted quota is that failure. Retrying the same account is pointless,
+/// possibly for days -- and a different provider is a different account, so it
+/// is exactly the case a second candidate was configured for. Requiring
+/// `retryable` here would mean the more truthful classification of a quota 429
+/// costs the failover that the *wrong* classification (`RateLimited`) was
+/// buying by accident.
+fn crosses_to_another_provider(kind: ModelErrorKind, retryable: bool) -> bool {
+    retryable || matches!(kind, ModelErrorKind::Billing)
+}
+
 fn is_policy_fallback(
     error: &ProviderExecutionError,
     policy: &ModelFailoverPolicySnapshot,
 ) -> bool {
     matches!(
         error,
-        ProviderExecutionError::Provider {
-            kind,
-            retryable: true,
-            ..
-        } if policy.fallback_on.contains(kind)
+        ProviderExecutionError::Provider { kind, retryable, .. }
+            if policy.fallback_on.contains(kind)
+                && crosses_to_another_provider(*kind, *retryable)
     )
 }

@@ -4038,8 +4038,20 @@ impl LocalRuntimeHost {
     }
 
     fn can_fallback(&self, failure: &LocalModelRouteFailure, committed_events: usize) -> bool {
+        // `retryable` and "worth trying somewhere else" are two questions, and
+        // they only coincide for the transient kinds. An exhausted quota is not
+        // retryable on the account that reported it -- possibly for days -- and
+        // is precisely what a second candidate exists for, because a different
+        // provider is a different account. Requiring `retryable` here meant the
+        // more truthful classification of a quota-bearing 429 cost the failover
+        // that the wrong one (`RateLimited`) had been buying by accident.
+        //
+        // The gateway states the same rule at `crosses_to_another_provider`
+        // (`model-gateway/src/failover.rs`); both paths have to agree or a Run
+        // fails over in one and not the other.
+        let crosses = failure.retryable || failure.kind == ModelErrorKind::Billing;
         committed_events == 0
-            && failure.retryable
+            && crosses
             && self
                 .config
                 .runtime_policy

@@ -310,6 +310,11 @@ impl Default for RuntimeExecutionPolicySnapshot {
                     ModelErrorKind::RateLimited,
                     ModelErrorKind::Timeout,
                     ModelErrorKind::Unavailable,
+                    // An exhausted account is the case a second candidate was
+                    // configured for. It is not retryable on the provider that
+                    // reported it, which is a different question -- see
+                    // `crosses_to_another_provider` in the gateway's failover.
+                    ModelErrorKind::Billing,
                 ]),
             },
             tool_execution: ToolExecutionPolicySnapshot {
@@ -347,6 +352,7 @@ impl RuntimeExecutionPolicySnapshot {
                     ModelErrorKind::RateLimited
                         | ModelErrorKind::Timeout
                         | ModelErrorKind::Unavailable
+                        | ModelErrorKind::Billing
                 )
             })
             && (1..=3_600_000).contains(&self.tool_execution.timeout_ms)

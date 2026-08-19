@@ -389,3 +389,88 @@ async fn preserves_reasoning_state_for_same_provider_and_omits_it_for_another() 
         })
     );
 }
+
+/// A turn the provider's filter stopped is not a turn that ran out of length.
+///
+/// `response.incomplete` carries `incomplete_details.reason`, and OpenAI puts
+/// two different endings there: `max_output_tokens` and `content_filter`.
+/// Reading neither and reporting `Length` for both made a blocked prompt end
+/// as a *successful* short answer -- the kernel turns `Length` into
+/// `run.succeeded` (`crates/kernel/src/lib.rs`), so the one failure only the
+/// person themselves can act on was drawn as "这段回答没说完 -- 模型到了单轮
+/// 长度上限", telling them to shorten a prompt that was never too long.
+///
+/// openclaw splits exactly this event and says why: "a content-filtered turn
+/// is a provider error rather than a truncated answer"
+/// (`packages/ai/src/providers/openai-responses-terminal-usage.ts:87-105`,
+/// where `status === "incomplete" && incompleteReason === "content_filter"`
+/// short-circuits to an error before the ordinary incomplete-status mapping).
+/// opencode maps the Responses reason to its own `content-filter` finish
+/// (`packages/llm/src/protocols/openai-responses.ts:527`) and then raises it
+/// as a session error, noting these turns may have produced no visible output
+/// at all (`packages/opencode/src/session/prompt.ts:1295-1307`).
+#[tokio::test]
+async fn an_incomplete_response_stopped_by_the_content_filter_is_not_a_length_cap() {
+    let sse = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Sure, here\"}\n\n",
+        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    server.await.unwrap();
+
+    assert_eq!(
+        events.last(),
+        Some(&ModelStreamEvent::Completed {
+            reason: ModelFinishReason::ContentFilter,
+        }),
+        "a filtered turn must end as content_filter, not as a length cap: {events:?}"
+    );
+}
+
+/// The other `incomplete_details.reason`, kept apart from the first.
+///
+/// `max_output_tokens` is the ending this branch was written for, and reading
+/// the reason must not cost it: a reply that really did hit its per-turn
+/// ceiling still ends `Length`, which the kernel reports as a succeeded Run
+/// carrying the truncation.
+#[tokio::test]
+async fn an_incomplete_response_that_hit_its_output_ceiling_is_still_a_length_cap() {
+    let sse = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Sure, here\"}\n\n",
+        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{}}}\n\n"
+    );
+    let (endpoint, _captured, server) = support::spawn_sse_server("/v1/responses", sse).await;
+    let adapter = OpenAiResponsesAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(8);
+
+    adapter
+        .execute(&request(), &credential, CancellationToken::new(), events_tx)
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    server.await.unwrap();
+
+    assert_eq!(
+        events.last(),
+        Some(&ModelStreamEvent::Completed {
+            reason: ModelFinishReason::Length,
+        }),
+        "a turn that hit its output ceiling must still end as length: {events:?}"
+    );
+}

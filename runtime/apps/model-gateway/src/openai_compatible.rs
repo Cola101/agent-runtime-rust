@@ -894,6 +894,16 @@ pub(crate) async fn classify_http_error(
     let (kind, retryable) = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => (ModelErrorKind::Authentication, false),
         StatusCode::PAYMENT_REQUIRED => (ModelErrorKind::Billing, false),
+        // Two different endings share this status code, and only the body
+        // tells them apart. "Slow down" clears by waiting; "this account is
+        // out of quota" does not, and retrying it is guaranteed-wasted time --
+        // `RateLimited` is in the default `fallback_on` set and carries
+        // `retryable: true`, so an exhausted key spent the full same-Provider
+        // backoff *and* the whole fallback chain before the person was told,
+        // wrongly, that they were calling too fast.
+        StatusCode::TOO_MANY_REQUESTS if looks_like_exhausted_quota(&message) => {
+            (ModelErrorKind::Billing, false)
+        }
         StatusCode::TOO_MANY_REQUESTS => (ModelErrorKind::RateLimited, true),
         StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
             (ModelErrorKind::Timeout, true)
@@ -1009,4 +1019,31 @@ fn looks_like_context_overflow(message: &str) -> bool {
     message.contains("context length")
         || message.contains("context window")
         || message.contains("too many tokens")
+}
+
+/// Whether a 429 body says the account has no allowance left, rather than that
+/// it is calling too fast.
+///
+/// Deliberately the provider's own error codes and their canonical sentences,
+/// not the word "quota". Vertex answers a *per-minute* rate limit with "Quota
+/// exceeded for quota metric 'Generate Content API requests per minute'" --
+/// which is the retryable case wearing the other one's vocabulary, and a loose
+/// match on "quota" would stop retrying the one ending that waiting actually
+/// fixes. The needles below are what the providers emit for an allowance that
+/// is gone: OpenAI's `insufficient_quota` and the sentence it ships with, the
+/// ChatGPT-plan `usage_limit_reached` / `usage_not_included` pair codex parses
+/// out of this same status (`codex-rs/codex-api/src/api_bridge.rs:94-127`),
+/// and Anthropic's balance sentence.
+///
+/// The in-band streaming path already made this split on the error's `type`
+/// field (`in_band_error`, `kind_hint.contains("quota")`); here there is only
+/// the body, because a provider that answers 429 answers with no stream at all.
+fn looks_like_exhausted_quota(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("insufficient_quota")
+        || message.contains("usage_limit_reached")
+        || message.contains("usage_not_included")
+        || message.contains("exceeded your current quota")
+        || message.contains("credit balance is too low")
+        || message.contains("billing_hard_limit_reached")
 }

@@ -1645,3 +1645,84 @@ async fn a_failed_run_repeats_what_the_provider_said_not_only_its_digest() {
     );
     server.await.unwrap();
 }
+
+/// An exhausted quota on one account is the reason the second provider exists.
+///
+/// Two questions were being answered by one flag. `retryable` asks whether the
+/// *same* call will work later; for a hard quota it will not, possibly for
+/// days, and waiting on it is the defect that made this round classify a
+/// quota-bearing 429 as `Billing` instead of `RateLimited`. Failover asks a
+/// different question -- whether a *different* provider will work now -- and
+/// for an exhausted account the answer is obviously yes, because a different
+/// provider is a different account.
+///
+/// Before that reclassification a quota 429 was called `RateLimited`, which is
+/// in the default `fallback_on` set, so it failed over by accident of being
+/// mislabelled. Getting the label right must not cost the behaviour the wrong
+/// label was buying.
+#[tokio::test]
+async fn an_exhausted_quota_still_crosses_to_the_next_provider() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace root");
+    let (primary_endpoint, primary_calls, primary_server) = spawn_repeated_compatible_responses(
+        vec![429],
+        r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+    )
+    .await;
+    let (fallback_endpoint, fallback_captured, fallback_server) = spawn_response(
+        200,
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the spare account answered\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+    )
+    .await;
+
+    let mut cfg = config(
+        state.path().to_path_buf(),
+        workspace.path().to_path_buf(),
+        vec![
+            candidate(
+                "out-of-credit",
+                ProviderProtocol::OpenAiCompatible,
+                primary_endpoint,
+                1,
+            ),
+            candidate(
+                "the-spare-account",
+                ProviderProtocol::OpenAiCompatible,
+                format!("{fallback_endpoint}/v1/chat/completions"),
+                2,
+            ),
+        ],
+    );
+
+    // The shipped default, not this file's narrowed harness value: what is
+    // being guarded is what a real deployment gets without configuring
+    // anything.
+    cfg.runtime_policy.model_failover.fallback_on =
+        RuntimeExecutionPolicySnapshot::default()
+            .model_failover
+            .fallback_on;
+
+    let mut host = LocalRuntimeHost::start(cfg).expect("Host");
+    let outcome = host.execute("ask past an exhausted quota").await.expect("Run");
+
+    assert_eq!(
+        outcome.status,
+        RunStatus::Succeeded,
+        "a spare provider was configured and never tried: {:?}",
+        outcome.event_types,
+    );
+    assert_eq!(outcome.output, "the spare account answered");
+    // Once, not repeatedly: retrying an exhausted quota is the wait this
+    // round set out to stop.
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        1,
+        "an exhausted quota must not be retried on the same account",
+    );
+    let _ = fallback_captured.await;
+    primary_server.await.unwrap();
+    fallback_server.await.unwrap();
+}

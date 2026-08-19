@@ -1639,3 +1639,61 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
     let body = serde_json::from_slice(&buffer[header_end..header_end + content_length]).unwrap();
     CapturedRequest { head, body }
 }
+
+/// A 429 that says the account is out of money is not a 429 that says "slow down".
+///
+/// Both arrive as `429 Too Many Requests`, and the only place the difference
+/// exists is the body. Classifying on the status alone filed an exhausted
+/// quota as `RateLimited`, which is in the default `fallback_on` set
+/// (`crates/protocol/src/lib.rs`, `ModelFailoverPolicySnapshot::default`) and
+/// carries `retryable: true` -- so a key with no money behind it spent the
+/// full same-provider backoff and then the whole fallback chain, up to eight
+/// Provider attempts, before telling the person they were "being rate
+/// limited". Waiting is the one thing that does not fix it.
+///
+/// opencode reads the body at exactly this point
+/// (`packages/llm/src/route/executor.ts:242-252`: at 429 it tests the body for
+/// `insufficient_quota|quota_exceeded` and returns `QuotaExceededReason`
+/// instead of `RateLimitReason`), and retryability is a property of the reason
+/// it picked -- `RateLimitReason.retryable = true`, `QuotaExceededReason.retryable
+/// = false` (`packages/llm/src/schema/errors.ts:74-95`), gating the retry loop
+/// at `executor.ts:359`. codex does the same in Rust
+/// (`codex-rs/codex-api/src/api_bridge.rs:94-127`: parse the 429 body, and
+/// `usage_limit_reached` / `usage_not_included` become their own errors, which
+/// `codex-rs/protocol/src/error.rs:359-382` reports as not retryable), falling
+/// through to a retryable 429 only when neither matches.
+#[tokio::test]
+async fn a_429_that_names_an_exhausted_quota_is_billing_rather_than_a_rate_limit() {
+    let (endpoint, _captured, server) = spawn_complete_server(
+        429,
+        r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+    )
+    .await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, _events_rx) = mpsc::channel(1);
+
+    let error = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    assert!(
+        matches!(
+            error,
+            ProviderExecutionError::Provider {
+                kind: ModelErrorKind::Billing,
+                retryable: false,
+                status: Some(429),
+                ..
+            }
+        ),
+        "a 429 whose body names an exhausted quota must not be retried as a rate limit: {error:?}"
+    );
+}

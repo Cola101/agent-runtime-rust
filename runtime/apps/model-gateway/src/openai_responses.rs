@@ -274,15 +274,32 @@ impl OpenAiResponsesAdapter {
                     .await?;
                     return Ok(());
                 }
+                // Two endings arrive on this one event, and the response says
+                // which: `incomplete_details.reason` is `max_output_tokens` or
+                // `content_filter`. Reading neither reported both as `Length`,
+                // and `Length` is a *success* -- the kernel ends the Run
+                // `run.succeeded` carrying the truncation. So a prompt the
+                // provider's safety filter refused was drawn as an answer that
+                // merely ran long, sending the person to shorten a prompt that
+                // was never too long, and the one failure only they can act on
+                // was never named.
+                //
+                // openclaw splits exactly this event, and states the rule:
+                // a content-filtered turn is a provider error rather than a
+                // truncated answer
+                // (`packages/ai/src/providers/openai-responses-terminal-usage.ts:87-105`).
                 "response.incomplete" => {
                     emit_usage(&events, &value["response"]["usage"], self.pricing).await?;
-                    emit(
-                        &events,
-                        ModelStreamEvent::Completed {
-                            reason: ModelFinishReason::Length,
-                        },
-                    )
-                    .await?;
+                    let reason = match value["response"]["incomplete_details"]["reason"].as_str() {
+                        Some("content_filter") => ModelFinishReason::ContentFilter,
+                        // Anything else, including a response that omits the
+                        // detail entirely, keeps the ending this branch has
+                        // always reported. An unnamed incomplete turn is a
+                        // short answer we still have the text of; calling it a
+                        // filter block would be inventing a reason.
+                        _ => ModelFinishReason::Length,
+                    };
+                    emit(&events, ModelStreamEvent::Completed { reason }).await?;
                     return Ok(());
                 }
                 "response.failed" => {
