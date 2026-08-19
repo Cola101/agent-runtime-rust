@@ -295,7 +295,7 @@ describe("rolling a branch back", () => {
     // offer is in the box, which says so.
     expect(document.querySelectorAll(".turn .branch")).toHaveLength(0);
     const box = await screen.findByRole("textbox");
-    expect((box as HTMLTextAreaElement).placeholder).toContain("改向");
+    expect((box as HTMLTextAreaElement).placeholder).toContain("排队");
   });
 
   it("is on no bare key the conversation surface claims", async () => {

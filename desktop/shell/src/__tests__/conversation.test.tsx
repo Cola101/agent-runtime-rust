@@ -112,19 +112,28 @@ describe("a conversation", () => {
     expect(new Set([sent.sessionId, sent.branchId, sent.runId]).size).toBe(3);
   });
 
-  /// This used to assert the opposite -- the box was shut while a Turn ran,
-  /// because the Runtime had no way to redirect one and the only honest thing
-  /// was to refuse. It has one now, so the same box does a different thing
-  /// depending on what the Run is doing, and the person is told which.
-  it("redirects the Turn in flight instead of queueing a next one", async () => {
+  /// This has now been rewritten twice, in opposite directions, and both
+  /// rewrites were the same correction.
+  ///
+  /// First the box was shut while a Turn ran, because the Runtime had no way to
+  /// redirect one. Then it had one, and Enter became a steer -- which made the
+  /// commonest thing a person does during a Turn (say the next thing) into the
+  /// rarest (rewrite what the Turn is doing). Enter queues now; the steer keeps
+  /// a key of its own. What is queued, and what happens to it, is
+  /// `queue.test.tsx`; what this holds is the boundary between the two.
+  it("keeps the steer on a key of its own, and it is still not a Turn", async () => {
     const { user, bridge } = await openChat({ activeRunId: RUN_LIVE });
     const box = await screen.findByRole("textbox");
     await waitFor(() => expect((box as HTMLTextAreaElement).disabled).toBe(false));
-    expect((box as HTMLTextAreaElement).placeholder).toContain("改向");
+    expect((box as HTMLTextAreaElement).placeholder).toContain("排队");
 
     await user.click(box);
-    await user.type(box, "换个方向");
+    await user.type(box, "先排着");
     await user.keyboard("{Enter}");
+    expect(bridge.steer).not.toHaveBeenCalled();
+
+    await user.type(box, "换个方向");
+    await user.keyboard("{Meta>}{Enter}{/Meta}");
     await waitFor(() => expect(bridge.steer).toHaveBeenCalled());
     const sent = bridge.steer.mock.calls[0][0];
     expect(sent.input).toBe("换个方向");
@@ -137,12 +146,13 @@ describe("a conversation", () => {
   it("never claims a steer was applied", async () => {
     await openChat({ activeRunId: RUN_LIVE });
     const box = await screen.findByRole("textbox");
-    // The box says what it will do with what you type, and the button says the
-    // same word. Neither says it worked -- the Runtime refuses to redirect
-    // while a tool call or approval is unresolved, and the only evidence is
-    // `run.steer.applied` appearing in the transcript.
+    // The box says what Enter will do with what you type, and the control
+    // beside it is the other thing this box can do. Neither says it worked --
+    // the Runtime refuses to redirect while a tool call or approval is
+    // unresolved, and the only evidence is `run.steer.applied` appearing in
+    // the transcript.
     await waitFor(() =>
-      expect((box as HTMLTextAreaElement).placeholder).toContain("会拿去改向"));
+      expect((box as HTMLTextAreaElement).placeholder).toContain("排队"));
     expect(screen.getByRole("button", { name: "改向" })).toBeTruthy();
     for (const claim of [/已改向/, /改向成功/, /已生效/]) {
       expect(screen.queryByText(claim)).toBeNull();

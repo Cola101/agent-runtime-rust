@@ -1037,18 +1037,55 @@ export function Composer() {
     });
   };
 
-  const send = async () => {
+  /// Puts a sentence into the box beside whatever is already there.
+  ///
+  /// Used by everything that gives words back -- a queued line taken out, a
+  /// Turn that ended badly -- and the order is always the order they were
+  /// typed: what came out of the queue was typed before what is in the box now.
+  const putBack = (text: string) => {
+    setDraft((current) => (current.trim() ? `${text}\n${current}` : text));
+    box.current?.focus();
+  };
+
+  /// What a Turn that will not be sending them gave back.
+  ///
+  /// The store cannot type into a textarea and does not know what is in one,
+  /// so it leaves the words here and this takes them. Depending on the
+  /// hand-back alone rather than on `desk`: the desk is a fresh object every
+  /// render, and the guard makes a re-run harmless anyway.
+  useEffect(() => {
+    const back = desk.handback;
+    if (!back) return;
+    putBack(back.text);
+    setError(back.why);
+    desk.clearHandback();
+  }, [desk.handback]);
+
+  const takeBack = (index: number) => {
+    const line = desk.unqueue(index);
+    if (line !== null) putBack(line);
+  };
+
+  const send = async (redirect = false) => {
     const input = draft.trim();
     if (!input || !live || sending) return;
     setSending(true);
     setDraft("");
     setHistory((past) => [input, ...past]);
     setAt(-1);
-    // While a Turn is running the same box redirects it instead of queueing a
-    // next Turn. Two different things, and which one happens is decided by
-    // what the Run is doing rather than by a mode the person has to hold in
-    // their head.
-    const failure = turning ? await desk.steer(input) : await desk.send(input);
+    // Three things one box does, and which one happens is decided by what the
+    // Run is doing rather than by a mode the person has to hold in their head.
+    //
+    // While a Turn is running the default is the queue, not the steer. What
+    // somebody types during a Turn is usually the next thing to say, and
+    // saying it used to mean changing the course of work already under way --
+    // the second sentence of a thought could not be said at all without
+    // rewriting the first one's instructions. A steer is still here and is
+    // still one keystroke away (⌘↵, and the control beside the box); it is
+    // asked for on purpose because it does something to work in flight.
+    const failure = redirect
+      ? await desk.steer(input)
+      : turning ? desk.queue(input) : await desk.send(input);
     setError(failure);
     // Put it back. The box is cleared before the write so that a send feels
     // finished the moment it is made, and that is right for the case that
@@ -1065,6 +1102,30 @@ export function Composer() {
 
   return (
     <div className="write">
+      {/* What is waiting, where it was typed. A queue nobody can see is a box
+          that swallowed a sentence: the point of drawing it is that the person
+          can count what is about to be said in their name, take one back, or
+          take all of them back before any of it goes.
+          The ceiling is drawn beside the count rather than met in silence --
+          a queue that quietly stops accepting reads as a broken box. */}
+      {desk.queued.length > 0 && (
+        <div className="queue">
+          <div className="queue-head">
+            排队 {desk.queued.length}/{desk.queueLimit} ・ 这轮跑完依次发出去 ・ 点一条放回输入框
+          </div>
+          <ul className="queued" aria-label="排队中">
+            {desk.queued.map((line, index) => (
+              <li key={`${index}:${line}`}>
+                <button type="button" onClick={() => takeBack(index)}>
+                  <span className="n mono">{index + 1}</span>
+                  <span className="q">{line}</span>
+                  <span className="back">放回</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {offered.length > 0 && (
         <ul className="mentions" role="listbox">
           {!whole && (
@@ -1092,7 +1153,7 @@ export function Composer() {
           disabled={!live || sending}
           placeholder={
             !live ? "没有连上 Runtime"
-              : turning ? "这轮还在跑 —— 现在说的话会拿去改向"
+              : turning ? "这轮还在跑 —— 现在打的字会排队，跑完依次发出去"
                 : desk.current ? "接着说" : "说一句话，就开始一段对话"
           }
           onChange={(event) => {
@@ -1127,6 +1188,14 @@ export function Composer() {
                 return;
               }
             }
+            // The steer, on a key of its own. Before the plain Enter branch,
+            // which does not look at the modifier and would otherwise queue
+            // what was meant to redirect.
+            if (event.key === "Enter" && turning && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              void send(true);
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
@@ -1146,8 +1215,24 @@ export function Composer() {
             }
           }}
         />
+        {/* The other thing this box can do, and only while there is a Turn to
+            do it to. Beside the primary control rather than replacing it: a
+            queue and a steer are two different intentions, and picking between
+            them by remembering which mode the box is in is how a person redirects
+            work they only meant to talk after. */}
+        {turning && (
+          <button
+            type="button"
+            className="steer"
+            title="改这轮正在做的事 ・ 只在两次工具调用之间生效"
+            disabled={!live || sending || !draft.trim()}
+            onClick={() => void send(true)}
+          >
+            改向
+          </button>
+        )}
         <button type="button" className="send" disabled={!live || sending || !draft.trim()} onClick={() => void send()}>
-          {sending ? "发送中" : turning ? "改向" : "发送"}
+          {sending ? "发送中" : turning ? "排队" : "发送"}
         </button>
       </div>
       {/* Key hints only. A paragraph of explanation used to live here -- what a
@@ -1161,7 +1246,9 @@ export function Composer() {
           from the key registry, and one affordance in two places is one of them
           being noise. */}
       <div className="write-hint">
-        <kbd>↵</kbd> {turning ? "改向" : "发送"} ・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
+        <kbd>↵</kbd> {turning ? "排队" : "发送"}
+        {turning && <> ・ <kbd>⌘↵</kbd> 改向</>}
+        {" "}・ <kbd>⇧↵</kbd> 换行 ・ <kbd>↑</kbd> 上一条
       </div>
       {error && <div className="err">{error}</div>}
     </div>

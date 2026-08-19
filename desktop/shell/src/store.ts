@@ -29,6 +29,24 @@ const PAGE_LIMIT = 256;
 const MAX_PAGES = 12;
 const POLL_MS = 1_200;
 
+/// How many sentences may wait for the Turn in flight to end.
+///
+/// A ceiling is needed because every sentence in this queue becomes a Turn of
+/// its own, sent one after another with nobody watching -- so the ceiling is a
+/// spend ceiling as much as a list ceiling. Ten, because type-ahead is two or
+/// three sentences in practice and ten is already a run of Turns nobody is
+/// reading; a person who reaches it is queueing into a Turn that has been stuck
+/// for a long time, which is worth being told about rather than absorbing.
+///
+/// What happens at the ceiling is a refusal, not a summary. OpenClaw's
+/// gateway-side followup queue caps at twenty and summarises the overflow,
+/// which it can do because those followups are the gateway's own. These are
+/// sentences a person wrote and has not sent: summarising one would put words
+/// in their mouth that they never typed, so the eleventh is refused and stays
+/// in the box, under their hand.
+const QUEUE_LIMIT = 10;
+const QUEUE_FULL = `排队已经满了（最多 ${QUEUE_LIMIT} 句），等它发出去几句再说`;
+
 /// One `ProcessSessionOutput` as a `tool.result` carried it.
 ///
 /// Every field is the runtime's, including the words: `state` and
@@ -749,6 +767,49 @@ export type Store = {
   /// or an approval is unresolved, and the only honest evidence is
   /// `run.steer.applied` appearing in that Run's log.
   steer(input: string): Promise<string | null>;
+  /// What was typed while a Turn was in flight, in the order it was typed,
+  /// waiting to be sent one at a time as Turns end.
+  ///
+  /// This queue is this window's, and that is the decision rather than an
+  /// omission. Nothing in it has ever been sent to a model: it is not Kernel
+  /// state, it is in no transcript, and it changes no durable contract -- it is
+  /// a draft that has not been sent yet. Codex places its own client queue the
+  /// same way, and its `input_restore.rs` says why in the same breath: when a
+  /// Turn is interrupted the core drops what it held and the *client* is what
+  /// merges the queued lines back into the composer, because they were never
+  /// the core's to keep.
+  ///
+  /// The Kernel could not hold this even if it should. `SteeringMailbox` is a
+  /// slot rather than a queue on purpose (`runtime-host/src/lib.rs`): a steer
+  /// is about the Turn in flight, so a second one replaces the first. Building
+  /// type-ahead on it would lose sentences silently.
+  ///
+  /// The price, said plainly: this lives in one window's memory. It does not
+  /// cross windows, and closing the window loses it. Which is also why a Turn
+  /// that ends any way but cleanly hands what is queued back to the box rather
+  /// than holding it -- text a person can see and edit is not lost, and text
+  /// held by a window they are about to close is.
+  queued: string[];
+  /// How many may wait at once. Read by the composer so the ceiling is on
+  /// screen, rather than being a number the code knows and the person meets.
+  queueLimit: number;
+  /// Hold a sentence until the Turn in flight ends.
+  ///
+  /// Returns null when it was taken, or why it was not -- the same shape
+  /// `send` answers in, so a refusal leaves the sentence in the box the same
+  /// way a refused send does.
+  queue(input: string): string | null;
+  /// Take one back out, and say what it said, so the box can be refilled with
+  /// it. Null when the index names nothing.
+  unqueue(index: number): string | null;
+  /// Queued sentences that will not be sent after all, given back to whatever
+  /// box is on screen, with the reason they came back.
+  ///
+  /// A store cannot type into a textarea, and the composer is the only thing
+  /// that knows what is already in one, so the hand-back is left here and the
+  /// composer takes it. Cleared by whoever takes it.
+  handback: { text: string; why: string } | null;
+  clearHandback(): void;
   /// Cut a new branch carrying this conversation through one Turn, and open it.
   ///
   /// Nothing is lost: the branch this was cut from keeps every Turn it had.
@@ -1164,6 +1225,142 @@ function sendRefusal(error: string): string {
     return null;
   }, [load]);
 
+  /// What was typed while a Turn was running, and the two facts that decide
+  /// what becomes of it.
+  ///
+  /// The list is held twice on purpose. `queued` is what the screen draws;
+  /// `waiting` is the same list readable outside a render, because the drain
+  /// runs in an effect and a write has to see what is queued *now* rather than
+  /// what was queued when its callback was built.
+  const [queued, setQueued] = useState<string[]>([]);
+  const waiting = useRef<string[]>([]);
+  const hold = useCallback((next: string[]) => {
+    waiting.current = next;
+    setQueued(next);
+  }, []);
+  /// The conversation these sentences were typed into.
+  ///
+  /// A queue belongs to one conversation. Sending it into another one would put
+  /// words somewhere the person never typed them, so leaving the conversation
+  /// hands them back instead of carrying them along -- and, incidentally, the
+  /// only other reading of "the open branch stopped naming an active Run" is
+  /// exactly that switch, which is why this is checked before the edge below.
+  const queuedFor = useRef<string | null>(null);
+  const [handback, setHandback] = useState<Store["handback"]>(null);
+  /// Gives sentences back to the box, newest last, with the reason.
+  ///
+  /// Merged onto a hand-back nobody has taken yet rather than replacing it:
+  /// two of these before the composer reads either is unlikely and losing the
+  /// first one's text is the exact failure this whole path exists to prevent.
+  const giveBack = useCallback((why: string, first: string[] = []) => {
+    const lines = [...first, ...waiting.current];
+    if (lines.length === 0) return;
+    hold([]);
+    queuedFor.current = null;
+    setHandback((standing) => ({
+      text: standing ? `${standing.text}\n${lines.join("\n")}` : lines.join("\n"),
+      why,
+    }));
+  }, [hold]);
+  const clearHandback = useCallback(() => setHandback(null), []);
+
+  const queue = useCallback((input: string) => {
+    if (waiting.current.length >= QUEUE_LIMIT) return QUEUE_FULL;
+    if (waiting.current.length === 0) queuedFor.current = current;
+    hold([...waiting.current, input]);
+    return null;
+  }, [hold, current]);
+
+  const unqueue = useCallback((index: number) => {
+    const held = waiting.current;
+    if (index < 0 || index >= held.length) return null;
+    hold(held.filter((_, at) => at !== index));
+    return held[index];
+  }, [hold]);
+
+  /// Sends what was queued, as Turns end.
+  ///
+  /// On the edge this store already has -- the open branch's head stops naming
+  /// an active Run -- rather than on a clock of its own. The poll is what knows
+  /// a Turn ended; a second timer would learn the same fact later and sometimes
+  /// disagree with the screen about it.
+  ///
+  /// One sentence per edge, never the whole queue. A branch holds one Turn at a
+  /// time, so the second sentence waits for the Turn the first one starts.
+  /// Codex and opencode both drain one at a time, and this is why.
+  ///
+  /// Anything but a clean ending gives everything back to the box. A Turn
+  /// somebody stopped is the case this is written for: firing the next sentence
+  /// into a conversation a person just cancelled is worse than not having a
+  /// queue at all. `succeeded` is the only ending that continues, so a Run that
+  /// failed, timed out, ended indeterminate, or is no longer on the run list to
+  /// be read at all is a hand-back -- being unsure is a reason to give the
+  /// words back, never a reason to send them.
+  ///
+  /// The same strictness has a cost, and it is the right one. A Turn that
+  /// started and finished entirely between two polls is never seen running, so
+  /// it produces no edge and the rest of the queue waits instead of going. What
+  /// waiting looks like is the queue still on screen with every sentence in it,
+  /// takeable back with one click, and it is undone by the next Turn that ends;
+  /// what the other choice looks like is a sentence sent into a conversation
+  /// somebody stopped, which nothing undoes.
+  const lastLive = useRef<string | null>(null);
+  /// The Run whose ending has not been read yet.
+  ///
+  /// One poll reads the run list and *then* the session heads (`load()` above),
+  /// so a head clearing is always seen before that Run's own lifecycle is seen
+  /// turning terminal. Reading the ending off the falling edge alone therefore
+  /// asks the older of two samples a question only the newer one can answer,
+  /// and every ordinary success passes through that window. It read as "did not
+  /// end properly", so the queue handed itself back on the happy path.
+  ///
+  /// Holding the id instead separates the two states the predicate below used
+  /// to conflate: "ended badly" and "has not been read as ended". The first is
+  /// a hand-back, the second is a wait -- and it resolves on its own, because
+  /// this effect depends on `runs`.
+  const endedRun = useRef<string | null>(null);
+  useEffect(() => {
+    const before = lastLive.current;
+    lastLive.current = live;
+    if (before !== null && live === null) endedRun.current = before;
+    if (waiting.current.length === 0) return;
+    if (queuedFor.current !== current) {
+      giveBack("换了对话，排队的话放回输入框了");
+      endedRun.current = null;
+      return;
+    }
+    // Only the falling edge. A Turn still running has not ended, and a Turn
+    // this window never saw running gives nothing to read an ending off.
+    const finished = endedRun.current;
+    if (finished === null || live !== null) return;
+    const record = runs.find((run) => run.id === finished);
+    // Gone from the list entirely -- retired, or aged out of what this client
+    // read. Nothing can be learned about how it ended, and being unsure is a
+    // reason to give the words back.
+    if (!record) {
+      giveBack("这轮读不到了，排队的话放回输入框了");
+      endedRun.current = null;
+      return;
+    }
+    // Present but not settled yet: this is the sampling window, not an ending.
+    // Wait for the poll that carries its lifecycle.
+    if (record.lifecycle.kind !== "terminal" && record.lifecycle.kind !== "retired") return;
+    endedRun.current = null;
+    if (record.lifecycle.status !== "succeeded") {
+      giveBack("这轮没有正常结束，排队的话放回输入框了");
+      return;
+    }
+    const [next, ...rest] = waiting.current;
+    hold(rest);
+    void send(next).then((failure) => {
+      // The window between reading the head and writing to it is real -- a
+      // Runtime restart resumes the Turn it interrupted -- so a drained send
+      // can still be refused. It goes back to the box with the rest, first,
+      // because it was typed first.
+      if (failure) giveBack(failure, [next]);
+    });
+  }, [live, current, runs, send, giveBack, hold]);
+
   /// Fork and Rollback, which share everything except what they do.
   ///
   /// Both read the head immediately before the write, for the same two reasons
@@ -1290,6 +1487,7 @@ function sendRefusal(error: string): string {
     sessions,
     current: sessions.find((session) => session.key === current) ?? null,
     selectSession, newConversation, send, steer, fork, rollback,
+    queued, queueLimit: QUEUE_LIMIT, queue, unqueue, handback, clearHandback,
     providers, saveProvider, forgetProvider,
     budget, mcp, mcpFailures: readMcpFailures(merged), saveMcpServer, forgetMcpServer,
     submit, decide, decisionRefusal, answerMcpInput, refresh: () => void load(),

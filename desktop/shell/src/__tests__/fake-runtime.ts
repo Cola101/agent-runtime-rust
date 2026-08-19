@@ -527,16 +527,26 @@ export function installFakeRuntime(
   ];
   const find = (sessionId: string, branchId: string) =>
     branches.find((branch) => branch.sessionId === sessionId && branch.branchId === branchId);
-  /// `active_run_id` is the branch's, and only the Session under test has one:
-  /// a Fork of a branch with a Turn in flight is refused by the daemon, so a
-  /// fake that reported one everywhere would be describing an impossible state.
+  /// What each branch is waiting on, by branch.
+  ///
+  /// `active_run_id` is the branch's, and it is held per branch here for the
+  /// same reason: "the open branch stopped naming an active Run" is a fact
+  /// about one branch, and a client that reads it as a fact about the window
+  /// would act on the wrong conversation. Only the Session under test starts
+  /// with one -- a Fork of a branch with a Turn in flight is refused by the
+  /// daemon, so a fake that reported one everywhere would be describing an
+  /// impossible state.
+  const active: Record<string, string | null> = {
+    [SESSION_BRANCH]: activeRunId,
+    [OLDER_BRANCH]: null,
+  };
   const headOf = (branch: (typeof branches)[number]) => ({
     session_id: branch.sessionId,
     branch_id: branch.branchId,
     generation: branch.generation,
     turn_count: branch.turns.length,
     history_digest: historyDigest(committed(branch.turns)),
-    active_run_id: branch.branchId === SESSION_BRANCH ? activeRunId : null,
+    active_run_id: active[branch.branchId] ?? null,
   });
   const head = () => headOf(find(SESSION, SESSION_BRANCH)!);
   /// `through_turn_ordinal` is inclusive, and 0 means "carry nothing", exactly
@@ -555,6 +565,45 @@ export function installFakeRuntime(
   /// Both go through the same branch list every reply is built from, so the
   /// next poll carries them.
   const elsewhere = {
+    /// A Turn on one branch starting, and ending.
+    ///
+    /// Two facts in two places, moved together because that is where they
+    /// live: the branch head names the Run it is waiting on, and that Run's
+    /// own cursor says how it ended. A client reads one to know what to follow
+    /// and the other to know whether the ending is the kind you may send the
+    /// next sentence after -- a fixture that moved only the head would let a
+    /// client pass while reading nothing about the ending at all.
+    starts(runId = RUN_LIVE, branchId = SESSION_BRANCH) {
+      active[branchId] = runId;
+      runLogs[runId].state = { state: "running" };
+    },
+    /// `status` is the Kernel's own word for how a Run ended. `cancelled` is
+    /// the one that matters most here: a Turn somebody stopped did not fail,
+    /// and it did not succeed either.
+    ends(status: "succeeded" | "cancelled" | "failed" = "succeeded", branchId = SESSION_BRANCH) {
+      const runId = active[branchId];
+      active[branchId] = null;
+      if (runId) runLogs[runId].state = { state: "terminal", status };
+    },
+    /// A Turn that has ended on the head but whose Run has not been read as
+    /// ended yet.
+    ///
+    /// This is not a contrived state, it is the ordinary one. A poll reads the
+    /// run list first and the session heads afterwards (`store.ts`, `load()`
+    /// calls `api.list()` and only later `api.sessionList()`), so the head's
+    /// `active_run_id` is always the *fresher* of the two. Every Turn that ends
+    /// passes through this window; `ends()` above skips it by clearing both in
+    /// one go, which is why nothing caught a drain predicate that treated the
+    /// window as a failed ending.
+    endsOnTheHeadFirst(branchId = SESSION_BRANCH) {
+      const runId = active[branchId];
+      active[branchId] = null;
+      return runId;
+    },
+    /// The other half: the run list catching up with what the head already said.
+    settles(runId: string, status: "succeeded" | "cancelled" | "failed" = "succeeded") {
+      runLogs[runId].state = { state: "terminal", status };
+    },
     commits(said: string, back: string) {
       const branch = find(SESSION, SESSION_BRANCH)!;
       branch.turns = committed([...branch.turns, {
