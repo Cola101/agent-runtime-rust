@@ -6,7 +6,7 @@ import {
   effectLabel, elapsed, eventNote,
   eventWords,
   size,
-  knownEvent, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
+  knownEvent, lifecycleLabel, lifecycleTone, retryWait, sandboxLabel, shortId, since,
 } from "./model";
 import { LinkBanner } from "./Link";
 import { DECISIONS, Decisions } from "./Approvals";
@@ -1268,8 +1268,14 @@ export function ChatStatus() {
   // definition of a part that is not doing anything.
   if (!run) return <span className="now">—</span>;
 
-  const lastEvent = run.events[run.events.length - 1]?.type ?? null;
-  const activity = moving ? doing(lastEvent) : null;
+  const last = run.events[run.events.length - 1] ?? null;
+  const lastEvent = last?.type ?? null;
+  // One event whose phrase needs its payload and its timestamp, not only its
+  // type: a Run parked on a Provider backoff is being asked one question, and
+  // it is how long. The same 1.2s re-read that advances the clock advances
+  // this, so the figure is at most one poll stale -- the same staleness the
+  // clock beside it has always had.
+  const activity = moving ? (retryWait(last, Date.now()) ?? doing(lastEvent)) : null;
   return (
     <>
       <span className={`now t-${lifecycleTone(run.lifecycle)}`}>

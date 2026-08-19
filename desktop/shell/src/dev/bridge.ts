@@ -222,12 +222,17 @@ const LOGS: Record<string, { state: Record<string, unknown>; events: ReturnType<
         status: "running",
       }, RUN_BROKE, 25),
       ev("model.output.delta", { text: "先把这个目录整个读一遍……" }, RUN_BROKE, 25),
+      // `status` on a Provider event is the HTTP status the Provider answered
+      // with (`kernel/src/lib.rs`, `record_model_provider_failure`, an
+      // `Option<u16>`), not the Run's --
+      // this fixture carried "running" in it, which is the shape `run.*`
+      // payloads have and the one thing this key never holds.
       ev("model.provider.failed", {
-        provider_id: "local-stub", kind: "rate_limited", retryable: true, status: "running",
+        provider_id: "local-stub", kind: "rate_limited", retryable: true, status: 429,
       }, RUN_BROKE, 25),
       ev("model.provider.retry_scheduled", {
         provider_id: "local-stub", provider_attempt: 2, delay_ms: 1500,
-        kind: "rate_limited", status: "running",
+        kind: "rate_limited", status: 429,
       }, RUN_BROKE, 25),
       ev("model.provider.selected", {
         provider_id: "backup-stub", failed_provider_ids: ["local-stub"],

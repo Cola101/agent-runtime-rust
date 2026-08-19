@@ -241,12 +241,16 @@ function failureReason(payload: Record<string, unknown>): string | null {
       return "时长预算用完了";
     default: {
       // How the turn stopped, when the kernel said so, beats the error kind it
-      // was filed under. A content-filtered reply arrives as
-      // `run.failed { kind: "protocol", reason: "content_filter" }`
-      // (`crates/kernel/src/lib.rs`), and `protocol` is a kind this build has a
-      // phrase for -- so it read "回复的格式不对", which is not what happened
-      // and not something anyone can act on. The sentence for the actual
-      // reason was already written and had never once been reached.
+      // was filed under. A content-filtered reply used to arrive as
+      // `run.failed { kind: "protocol", reason: "content_filter" }`, and
+      // `protocol` is a kind this build has a phrase for -- so it read
+      // "回复的格式不对", which is not what happened and not something anyone
+      // can act on. The sentence for the actual reason was already written and
+      // had never once been reached. The kernel files that ending under
+      // `content_filter` now (`crates/kernel/src/lib.rs`), so the two agree;
+      // reading the reason first still matters, because it is the narrower
+      // fact and it is the field that says a *reply* was cut short rather than
+      // a request refused.
       const stopped = cutShort(payload);
       if (stopped) return stopped;
       // Every model-originated ending arrives with a `ModelErrorKind`
@@ -395,7 +399,7 @@ export function mcpDiscoveryNote(payload: Record<string, unknown>): string | nul
 /// overflow is a shorter sentence. "Provider 失败" is none of those and was all
 /// the transcript said. A kind this build has never seen is printed as it
 /// arrived, for the same reason an unknown `run.failed` kind is.
-/// The eight `ModelErrorKind` the runtime writes
+/// The nine `ModelErrorKind` the runtime writes
 /// (`runtime/crates/protocol/src/lib.rs`, `ModelErrorKind`), each said as the
 /// thing to do about it.
 ///
@@ -414,6 +418,13 @@ const PROVIDER_FAILURE: Record<string, string> = {
   context_overflow: "这轮的上文超过它能接受的长度",
   capability_mismatch: "这个 Provider 给不了这次要用的能力",
   unavailable: "连不上，或者对面不可用",
+  // Split out of `protocol`, where it used to live. Filed there it read
+  // "回复的格式不对" -- which blames the wire for a decision about the words,
+  // and sends the person to debug a transport that is working fine. Nothing
+  // about the connection can be fixed here and no other Provider will say yes
+  // either; the prompt is the only thing that can change, so the sentence says
+  // so.
+  content_filter: "这次请求被内容过滤挡下了，只能改提示词",
 };
 
 function providerFailure(payload: Record<string, unknown>): string | null {
@@ -422,6 +433,26 @@ function providerFailure(payload: Record<string, unknown>): string | null {
   const said = PROVIDER_FAILURE[kind] ?? `这个版本不认识的原因：${kind}`;
   const provider = typeof payload.provider_id === "string" ? payload.provider_id : "";
   return provider ? `${provider}：${said}` : said;
+}
+
+/// The status the Provider answered with, when the transport got one.
+///
+/// One status is now two kinds: the runtime tells a 429 that means "slow down"
+/// (`RateLimited`, retried) apart from a 429 that means "this account is out of
+/// quota" (`Billing`, not retried here but carried to the next Provider). The
+/// category says which of the two the runtime decided; the status is what ties
+/// that decision back to something a person can check against the Provider's
+/// own dashboard or its docs, and it was on the payload
+/// (`runtime/crates/kernel/src/lib.rs`, `record_model_provider_failure`) and
+/// never drawn.
+///
+/// `Option<u16>` on the kernel side, so a failure the transport never got a
+/// status for -- a socket that never opened -- says nothing rather than
+/// inventing a zero. Read as a number and only a number: a run status has been
+/// written into this key by fixtures before, and "HTTP running" is worse than
+/// silence.
+function providerStatus(payload: Record<string, unknown>): string | null {
+  return typeof payload.status === "number" ? `HTTP ${payload.status}` : null;
 }
 
 /// A wait a person can see is a wait they can decide to sit through.
@@ -433,8 +464,16 @@ function providerRetry(payload: Record<string, unknown>): string | null {
   if (delay !== null) {
     parts.push(delay >= 1000 ? `${(delay / 1000).toFixed(1)} 秒后再试` : `${delay} 毫秒后再试`);
   }
-  if (attempt !== null) parts.push(`第 ${attempt} 次`);
-  const because = providerFailure(payload);
+  // What the number counts, said with the number. `provider_attempt` is
+  // `same_provider_attempts + 1` (`runtime-host/src/lib.rs`, where the retry is
+  // pushed onto the route journal) -- it counts tries at *this* Provider. Printed as a bare 第 2 次 in a transcript
+  // whose other Provider lines are about changing Provider, it reads as the
+  // second Provider, which is a different event and a different thing to do
+  // about it.
+  if (attempt !== null) parts.push(`第 ${attempt} 次试这个 Provider`);
+  const because = [providerFailure(payload), providerStatus(payload)]
+    .filter((part): part is string => part !== null)
+    .join("・");
   return because ? `${parts.join("・")}（${because}）` : parts.join("・");
 }
 
@@ -457,7 +496,9 @@ export function eventWords(type: string, payload: Record<string, unknown>): stri
   }
   if (type === "model.provider.failed") {
     const why = providerFailure(payload);
-    return why ? [why] : null;
+    if (!why) return null;
+    const status = providerStatus(payload);
+    return [status ? `${why}・${status}` : why];
   }
   if (type === "model.provider.retry_scheduled") {
     const waiting = providerRetry(payload);
@@ -660,6 +701,39 @@ export function elapsed(startedAt: string | null, until: string | null): string 
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
+/// How much of a scheduled Provider retry is still to come.
+///
+/// The one activity phrase that cannot be written from the event type alone,
+/// which is why it is here rather than in `doing`. A backoff is the only thing
+/// a Run does where the whole question is *how long*: the transcript line above
+/// says what was scheduled and is right to stay frozen, being a log entry, and
+/// the status line is the live one -- and it had no phrase for this event at
+/// all, so a Run parked on a 30-second wait printed the raw type under a
+/// tooltip apologising for having no words for it.
+///
+/// Both figures come off the event: `delay_ms` is the kernel's
+/// (`runtime/crates/kernel/src/lib.rs`, `record_model_provider_retry_scheduled`)
+/// and `timestamp` is the
+/// envelope's, so the deadline is the runtime's own and nothing here is
+/// estimated. `now` is the caller's, because a function that reads the clock
+/// itself cannot be asked what it says at a given moment.
+///
+/// Past the deadline the figure goes and the phrase stays: the wait is over,
+/// the retry is in flight, and the next event will say so. Counting into
+/// negative numbers, or freezing on the last figure, would both be the screen
+/// saying something no event supports.
+export function retryWait(
+  event: { type: string; timestamp: string; payload: Record<string, unknown> } | null,
+  now: number,
+): string | null {
+  if (!event || event.type !== "model.provider.retry_scheduled") return null;
+  const delay = typeof event.payload.delay_ms === "number" ? event.payload.delay_ms : null;
+  const scheduled = Date.parse(event.timestamp);
+  if (delay === null || Number.isNaN(scheduled)) return "在等重试";
+  const left = scheduled + delay - now;
+  return left > 0 ? `在等重试・还要 ${Math.ceil(left / 1000)} 秒` : "在等重试";
+}
+
 /// What the Run is doing, from the last event it wrote.
 ///
 /// Every phrase here is something an event says. Nothing estimates progress:
@@ -698,6 +772,20 @@ export function doing(lastEventType: string | null): string | null {
       return "等你回答";
     case "run.steer.applied":
       return "刚改了向";
+    // A failover in flight, and it stays on screen for the whole of it. This is
+    // the last event a Run writes before the next candidate is called, and the
+    // runtime writes nothing during that call -- the adapter's events are
+    // collected and only flushed once it finishes. On a long reply that is tens
+    // of seconds.
+    //
+    // Without this the line fell through to the raw event type in dim
+    // monospace, captioned "这个版本没有给这个事件写说法", so a Run that was
+    // failing over successfully and streaming a perfectly good answer read as
+    // "the Provider failed and your client cannot understand it". The
+    // reasonable response to that is to press cancel, which is the one thing
+    // that must not happen here.
+    case "model.provider.failed":
+      return "在换一个 Provider";
     case "subagent.spawned":
     case "subagent.spawn.requested":
       return "在派子代理";

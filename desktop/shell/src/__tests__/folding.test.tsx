@@ -393,6 +393,29 @@ describe("what the runtime said in words", () => {
     expect(screen.getByText(/第 2 次/)).toBeTruthy();
   });
 
+  /// The ninth kind, and the one that arrived last.
+  ///
+  /// A refusal by the provider's safety filter used to be reported as
+  /// `protocol` -- so a Run that was declined read "回复的格式不对", which
+  /// blames the wire for a decision about the words, and sends the person to
+  /// debug a transport that is working. It has its own `ModelErrorKind` now
+  /// (`runtime/crates/protocol/src/lib.rs`), and the Responses adapter files
+  /// a policy refusal on `response.failed` under it
+  /// (`model-gateway/src/openai_responses.rs`), which reaches this column as a
+  /// `model.provider.failed` carrying the kind and nothing else -- there is no
+  /// finish reason on that event to fall back on. Without a phrase for it the
+  /// transcript would print the raw enum.
+  it("says a provider refused the content rather than blaming the wire", async () => {
+    const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
+    render(<App />);
+    await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
+    bridge.emit(RUN_LIVE, bridge.event(20, "model.provider.failed", {
+      provider_id: "local-stub", kind: "content_filter", retryable: false, status: "running",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/内容过滤/)).toBeTruthy());
+    expect(screen.queryByText(/不认识/)).toBeNull();
+  });
+
   /// A kind this build has never seen is printed as it arrived, for the same
   /// reason an unknown `run.failed` kind is.
   it("prints a provider failure kind it does not recognise", async () => {
@@ -459,12 +482,13 @@ describe("what the runtime said in words", () => {
     render(<App />);
     await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
     // Likewise: a content filter arrives as
-    // `run.failed { kind: "protocol", reason: "content_filter" }`
+    // `run.failed { kind: "content_filter", reason: "content_filter" }`
     // (`crates/kernel/src/lib.rs`), never as a completed turn. Against the real
     // shape this said "回复的格式不对" until `failureReason` learned to prefer
-    // the reason over the kind.
+    // the reason over the kind -- and the kind was `protocol` back then, which
+    // is the reason it now has one of its own.
     bridge.emit(RUN_LIVE, bridge.event(20, "run.failed", {
-      status: "failed", kind: "protocol", reason: "content_filter",
+      status: "failed", kind: "content_filter", reason: "content_filter",
     }, 30));
     await waitFor(() => expect(screen.getByText(/内容过滤/)).toBeTruthy());
   });

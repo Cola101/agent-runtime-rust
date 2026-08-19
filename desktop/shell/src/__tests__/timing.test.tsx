@@ -72,6 +72,21 @@ describe("what it says the Run is doing", () => {
     expect(doing("run.started")).toBe("在想");
     expect(doing("model.output.delta")).toBe("在回答");
     expect(doing("model.tool_call")).toBe("在用工具");
+    // A failover in progress. `model.provider.failed` is the *last* event a Run
+    // writes before the fallback Provider is called, and the runtime writes
+    // nothing at all for the whole duration of that call -- the adapter's
+    // events are collected into a Vec and only flushed at the end
+    // (`runtime-host/src/lib.rs`, the collector before
+    // `flush_model_route_observations`). So this event sits at the tail of the
+    // log for as long as the spare Provider takes to answer, which on a long
+    // reply is tens of seconds.
+    //
+    // With no branch here, the status line fell through to drawing the raw
+    // event type in dim monospace with the tooltip "这个版本没有给这个事件写说法".
+    // A Run that is failing over *successfully* and streaming a normal answer
+    // read as "Provider failed, and your client does not understand it" -- and
+    // the reasonable thing to do about that is press cancel.
+    expect(doing("model.provider.failed")).toBe("在换一个 Provider");
     expect(doing("approval.required")).toBe("等你决定");
     // Not the same phrase: an MCP server asking for content is a different
     // question from a decision about a tool call, and the gate says so too.
