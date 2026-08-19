@@ -564,18 +564,32 @@ impl RunMachine {
             // stripped) and then continues its loop. We keep the text and stop:
             // continuing spends money nobody agreed to spend, and a turn that
             // says it is short lets the person decide.
-            // Terminal, and terminal as a success. Only `ToolCalls` plans
-            // another turn (`worker/src/lib.rs:10089-10116`), so leaving this
-            // one Running would leave it running forever -- the composer
-            // disabled and nothing on its way. The event is still
-            // `model.turn.completed { reason: "length" }` because that is what
-            // happened and because the client already has words for it; the
-            // status is what ends the Run.
+            // Terminal, and terminal as a success carrying the reason.
+            //
+            // Terminal because only `ToolCalls` plans another turn
+            // (`worker/src/lib.rs:10089-10116`), so leaving this one Running
+            // would leave it running forever -- composer disabled, nothing on
+            // its way.
+            //
+            // `run.succeeded` rather than `model.turn.completed`, and that is
+            // not cosmetic. Five event types *are* the terminal vocabulary:
+            // `completed_subagent_result_with_transcript`
+            // (`runtime-host/src/lib.rs:5067-5074`) finds a child Run's outcome
+            // by scanning its log backwards for one of them. An earlier version
+            // of this branch ended the Run on `model.turn.completed`, which
+            // matches none -- so a subagent whose reply hit the cap returned
+            // `Ok(None)` and its parent waited forever for a result that had
+            // already been produced. The whole gate stayed green, because
+            // nothing covered a subagent being truncated.
+            //
+            // The reason rides on the terminal event instead. Adding a sixth
+            // terminal type would mean auditing every backwards scan in the
+            // tree; carrying a field does not.
             ModelStreamEvent::Completed {
                 reason: ModelFinishReason::Length,
             } => self.emit(
                 RunStatus::Succeeded,
-                "model.turn.completed",
+                "run.succeeded",
                 json!({ "status": RunStatus::Succeeded, "reason": ModelFinishReason::Length }),
             ),
             ModelStreamEvent::Completed {

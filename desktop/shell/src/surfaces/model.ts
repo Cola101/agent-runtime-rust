@@ -240,6 +240,15 @@ function failureReason(payload: Record<string, unknown>): string | null {
     case "duration_budget_exhausted":
       return "时长预算用完了";
     default: {
+      // How the turn stopped, when the kernel said so, beats the error kind it
+      // was filed under. A content-filtered reply arrives as
+      // `run.failed { kind: "protocol", reason: "content_filter" }`
+      // (`crates/kernel/src/lib.rs`), and `protocol` is a kind this build has a
+      // phrase for -- so it read "回复的格式不对", which is not what happened
+      // and not something anyone can act on. The sentence for the actual
+      // reason was already written and had never once been reached.
+      const stopped = cutShort(payload);
+      if (stopped) return stopped;
       // Every model-originated ending arrives with a `ModelErrorKind`
       // (`runtime/crates/kernel/src/lib.rs:560-579`), and this build has words
       // for all of them already -- they were only ever reached through the
@@ -325,6 +334,13 @@ export function eventNote(type: string, payload: Record<string, unknown> = {}): 
   if (type === "tool.result") {
     const declined = toolResultNote(payload);
     if (declined) return declined;
+  }
+  // A Run that ended because the reply ran out of room did not "succeed" in
+  // any sense a person means by the word -- the answer stops mid-thought. The
+  // ending is still a success to the machine, and the status line says so;
+  // this line is the one a person reads next to the truncated text.
+  if (type === "run.succeeded" && cutShort(payload) !== null) {
+    return EVENT_NOTE["model.turn.completed"];
   }
   if (type === "mcp.discovery.completed") return mcpDiscoveryNote(payload);
   return EVENT_NOTE[type] ?? null;
@@ -423,7 +439,13 @@ function providerRetry(payload: Record<string, unknown>): string | null {
 }
 
 export function eventWords(type: string, payload: Record<string, unknown>): string[] | null {
-  if (type === "model.turn.completed") {
+  // On the terminal event, not on `model.turn.completed`. The kernel emits
+  // that one only for `tool_calls` now: a length-capped reply ends the Run, and
+  // it has to end on one of the five event types a log reader recognises as an
+  // ending (`crates/kernel/src/lib.rs`, and the backwards scan it names at
+  // `runtime-host/src/lib.rs:5067-5074`). Left keyed to the old event this
+  // said nothing at all, which is how the sentence went missing the first time.
+  if (type === "run.succeeded") {
     const cut = cutShort(payload);
     return cut ? [cut] : null;
   }
@@ -539,7 +561,10 @@ export function belongsInConversation(
   // through a conversation. `length` and `content_filter` are not that: the
   // reply above is unfinished, and a person reading a cut-off answer takes it
   // for the whole one unless something says otherwise.
-  if (type === "model.turn.completed") return cutShort(payload) !== null;
+  // The `model.turn.completed` branch that used to sit here is gone with the
+  // case it served: that event now only ever means `tool_calls`, which is
+  // routine, and `ROUTINE` already keeps it out. The truncation case moved to
+  // the terminal event, which was never routine to begin with.
   return !ROUTINE.has(type);
 }
 

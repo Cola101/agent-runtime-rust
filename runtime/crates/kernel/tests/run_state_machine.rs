@@ -318,9 +318,19 @@ fn a_reply_that_hit_its_length_cap_is_kept_and_called_short() {
         })
         .expect("a truncated reply still completes its turn");
 
+    // `run.succeeded`, not `model.turn.completed`. Five event types are the
+    // terminal vocabulary of this log, and something has to find this Run's
+    // outcome by scanning backwards for one of them --
+    // `completed_subagent_result_with_transcript`
+    // (`runtime-host/src/lib.rs:5067-5074`) does exactly that to hand a child's
+    // result to its parent. An earlier version of this branch ended on
+    // `model.turn.completed`; a truncated subagent then returned `Ok(None)` and
+    // its parent waited forever for a result already sitting in the log. The
+    // full gate stayed green because nothing covered a truncated subagent.
     assert_eq!(
-        turn.event_type, "model.turn.completed",
-        "a length-capped reply is a completed turn, not a failed Run: {:?}",
+        turn.event_type, "run.succeeded",
+        "a length-capped reply is a completed Run, not a failed one, and it has \
+         to end on a terminal event type something can find: {:?}",
         turn.payload,
     );
     assert_eq!(turn.payload["reason"], "length");
@@ -340,4 +350,80 @@ fn a_reply_that_hit_its_length_cap_is_kept_and_called_short() {
         run.status(),
     );
     assert_eq!(run.status(), RunStatus::Succeeded);
+}
+
+/// Every way this machine can end a Run has to end it on an event type that
+/// something downstream can recognise as an ending.
+///
+/// Five event types are the terminal vocabulary of a Run log, and that set is
+/// not documentation -- `completed_subagent_result_with_transcript`
+/// (`runtime-host/src/lib.rs:5067-5074`) hands a child Run's outcome to its
+/// parent by scanning the child's log backwards for one of exactly these, and
+/// returns `Ok(None)` when it finds none.
+///
+/// This is a guard against a class rather than an incident. The incident: a
+/// length-capped reply was briefly made terminal on `model.turn.completed`,
+/// which is in no such set, so a subagent that hit its cap produced a complete
+/// result and its parent waited forever for it. The entire workspace gate --
+/// 935 tests -- stayed green, because every existing subagent test has its
+/// child finish on `stop`. Any future terminal ending added without a matching
+/// entry downstream fails here instead of in someone's session.
+#[test]
+fn every_terminal_ending_uses_an_event_type_the_log_readers_recognise() {
+    // The set `runtime-host` scans for. Kept as a literal so that widening it
+    // there is a deliberate act with a failing test attached, not a silent
+    // divergence.
+    const RECOGNISED: [&str; 5] = [
+        "run.succeeded",
+        "run.failed",
+        "run.cancelled",
+        "run.timed_out",
+        "run.indeterminate",
+    ];
+
+    // Every model-side ending this machine can reach. `ToolCalls` is absent on
+    // purpose: it is the one completion that does *not* end a Run.
+    let endings = [
+        ModelFinishReason::Stop,
+        ModelFinishReason::Length,
+        ModelFinishReason::ContentFilter,
+    ];
+
+    for reason in endings {
+        let mut run = machine();
+        run.apply(RunCommand::Start).unwrap();
+        let ending = run
+            .apply_model_event(ModelStreamEvent::Completed { reason })
+            .expect("a completion is applicable to a running Run");
+
+        if !run.status().is_terminal() {
+            continue;
+        }
+        assert!(
+            RECOGNISED.contains(&ending.event_type.as_str()),
+            "{reason:?} ends the Run on `{}`, which no log reader recognises as \
+             an ending -- a subagent finishing this way would never deliver its \
+             result to its parent",
+            ending.event_type,
+        );
+    }
+
+    // And the failure path, which reaches a terminal state through a different
+    // branch and must obey the same rule.
+    for kind in [ModelErrorKind::Timeout, ModelErrorKind::Protocol] {
+        let mut run = machine();
+        run.apply(RunCommand::Start).unwrap();
+        let ending = run
+            .apply_model_event(ModelStreamEvent::Failed {
+                kind,
+                retryable: false,
+                message: "ended".into(),
+            })
+            .expect("a failure is applicable to a running Run");
+        assert!(
+            RECOGNISED.contains(&ending.event_type.as_str()),
+            "{kind:?} ends the Run on `{}`, which no log reader recognises",
+            ending.event_type,
+        );
+    }
 }

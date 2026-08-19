@@ -444,7 +444,13 @@ describe("what the runtime said in words", () => {
     render(<App />);
     await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
     bridge.emit(RUN_LIVE, bridge.event(20, "model.output.delta", { text: "开头是这样的" }, 30));
-    bridge.emit(RUN_LIVE, bridge.event(21, "model.turn.completed", { reason: "length" }, 30));
+    // The shape the kernel actually emits. This used to send
+    // `model.turn.completed { reason: "length" }`, which the runtime has never
+    // produced -- a length-capped reply *ends* the Run, so it arrives on a
+    // terminal event. The guard was green against a fiction.
+    bridge.emit(RUN_LIVE, bridge.event(21, "run.succeeded", {
+      status: "succeeded", reason: "length",
+    }, 30));
     await waitFor(() => expect(screen.getByText(/没说完/)).toBeTruthy());
   });
 
@@ -452,7 +458,14 @@ describe("what the runtime said in words", () => {
     const bridge = installFakeRuntime({ activeRunId: RUN_LIVE });
     render(<App />);
     await waitFor(() => expect(bridge.watch).toHaveBeenCalled());
-    bridge.emit(RUN_LIVE, bridge.event(20, "model.turn.completed", { reason: "content_filter" }, 30));
+    // Likewise: a content filter arrives as
+    // `run.failed { kind: "protocol", reason: "content_filter" }`
+    // (`crates/kernel/src/lib.rs`), never as a completed turn. Against the real
+    // shape this said "回复的格式不对" until `failureReason` learned to prefer
+    // the reason over the kind.
+    bridge.emit(RUN_LIVE, bridge.event(20, "run.failed", {
+      status: "failed", kind: "protocol", reason: "content_filter",
+    }, 30));
     await waitFor(() => expect(screen.getByText(/内容过滤/)).toBeTruthy());
   });
 

@@ -73,7 +73,10 @@ describe("events the runtime reports about the exchange", () => {
   it("says a reply hit its length cap instead of losing it", async () => {
     const { bridge } = await watching();
     bridge.emit(RUN_LIVE, bridge.event(40, "model.output.delta", { text: "答案的前半段" }, 30));
-    bridge.emit(RUN_LIVE, bridge.event(41, "model.turn.completed", {
+    // On the terminal event. A length-capped reply *ends* the Run, and it has
+    // to end on an event type a log reader recognises as an ending -- keyed to
+    // `model.turn.completed` this note never fired at all.
+    bridge.emit(RUN_LIVE, bridge.event(41, "run.succeeded", {
       status: "succeeded", reason: "length",
     }, 30));
     await waitFor(() => expect(screen.getByText(/没说完/)).toBeTruthy());
