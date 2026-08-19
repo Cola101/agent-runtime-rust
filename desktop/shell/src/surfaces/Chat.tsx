@@ -20,6 +20,7 @@ import { textOf, type SessionView } from "../session";
 import { lineage, subagentsOf, type SubagentState } from "../subagents";
 import { Mark } from "./Mark";
 import { Markdown } from "./markdown";
+import { staysWithTheTail } from "./follow";
 import { WriteReview } from "./WriteReview";
 
 /// What one tool call draws: the tool's name, and its arguments as the line
@@ -754,6 +755,10 @@ function ChatView() {
   const session = chosen ? null : desk.current;
   const run = shownRun(desk);
   const scroller = useRef<HTMLDivElement>(null);
+  // Mirrors `pinned` into render, only so the column can say which of the two
+  // scroll-anchoring mechanisms is in charge. The ref stays the one the scroll
+  // effect reads, because that effect must not be rebuilt on every scroll.
+  const [following, setFollowing] = useState(true);
   const pinned = useRef(true);
 
   const opened = useSyncExternalStore(watchFind, findOpened);
@@ -844,9 +849,29 @@ function ChatView() {
       <div
         className="flow"
         ref={scroller}
+        // `overflow-anchor` is turned off while the column is following, and
+        // back on when a person has taken it over. The browser's own scroll
+        // anchoring and this handler are two mechanisms trying to hold the
+        // same column still, and while they disagree the result is a jitter
+        // neither of them would produce alone. opencode toggles it for the
+        // same reason (`create-auto-scroll.tsx:156-170`).
+        style={{ overflowAnchor: following ? "none" : "auto" }}
         onScroll={(event) => {
           const node = event.currentTarget;
-          pinned.current = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+          const selection = node.ownerDocument.getSelection();
+          const stays = staysWithTheTail({
+            distanceFromBottom: node.scrollHeight - node.scrollTop - node.clientHeight,
+            // Only a selection inside this column counts. Selecting a filename
+            // in the status line is not a reason to stop following a reply.
+            selecting: Boolean(
+              selection
+                && !selection.isCollapsed
+                && selection.anchorNode
+                && node.contains(selection.anchorNode),
+            ),
+          });
+          pinned.current = stays;
+          if (stays !== following) setFollowing(stays);
         }}
       >
         <LinkBanner link={desk.link} />
