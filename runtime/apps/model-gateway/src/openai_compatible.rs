@@ -173,12 +173,34 @@ impl OpenAiCompatibleAdapter {
                 },
             };
             let Some(event) = next else {
-                return Err(provider_error(
-                    ModelErrorKind::Protocol,
-                    false,
-                    None,
-                    "provider stream ended without [DONE]",
-                ));
+                // The stream ended. `[DONE]` is an SSE framing convention;
+                // `finish_reason` is the provider saying the turn ended. A
+                // server that closes cleanly after saying so has given us
+                // everything, and refusing it threw away a complete,
+                // already-paid-for answer -- the text had reached the person
+                // and the Run failed anyway. opencode does not require the
+                // sentinel at all: it is filtered out with the other
+                // keep-alives before its parser sees it
+                // (`opencode/packages/llm/src/protocols/shared.ts:247`).
+                //
+                // Without a finish_reason it is a different thing: a
+                // connection dropped mid-answer looks exactly like a clean end
+                // except for that, and reporting it as success would hand the
+                // model half a turn as though it were whole. openclaw draws
+                // the same line, in the same words -- "EOF without [DONE]
+                // remains fail-closed".
+                let Some(reason) = finish_reason else {
+                    return Err(provider_error(
+                        ModelErrorKind::Protocol,
+                        false,
+                        None,
+                        "provider stream ended before the model said the turn was over",
+                    ));
+                };
+                let reason = tool_turn(reason, &tool_calls);
+                flush_tool_calls(&events, tool_calls).await?;
+                emit(&events, ModelStreamEvent::Completed { reason }).await?;
+                return Ok(());
             };
             let event = event.map_err(|error| {
                 provider_error(
@@ -197,6 +219,7 @@ impl OpenAiCompatibleAdapter {
                         "provider stream completed without finish_reason",
                     )
                 })?;
+                let reason = tool_turn(reason, &tool_calls);
                 flush_tool_calls(&events, tool_calls).await?;
                 emit(&events, ModelStreamEvent::Completed { reason }).await?;
                 return Ok(());
@@ -596,6 +619,35 @@ pub(crate) fn calculate_cost(
 /// servers are not consistent about `type`: a context overrun arrives as
 /// `invalid_request_error`, as `BadRequestError`, or with no type at all, and
 /// the sentence is the one part that reliably names it.
+/// A turn that asked for a tool ends as a tool turn, whatever word the provider
+/// used to end it.
+///
+/// Plenty of servers in this family close a tool-calling turn with `stop`. Read
+/// literally, the consequence is not cosmetic: `requested_tool_turn`
+/// (`runtime/apps/worker/src/lib.rs:10089-10094`) matches only
+/// `Completed { reason: ToolCalls }`, so nothing plans the tool, nothing runs
+/// it, and the kernel marks the Run **succeeded** with the call abandoned --
+/// and leaves a Tool call with no result in the committed transcript.
+///
+/// opencode promotes unconditionally
+/// (`packages/llm/src/protocols/openai-chat.ts:465`). openclaw promotes only
+/// when there was no visible text and the stream ended cleanly, and **drops**
+/// the calls otherwise
+/// (`packages/ai/src/transports/openai-completions-transport.ts:815-834`).
+/// Either is coherent; what we do today is the one thing neither does, which is
+/// to deliver the call and then abandon it. Taking opencode's form because
+/// dropping a call the model asked for is a silent loss of its intent, while
+/// running it is what the model asked for in the first place.
+fn tool_turn(
+    reason: ModelFinishReason,
+    tool_calls: &BTreeMap<u64, PartialToolCall>,
+) -> ModelFinishReason {
+    if reason == ModelFinishReason::Stop && !tool_calls.is_empty() {
+        return ModelFinishReason::ToolCalls;
+    }
+    reason
+}
+
 fn in_band_error(chunk: &Value, credential: &ProviderCredential) -> Option<ProviderExecutionError> {
     let error = chunk.get("error").filter(|value| !value.is_null())?;
     let kind_hint = error

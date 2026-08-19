@@ -589,6 +589,198 @@ async fn a_mid_stream_context_overrun_is_not_reported_as_retryable() {
     );
 }
 
+/// A stream that ends cleanly after saying it finished is finished.
+///
+/// `[DONE]` is an SSE framing convention, not the provider saying the turn
+/// ended -- `finish_reason` is. Requiring the sentinel threw away a complete,
+/// already-paid-for answer over a missing token: the text had streamed to the
+/// person and the Run failed anyway, non-retryably.
+///
+/// opencode does not require it at all: `[DONE]` is filtered out with the
+/// other keep-alives before the parser ever sees it
+/// (`opencode/packages/llm/src/protocols/shared.ts:247`).
+#[tokio::test]
+async fn a_clean_end_after_finish_reason_is_a_finished_turn() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answered\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n",
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        outcome.is_ok(),
+        "a finished turn must not fail for want of [DONE]: {outcome:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::TextDelta { text, .. } if text == "answered")),
+        "the answer must survive: {events:?}",
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Completed {
+                reason: ModelFinishReason::Stop
+            }
+        )),
+        "the turn must end, and end as the provider said it did: {events:?}",
+    );
+}
+
+/// A stream that stops before saying it finished is truncated, and still fails.
+///
+/// This is the half worth keeping. openclaw draws the same line and says why
+/// in its own comment -- "[DONE] tracking distinguishes clean termination from
+/// connection drops (EOF without [DONE] remains fail-closed)"
+/// (`openclaw/packages/ai/src/transports/openai-completions-transport.ts:820-826`).
+/// A connection dropped mid-answer looks exactly like a clean end except for
+/// the missing `finish_reason`, and reporting it as success would hand the
+/// model half a turn as though it were whole.
+#[tokio::test]
+async fn a_stream_cut_off_before_it_finished_is_still_a_failure() {
+    let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half a sen\"}}]}\n\n";
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    let outcome = adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await;
+    while events_rx.recv().await.is_some() {}
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let error = outcome.expect_err("a truncated stream is not a finished turn");
+    assert!(
+        format!("{error:?}").contains("ended before"),
+        "the failure must say the stream was cut off, not that a token was missing: {error:?}",
+    );
+}
+
+/// A provider that asks for a tool and then says "stop".
+///
+/// Plenty do -- it is the commonest deviation in this family. Reported as
+/// `Stop`, the consequence is not cosmetic: `requested_tool_turn`
+/// (`runtime/apps/worker/src/lib.rs:10089-10094`) matches only
+/// `Completed { reason: ToolCalls }`, so nothing plans the tool, nothing runs
+/// it, and the kernel marks the Run **succeeded** with the call abandoned.
+///
+/// It also puts a Tool call with no result into the committed transcript,
+/// which is the state a test of mine last round asserted was unreachable. It
+/// was unreachable by the two paths that test drove; this is a third.
+///
+/// opencode promotes unconditionally --
+/// `opencode/packages/llm/src/protocols/openai-chat.ts:465`:
+/// `state.finishReason === "stop" && hasToolCalls ? "tool-calls" : ...`.
+/// openclaw promotes only when there is no visible text and the stream ended
+/// cleanly, and **drops the calls** otherwise
+/// (`openclaw/.../openai-completions-transport.ts:815-834`). We take
+/// opencode's form: emitting a call and then abandoning it is the one outcome
+/// neither reference produces, and it is what we do today.
+#[tokio::test]
+async fn a_tool_call_that_closes_with_stop_still_asks_for_the_tool() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::ToolCall { .. })),
+        "the call the model asked for must still be delivered: {events:?}",
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Completed {
+                reason: ModelFinishReason::ToolCalls
+            }
+        )),
+        "a turn that asked for a tool ends as a tool turn, whatever word the \
+         provider used: {events:?}",
+    );
+}
+
+/// And a turn that asked for nothing still ends as a stop.
+#[tokio::test]
+async fn an_ordinary_answer_still_ends_as_a_stop() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"just words\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Completed {
+                reason: ModelFinishReason::Stop
+            }
+        )),
+        "promotion must need a tool call, not merely a stop: {events:?}",
+    );
+}
+
 #[tokio::test]
 async fn cancellation_stops_a_live_provider_http_stream_without_waiting_for_timeout() {
     let first_delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"started\"},\"finish_reason\":null}]}\n\n";

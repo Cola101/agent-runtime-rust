@@ -682,6 +682,27 @@ export function costLabel(micros: number): string {
   return dollars < 0.01 ? `<$0.01` : `$${dollars.toFixed(2)}`;
 }
 
+/// A cap in cents, said the way the spend beside it is said.
+///
+/// Its own function rather than `costLabel(cents * 10_000)`: a cap is a round
+/// figure a person chose and `<$0.01` is the wrong thing to say about one.
+export function costCapLabel(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+/// A cap in seconds, in the units the clock beside it uses.
+///
+/// `elapsed` takes two timestamps because it measures a Run; this takes a
+/// number because a cap is not a measurement. The formats agree on purpose --
+/// a limit written in different units from the number it bounds is a
+/// subtraction the person has to do.
+export function durationCapLabel(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
 export function shortId(id: string): string {
   return id.slice(0, 8);
 }

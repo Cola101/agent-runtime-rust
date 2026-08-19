@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { register } from "./registry";
 import {
-  belongsInConversation, callLine, costLabel, doing, effectLabel, elapsed, eventNote,
+  belongsInConversation, callLine, costCapLabel, costLabel, doing, durationCapLabel,
+  effectLabel, elapsed, eventNote,
   eventWords,
   size,
   knownEvent, lifecycleLabel, lifecycleTone, sandboxLabel, shortId, since,
@@ -1181,9 +1182,23 @@ export function ChatStatus() {
               </span>
             )}
           <i>・</i>
-          {/* Counted from the Run's first event to now. A finished Run is
-              measured end to end instead. */}
-          <span title={run.startedAt ?? ""}>{elapsed(run.startedAt, null)}</span>
+          {/* Counted from the Run's first event to now, and against the cap
+              this app configured -- the third of the three budgets, drawn like
+              the other two. A Run one minute from its duration limit looked
+              exactly like one with hours left, and the ending then reads as the
+              agent giving up rather than as a limit somebody chose.
+              A finished Run is measured end to end instead.
+              The cap goes on this clock rather than beside it: the line
+              already carries two time figures, and a third would be one more
+              number for a person to place. */}
+          <span
+            title={desk.budget
+              ? `${run.startedAt ?? ""} ・ 时长上限 ${durationCapLabel(desk.budget.maxDurationSeconds)}`
+              : run.startedAt ?? ""}
+          >
+            {elapsed(run.startedAt, null)}
+            {desk.budget && ` / ${durationCapLabel(desk.budget.maxDurationSeconds)}`}
+          </span>
         </>
       )}
       <i>・</i><span className="mono">{shortId(run.id)}</span>
@@ -1197,13 +1212,29 @@ export function ChatStatus() {
           ? `${run.tokens.toLocaleString()} / ${desk.budget.maxTokens.toLocaleString()} token`
           : `${run.tokens.toLocaleString()} token`}
       </span>
-      <i>・</i><span>{costLabel(run.costMicros)}</span>
+      {/* Beside its cap, for the same reason the token count is: a figure on
+          its own does not say whether the Run is near the limit that will end
+          it.
+          Two ways the cap is absent, and both are honest. The host may refuse
+          to say what it is -- a Runtime this app did not start has a budget of
+          its own, which is a different answer from "no limit". And there may be
+          no spend to measure: this app writes a Provider price of zero
+          (`electron/credentials.cjs`), so on a desktop build the cost is
+          structurally 0 and drawn as "—". A cap beside a dash would claim a
+          measurement nothing is taking. */}
+      <i>・</i>
+      <span title={desk.budget ? `上限 ${costCapLabel(desk.budget.maxCostCents)}` : ""}>
+        {desk.budget && run.costMicros > 0
+          ? `${costLabel(run.costMicros)} / ${costCapLabel(desk.budget.maxCostCents)}`
+          : costLabel(run.costMicros)}
+      </span>
       <i>・</i>
       {moving
         ? <span title={run.updatedAt ?? ""}>{since(run.updatedAt)}</span>
         : <span title={`${run.startedAt ?? ""} → ${run.updatedAt ?? ""}`}>
           用了 {elapsed(run.startedAt, run.updatedAt)}
         </span>}
+
       {moving && (
         <button type="button" className="flat stop" onClick={() => void desk.decide(run.id, "cancel")}>
           停止

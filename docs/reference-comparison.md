@@ -2704,6 +2704,54 @@ provider stream ended without [DONE]
 把三份客户端列表**都还回输入框**。我们已经做了其中一半（被拒的发送把句子放回框里）。
 
 
+
+## 2026-08-19（五）：流怎么算结束，以及一个「成功」里藏着的没跑的工具
+
+### 一、`[DONE]` 不是终局信号，`finish_reason` 才是
+
+| 谁 | 怎么做 |
+| --- | --- |
+| opencode | `packages/llm/src/protocols/shared.ts:247` 把 `[DONE]` 当保活帧**过滤掉**，协议层根本看不见它；终局条件是 `finish_reason` |
+| openclaw | 正常路径也不要求它；只在「静默工具调用提升」那个判断上把它当**干净终止**的旁证（`openai-completions-transport.ts:820-826`：*"EOF without [DONE] remains fail-closed"*） |
+| 我们（改前） | EOF 缺 `[DONE]` 一律硬失败、不可重试——哪怕 `finish_reason` 已经到了 |
+
+**同意两家**：`[DONE]` 是 SSE 的约定，`finish_reason` 才是协议真正定义的终局。
+改成：**EOF 带着 finish_reason = 完整**，刷掉缓存的工具调用并正常终局；
+**EOF 没有 finish_reason = 被截断**，仍然报错——一条中途断掉的连接和一次干净结束
+逐字节一样，只差这个。这一半正是 openclaw 那句 fail-closed 的意思，保留。
+
+### 二、`stop` + 有工具调用：两家都提升，我们两家都不像
+
+| 谁 | 怎么做 |
+| --- | --- |
+| opencode | `openai-chat.ts:465` **无条件**提升：`finishReason === "stop" && hasToolCalls ? "tool-calls" : ...` |
+| openclaw | `openai-completions-transport.ts:815-834` 有条件提升（无可见文本 + 干净终止），**否则把工具调用块丢掉** |
+| 我们（改前） | 把调用发出去，然后报 `Stop` |
+
+**后果不是措辞问题。** `requested_tool_turn`（`worker/src/lib.rs:10089-10094`）
+只匹配 `Completed { reason: ToolCalls }`——报 `Stop` 就没有东西去规划这次调用、
+没有东西去执行它，而内核已经把 Run 标成**成功**了。
+
+**取 opencode 的形式**，理由是:两家的做法各自自洽,而**我们今天做的是两家都不做的那种**
+——把调用交出去然后弃掉它。丢掉一个模型明确要的调用是静默丢失它的意图。
+
+**这条同时推翻了我上一轮的一个结论**：我说过「悬空工具调用进不了冻结转录」，
+并用两条路径的测试撑着。那两条确实进不去，**这是第三条**：Run 成功、调用没有结果、
+转录里就留下一个悬空调用。原结论的范围写窄了，已在扫描表里注明。
+
+### 三、成本该不该显示：读完之后我们和 Codex 分道
+
+- **Codex 从不显示价格**。整个 codex-rs 里唯一和钱有关的是后端下发的字符串
+  （额度余额、「N of M credits used」），没有本地算价。
+- **Codex 在轮次进行中只显示两样**：一个走字的计时和中断键。不显示 token，不显示钱。
+
+**我们不同意，但只不同意一半。** 我们保留 token 的「已用 / 上限」，
+因为 `budget_exhausted` 是我们真会发生的终局，而它突然到来读起来像 agent 罢工。
+时长同理。**成本这条我们其实站到了 Codex 那边**——不是出于同一个理由，
+而是因为这个应用给 Provider 写的定价是 0，成本恒为 0，
+在一个破折号旁边挂上限等于声称有个度量在进行。所以**只在真有花费时才画上限**。
+
+
 ## 参考源码
 
 - Codex：`agent-source-research/codex/codex-rs/app-server-protocol/src/protocol/v2/thread.rs`

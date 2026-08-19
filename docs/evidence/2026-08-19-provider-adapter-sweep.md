@@ -72,6 +72,14 @@
 - **后果**：When a provider emits tool_calls deltas but terminates with finish_reason 'stop' (openclaw names Evolink DeepSeek V4 for exactly this), we emit ToolCall events and then Completed{Stop}. The kernel sees a Stop and marks the run succeeded (runtime/crates/kernel/src/lib.rs:~525) while tool calls sit unexecuted. The agent silently stops mid-task instead of running its tools.
 - **同不同意**：同意 —— Both references independently implement this promotion, and openclaw adds the inverse guard (drop tool blocks when the turn is not a tool turn) so the two states can never disagree. We have neither half.
 - **改哪里**：runtime/apps/model-gateway/src/openai_compatible.rs:192-201 — before emitting Completed, promote Stop to ToolCalls when the tool_calls map is non-empty.
+- **已关闭（2026-08-19）**：照做了，两条终局路径（收到 `[DONE]` 和干净 EOF）共用一个
+  `tool_turn` 函数。取的是 opencode 那种无条件形式，不是 openclaw 的「没有可见文本 +
+  干净终止才提升、否则丢掉调用」——两种都自洽，而**我们今天做的是两家都不做的那种**：
+  把调用发出去然后弃掉它。丢掉一个模型明确要的调用是静默丢失它的意图，执行它才是它要的。
+  两个方向各有守卫（不提升红 1 条，无条件提升红 3 条）。
+  **顺带**：这条同时是我上一轮「悬空工具调用进不了冻结转录」那个结论的**反例**——
+  那条测试驱动的两条路径确实进不去，而这是第三条：Run 被标成成功、调用没有结果、
+  转录里就留下一个悬空调用。
 
 ### usage.prompt_tokens_details.cached_tokens
 
@@ -90,6 +98,12 @@
 - **后果**：We are the only one of the three that treats a missing [DONE] as fatal. Against any endpoint that closes cleanly after the final finish_reason chunk without emitting the sentinel — common among self-hosted vLLM builds, some Azure api-versions, and several gateways — every single run fails after the complete answer has already been streamed. The person sees the full text and then a protocol error.
 - **同不同意**：同意 —— Neither reference makes [DONE] load-bearing, and both make finish_reason the terminal signal instead. [DONE] is a convention, not a guarantee; finish_reason is the thing the protocol actually defines.
 - **改哪里**：runtime/apps/model-gateway/src/openai_compatible.rs:175-182 — on EOF, if a finish_reason was already seen, flush tool calls and complete normally; reserve the error for EOF with no finish_reason.
+- **已关闭（2026-08-19）**：照上面这条改了。EOF 带着 finish_reason 就是完整的一轮，
+  刷掉缓存的工具调用并正常终局；没有 finish_reason 才报错，措辞也换成了说事实的那句
+  「provider stream ended before the model said the turn was over」。两个方向各有守卫
+  （`a_clean_end_after_finish_reason_is_a_finished_turn` /
+  `a_stream_cut_off_before_it_finished_is_still_a_failure`），各自破坏一次确认独立。
+  **收到 `[DONE]` 但没有 finish_reason 那条仍然报错**，那是另一件事，没有动。
 
 ### top-level `error` object arriving mid-stream (HTTP 200, then data: {"error": {...}})
 

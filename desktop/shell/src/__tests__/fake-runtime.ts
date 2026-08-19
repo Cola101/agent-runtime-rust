@@ -761,10 +761,16 @@ export function installFakeRuntime(
     startRuntime: async () => ({ ok: true as const, value: true }),
     shutdown: async () => ({ ok: true as const, value: {} }),
     restart,
-    // The cap the app configured. Read by the surface so a token count is
-    // shown against something rather than on its own.
-    budget: async () => ({
-      ok: true as const,
+    // The cap the app configured. Read by the surface so a spend is shown
+    // against something rather than on its own.
+    //
+    // Typed as the real call is -- a `Reply`, either half. A Runtime this app
+    // did not start has a budget of its own and refuses to say, and a mock
+    // that could only succeed made that case unwritable.
+    budget: async (): Promise<Reply<{
+      maxTokens: number; maxCostCents: number; maxDurationSeconds: number;
+    }>> => ({
+      ok: true,
       value: { maxTokens: 400_000, maxCostCents: 500, maxDurationSeconds: 3_600 },
     }),
     events: async (
