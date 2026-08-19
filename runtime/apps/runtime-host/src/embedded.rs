@@ -532,10 +532,25 @@ pub struct RuntimeProfile {
     pub config: LocalRuntimeConfig,
 }
 
+/// The most one Turn may carry, in bytes.
+///
+/// Named because two places enforce it and a person who breaks it is told the
+/// number: a bound that only appears as a literal in a condition is a bound
+/// nobody can be told about.
+pub const MAX_SESSION_TURN_INPUT_BYTES: usize = 32_000;
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EmbeddedRuntimeError {
     #[error("embedded Runtime configuration is invalid: {0}")]
     Configuration(String),
+    /// What the caller asked for cannot be a Turn, and they can fix it.
+    ///
+    /// Separate from `Configuration` because that variant says "your setup is
+    /// wrong" and sends someone to look at a config file. A message that is
+    /// too long is not a fault in anyone's setup, and the sentence a person
+    /// gets should be about the message.
+    #[error("this cannot be sent as a Turn: {0}")]
+    RejectedSessionTurn(String),
     /// The caller supplied a structurally valid transport document whose
     /// command identity, version, or bounded action is invalid.
     #[error("Runtime control command is invalid: {0}")]
@@ -2157,12 +2172,35 @@ impl EmbeddedRuntime {
         start: bool,
     ) -> Result<EmbeddedSessionTurnReceipt, EmbeddedRuntimeError> {
         let config = self.profile(invocation)?.clone();
+        // One chain of six conditions used to answer all of them with
+        // "Session Turn request is invalid", carried on the `Configuration`
+        // variant. Measured by typing into the desktop app, a message of
+        // 144,020 characters came back as "embedded Runtime configuration is
+        // invalid: Session Turn request is invalid" -- which sends the person
+        // to look at a configuration that is fine, and never mentions the one
+        // thing they could act on, which is that their message was too long.
+        //
+        // The identity conditions stay collapsed: a nil id or a zero
+        // generation is this client having a bug, not a person having done
+        // something, and there is nothing for them to do about which field it
+        // was. The two a person can actually hit are separated and given their
+        // numbers.
+        if input.trim().is_empty() {
+            return Err(EmbeddedRuntimeError::RejectedSessionTurn(
+                "a Turn must carry something to say".into(),
+            ));
+        }
+        if input.len() > MAX_SESSION_TURN_INPUT_BYTES {
+            return Err(EmbeddedRuntimeError::RejectedSessionTurn(format!(
+                "this message is {} bytes and the most a Turn can carry is {}",
+                input.len(),
+                MAX_SESSION_TURN_INPUT_BYTES,
+            )));
+        }
         if session_id.is_nil()
             || branch_id.is_nil()
             || run_id.is_nil()
             || generation == 0
-            || input.trim().is_empty()
-            || input.len() > 32_000
             || (start && generation != 1)
         {
             return Err(EmbeddedRuntimeError::Configuration(

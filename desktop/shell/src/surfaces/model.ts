@@ -245,12 +245,22 @@ function failureReason(payload: Record<string, unknown>): string | null {
       // for all of them already -- they were only ever reached through the
       // provider-failure path. Without this, an authentication failure and a
       // rate limit both read as "a reason this build does not recognise".
-      const named = PROVIDER_FAILURE[kind];
-      if (named) return named;
-      // The runtime also writes the provider's own sentence, which nothing
-      // read. It is the only thing that can say anything about a kind this
-      // build genuinely has never seen.
+      // The runtime writes the Provider's own sentence alongside the kind, and
+      // it is the only part of a failure that can be acted on. The category
+      // orients -- it says this was the model call rather than the tool after
+      // it -- but it cannot say what to do, and for a recognised kind it used
+      // to be the only thing shown.
+      //
+      // Measured against a self-hosted vLLM: a Run ended `kind: "protocol"`
+      // carrying "max_tokens=400000 cannot be greater than
+      // max_model_len=204800. Please request fewer output tokens." That names
+      // the parameter, both numbers and the fix. The person was shown
+      // "回复的格式不对" -- which is not even what happened, since nothing was
+      // malformed and a parameter was refused -- and the sentence was dropped
+      // on the floor because `protocol` is a kind this build has a phrase for.
       const said = typeof payload.message === "string" ? payload.message.trim() : "";
+      const named = PROVIDER_FAILURE[kind];
+      if (named) return said ? `${named} —— ${said}` : named;
       return said
         ? `这个版本不认识的失败原因：${kind} —— ${said}`
         : `这个版本不认识的失败原因：${kind}`;

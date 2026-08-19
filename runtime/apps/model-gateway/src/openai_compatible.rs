@@ -454,7 +454,21 @@ async fn consume_chunk(
     pricing: ProviderPricing,
 ) -> Result<(), ProviderExecutionError> {
     for choice in chunk["choices"].as_array().into_iter().flatten() {
-        let delta = &choice["delta"];
+        // Some OpenAI-compatible servers answer a `stream: true` request with
+        // the non-streaming shape: the whole assistant turn arrives as
+        // `message` where the streaming shape puts `delta`. Everything the
+        // choice says hangs off that one field, so reading only `delta` found
+        // nothing to emit and then completed the turn off the same choice's
+        // `finish_reason` -- a Run that succeeded with the answer, the
+        // thinking and the tool calls all missing, and nothing anywhere
+        // saying so. openclaw normalises this in both of its code paths
+        // (`openai-completions-transport.ts:672-674` and
+        // `providers/openai-completions.ts:433-438`, whose comment names the
+        // cause and notes refusal-only turns arrive this way too).
+        let delta = match &choice["delta"] {
+            Value::Null => &choice["message"],
+            delta => delta,
+        };
         // Two spellings, one fact. `reasoning` is what a vLLM-served Qwen3
         // emits; `reasoning_content` is DeepSeek's and what the SGLang and
         // vLLM reasoning parsers produce. Neither was read, so on a reasoning

@@ -2904,3 +2904,96 @@ self-end px-4 py-2.5"`，openhands 的 `chat-message.tsx:148` 是同一套写法
 - 第 33 行 · 会话列表——原来是 `说的是 / 状态 / 轮次 / 最后更新` 四列表格。表格适合
   Run 列表（列与列之间真的要比），不适合这里：没人按轮次排序找对话，人找的是**认得出
   的那句话**。改成标题 + 末次回复摘要（经 `plain()` 去掉 markdown 标记）+ 元信息。
+
+## 2026-08-19（八）：两个在卖的产品都用 marked，以及为什么不整包接 assistant-ui
+
+上一节读的是 ChatGPT 桌面版的样式表。这一节把范围铺开：本机装着的两个产品
+的 asar，加上 assistant-ui 与 Vercel AI Elements 两个仓库（本轮 clone 到
+`~/Documents/Code/agent-source-research/{assistant-ui,ai-elements}`）。
+
+### 一、两个产品各自打包了什么
+
+对 asar 做 `strings` 后按库名计数：
+
+| | Claude Desktop | ChatGPT Desktop |
+| --- | --- | --- |
+| `marked` | 98 | 516 |
+| `katex` | — | 1852 |
+| `shiki` | — | 221 |
+| `micromark` | — | 11 |
+| `react-markdown` / `remark-*` | — | — |
+
+**两家都用 `marked` 解析 markdown，都没有 remark / react-markdown 那条流水线。**
+ChatGPT 在上面加了 katex（数学）和 shiki（高亮），Claude 连这两样都没有。
+
+**因此推翻本轮早些时候的一条自己的结论**：我原来写「这是一个小解析器而不是
+依赖，因为一条回复里的形状是一个已知的短列表」。这句话是错的，而且错得可以
+量出来——我那个手写解析器没有表格、没有嵌套列表、没有任务清单、没有删除线、
+没有裸链接、没有转义字符、没有硬换行，而模型这些全都天天写。**一条回复里的
+形状不是一个有人猜得完的列表**，两个在卖的产品都不猜，我也不该猜。
+
+现在解析器是 `marked`，但**不用 `marked.parse()`**。那个返回 HTML 字符串，
+把模型输出经 `dangerouslySetInnerHTML` 送进 DOM 就是把每一条回复变成一个注入
+面——模型正在转述互联网，而互联网有一部分是敌意的。改成走 `marked.lexer()`
+拿 token 树、自己建 React 元素：不插入任何原始 HTML；每个文本叶子仍过 `Mark`，
+⌘F 的计数没变；不想画的形状就是不画，而不是透传。守卫里有两条专门盯这个
+（模型写的 `<script>` 是字不是标签、`javascript:` 链接不给点）。
+
+### 二、流式下的残缺文档，分工在哪一层
+
+AI Elements 把这件事外包给 `streamdown`，而 `streamdown` 的依赖树
+（`ai-elements/pnpm-lock.yaml:12846-12865`）里两个承重件说明了分工：
+
+- `remend@1.2.2` 补闭合符，只处理**行内**标记（粗体、斜体、行内代码、删除线、
+  链接、图片、KaTeX、setext 标题），**它的 handler 列表里没有围栏代码块，也没有
+  表格**。
+- `marked@17` 把缓冲区按块级 token 切开，完整块各自记忆化，只有末尾那个残块
+  每 tick 重画。
+
+也就是说：**围栏和表格不是靠补闭合符救的，是靠分块救的**。这条我们同意并照做——
+本轮的守卫里「表格只写了表头也画得出来」「表格写到一半那行不吃掉整张表」
+「链接写到一半先把已经到的字给人看」都是按这个分工写的，`marked` 的 lexer
+本身就把残缺块降级成能画的东西。
+
+### 三、assistant-ui：能薄接，但本轮不接
+
+结论先说：**不整包接入，只学做法。**
+
+它的三层 runtime 里，`LocalRuntime`（`assistant-ui/packages/core/src/runtimes/local/local-thread-runtime-core.ts`，897 行）
+自己持有 repository、run generation、队列、历史写入和 abort，连「要不要继续
+跑下一轮」都在前端判（`.../local/should-continue.ts:3-39`）。**这正是常驻要求里
+「GUI 不复制内核状态机」明令禁止的那件事**，这条路直接排除。
+
+`AssistantTransport`（`packages/core/src/react/runtimes/assistant-transport/types.ts:110-168`）
+确实是照着「后端唯一权威」设计的，客户端权威状态就是一个 ref、每个 chunk 整体
+替换（`useAssistantTransportRuntime.ts:152, 311-319`），线协议只有 `set` 和
+`append-text` 两个 op（`assistant-stream/src/core/gorp/types.ts:3-13`）。技术上
+能接。**不接的理由是词汇会降维**：我们的 `Lifecycle` 有 8 个变体
+（`desktop/shell/src/surfaces/model.ts`，含 `retired` / `indeterminate` /
+`unrecognised`），它的 `MessageStatus` 只有 4 个，thread 级只有 `isRunning:
+boolean`；而且它的 `auto-status.ts` 默认**从 parts 反推 status**，恰好是我们
+model.ts 顶上那条注释明令禁止的事（Lifecycle 是运行时类型边界的翻译，绝不从
+事件列表推导）。为了拿它的组件而把 8 态塞进 4 态，是拿契约换皮肤。
+
+AI Elements 那边的判断不同：它对 AI SDK 的耦合**全是 `import type`**，编译期
+擦除，`<Message>` 只吃 `role` 字符串、`<Tool>` 只吃字符串、`<Conversation>` 就是
+`use-stick-to-bottom` 的薄包装。它没有状态层可复制。但它硬性要求 Tailwind 4 +
+shadcn + `@/` 别名，而这个 shell 是裸 React 19 + Vite，没有 Tailwind——为了几个
+组件引入整条 Tailwind/shadcn 工具链，代价大于收益。**所以也不接，但它的实现
+值得照抄具体做法**，下面两条是本轮记下、尚未实现的：
+
+- 平滑输出 `assistant-ui/packages/react/src/utils/smooth/useSmooth.ts:88-91`：
+  rAF 驱动，`baseTimePerChar = min(5ms, 250ms / 剩余字数)`——积压越多每字越快，
+  目标是无论 chunk 多突发，积压都在 ~250ms 内摊平。`prefers-reduced-motion`
+  直接绕过（`:161-164`）。
+- 「用户是不是自己往上滚了」`assistant-ui/packages/store/src/utils/viewport-scroll.ts:14-21`：
+  `previous.scrollTop > current.scrollTop && previous.scrollHeight === current.scrollHeight`。
+  **`scrollHeight` 必须完全相等**是这条判据的核心——流式文本会让 scrollHeight
+  增长，这一条把「内容长高导致的相对位移」和「真人手势」分开了。
+
+这两条都**没有实现，本节只记录出处和数字**，不算已做。
+
+### 四、因此关闭
+
+- `docs/desktop-ui-gap.md` 第 32 行从「已接入」改写为覆盖真实形状：表格、嵌套
+  列表、任务清单、删除线、裸链接、转义、硬换行，以及流式残缺块。

@@ -202,3 +202,56 @@ async fn a_runtime_restart_during_a_turn_leaves_the_conversation_continuable() {
     provider.abort();
     let _ = provider.await;
 }
+
+/// A message too long to send says so, and says nothing about configuration.
+///
+/// Measured by typing into the desktop app: a 144,020-character message came
+/// back as
+///
+///   embedded Runtime configuration is invalid: Session Turn request is invalid
+///
+/// which is wrong twice. Nothing is wrong with the configuration -- the
+/// operator's setup is fine and this sentence sends them to look at it. And
+/// "is invalid" is the whole diagnosis for a chain of six separate conditions
+/// (nil ids, generation zero, blank input, and the length bound), so the one
+/// that actually fired is the one thing not said. The bound is 32,000 bytes,
+/// the runtime knows it, and the person retyping their message does not.
+#[tokio::test]
+async fn a_message_over_the_bound_says_it_is_too_long_and_by_how_much() {
+    let state = tempfile::tempdir().expect("state root");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let (endpoint, provider) = spawn_provider_silent_once().await;
+    let socket = socket_path(state.path());
+
+    let mut host = serve(state.path(), workspace.path(), &endpoint);
+    wait_for_socket(&socket).await;
+
+    let refused = owner(
+        &socket,
+        serde_json::json!({
+            "scope": "owner", "type": "session_start",
+            "session_id": uuid::Uuid::now_v7(), "branch_id": uuid::Uuid::now_v7(),
+            "run_id": uuid::Uuid::now_v7(), "input": "x".repeat(32_001),
+        }),
+    )
+    .await;
+
+    let said = refused.to_string();
+    assert!(
+        said.contains("32000") || said.contains("32,000") || said.contains("32_000"),
+        "the refusal must name the bound it broke: {said}",
+    );
+    assert!(
+        said.contains("32001") || said.contains("32,001") || said.contains("32_001"),
+        "the refusal must name how long the message actually was: {said}",
+    );
+    assert!(
+        !said.contains("configuration"),
+        "a message being too long is not a configuration fault: {said}",
+    );
+
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    provider.abort();
+    let _ = provider.await;
+}

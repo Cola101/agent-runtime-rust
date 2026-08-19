@@ -282,21 +282,29 @@ const REPLY = `改好了。下面是这次动过的地方。
 
 ## 改了什么
 
-写入 \`notes.txt\` 用的是 **工作区工具**，不是 shell，所以这一步走的是受信任根目录里的路径检查：
+写入 \`notes.txt\` 用的是 **工作区工具**，不是 shell，所以走的是受信任根里的路径检查：
 
 \`\`\`rust
 let path = trusted.resolve(request.path)?;
 fs::write(&path, request.text)?;
-Ok(WriteResult { bytes: request.text.len() })
 \`\`\`
 
-有三点要注意：
+| 文件 | 字节 | 结果 |
+| --- | ---: | :---: |
+| notes.txt | 88 | 写入 |
+| README.md | 0 | ~~跳过~~ |
+
+- [x] 路径在受信任根内
+- [ ] 原子写（还没做）
+
+有几点要注意：
 
 1. 原来的文件是空的，现在有一行；
-2. 路径在受信任根之外会被拒绝，*不会*落盘；
-3. 写入不是原子的，中途失败会留下半个文件。
+   - 越界的路径会被拒绝，*不会*落盘
+   - 写入不是原子的
+2. 想原子写要先写临时文件再 rename。
 
-> 如果要原子写，得先写临时文件再 rename。
+> 裸链接也认：https://example.com/atomic-writes
 
 细节见 [工作区工具说明](https://example.com/workspace)。`;
 

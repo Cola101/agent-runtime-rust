@@ -315,6 +315,103 @@ async fn a_thinking_part_inside_content_is_reported_as_thinking() {
     assert_eq!(answer, "done");
 }
 
+/// A server that answers `stream: true` with non-streaming-shaped chunks.
+///
+/// The choice carries a whole `message` where the streaming shape puts a
+/// `delta`. Reading only `delta` found `Value::Null`, emitted nothing, and
+/// then read `finish_reason` off the same choice and completed the turn --
+/// so the Run succeeded with the answer nowhere in it, and nothing anywhere
+/// said a word had been lost.
+///
+/// openclaw normalises this in both of its code paths
+/// (`packages/ai/src/transports/openai-completions-transport.ts:672-674` and
+/// `packages/ai/src/providers/openai-completions.ts:433-438`, whose comment
+/// names the cause: "Some OpenAI-compatible endpoints deliver a full
+/// `message` instead of `delta`").
+#[tokio::test]
+async fn a_message_shaped_chunk_still_carries_the_answer() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    let answer = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        answer, "Hello",
+        "an answer sent in a message-shaped chunk is still the answer: {events:?}"
+    );
+}
+
+/// The same shape, carrying a tool call and thinking rather than an answer.
+///
+/// Everything the choice holds hangs off the one field we did not read, so
+/// the call the model asked for was dropped as silently as the text -- and
+/// the turn still completed, reporting success for work that never happened.
+#[tokio::test]
+async fn a_message_shaped_chunk_still_asks_for_the_tool() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"reasoning\":\"which file\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (endpoint, captured, server) = spawn_complete_server(200, sse).await;
+    let adapter = OpenAiCompatibleAdapter::new(config(endpoint)).unwrap();
+    let credential = ProviderCredential::bearer("tenant-secret-token").unwrap();
+    let (events_tx, mut events_rx) = mpsc::channel(16);
+    adapter
+        .execute(
+            &model_request(),
+            &credential,
+            CancellationToken::new(),
+            events_tx,
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = events_rx.recv().await {
+        events.push(event);
+    }
+    let _ = captured.await.unwrap();
+    server.await.unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCall { id, name, arguments }
+                if id == "call_7" && name == "read_file" && arguments["path"] == "a.txt")),
+        "the call the model asked for must survive the chunk's shape: {events:?}",
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event, ModelStreamEvent::ReasoningDelta { text, .. } if text == "which file")),
+        "the thinking hangs off the same field and is lost the same way: {events:?}",
+    );
+}
+
 /// A provider that repeats the tool call id and name on every fragment.
 ///
 /// Both references replace these; we appended. Azure and some vLLM builds

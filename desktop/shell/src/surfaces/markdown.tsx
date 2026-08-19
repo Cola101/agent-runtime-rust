@@ -1,204 +1,238 @@
 import type { ReactNode } from "react";
+import { marked } from "marked";
 import { Mark } from "./Mark";
+
+type Token = marked.Token;
 
 /// Drawing what the model actually wrote.
 ///
-/// Models answer in markdown. Until this existed the transcript drew that
+/// Models answer in markdown. Before this existed the transcript drew that
 /// markdown as one flat paragraph, so a fenced block arrived as prose with
-/// three backticks in it and a five-step list arrived as one long line. The
-/// content was all there and none of it was readable.
+/// three backticks in it and a five-step list arrived as one long line.
 ///
-/// This is deliberately a small parser rather than a dependency. What a reply
-/// contains is a known, short list -- paragraphs, fences, lists, headings,
-/// emphasis, links -- and the failure mode that matters is a half-written
-/// document, because every reply is a half-written document until the last
-/// token lands. A fence with no closing fence is a code block here, not a
-/// parse error, and that is the case a general-purpose renderer gets to be
-/// pedantic about and this one does not.
+/// The parser is `marked`, and that choice is evidence rather than taste: both
+/// shipping desktop clients on this machine bundle it and nothing else of the
+/// kind -- `/Applications/Claude.app/Contents/Resources/app.asar` carries
+/// `marked` alone, and ChatGPT's carries `marked` plus `katex` and `shiki` for
+/// maths and highlighting. Neither ships the remark/react-markdown pipeline.
+/// The first version of this file was a hand-written parser covering the
+/// shapes I happened to think of; it had no tables, no nested lists, no task
+/// lists, no strikethrough and no autolinks, and a model writes all of those
+/// constantly. The list of things a person can type is not a list anyone
+/// finishes guessing.
+///
+/// What is deliberately *not* taken is `marked.parse()`. That returns an HTML
+/// string, and putting a model's output through `dangerouslySetInnerHTML`
+/// makes every reply an injection surface -- the model is quoting the web, and
+/// some of the web is hostile. This walks the token tree instead and builds
+/// React elements, which costs one function and buys three things: no raw HTML
+/// is ever inserted, every text leaf can still go through `Mark` so ⌘F counts
+/// what it counted before, and the shapes we choose not to draw are simply not
+/// drawn rather than passed through.
 
-type Block =
-  | { kind: "code"; lang: string; text: string }
-  | { kind: "heading"; level: number; text: string }
-  | { kind: "list"; ordered: boolean; start: number; items: string[] }
-  | { kind: "quote"; text: string }
-  | { kind: "rule" }
-  | { kind: "para"; text: string };
+marked.use({ gfm: true, breaks: true });
 
-const FENCE = /^\s*```+\s*([A-Za-z0-9_+-]*)\s*$/;
-const HEADING = /^(#{1,6})\s+(.*)$/;
-const BULLET = /^\s*[-*+]\s+(.*)$/;
-const NUMBER = /^\s*(\d{1,9})[.)]\s+(.*)$/;
-const QUOTE = /^\s*>\s?(.*)$/;
-const RULE = /^\s*(?:---+|\*\*\*+|___+)\s*$/;
+/// Where a link is allowed to point.
+///
+/// Anything else is drawn as text with no href. `javascript:` is the reason --
+/// it is a script the person runs by clicking something the model wrote -- and
+/// an allow-list is the only form of this check that stays correct as new
+/// schemes are invented.
+const REACHABLE = /^(https?:|mailto:|#|\/|\.)/i;
 
-export function parse(text: string): Block[] {
-  const lines = text.split("\n");
-  const blocks: Block[] = [];
-  let at = 0;
-
-  while (at < lines.length) {
-    const line = lines[at];
-
-    const fence = FENCE.exec(line);
-    if (fence) {
-      const body: string[] = [];
-      at += 1;
-      // Runs to the closing fence, or to the end of what has arrived. The
-      // second case is every streamed reply mid-flight.
-      while (at < lines.length && !FENCE.test(lines[at])) {
-        body.push(lines[at]);
-        at += 1;
-      }
-      if (at < lines.length) at += 1;
-      blocks.push({ kind: "code", lang: fence[1] ?? "", text: body.join("\n") });
-      continue;
-    }
-
-    if (line.trim() === "") { at += 1; continue; }
-
-    if (RULE.test(line)) { blocks.push({ kind: "rule" }); at += 1; continue; }
-
-    const heading = HEADING.exec(line);
-    if (heading) {
-      blocks.push({ kind: "heading", level: heading[1].length, text: heading[2] });
-      at += 1;
-      continue;
-    }
-
-    const bullet = BULLET.exec(line);
-    const numbered = NUMBER.exec(line);
-    if (bullet || numbered) {
-      const ordered = numbered !== null;
-      const start = numbered ? Number(numbered[1]) : 1;
-      const items: string[] = [];
-      while (at < lines.length) {
-        const b = BULLET.exec(lines[at]);
-        const n = NUMBER.exec(lines[at]);
-        if (ordered && n) items.push(n[2]);
-        else if (!ordered && b) items.push(b[1]);
-        else break;
-        at += 1;
-      }
-      blocks.push({ kind: "list", ordered, start, items });
-      continue;
-    }
-
-    const quote = QUOTE.exec(line);
-    if (quote) {
-      const body = [quote[1]];
-      at += 1;
-      while (at < lines.length) {
-        const more = QUOTE.exec(lines[at]);
-        if (!more) break;
-        body.push(more[1]);
-        at += 1;
-      }
-      blocks.push({ kind: "quote", text: body.join("\n") });
-      continue;
-    }
-
-    // A paragraph runs until a blank line or until some other block starts on
-    // its own line, so a list that follows prose without a blank line between
-    // them is still a list.
-    const body: string[] = [];
-    while (at < lines.length) {
-      const next = lines[at];
-      if (next.trim() === "") break;
-      if (body.length > 0 && (FENCE.test(next) || HEADING.test(next) || RULE.test(next)
-        || BULLET.test(next) || NUMBER.test(next) || QUOTE.test(next))) break;
-      body.push(next);
-      at += 1;
-    }
-    blocks.push({ kind: "para", text: body.join("\n") });
-  }
-
-  return blocks;
+function safeHref(href: string): string | null {
+  const cleaned = href.trim();
+  return REACHABLE.test(cleaned) ? cleaned : null;
 }
 
-// Code first: whatever is inside a span of code is text, including the
-// characters that would otherwise be emphasis.
-const INLINE = /`([^`\n]+)`|\*\*([\s\S]+?)\*\*|\[([^\]\n]+)\]\(([^)\s]+)\)|\*([^*\n]+)\*/g;
-
-function inline(text: string, query: string): ReactNode {
-  const out: ReactNode[] = [];
-  let at = 0;
-  let key = 0;
-  INLINE.lastIndex = 0;
-  for (;;) {
-    const found = INLINE.exec(text);
-    if (!found) break;
-    if (found.index > at) {
-      out.push(<Mark key={key++} text={text.slice(at, found.index)} query={query} />);
-    }
-    const [, code, strong, label, href, em] = found;
-    if (code !== undefined) {
-      out.push(<code key={key++}><Mark text={code} query={query} /></code>);
-    } else if (strong !== undefined) {
-      out.push(<strong key={key++}><Mark text={strong} query={query} /></strong>);
-    } else if (label !== undefined) {
-      // Denied in-window by the main process's window-open handler, which
-      // hands the URL to the real browser instead.
-      out.push(
-        <a key={key++} href={href} target="_blank" rel="noreferrer noopener">
-          <Mark text={label} query={query} />
-        </a>,
-      );
-    } else if (em !== undefined) {
-      out.push(<em key={key++}><Mark text={em} query={query} /></em>);
-    }
-    at = found.index + found[0].length;
-  }
-  if (at < text.length) {
-    out.push(<Mark key={key++} text={text.slice(at)} query={query} />);
-  }
-  return <>{out}</>;
+function inline(tokens: Token[] | undefined, query: string, text = ""): ReactNode {
+  if (!tokens || tokens.length === 0) return <Mark text={text} query={query} />;
+  return (
+    <>
+      {tokens.map((token, index) => {
+        switch (token.type) {
+          case "strong":
+            return (
+              <strong key={index}>
+                {inline((token as marked.Tokens.Strong).tokens, query, token.text)}
+              </strong>
+            );
+          case "em":
+            return (
+              <em key={index}>{inline((token as marked.Tokens.Em).tokens, query, token.text)}</em>
+            );
+          case "del":
+            return (
+              <del key={index}>{inline((token as marked.Tokens.Del).tokens, query, token.text)}</del>
+            );
+          case "codespan":
+            // `marked` has already resolved the doubled-backtick form and
+            // decoded the entities it introduced, so this is the literal text
+            // the person meant to show.
+            return (
+              <code key={index}>
+                <Mark text={decode((token as marked.Tokens.Codespan).text)} query={query} />
+              </code>
+            );
+          case "br":
+            return <br key={index} />;
+          case "link": {
+            const link = token as marked.Tokens.Link;
+            const href = safeHref(link.href);
+            const body = inline(link.tokens, query, link.text);
+            // Denied in-window by the main process's window-open handler,
+            // which hands the URL to the real browser instead.
+            return href
+              ? (
+                <a key={index} href={href} target="_blank" rel="noreferrer noopener">
+                  {body}
+                </a>
+              )
+              : <span key={index}>{body}</span>;
+          }
+          case "image": {
+            // Drawn as its own text rather than fetched. A remote image in a
+            // reply is a request this app makes to a third party because a
+            // model named it, which is a tracking pixel with extra steps.
+            const image = token as marked.Tokens.Image;
+            return (
+              <span key={index} className="img-ref">
+                <Mark text={image.text || image.href} query={query} />
+              </span>
+            );
+          }
+          case "html":
+            // The model wrote a tag. It is a thing it said, not a thing to run.
+            return <Mark key={index} text={(token as marked.Tokens.HTML).raw} query={query} />;
+          case "escape":
+            return <Mark key={index} text={(token as marked.Tokens.Escape).text} query={query} />;
+          default:
+            return (
+              <Mark key={index} text={decode((token as marked.Tokens.Text).text ?? "")} query={query} />
+            );
+        }
+      })}
+    </>
+  );
 }
 
-function Heading({ level, children }: { level: number; children: ReactNode }) {
+/// `marked` escapes text for HTML output; we are not producing HTML.
+///
+/// Without this a reply containing `a < b` reaches the screen as `a &lt; b`,
+/// which is the one thing worse than not rendering markdown at all: it is
+/// wrong text presented as if it were what the model said.
+const ENTITIES: Record<string, string> = {
+  "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&#x27;": "'",
+};
+function decode(text: string): string {
+  return text.replace(/&(?:amp|lt|gt|quot|#39|#x27);/g, (found) => ENTITIES[found] ?? found);
+}
+
+function Heading({ depth, children }: { depth: number; children: ReactNode }) {
   // Past three the visual scale has nothing left to say, and a reply is not a
   // document with six levels of structure.
-  const Tag = `h${Math.min(level, 3)}` as "h1" | "h2" | "h3";
+  const Tag = `h${Math.min(depth, 3)}` as "h1" | "h2" | "h3";
   return <Tag>{children}</Tag>;
 }
 
-/// One block of a reply, drawn.
+function Block({ token, query }: { token: Token; query: string }): ReactNode {
+  switch (token.type) {
+    case "space":
+      return null;
+    case "code": {
+      const code = token as marked.Tokens.Code;
+      return (
+        <pre data-lang={code.lang || undefined}>
+          <code><Mark text={code.text} query={query} /></code>
+        </pre>
+      );
+    }
+    case "heading": {
+      const heading = token as marked.Tokens.Heading;
+      return (
+        <Heading depth={heading.depth}>{inline(heading.tokens, query, heading.text)}</Heading>
+      );
+    }
+    case "table": {
+      const table = token as marked.Tokens.Table;
+      return (
+        // Its own scroller: a wide table must not stretch the reading column,
+        // and wrapped cells are a table nobody can read down.
+        <div className="tbl">
+          <table>
+            <thead>
+              <tr>
+                {table.header.map((cell, at) => (
+                  <th key={at} align={table.align[at] ?? undefined}>
+                    {inline(cell.tokens, query, cell.text)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {table.rows.map((row, at) => (
+                <tr key={at}>
+                  {row.map((cell, column) => (
+                    <td key={column} align={table.align[column] ?? undefined}>
+                      {inline(cell.tokens, query, cell.text)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+    case "hr":
+      return <hr />;
+    case "blockquote":
+      return (
+        <blockquote>
+          {(token as marked.Tokens.Blockquote).tokens.map((inner, at) => (
+            <Block key={at} token={inner} query={query} />
+          ))}
+        </blockquote>
+      );
+    case "list": {
+      const list = token as marked.Tokens.List;
+      const items = list.items.map((item, at) => (
+        <li key={at} className={item.task ? "task" : undefined}>
+          {item.task && (
+            // Readable, not operable. The transcript is a record of what was
+            // said; a checkbox a person could tick would be a control that
+            // changes nothing, which is worse than no control.
+            <input type="checkbox" checked={item.checked === true} disabled readOnly />
+          )}
+          {item.tokens.map((inner, index) => <Block key={index} token={inner} query={query} />)}
+        </li>
+      ));
+      return list.ordered
+        ? <ol start={typeof list.start === "number" ? list.start : undefined}>{items}</ol>
+        : <ul>{items}</ul>;
+    }
+    case "html":
+      return <p>{<Mark text={(token as marked.Tokens.HTML).raw} query={query} />}</p>;
+    case "paragraph":
+      return <p>{inline((token as marked.Tokens.Paragraph).tokens, query, token.text)}</p>;
+    case "text": {
+      const text = token as marked.Tokens.Text;
+      // Inside a list item this is the item's own words and must not open a
+      // paragraph, or every tight list becomes a loose one.
+      return <>{inline(text.tokens, query, text.text)}</>;
+    }
+    default:
+      return null;
+  }
+}
+
+/// One reply, drawn.
 export function Markdown({ text, query }: { text: string; query: string }) {
   return (
     <>
-      {parse(text).map((block, index) => {
-        switch (block.kind) {
-          case "code":
-            return (
-              <pre key={index} data-lang={block.lang || undefined}>
-                <code><Mark text={block.text} query={query} /></code>
-              </pre>
-            );
-          case "heading":
-            return (
-              <Heading key={index} level={block.level}>
-                {inline(block.text, query)}
-              </Heading>
-            );
-          case "list":
-            return block.ordered
-              ? (
-                <ol key={index} start={block.start}>
-                  {block.items.map((item, at) => <li key={at}>{inline(item, query)}</li>)}
-                </ol>
-              )
-              : (
-                <ul key={index}>
-                  {block.items.map((item, at) => <li key={at}>{inline(item, query)}</li>)}
-                </ul>
-              );
-          case "quote":
-            return <blockquote key={index}>{inline(block.text, query)}</blockquote>;
-          case "rule":
-            return <hr key={index} />;
-          case "para":
-            return <p key={index}>{inline(block.text, query)}</p>;
-        }
-      })}
+      {marked.lexer(text).map((token, index) => (
+        <Block key={index} token={token} query={query} />
+      ))}
     </>
   );
 }
@@ -216,28 +250,51 @@ export function Markdown({ text, query }: { text: string; query: string }) {
 /// statement. A reply that is nothing but code therefore summarises to
 /// nothing, which is the honest answer -- the caller draws no line at all.
 export function plain(text: string): string {
-  const parts: string[] = [];
-  for (const block of parse(text)) {
-    switch (block.kind) {
-      case "code":
-      case "rule":
-        break;
-      case "list":
-        parts.push(...block.items);
-        break;
-      case "heading":
-      case "quote":
-      case "para":
-        parts.push(block.text);
-        break;
+  // Inline pieces of one block join with nothing and blocks join with a
+  // space. Joining everything with a space put a gap before every comma that
+  // followed a bold run -- "工作区工具 ，不是 shell" -- which is the sort of
+  // wrongness that reads as a rendering bug in the row itself.
+  // Not every token kind carries `text` -- `space` and `def` do not -- so the
+  // read is guarded rather than asserted.
+  const textOf = (token: Token): string =>
+    "text" in token && typeof token.text === "string" ? token.text : "";
+  const blocks: string[] = [];
+  const inlineText = (tokens: Token[] | undefined, fallback: string): string => {
+    if (!tokens || tokens.length === 0) return fallback;
+    return tokens.map((token) => {
+      if (token.type === "image") return "";
+      const carried = (token as marked.Tokens.Paragraph).tokens;
+      if (carried && carried.length > 0) return inlineText(carried, textOf(token));
+      if (token.type === "br") return " ";
+      return (token as marked.Tokens.Text).text ?? "";
+    }).join("");
+  };
+  const walk = (tokens: Token[]) => {
+    for (const token of tokens) {
+      switch (token.type) {
+        case "code":
+        case "space":
+        case "hr":
+          break;
+        case "table": {
+          const table = token as marked.Tokens.Table;
+          for (const cell of table.header) blocks.push(cell.text);
+          for (const row of table.rows) for (const cell of row) blocks.push(cell.text);
+          break;
+        }
+        case "list":
+          for (const item of (token as marked.Tokens.List).items) walk(item.tokens);
+          break;
+        case "blockquote":
+          walk((token as marked.Tokens.Blockquote).tokens);
+          break;
+        default: {
+          const said = inlineText((token as marked.Tokens.Paragraph).tokens, textOf(token));
+          if (said.trim()) blocks.push(said);
+        }
+      }
     }
-  }
-  return parts
-    .join(" ")
-    .replace(/`([^`\n]+)`/g, "$1")
-    .replace(/\*\*([\s\S]+?)\*\*/g, "$1")
-    .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, "$1")
-    .replace(/\*([^*\n]+)\*/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
+  };
+  walk(marked.lexer(text));
+  return decode(blocks.join(" ")).replace(/\s+/g, " ").trim();
 }

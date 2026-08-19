@@ -436,6 +436,14 @@ impl RuntimeClientError {
                     "the event log is unavailable",
                 ),
             },
+            // The one refusal here a person can act on, so it is the one that
+            // keeps its sentence. Every other arm answers with a fixed string
+            // because the detail behind it is about this Runtime's internals
+            // and would only be noise on someone's screen; this one is about
+            // what they just typed.
+            EmbeddedRuntimeError::RejectedSessionTurn(why) => {
+                Self::new(RuntimeClientErrorCode::InvalidRequest, why)
+            }
             EmbeddedRuntimeError::Configuration(_) | EmbeddedRuntimeError::Runtime(_) => Self::new(
                 RuntimeClientErrorCode::Internal,
                 "the Runtime could not complete this request",

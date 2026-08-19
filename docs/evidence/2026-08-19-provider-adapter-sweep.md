@@ -27,6 +27,17 @@
 - **同不同意**：同意 —— openclaw's own code comment says coercing these objects produced persisted '[object Object]' text, so they hit this in production. Silently returning empty is worse than that. opencode does not handle it either, but opencode fails loudly (Schema.String decode error, openai-chat.test.ts:619-625 'fails on malformed stream events') rather than silently emitting nothing — either behaviour beats ours.
 - **改哪里**：runtime/apps/model-gateway/src/openai_compatible.rs:386 — branch on Value::String vs Value::Array before `.as_str()`; at minimum return a Protocol error when content is present but not a string, so it fails loudly.
 - **复核更正**：Line number only: the cited `openai_compatible.rs:386` is now :410 (commit cde0e90 "Show the model thinking instead of an empty screen" inserted the reasoning branch and its comment above it). `consume_chunk` starts at :375. Everything else in the gap is accurate as written. Two refinements to the CHANGE: (1) the useful branch is three-way, not two — string, array (recurse per part), and object (r
+- **已关闭（2026-08-19）**：走的是「正确解析」，不是「响亮失败」。`content_parts`
+  三路递归：string、array（逐 part 递归）、object（取 `text`/`content`/`thinking`
+  再递归），照 openclaw `getCompletionsContentDeltas`
+  （`openai-completions-transport.ts:1061-1101`）。`type` 里含 thinking/reasoning
+  的 part 走 `ReasoningDelta`，其余走 `TextDelta`。
+  **和 openclaw 差一处，是故意的**：openclaw 只认 `text`/`output_text`/`*.output_text`
+  三种 type 为可见文本，其余一律返回 `[]`；我们对认不出的 type 仍然把文字发出去。
+  丢一个我们没见过的 type，就是这条缺口本身——一个没预料到的拼法不该让答案消失。
+  两条守卫（`content_streamed_as_parts_is_not_silently_dropped` /
+  `a_thinking_part_inside_content_is_reported_as_thinking`），破坏一次确认独立：
+  改回 `.as_str()` 后两条同时红，其余 26 条全绿。
 
 ### delta.tool_calls[].id
 
@@ -280,6 +291,15 @@
 - **后果**：Against a server that answers a `stream: true` request with message-shaped chunks, `delta["content"]` and `delta["tool_calls"]` are both `Value::Null`, so `.as_str()` and `.as_array()` yield `None` and both loops are skipped. We still read `choice["finish_reason"]` at line 422, so the turn completes normally with `Completed { reason: Stop }` and *zero* content events. Silent, total data loss presenting as a successful empty turn — the one failure mode in this file with no error attached to it. openclaw considered this shape common enough to handle in two independent code paths.
 - **同不同意**：同意 —— A silent empty success is worse than any of the loud failures above, and the fix is one fallback expression that openclaw ships twice. This is also the failure most likely to be misdiagnosed as a model problem rather than an adapter problem.
 - **改哪里**：/Users/cola/Documents/Code/agent-runtime-platform/runtime/apps/model-gateway/src/openai_compatible.rs:385 — `let delta = if choice["delta"].is_null() { &choice["message"] } else { &choice["delta"] };`, matching openai-completions-transport.ts:672.
+- **已关闭（2026-08-19）**：照做了，`delta` 为 `Value::Null` 时回落到
+  `choice["message"]`，和 openclaw 两条路径同形。回落一次，后面读 content、
+  reasoning、refusal、tool_calls 的代码一行没动——整个 choice 都挂在这一个字段上，
+  所以修一处就够。
+  两条守卫（`a_message_shaped_chunk_still_carries_the_answer` /
+  `a_message_shaped_chunk_still_asks_for_the_tool`）。红的时候的样子正是这条缺口
+  说的那种：第一条拿到 `[Completed { reason: Stop }]`，一个成功的空回答；第二条拿到
+  `[Completed { reason: ToolCalls }]`——这一轮**宣称**自己要调工具，一个 ToolCall
+  事件都没发。
 
 ### disposition when assembly fails — drop, error the turn, or send back to the model
 

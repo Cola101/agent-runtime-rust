@@ -354,6 +354,40 @@ div.note span { white-space: nowrap; }
 .rep a:hover { text-decoration-thickness: 2px; }
 .rep strong { font-weight: 650; }
 
+/* A table is the one block that must be allowed to be wider than the column.
+   Wrapped cells are a table nobody can read down, so it scrolls inside its own
+   box and the reading column keeps its width. */
+.rep .tbl { margin: var(--chat-line) 0; overflow-x: auto; }
+.rep table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: .94em; }
+.rep th, .rep td {
+  padding: 6px 11px; border: 1px solid var(--hair);
+  text-align: left; vertical-align: top;
+}
+/* The alignment the author wrote in the delimiter row. `align` is on the cell
+   as an attribute, so this only has to stop `text-align: left` above from
+   overriding it. */
+.rep th[align="right"], .rep td[align="right"] { text-align: right; }
+.rep th[align="center"], .rep td[align="center"] { text-align: center; }
+.rep thead th { background: var(--wash-2); font-weight: 600; white-space: nowrap; }
+
+/* A ticked box in a reply is a record of what the model said it did, not a
+   control. Drawn at the text's size and out of the flow of the marker. */
+.rep li.task { list-style: none; margin-left: -1.5em; }
+.rep li.task > input {
+  width: .95em; height: .95em; margin-right: .5em;
+  vertical-align: -1px; accent-color: var(--accent); cursor: default;
+}
+
+/* An image the model named. Not fetched -- a remote image in a reply is a
+   request this app would make to a third party because a model said so. */
+.rep .img-ref {
+  padding: .1em .4em; border-radius: 4px; border: 1px dashed var(--hair);
+  color: var(--ink-2); font-size: .9em;
+}
+.rep .img-ref::before { content: "图 "; color: var(--ink-3); }
+
+.rep del { color: var(--ink-3); }
+
 /* Each block fades in as it is committed, which is what the eye reads as
    "arriving" rather than "appearing". Copied in spirit from ChatGPT's own
    thread renderer, which starts each markdown block at opacity 0 and runs it

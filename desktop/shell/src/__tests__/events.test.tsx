@@ -58,6 +58,33 @@ describe("events the runtime reports about the exchange", () => {
     expect(screen.queryByText(/这个版本不认识/)).toBeNull();
   });
 
+  /// A kind this build *does* know still has to say what the provider said.
+  ///
+  /// The real case, measured against a self-hosted vLLM: the Run ended
+  /// `kind: "protocol"` and the server's own sentence was
+  ///
+  ///   max_tokens=400000 cannot be greater than max_model_len=204800.
+  ///   Please request fewer output tokens.
+  ///
+  /// which names the parameter, both numbers and the fix. Because `protocol`
+  /// is a kind this build has a phrase for, that phrase won and the sentence
+  /// was dropped: the person was told "回复的格式不对", which is not what
+  /// happened -- nothing was malformed, a parameter was refused -- and tells
+  /// them nothing to do. The category orients; the sentence is the only part
+  /// that can be acted on, so a recognised kind keeps both.
+  it("keeps the provider's own sentence even for a failure kind it knows", async () => {
+    const { bridge } = await watching();
+    bridge.emit(RUN_LIVE, bridge.event(40, "run.failed", {
+      status: "failed", kind: "protocol", retryable: false,
+      message: "Provider qwen-local failed: max_tokens=400000 cannot be greater "
+        + "than max_model_len=204800. Please request fewer output tokens.",
+    }, 30));
+    await waitFor(() => expect(screen.getByText(/max_model_len=204800/)).toBeTruthy());
+    // The category still orients -- it is what tells a person this was the
+    // model call and not the tool that follows it.
+    expect(screen.getByText(/回复的格式不对/)).toBeTruthy();
+  });
+
   /// And a kind this build genuinely has not seen still says what the runtime
   /// said, rather than only naming the kind.
   it("prints the runtime's own sentence for a failure kind it does not know", async () => {
